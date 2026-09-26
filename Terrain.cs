@@ -344,9 +344,27 @@ internal sealed class Terrain
             if (slab.Bytes[i] != 0)
                 open++;
 
-        return open * 100 < slab.Bytes.Length * Least
-            ? $"only {open} of {slab.Bytes.Length} routing cells read as navigable, under the " +
-              $"{Least}% a real grid never falls below"
+        // **An absolute floor, because the share of the grid that is routable measures the MAP's size
+        // and not whether the read worked.**
+        //
+        // The grid spans the whole map; a dig site occupies a small and roughly fixed part of it. So
+        // the fraction falls as the map grows, and the test failed on a big one. Measured on two sites
+        // that both plan perfectly well:
+        //
+        //   Scorched Cay   187 x 157 =  29,359 cells, 3,077 routable = 10.48%  - passed
+        //   Port           271 x 223 =  60,433 cells, 3,001 routable =  4.97%  - REFUSED
+        //
+        // Nearly the same number of routable cells; Port is simply twice the area. A tester saw
+        // "Offsets are broken" on an ordinary expedition because of it, and the old message claimed
+        // 5% was a figure "a real grid never falls below" while holding a real grid that did.
+        //
+        // What the check is actually for is a read that produced nothing - a slab of zeroes, or a
+        // pointer into the wrong place. That shows up as a handful of cells, not as three thousand, so
+        // an absolute floor separates the two with an order of magnitude to spare and does not care how
+        // large the map is.
+        return open < Fewest
+            ? $"only {open} of {slab.Bytes.Length} routing cells read as navigable, fewer than the " +
+              $"{Fewest} a real grid has anywhere a dig site will fit"
             : null;
     }
 
@@ -354,7 +372,14 @@ internal sealed class Terrain
     private const int Most = 4096;
 
     /// <summary>What percentage of a real routing grid is navigable, at the very lowest.</summary>
-    private const int Least = 5;
+    /// <summary>
+    /// The fewest routable coarse cells a real grid has, as an absolute count.
+    ///
+    /// Two hundred and fifty, against the three thousand both measured sites carry - twelve times the
+    /// margin - and against the nought or handful a failed read gives. Replaced a 5% share, which was
+    /// a measure of the map's area rather than of the read. See Wrong.
+    /// </summary>
+    private const int Fewest = 250;
 
     /// <summary>
     /// Whether the ground between two links is clear the whole way.

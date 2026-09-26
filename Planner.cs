@@ -8309,6 +8309,9 @@ internal static class Planner
                             : "");
                 }
 
+                // Written, so whatever was out of date no longer is. See RuneTallyOutOfDate.
+                RuneTallyOutOfDate = false;
+
                 RuneTallyByRemnant[_localGrid[n]] = new RuneTally(
                     // Counts every socket, empowering ones included - they were invisible here too,
                     // which is what made a six socket remnant read five. See LocalSharesOfMarker's lift.
@@ -8588,6 +8591,25 @@ internal static class Planner
 
     /// <summary>What each remnant's waves are wearing, from the last detailed pass.</summary>
     public static readonly Dictionary<(int X, int Y), RuneTally> RuneTallyByRemnant = new();
+
+    /// <summary>
+    /// Whether RuneTallyByRemnant describes a chain that has since changed under it.
+    ///
+    /// **A roll changes what a remnant passes on, and the table cannot know that until a pass rewrites
+    /// it.** The figures are published by the detailed pass and read by the overlay - deliberately, so
+    /// that the ground and the objective are one answer and cannot drift. The cost is that between a
+    /// roll and the next pass the line under a remnant states the OLD runes with full confidence, which
+    /// is the reading that prompted this.
+    ///
+    /// **Set rather than cleared, because the table is load-bearing for more than the line.** Overlay
+    /// tests ContainsKey to decide whether a remnant is drawn at all when rewards are switched off, so
+    /// emptying it would make whole remnant blocks disappear rather than one line. The table stays and
+    /// this says not to trust it.
+    ///
+    /// Propagation is chain-wide, so a roll invalidates every entry and not only the rolled remnant's:
+    /// what that one passes on is what the ones after it receive.
+    /// </summary>
+    public static bool RuneTallyOutOfDate { get; set; }
 
     /// <summary>
     /// Which combination the objective took at each remnant, from the last detailed pass.

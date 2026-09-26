@@ -2107,6 +2107,22 @@ internal sealed class Planning
 
         _env = env;
 
+        // **The readout is re-scored against the new environment now, not when the search finishes.**
+        //
+        // Breakdown publishes Planner.RuneTallyByRemnant - the figures the line under each remnant is
+        // written from - and the overlay already calls it every frame with the plan's points. It
+        // answers from cache while the tail and the laid count are unchanged, which they are after a
+        // roll: the CHAIN did not move, the runes on it did. So the line went on stating the runes the
+        // roll replaced until the search ended and published, which on a large site is seconds.
+        //
+        // Env above is freshly built and PlanTarget snapshots its runes and choices, so it is the
+        // first thing in the process that knows about the roll. Dropping the cache here means the
+        // overlay's own next call re-scores against it and the line is right on the next frame.
+        //
+        // One chain scored, which is what the overlay pays whenever a plan changes - the search is
+        // the expensive part and this is not it.
+        _split = null;
+
         // Counted per site, so "run 4" means the fourth press here rather than the fourth this
         // session - which is the number the question is about.
         if (Vector2.Distance(_counting, Detonator.DetonatorGridPosition(gc)) >= 1f)
@@ -2567,6 +2583,30 @@ internal sealed class Planning
         // Valuation.ChosenRecipeId.
         if (target.Rerolled)
             return Safe.Read(() => valuation?.ChosenRecipeId(target.Entity), null);
+
+        // **A must take earned by a reward's price pins that reward.**
+        //
+        // Insisted.Automatic reads Reroll.Worth, which is the price of the richest offer, so a remnant
+        // clears the threshold because of ONE combination. Marking the remnant and then leaving the
+        // objective to choose freely among its offers honours the letter of that and none of the point:
+        // reported from the game, a 471ex Masterwork Rune made a remnant must take and a 12ex reward
+        // with better runes was taken instead. The chain took the remnant and left the money.
+        //
+        // The recipe rather than the reward's name, like every other pin here - two combinations can
+        // yield one reward and propagate differently, and Reward carries the recipe it came from.
+        // Rewards[0] because the list is ordered by price and that is the entry Worth read.
+        //
+        // **Below the two pins above it, both of which outrank it.** A rolled remnant cannot be
+        // changed at all, so what it landed on is the only truth about it. And Overrule off means "do
+        // not override my choice", which a pin from the planner would do precisely.
+        if (Safe.Read(() => Insisted.Here.MarkedForRewardValue(target.Grid), false) &&
+            Safe.Read(() => settings.Rewards.Overrule.Value, true))
+        {
+            var earned = Safe.Read(() => target.Rewards[0].Recipe, null);
+
+            if (!string.IsNullOrEmpty(earned))
+                return earned;
+        }
 
         return Safe.Read(() => settings.Rewards.Overrule.Value, true)
             ? null

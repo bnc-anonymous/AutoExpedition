@@ -1,5 +1,6 @@
 ﻿using ExileCore2;
 using ExileCore2.PoEMemory.FilesInMemory;
+using ExileCore2.Shared.Enums;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -63,7 +64,13 @@ internal sealed class Census
     public void AreaChange(uint areaHash)
     {
         if (areaHash != _area)
+        {
             _seen.Clear();
+
+            // Emptied, so it has to be filled again before the next decision - otherwise leaving a
+            // site and coming back writes every remnant in it a second time. See Remembering.
+            _remembered = false;
+        }
 
         _area = areaHash;
     }
@@ -95,6 +102,39 @@ internal sealed class Census
         var area = Safe.Read(() => gc.Area.CurrentArea.Name, "?") ?? "?";
         var hash = Safe.Read(() => gc.Area.CurrentArea.Hash, 0u);
         var level = Safe.Read(() => gc.IngameState.Data.CurrentAreaLevel, 0);
+
+        // **The map's floor on rune slots, because it makes the socket counts in this file not a
+        // sample of anything.**
+        //
+        // An atlas passive grants "All Verisium Remnants have at least X rune slots" and the map
+        // carries it as a visible stat, so it is readable in the map rather than only on the tree:
+        // MapExpedition2RemnantsHaveAtLeastXSlots, seen at 5 and reported as reaching 7. Every
+        // remnant in such a map is at or above that floor by construction.
+        //
+        // Without the column those rows are indistinguishable from natural ones, and a few of these
+        // maps would pull the whole socket distribution upwards - which is the distribution the
+        // reroll shares are drawn from. See Rolls.Pins and NOTES on reading this file: the floor is
+        // what a reader filters on before counting sockets at all.
+        //
+        // Nought where no such modifier is present, which is the ordinary case, and nought is also
+        // what an unreadable stat gives - a distinction that does not matter here, since both mean
+        // "no floor stated".
+        var floor = Safe.Read(() => gc.IngameState.Data.MapStatsVisible
+            .TryGetValue(GameStat.MapExpedition2RemnantsHaveAtLeastXSlots, out var said)
+            ? said
+            : 0, 0);
+
+        // **Read the file back BEFORE deciding what is new, which is the whole of the dedupe bug.**
+        //
+        // _seen is what stops a remnant being written twice, and it was seeded by Remember - called
+        // from Append, which runs after this loop has already decided every row. So the first sighting
+        // of a session compared each remnant against an EMPTY set, wrote the lot, and only then read
+        // the file. Four plugin reloads in one map therefore produced four copies of every remnant:
+        // measured at 67 rows over 28 distinct keys on one site, and 32 over 21 on another.
+        //
+        // Costs one read of the file per generation and nothing afterwards. See Remembering.
+        Remembering(plugin);
+
         var rows = new List<string>();
 
         foreach (var target in scan.Targets)
@@ -188,7 +228,12 @@ internal sealed class Census
                 // count that was in force when it was taken. Written per row, the file answers both
                 // on its own.
                 reachable.ToString(CultureInfo.InvariantCulture),
-                pins.ToString(CultureInfo.InvariantCulture)));
+                pins.ToString(CultureInfo.InvariantCulture),
+
+                // The map's floor on rune slots, last because columns are only ever appended. See
+                // where it is read: a row from a map with a floor is not a sample of the natural
+                // socket distribution and has to be filtered out before counting.
+                floor.ToString(CultureInfo.InvariantCulture)));
         }
 
         if (rows.Count > 0)
@@ -288,7 +333,8 @@ internal sealed class Census
 
         // Appended, never inserted, so Upgrade can bring an existing file forward and its old rows
         // stay valid while simply stopping short. See Upgrade.
-        "dedupe,activated,selected,reachable,admittedPins";
+        "dedupe,activated,selected,reachable,admittedPins," +
+        "mapSlotFloor";
 
     /// <summary>
     /// Brings an existing file up to the current header, once, leaving its rows alone.
@@ -391,6 +437,33 @@ internal sealed class Census
     private static string Clean(string text) =>
         string.IsNullOrEmpty(text) ? "" : text.Replace(',', ';').Replace('\n', ' ').Trim();
 
+    /// <summary>
+    /// Fills _seen from the file, once per generation, before anything is compared against it.
+    ///
+    /// **Resolves the path without writing to it**, so asking what is already recorded cannot create
+    /// the file or rewrite its header - Append still owns both of those.
+    ///
+    /// A generation ends when AreaChange empties the set. Re-seeding then matters because the set is
+    /// cleared on entering a different area and Remember only ever ran once a session, so returning to
+    /// a site already in the file wrote all of it again.
+    /// </summary>
+    private void Remembering(BaseSettingsPlugin<AutoExpeditionSettings> plugin)
+    {
+        if (_remembered)
+            return;
+
+        _remembered = true;
+
+        var at = _path ?? Safe.Read(
+            () => Path.Combine(plugin.ConfigDirectory, "dumps", "remnants.csv"), null);
+
+        if (at != null)
+            Remember(at);
+    }
+
+    /// <summary>Whether _seen has been filled from the file for this generation. See Remembering.</summary>
+    private bool _remembered;
+
     private void Append(BaseSettingsPlugin<AutoExpeditionSettings> plugin, List<string> rows)
     {
         try
@@ -414,7 +487,9 @@ internal sealed class Census
                     File.WriteAllText(_path, Columns + "\n");
                 }
 
-                Remember(_path);
+                // Remembering has already filled _seen for this generation, before anything was
+                // compared against it - which is the point. Reading the file again here would be a
+                // second path doing one job, and the one that used to run too late.
             }
 
             File.AppendAllLines(_path, rows);

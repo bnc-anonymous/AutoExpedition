@@ -3658,7 +3658,18 @@ internal static class Overlay
 
             using var waves = Spent.On("Remnants/Waves");
 
-            var line = settings.Display.Remnants.Propagation.ShowWaves && Planner.RuneTallyByRemnant.TryGetValue(cell, out var runes)
+            // **Nothing while the figures are a roll out of date.** They describe what the chain
+            // carried before the roll, and propagation is chain-wide, so every remnant's line is wrong
+            // and not only the rolled one's. A blank line for the second or two until the next detailed
+            // pass publishes is the honest reading; the alternative is the same confident sentence about
+            // runes that are no longer there. The same choice the paragraph above makes for a remnant no
+            // chain reaches: no answer is what gets drawn when there is no answer.
+            //
+            // Suppressed here rather than by emptying the table, because the test above uses it to
+            // decide whether a remnant is drawn at all. See Planner.RuneTallyOutOfDate.
+            var line = settings.Display.Remnants.Propagation.ShowWaves &&
+                       !Planner.RuneTallyOutOfDate &&
+                       Planner.RuneTallyByRemnant.TryGetValue(cell, out var runes)
                 ? Propagation.Waves(runes)
                 : null;
 
@@ -3819,7 +3830,9 @@ internal static class Overlay
     private static void Figure(Graphics graphics, AutoExpeditionSettings settings, ref Vector2 at,
         double worth, Color colour)
     {
-        var said = worth.ToString("+0;-0;0");
+        // Thousands separated, because the figure beside a remnant runs to five digits on a big chain
+        // and "+32220" is not a number anybody reads at a glance.
+        var said = worth.ToString("+#,##0;-#,##0;0");
         var size = graphics.MeasureText(said);
 
         graphics.DrawBox(new RectangleF(at.X - 2f, at.Y, size.X + 4f, size.Y),

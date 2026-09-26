@@ -831,6 +831,22 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Rolling.Mode(Settings) != RerollSettings.Continuous)
             _planning.Stop("a remnant was rolled");
 
+        // **A roll makes the propagation figures wrong, whether or not anything can act on it yet.**
+        //
+        // The block below only runs when no search is in flight, which in the continuous mode is
+        // almost never - so putting this inside it, which is where it was first written, meant the one
+        // mode people use never marked anything. Reported from the game: a rolled remnant went on
+        // showing the rune it used to pass until the next solve cycle published.
+        //
+        // RollPending rather than TakeRolled, because this must not consume the signal the block below
+        // is waiting for.
+        //
+        // Planner.RuneTallyByRemnant is published by the detailed pass and read only by the readouts,
+        // so marking it is enough: the line and the combinations window both go blank rather than
+        // stating runes that are no longer there. See Planner.RuneTallyOutOfDate.
+        if (_scan.RollPending)
+            Planner.RuneTallyOutOfDate = true;
+
         if (!_planning.Searching && !_placement.Busy && _scan.TakeRolled())
         {
             // **The advice is dropped as well as re-solved, because the plan may not change.** Consider
@@ -847,6 +863,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             // uses. Their gains are a roll out of date, which is what Stale is for.
             if (Rolling.Mode(Settings) != RerollSettings.Continuous)
                 Rolling.Here.Forget();
+
 
             _planning.Start(GameController, Settings, _scan, _blast, _valuation,
                 ZoneCancellationToken, cause: "a remnant was rolled", looped: true);

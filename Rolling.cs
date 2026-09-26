@@ -312,9 +312,9 @@ internal sealed class Rolling
                       : "");
 
             text.Add($"        ({cell.X},{cell.Y}) {(Advising(verdict.Grid) ? "ROLL" : "keep")} " +
-                     $"{verdict.Gain:+0.0;-0.0;0} [runes " +
-                     $"layout {verdict.Exact:+0.0;-0.0;0} + " +
-                     $"re-route {verdict.Extra:+0.0;-0.0;0}{spread}] - {verdict.Why}");
+                     $"{verdict.Gain:+#,##0.0;-#,##0.0;0} [runes " +
+                     $"layout {verdict.Exact:+#,##0.0;-#,##0.0;0} + " +
+                     $"re-route {verdict.Extra:+#,##0.0;-#,##0.0;0}{spread}] - {verdict.Why}");
         }
 
         text.Sort(StringComparer.Ordinal);
@@ -1597,7 +1597,7 @@ internal sealed class Rolling
         {
             text.Add($"        ({env.Targets[i].Grid.X:0},{env.Targets[i].Grid.Y:0}) " +
                      $"destroys {destroyed:N1} weight of runes nothing else carries, " +
-                     $"enumerated {gain:+0.0;-0.0;0}" +
+                     $"enumerated {gain:+#,##0.0;-#,##0.0;0}" +
                      (i == byGain[0].Index ? "   <- the enumerated pick" : ""));
         }
 
@@ -1760,6 +1760,28 @@ internal sealed class Rolling
 
             foreach (var (id, weight) in target.Runes ?? [])
                 said.Append(id).Append('/').Append(weight.ToString("0.###")).Append('+');
+
+            // **What the remnant OFFERS, and whether it is insisted, because the standing side depends
+            // on both and neither was here.**
+            //
+            // The accumulation holds two halves: a mean over rolled arrangements, which does not
+            // depend on the remnant's current offers because the rolled side prices every recipe at
+            // nought, and a STANDING - the chain as it is - which depends on them entirely. Fingerprint
+            // one half and the cache survives a change that moved the other.
+            //
+            // Turning a must take on or off does exactly that: Planning.Pinned collapses Choices to the
+            // single insisted reward, which changes the standing and nothing else here. So a cached
+            // standing from the pinned chain was subtracted from a mean belonging to the unpinned one,
+            // and a remnant read as worth rolling by tens of thousands. Reported as a bogus +32,220 on
+            // a first propagator, and it went away on a plan reset - which is this cache being dropped.
+            said.Append(target.Must ? "M" : "m");
+
+            foreach (var choice in target.Choices ?? [])
+            {
+                said.Append(choice.Reward.ToString("0.#")).Append('/')
+                    .Append(choice.Carries.ToString("0.##")).Append('/')
+                    .Append(choice.Local.ToString("0.##")).Append(',');
+            }
 
             said.Append(';');
         }

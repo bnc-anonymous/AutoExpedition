@@ -2343,6 +2343,19 @@ internal static class Dump
 
         b.AppendLine("  runes landing on each remnant, as drawn:");
 
+        // **Whether the table is current, because a stale one looks identical to a fresh one.** The
+        // figures survive a roll and describe the runes it replaced, so a reader comparing them against
+        // a remnant on screen would be comparing two different remnants. The line on the ground and the
+        // combinations window both go blank while this holds; the dump prints the numbers anyway,
+        // because knowing what the last pass concluded is the point of a dump.
+        if (Planner.RuneTallyOutOfDate)
+        {
+            b.AppendLine("  !!   these figures are A ROLL OUT OF DATE - a remnant was rolled after the " +
+                         "pass that wrote them, and propagation is chain-wide, so every row below " +
+                         "describes runes that may no longer be there. The next detailed pass rewrites " +
+                         "it. See Planner.RuneTallyOutOfDate.");
+        }
+
         if (Planner.RuneTallyByRemnant.Count == 0)
         {
             b.AppendLine("    none recorded - no chain has been scored in detail yet");

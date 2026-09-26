@@ -70,6 +70,47 @@ internal sealed class Insisted
     /// </summary>
     private readonly HashSet<(int X, int Y)> _offered = new();
 
+    /// <summary>
+    /// The cells marked must take because of what a reward is WORTH, as opposed to by hand.
+    ///
+    /// **A must take on reward value is a statement about one reward, and the chain has to honour that
+    /// reward rather than merely the remnant.** Automatic reads Reroll.Worth, the price of the richest
+    /// offer, so a remnant clears the threshold because of one specific combination. Nothing carried
+    /// that fact, so the objective took the remnant and then chose freely among its offers - reported
+    /// from the game: a 471ex Masterwork Rune made a remnant must take and a 12ex reward with better
+    /// runes was taken instead, which honours the letter of the instruction and none of the point.
+    ///
+    /// Kept apart from _cells rather than folded into Said, because a must take set BY HAND says
+    /// nothing about which reward to take: somebody marking a marker wants it in the chain, and the
+    /// objective is still the right thing to pick its combination. Only the value-driven ones name a
+    /// reward.
+    /// </summary>
+    private readonly HashSet<(int X, int Y)> _forReward = new();
+
+    /// <summary>
+    /// Whether this cell is must take BECAUSE of a reward's value, right now. See _forReward.
+    ///
+    /// **Both halves, so the pin cannot outlive the insistence that justified it.** _forReward records
+    /// why a cell was marked and is never unmarked: Cycle takes a cell out of _cells when somebody
+    /// turns the must take off, and the stale-cell sweep does the same, and neither knew about this
+    /// set. Read on its own it therefore went on pinning the reward after the must take was gone -
+    /// which locked a remnant to the rich offer whose runes are poor, cost the chain about six
+    /// thousand, and then made rolling that remnant look like a gain of eight hundred. Reported as
+    /// exactly that: the score fell from 30k to 24k and the roll advice would not go away.
+    ///
+    /// Derived rather than kept in step, because "remember to remove it in three places" is the shape
+    /// of a fault that comes back. _cells is the one truth about whether a cell is insisted; this only
+    /// says what the reason was.
+    /// </summary>
+    public bool MarkedForRewardValue(Vector2 grid)
+    {
+        var cell = Cell(grid);
+
+        return _forReward.Contains(cell) &&
+               _cells.TryGetValue(cell, out var said) &&
+               said == Said.Take;
+    }
+
     private uint _area;
 
     public int Count => _cells.Count;
@@ -115,6 +156,7 @@ internal sealed class Insisted
         // Cleared too, so a reset is a genuine fresh start: the threshold gets to make its offer
         // again on a site somebody has deliberately wiped.
         _offered.Clear();
+        _forReward.Clear();
     }
 
     /// <summary>
@@ -204,7 +246,13 @@ internal sealed class Insisted
             var cell = Cell(target.Grid);
 
             if (_offered.Add(cell) && worth >= above)
+            {
                 _cells[cell] = Said.Take;
+
+                // Recorded so the reward that cleared the threshold is the one the chain takes. See
+                // _forReward and Planning.Pinned.
+                _forReward.Add(cell);
+            }
         }
     }
 
@@ -283,6 +331,7 @@ internal sealed class Insisted
         {
             _cells.Clear();
             _offered.Clear();
+            _forReward.Clear();
         }
 
         _area = areaHash;

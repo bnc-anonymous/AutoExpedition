@@ -3610,6 +3610,21 @@ public class RewardSettings
 /// </summary>
 public class RecordingSettings
 {
+    /// <summary>
+    /// The same button as the one under Investigation, at the top of the section whose files people
+    /// are asked to send.
+    ///
+    /// **A second button, not a second implementation.** Both call DumpFolder.Open, which owns the
+    /// path and creates the folder - see there for why that is one place. The ImGui id differs because
+    /// two controls with one id are one control: the second would be swallowed and never drawn.
+    /// </summary>
+    [JsonIgnore]
+    public CustomNode DumpFolderUi { get; set; } = new CustomNode(() =>
+    {
+        if (ImGui.Button("Open dump folder###openDumpsRecording"))
+            DumpFolder.Open();
+    });
+
 
     /// <summary>
     /// One switch over everything that watches the game and writes a file while you play.
@@ -4614,25 +4629,8 @@ public class DebugSettings
     [JsonIgnore]
     public CustomNode DumpFolderUi { get; set; } = new CustomNode(() =>
     {
-        if (!ImGui.Button("Open dump folder###openDumps"))
-            return;
-
-        try
-        {
-            var where = System.IO.Path.Combine(Unknowns.Home, "dumps");
-
-            System.IO.Directory.CreateDirectory(where);
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = where,
-                UseShellExecute = true,
-            });
-        }
-        catch (System.Exception ex)
-        {
-            ExileCore2.DebugWindow.LogError(
-                $"[AutoExpedition] Could not open the dump folder: {ex.Message}", 5f);
-        }
+        if (ImGui.Button("Open dump folder###openDumps"))
+            DumpFolder.Open();
     });
 
     [Menu("Max dump files")]

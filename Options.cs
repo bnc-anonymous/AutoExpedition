@@ -400,7 +400,10 @@ internal static class Options
         Planner.RuneTally? landing = null;
         var was = mine == null ? default : ((int)MathF.Round(mine.Grid.X), (int)MathF.Round(mine.Grid.Y));
 
-        if (mine != null &&
+        // Blank while the figures are a roll out of date, for the same reason the line on the ground is
+        // blank: the window and the ground read one table and must not disagree about it. See
+        // Planner.RuneTallyOutOfDate.
+        if (mine != null && !Planner.RuneTallyOutOfDate &&
             Planner.RuneTallyByRemnant.TryGetValue(
                 ((int)MathF.Round(mine.Grid.X), (int)MathF.Round(mine.Grid.Y)), out var found))
         {
