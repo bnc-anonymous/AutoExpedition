@@ -3301,7 +3301,23 @@ internal static class Overlay
         var screen = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default(RectangleF));
         var sane = 4f * MathF.Max(MathF.Max(screen.Width, screen.Height), 1000f);
 
-        for (var reach = Vector2.Distance(target, here); reach >= 20f; reach *= 0.5f)
+        // **Bounded twice, because halving does not terminate on an infinity.**
+        //
+        // reach *= 0.5f leaves an infinite reach infinite, and the loop test passes every time - so a
+        // grid coordinate that reads as huge or non-finite, which a bad memory read can produce at any
+        // moment, spins this forever ON THE RENDER THREAD, taking a terrain read and a projection each
+        // time round. A hung render thread is not a dropped frame: the overlay stops presenting and
+        // the device is left waiting, which is how a plugin reaches the display driver.
+        //
+        // So the span is checked for being finite before the loop starts, and the loop carries its own
+        // trip count regardless. Twenty-four halvings take any sane distance below twenty, so the
+        // count never ends a run that was going to succeed - it only ends one that was not.
+        var span = Vector2.Distance(target, here);
+
+        if (!float.IsFinite(span) || span <= 0f)
+            return bearing;
+
+        for (var (reach, tries) = (span, 0); reach >= 20f && tries < 24; reach *= 0.5f, tries++)
         {
             var step = Where(gc, here + way * reach);
 
