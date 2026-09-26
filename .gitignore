@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+*.user
+expedition_solve_plan.md
+Errors.txt
+README.md
+NOTES.md
+CLAUDE.md
+STATE.md
+__pycache__/
+composition_plan.md
+*.before-*

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Library</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <DebugType>embedded</DebugType>
+    <PathMap>$(MSBuildProjectDirectory)=$(MSBuildProjectName)</PathMap>
+    <EmbedAllSources>true</EmbedAllSources>
+    <!-- The HUD sets the output path itself when the source lives in Plugins/Source -->
+  </PropertyGroup>
+
+  <ItemGroup>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Set the exileCore2Package environment variable to your ExileCore2 folder -->
+    <Reference Include="ExileCore2">
+      <HintPath>$(exileCore2Package)\ExileCore2.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="GameOffsets2">
+      <HintPath>$(exileCore2Package)\GameOffsets2.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The shipped weight reference table, copied beside the assembly.
+
+      Wrt.Source is DirectoryFullName, which is where the DLL lands - Plugins/Temp - and not the
+      source folder this file sits in. Without this the file is version controlled, present, and
+      never read: every row shows as unset and the prune that empties a custom file agreeing with
+      it never runs. The same rule ExileMaps uses for its own json.
+    -->
+    <Content Include="weight_reference_table_defaults.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ImGui.NET" Version="1.90.0.1" />
+    <!-- The unscouted wash is one generated texture rather than a heap of quads. See Wash. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="2.1.3" />
+    <!-- For [JsonIgnore] on the settings back-reference; the HUD ships this assembly. -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+</Project>
