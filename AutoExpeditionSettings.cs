@@ -3768,6 +3768,25 @@ public class DebugSettings
     /// would explain it, or does not arrive. Requiring a debug mode in order to record what the
     /// plugin does with it off is a measurement that cannot be taken.
     /// </remarks>
+    /// <summary>
+    /// Whether the plugin tries to find an offset again when the one baked in stops resolving.
+    ///
+    /// **Because a game patch moves these and the symptom is silent.** The client's no-placement volumes are
+    /// found through a static type descriptor, and after the 28 September update the descriptor had moved: the
+    /// lookup returned nothing, every authored no-placement rectangle read as ordinary ground, and the planner
+    /// routed onto ground the game refuses. Nothing said so - the readouts showed a site with no forbidden
+    /// volumes, which is indistinguishable from a site that has none.
+    ///
+    /// The repair is self-validating rather than a guess. The tag it is looking for is known independently and
+    /// confirmed two ways, so each candidate the client's own table offers is tried and only one whose
+    /// component carries that tag is adopted. A wrong guess cannot be accepted; it can only fail and say so.
+    ///
+    /// On by default: a stale offset that reads as "this site has none" is worse than a repair attempt that
+    /// reports failure. Either way the dump says which offset was used and where it came from.
+    /// </summary>
+    [Menu("Attempt to repair broken offsets")]
+    public ToggleNode RepairOffsets { get; set; } = new ToggleNode(true);
+
     [Menu("Enable debug mode")]
     public ToggleNode ShowOverlay { get; set; } = new ToggleNode(false);
 

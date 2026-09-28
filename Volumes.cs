@@ -35,6 +35,28 @@ namespace AutoExpedition;
 /// </summary>
 internal sealed class Volumes
 {
+    /// <summary>
+    /// The type descriptor key that actually resolves, when the one baked into Offsets no longer does.
+    ///
+    /// **A game patch moves these and the symptom is silent.** After the 28 September update the descriptor
+    /// at Offsets.VolumeDescriptor resolved to no slot at all - measured, six instances with every lookup
+    /// returning -1, where the day before three instances resolved and one carried the tag. Every authored
+    /// no-placement rectangle then reads as ordinary ground, which is indistinguishable from a site that has
+    /// none, so the planner routes onto ground the game refuses and nothing on the page says why.
+    ///
+    /// Nought until a repair has found something. See Repair and DebugSettings.RepairOffsets.
+    /// </summary>
+    internal static long Repaired { get; private set; }
+
+    /// <summary>What the last read made of its offsets, for the dump and the overlay to say out loud.</summary>
+    internal static string Said { get; private set; } = "not read yet";
+
+    /// <summary>
+    /// Whether the last read resolved no component at all, which is a broken offset rather than a site with no
+    /// volumes. The two look identical from the outside, which is why this is recorded separately.
+    /// </summary>
+    internal static bool Broken { get; private set; }
+
     /// <summary>One forbidden rectangle, in grid units, half-open on its far edges.</summary>
     internal readonly record struct Box(int Left, int Top, int Right, int Bottom)
     {
@@ -134,6 +156,12 @@ internal sealed class Volumes
         var seen = new HashSet<long>();
         var index = new Dictionary<long, int>();
 
+        // **Counted because the two failures look identical from outside.** A site with no forbidden
+        // rectangles and a site whose descriptor offset has moved both return an empty list. Instances found
+        // with nothing resolved is the second one, and only the counts can say so.
+        var instances = 0;
+        var resolved = 0;
+
         for (var y = ty; y <= by; y++)
         {
             for (var x = lx; x <= rx; x++)
@@ -174,7 +202,12 @@ internal sealed class Volumes
                     if (inst <= Lowest || !seen.Add(inst))
                         continue;
 
+                    instances++;
+
                     var part = Resolve(gc, inst, index, key);
+
+                    if (part > Lowest)
+                        resolved++;
 
                     if (part <= Lowest || Word(gc, part + Offsets.VolumeTag) != Offsets.NoPlacementTag)
                         continue;
@@ -186,6 +219,15 @@ internal sealed class Volumes
                 }
             }
         }
+
+        Broken = instances > 0 && resolved == 0;
+
+        Said = Broken
+            ? $"BROKEN: {instances} volume instance(s) found and none resolved a component, so the type " +
+              "descriptor offset no longer matches the client. Every authored no-placement rectangle is " +
+              "being read as ordinary ground."
+            : $"{instances} instance(s), {resolved} resolved, {found._boxes.Count} forbidden rectangle(s)" +
+              (Repaired != 0 ? $", using a repaired descriptor at {Repaired:X}" : "");
 
         return found;
     }
