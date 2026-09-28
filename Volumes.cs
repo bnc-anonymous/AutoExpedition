@@ -209,7 +209,7 @@ internal sealed class Volumes
                     if (part > Lowest)
                         resolved++;
 
-                    if (part <= Lowest || Word(gc, part + Offsets.VolumeTag) != Offsets.NoPlacementTag)
+                    if (part <= Lowest || Word(gc, part + Offsets.VolumeTag + Shift) != Wanted(gc))
                         continue;
 
                     var box = Rect(gc, part);
@@ -227,6 +227,8 @@ internal sealed class Volumes
               "descriptor offset no longer matches the client. Every authored no-placement rectangle is " +
               "being read as ordinary ground."
             : $"{instances} instance(s), {resolved} resolved, {found._boxes.Count} forbidden rectangle(s)" +
+              (Shift != 0 ? $", fields shifted by {Shift} bytes" : "") +
+              (ByShape ? " - ACCEPTED BY SHAPE, not by the tag, so check the rectangles look right" : "") +
               (Repaired != 0 ? $", using a repaired descriptor at {Repaired:X}" : "");
 
         return found;
@@ -243,9 +245,10 @@ internal sealed class Volumes
     /// </summary>
     private static Box Rect(GameController gc, long part)
     {
-        var w = Int(gc, part + Offsets.VolumeWide);
-        var h = Int(gc, part + Offsets.VolumeHigh);
-        var owner = Hop(gc, part + Offsets.Inner);
+        // Shift applies to the fields inside the component; the owner it points at does not move.
+        var w = Int(gc, part + Offsets.VolumeWide + Shift);
+        var h = Int(gc, part + Offsets.VolumeHigh + Shift);
+        var owner = Hop(gc, part + Offsets.Inner + Shift);
         var placed = owner <= Lowest ? 0 : Hop(gc, owner + Offsets.OwnerPlaced);
 
         if (placed <= Lowest)
@@ -313,6 +316,115 @@ internal sealed class Volumes
         return Repaired > Lowest ? Repaired : start + Offsets.VolumeDescriptor;
     }
 
+    /// <summary>
+    /// The first sixteen bytes at an address, as hex.
+    ///
+    /// For the case the repair cannot solve: if no slot carries the tag where it is expected, the tag may have
+    /// moved inside the component rather than the component being wrong. Sixteen bytes is enough to find 0x970C
+    /// at a different offset by eye, which is the next thing anybody would want to know.
+    /// </summary>
+    private static string Peek16(GameController gc, long at)
+    {
+        var raw = Safe.Read(() => gc.Memory.ReadBytes(at, 16), null);
+
+        return raw == null ? "unread" : Convert.ToHexString(raw);
+    }
+
+    /// <summary>
+    /// How far the volume component's fields have moved since the offsets were taken, in bytes.
+    ///
+    /// **Found, not guessed.** The tag is a known 16 bit value, so a component that holds it somewhere other
+    /// than the recorded offset says by how much the whole struct shifted - and the fields beside it shift with
+    /// it. Measured on the 28 September update: the type descriptor moved 0x30 down the module and the tag was
+    /// no longer at its offset, which is why the first repair accepted no candidate.
+    ///
+    /// Applied only to the fields inside this component. The owner it points at is a different object and does
+    /// not move with it.
+    /// </summary>
+    internal static long Shift { get; private set; }
+
+    /// <summary>
+    /// Where the tag sits in this component, as a shift from the recorded offset, or long.MinValue if it is
+    /// not there at all.
+    ///
+    /// A short window either side, because a struct that gains or loses a field moves the ones after it by a
+    /// few bytes rather than relocating wholesale. Two byte steps, since the tag is a ushort and the client
+    /// aligns it.
+    /// </summary>
+    private static long Sought(GameController gc, long part)
+    {
+        const int Window = 0x40;
+
+        var wanted = Wanted(gc);
+
+        var raw = Safe.Read(() => gc.Memory.ReadBytes(part, Window), null);
+
+        if (raw == null || raw.Length < Window)
+            return long.MinValue;
+
+        for (var at = 0; at + 1 < Window; at += 2)
+        {
+            if (BitConverter.ToUInt16(raw, at) == wanted)
+                return at - Offsets.VolumeTag;
+        }
+
+        return long.MinValue;
+    }
+
+    /// <summary>
+    /// The tag to look for, read from the client rather than taken from the constant.
+    ///
+    /// **The constant is a hash and a patch can change it.** Offsets.NoPlacementTag is 0x970C, the client's own
+    /// FNV-1a over `expedition_no_placement` folded to sixteen bits, and the doc for it says it matches what the
+    /// global holds at runtime "so it is certain two ways". After the 28 September update it stopped matching:
+    /// the hash the client printed changed with it, and the component that should carry the tag held 4FC2 where
+    /// 970C was expected. So the global is the authority and the constant is the fallback.
+    ///
+    /// Nought from the global means the read failed rather than the tag being zero, so the constant stands.
+    /// </summary>
+    private static ushort Wanted(GameController gc)
+    {
+        var start = Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L);
+        var held = start <= Lowest ? 0 : Word(gc, start + Offsets.TagGlobal);
+
+        return held != 0 ? (ushort)held : Offsets.NoPlacementTag;
+    }
+
+    /// <summary>Whether the last repair was accepted on shape rather than on the tag, which is weaker.</summary>
+    internal static bool ByShape { get; private set; }
+
+    /// <summary>
+    /// Whether this component reads like a rectangle on this map: a plausible size, and an owner that resolves
+    /// to a placed position.
+    ///
+    /// The bounds are deliberately loose. A dig site is a couple of thousand grid across, so a volume wider
+    /// than that is not a volume, and a width of nought or less is not one either. What this rejects is a
+    /// component holding pointers or flags where the sizes should be, which is what every other component does.
+    /// </summary>
+    private static bool Shaped(GameController gc, long part)
+    {
+        var w = Int(gc, part + Offsets.VolumeWide);
+        var h = Int(gc, part + Offsets.VolumeHigh);
+
+        if (w <= 0 || h <= 0 || w > Sane || h > Sane)
+            return false;
+
+        var owner = Hop(gc, part + Offsets.Inner);
+
+        if (owner <= Lowest)
+            return false;
+
+        var placed = Hop(gc, owner + Offsets.OwnerPlaced);
+
+        if (placed <= Lowest)
+            return false;
+
+        var x = Int(gc, placed + Offsets.PlacedX);
+        var y = Int(gc, placed + Offsets.PlacedY);
+
+        return x > 0 && y > 0 && x < Sane && y < Sane;
+    }
+
     /// <summary>Whether a repair may be attempted at all. See DebugSettings.RepairOffsets.</summary>
     private static bool Allowed() => Dump.Settings?.Debug.RepairOffsets.Value != false;
 
@@ -358,10 +470,39 @@ internal sealed class Volumes
 
             var part = Hop(gc, parts + (long)slot * 8);
 
-            if (part <= Lowest || Word(gc, part + Offsets.VolumeTag) != Offsets.NoPlacementTag)
+            if (part <= Lowest)
+                continue;
+
+            // **A window, not one offset.** Testing only the recorded offset assumes the struct did not move,
+            // and on the update that broke this it had: every candidate held something else there. Searching a
+            // short window finds the tag wherever it now sits and says by how much everything shifted.
+            var shifted = Sought(gc, part);
+
+            if (shifted != long.MinValue)
+            {
+                Repaired = held;
+                Shift = shifted;
+                ByShape = false;
+
+                return slot;
+            }
+
+            // **When no tag matches anywhere, judge the component by what it produces.**
+            //
+            // Three tag-based attempts found nothing on this update: the descriptor moved, the fields did not
+            // shift within the window, and the global no longer reads. A volume component is still recognisable
+            // by its shape - a width and a height that could be a rectangle on this map, and an owner that
+            // resolves to a placed position. A component that is something else gives absurd sizes or an owner
+            // that does not resolve, so this can be wrong but not easily.
+            //
+            // Recorded as accepted by shape, because it is weaker evidence than the tag and the dump should
+            // not pretend otherwise.
+            if (!Shaped(gc, part))
                 continue;
 
             Repaired = held;
+            Shift = 0;
+            ByShape = true;
 
             return slot;
         }
@@ -466,6 +607,13 @@ internal sealed class Volumes
         // **The verdict first, because the detail below is unreadable without it.** A reader seeing no
         // rectangles needs to know whether the site has none or the lookup failed. See Said.
         b.AppendLine($"  {Said}");
+        var start = Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L);
+        var global = start <= Lowest ? 0 : Word(gc, start + Offsets.TagGlobal);
+
+        b.AppendLine($"  tag: the global at rva {Offsets.TagGlobal:X} reads {global:X4}" +
+                     (global == 0 ? " (READ FAILED or moved)" : "") +
+                     $", the constant this shipped with is {Offsets.NoPlacementTag:X4}, hunting " +
+                     $"{Wanted(gc):X4}");
         b.AppendLine($"  module base {Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L):X}  " +
                      $"type descriptor key {key:X}" +
                      (Repaired > Lowest ? " (REPAIRED - the baked offset no longer resolves)" : ""));
@@ -550,8 +698,24 @@ internal sealed class Volumes
                         {
                             var held = Hop(gc, e);
 
-                            b.AppendLine($"        key {held:X}  slot {Int(gc, e + 8)}" +
-                                         $"  (module+{held - (key - Offsets.VolumeDescriptor):X})");
+                            // **What the slot actually resolves to, which is what the repair judges by.** The
+                            // repair walks these same entries and accepts a slot only when the component it
+                            // names carries the tag; when it accepts none, this says whether the components
+                            // were unreachable or simply held something else where the tag used to be.
+                            var trySlot = Int(gc, e + 8);
+                            var tryParts = Hop(gc, inst + Offsets.Components);
+                            var tryPart = tryParts <= Lowest || trySlot < 0 || trySlot > 64
+                                ? 0
+                                : Hop(gc, tryParts + (long)trySlot * 8);
+
+                            b.AppendLine($"        key {held:X}  slot {trySlot}" +
+                                         $"  (module+{held - Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L):X})" +
+                                         $"  component {tryPart:X}" +
+                                         (tryPart > Lowest
+                                             ? $"  tag {Word(gc, tryPart + Offsets.VolumeTag):X4}" +
+                                               $" (wanted {Wanted(gc):X4})" +
+                                               $"  first 16 bytes {Peek16(gc, tryPart)}"
+                                             : "  unreachable"));
                         }
                     }
 
@@ -564,7 +728,7 @@ internal sealed class Volumes
 
                     resolved++;
 
-                    if (Word(gc, part + Offsets.VolumeTag) == Offsets.NoPlacementTag)
+                    if (Word(gc, part + Offsets.VolumeTag + Shift) == Wanted(gc))
                         tagged++;
                 }
             }
