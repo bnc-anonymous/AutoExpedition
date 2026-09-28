@@ -152,7 +152,7 @@ internal sealed class Volumes
         var ty = Math.Max(0, (int)(around.Y - span) / Tile);
         var by = Math.Min(high - 1, (int)(around.Y + span) / Tile);
 
-        var key = Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L) + Offsets.VolumeDescriptor;
+        var key = Key(gc);
         var seen = new HashSet<long>();
         var index = new Dictionary<long, int>();
 
@@ -277,6 +277,11 @@ internal sealed class Volumes
         if (!index.TryGetValue(type, out var slot))
         {
             slot = Slot(gc, Hop(gc, type + Offsets.TypeRegistry), key);
+
+            // The baked descriptor no longer names a slot, so ask the client's own table which slot does.
+            if (slot < 0 && Allowed())
+                slot = Found(gc, inst, type);
+
             index[type] = slot;
         }
 
@@ -295,6 +300,75 @@ internal sealed class Volumes
     /// tag and an entry number. The tag is `0x100 or (h and 0xFF)` and rises by 0x100 per probe, so
     /// a slot's tag says both what it holds and how far it has been displaced.
     /// </summary>
+    /// <summary>
+    /// The descriptor key to look the component up by: the one a repair found, or the one baked in.
+    ///
+    /// Both the read and the dump go through this, or the dump would keep reporting the stale offset failing
+    /// after a repair had already moved past it.
+    /// </summary>
+    private static long Key(GameController gc)
+    {
+        var start = Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L);
+
+        return Repaired > Lowest ? Repaired : start + Offsets.VolumeDescriptor;
+    }
+
+    /// <summary>Whether a repair may be attempted at all. See DebugSettings.RepairOffsets.</summary>
+    private static bool Allowed() => Dump.Settings?.Debug.RepairOffsets.Value != false;
+
+    /// <summary>
+    /// Finds the component slot by trying the ones the client's own table offers, keeping only a slot whose
+    /// component carries the tag.
+    ///
+    /// **Self-validating, which is the only reason a repair is safe here.** The tag is known independently -
+    /// `expedition_no_placement` hashed by the client's own FNV-1a is 0x970C, and the global at rva 0x047159B4
+    /// holds the same at runtime - so a candidate is accepted only when the component it resolves actually
+    /// carries it. A wrong guess cannot be adopted; it can only fail and leave the offset reported as broken.
+    /// Guessing an offset with no such check reads whatever happens to lie at the address and treats plausible
+    /// rubbish as truth, which is worse than failing, because failing is visible.
+    ///
+    /// The key that worked is remembered in Repaired so later reads resolve through the ordinary path instead
+    /// of searching again. The table is small - capacity four on every site measured - and the walk is bounded,
+    /// so a site with nothing to find costs a few reads once.
+    /// </summary>
+    private static int Found(GameController gc, long inst, long type)
+    {
+        var parts = Hop(gc, inst + Offsets.Components);
+        var reg = Hop(gc, type + Offsets.TypeRegistry);
+
+        if (parts <= Lowest || reg <= Lowest)
+            return -1;
+
+        var map = reg + Offsets.TableAt;
+        var one = Hop(gc, map);
+        var stop = Hop(gc, map + 8);
+
+        if (one <= Lowest || stop <= one)
+            return -1;
+
+        // Sixteen bytes an entry: the descriptor key at +0, the slot it names at +8. The span is capped for the
+        // same reason the dump caps it - a table that did not read must not become a long walk.
+        for (var e = one; e < stop && e - one < 0x200; e += 16)
+        {
+            var held = Hop(gc, e);
+            var slot = Int(gc, e + 8);
+
+            if (held <= Lowest || slot < 0 || slot > 64)
+                continue;
+
+            var part = Hop(gc, parts + (long)slot * 8);
+
+            if (part <= Lowest || Word(gc, part + Offsets.VolumeTag) != Offsets.NoPlacementTag)
+                continue;
+
+            Repaired = held;
+
+            return slot;
+        }
+
+        return -1;
+    }
+
     private static int Slot(GameController gc, long reg, long key)
     {
         if (reg <= Lowest || key <= Lowest)
@@ -387,9 +461,14 @@ internal sealed class Volumes
         int scanned = 0, withAny = 0, entries = 0, passed = 0, instanced = 0,
             resolved = 0, tagged = 0;
 
-        var key = Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L) + Offsets.VolumeDescriptor;
+        var key = Key(gc);
 
-        b.AppendLine($"  module base {key - Offsets.VolumeDescriptor:X}  type descriptor key {key:X}");
+        // **The verdict first, because the detail below is unreadable without it.** A reader seeing no
+        // rectangles needs to know whether the site has none or the lookup failed. See Said.
+        b.AppendLine($"  {Said}");
+        b.AppendLine($"  module base {Safe.Read(gc, static g => g.Memory.AddressOfProcess, 0L):X}  " +
+                     $"type descriptor key {key:X}" +
+                     (Repaired > Lowest ? " (REPAIRED - the baked offset no longer resolves)" : ""));
 
         var index = new Dictionary<long, int>();
         var slots = new Dictionary<int, int>();
