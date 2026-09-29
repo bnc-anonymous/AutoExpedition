@@ -517,21 +517,17 @@ internal sealed record PlanEnvironment(
 
     // Read once per solve and carried, rather than reached for per round: the search runs off the
     // main thread and the settings tree is not its to touch. See SolverSettings.
-    bool VaryOpenings = false,
-    bool VaryOperators = true,
-    string TearingMix = "",
     bool VaryReachFill = true,
-    bool ShareBest = true,
-    string ShareNot = "0",
-    bool EstimateDetour = false,
     int ShortlistRich = 400,
     int ShortlistSpread = 200,
     float ShortlistSparse = 64f,
     double AcceptSlack = 0.02d,
     int OpeningShakes = 2,
-    double RescueBelow = 0.10d,
+    //How far below the pool's best a worker has to fall before it throws its chain away and builds
+    //a fresh one. The setting reads "At a kick, restart if behind the pool by (%)" and this is that figure as a
+    //fraction; the words are the label's, because the label is what somebody greps for.
+    double RestartThreshold = 0.10d,
     int RestartShakes = 0,
-    int AdoptedShake = 3,
 
     /// <summary>
     /// Remnants a placed explosive already caught, carried for the readout and nothing else.
@@ -584,28 +580,12 @@ internal sealed record PlanEnvironment(
     (string Id, (int X, int Y) From)[] BankedRunes = null,
 
     /// <summary>
-    /// The longest planned tail whose every ordering is tried, or nought to leave it to the operators.
-    ///
-    /// See Repair.Permuted for why a factorial is the right tool below this bound and hopeless above
-    /// it.
-    /// </summary>
-    int PermuteUpTo = 0,
-
-    /// <summary>
     /// The fewest links a bridge may spend reaching for missed content, when the tail allows.
     ///
     /// See Reaching's spend - half the tail starves this operator on a short chain, and a bridge needs
     /// a minimum number of steps whatever the chain length.
     /// </summary>
     int BridgeLinks = 3,
-
-    /// <summary>
-    /// How far a slide moves each link along the route, in grid units. Nought never slides.
-    ///
-    /// See Repair.Slid - a compound move whose individual steps are not worth making, so it has to be
-    /// offered as one move or it is never made at all.
-    /// </summary>
-    float SlideBy = 0f,
 
     /// <summary>
     /// The reach model alone, with the game's own measurements NOT consulted first.
@@ -635,7 +615,91 @@ internal sealed record PlanEnvironment(
     /// main thread and the settings tree is not its to touch. See Planner.Outright and
     /// SolverSettings.UseEnumeratedSolve.
     /// </summary>
-    bool UseEnumeratedSolve = true)
+    bool UseEnumeratedSolve = true,
+
+    /// <summary>
+    /// Which draw of the random numbers this solve is.
+    ///
+    /// **Every seed in the search is a constant plus the worker's own number, so two solves of one
+    /// site are the same eight searches.** Measured: five cold presses landing on 9,928.0 to the
+    /// decimal, spread nought, and five uncapped ones landing on 10,692.1 three times and 11,196 twice.
+    /// That reproducibility is worth having and it means a batch of presses samples one trajectory
+    /// rather than a distribution - so "does this configuration usually win" could not be asked.
+    ///
+    /// Added to the seeds by whoever varies it. Nought is the old behaviour exactly, so a run that does
+    /// not set it is the run this plugin always did. Last in the list because everything before it is
+    /// matched by position at the one place an environment is built.
+    /// </summary>
+    int Draw = 0,
+
+    /// <summary>
+    /// How many near-best spots a randomised opening chooses among at each link - GRASP's restricted
+    /// candidate list. See SolverSettings.OpeningChoices, and Repair.Opening for where it is spent.
+    /// </summary>
+    int OpeningChoices = 5,
+
+    /// <summary>
+    /// Whether a chain's links may be re-ordered by reversing a run of them. See Repair.Reversed, and
+    /// SolverSettings.ReverseRuns for the measurement that asked for it.
+    /// </summary>
+    bool ReverseRuns = true,
+
+    /// <summary>
+    /// Whether the pool's best chain is relinked with the others once every worker has finished. See
+    /// Repair.Relinked, and SolverSettings.Relink.
+    /// </summary>
+    bool Relink = false,
+
+    /// <summary>
+    /// The enumerated openings a worker may start from, best first, or null when none were worked out.
+    ///
+    /// **The same word as the class that builds them, deliberately.** Grep Openings and both the enumerator
+    /// and the thing it hands the search come back, because they are one subject. See Openings.Generate and
+    /// Repair.Opening, which is where a worker takes one.
+    /// </summary>
+    IReadOnlyList<List<Vector2>> Openings = null,
+
+    /// <summary>
+    /// What each worker is for, parsed once per solve. Null leaves every worker at the defaults.
+    ///
+    /// Carried rather than read per worker for the same reason every other knob here is: a running search keeps
+    /// what it started under. See SolverSettings.ThreadRoles and ThreadRoles.Read.
+    /// </summary>
+    IReadOnlyList<ThreadRoles.Role> Roles = null,
+
+    /// <summary>
+    /// How many rounds a worker may run before it stops, or nought to stop on the clock instead.
+    ///
+    /// A measurement mode: with a round budget the work per press is fixed, so a draw reproduces and two
+    /// configurations can be compared. See SolverSettings.RoundsPerWorker.
+    /// </summary>
+    int RoundsPerWorker = 0,
+
+    /// <summary>
+    /// How long a worker may go without a record before it kicks, as a percentage of the improvement window, or
+    /// nought to kick on the round count alone. See SolverSettings.StagnationKickPercent.
+    /// </summary>
+    int StagnationKickPercent = 0,
+
+    /// <summary>
+    /// How many rounds a worker may run without a record before it kicks, or nought to kick on the clock alone.
+    /// See SolverSettings.StagnationKickRounds.
+    /// </summary>
+    int StagnationKickRounds = 500,
+
+    /// <summary>
+    /// The window the kick, keep-opening and refine-after are shares of, in milliseconds, when it
+    /// differs from the solve's own - a continuous reroll pass runs far longer than an ordinary one and keeps
+    /// the ordinary clock for these. Nought uses the solve's own window. See RerollSettings.ContinuousPassMs.
+    /// </summary>
+    int PressWindowMs = 0,
+
+
+    /// <summary>
+    /// How long a worker's current chain may go without improving before it restarts, or nought for never. See
+    /// DestroyAndRepairSettings.StallRestartMs.
+    /// </summary>
+    int StallRestartMs = 0)
 {
     /// <summary>
     /// The distinct tags some effect in this dig site is scoped to, and nothing else.
@@ -3888,7 +3952,93 @@ internal static class Planner
         return GreedyInner(env, candidates, random, among, first, keep);
     }
 
+    /// <summary>
+    /// The chain's first <paramref name="keep"/> links, and the best whole chain found by trying each of the
+    /// <paramref name="width"/> best next links in turn and finishing every one - once greedily and once with
+    /// randomness among the best three. Null when nothing can follow the prefix.
+    ///
+    /// **Judged on the whole chain, not the next link.** A greedy tail takes the richest next step, and where
+    /// taking a rich area last earns more propagation than taking it next, greedy never finds out: on Scorched
+    /// Cay a 16,455 chain went east to a remnant at link 11 and then west, where a 16,630 chain went west first
+    /// and took the remnant last, 137 content down and 312 propagation up. No tear reaches that, because every
+    /// step between the two tails scores worse. Trying each first step and scoring the finished chain does.
+    ///
+    /// The candidates for the next link are ranked by what they catch and kept at least 16 grid apart, so the
+    /// width is spent on directions rather than on neighbours of the richest spot.
+    /// </summary>
+    internal static List<Vector2> TailRollout(PlanEnvironment env, List<Vector2> candidates, List<Vector2> chain,
+        int keep, int width, Random random)
+    {
+        if (env == null || chain == null || keep < 1 || keep >= chain.Count || width < 1)
+            return null;
+
+        var prefix = chain.GetRange(0, keep);
+        var taken = new HashSet<int>();
+
+        foreach (var at in prefix)
+            Cover(env, at, taken);
+
+        var from = prefix[^1];
+        var priced = new List<(Vector2 At, double Gain)>();
+
+        foreach (var candidate in candidates)
+        {
+            if (Span(from, candidate) > env.Reach || !Spaced(env, prefix, candidate))
+                continue;
+
+            priced.Add((candidate, NewWeight(env, candidate, taken, env.Explosives - keep - 1, true)));
+        }
+
+        priced.Sort(static (a, b) => b.Gain.CompareTo(a.Gain));
+
+        var firsts = new List<Vector2>(width);
+
+        foreach (var (at, gain) in priced)
+        {
+            if (firsts.Count >= width || gain <= 0d)
+                break;
+
+            var apart = true;
+
+            foreach (var other in firsts)
+                apart &= Vector2.DistanceSquared(at, other) >= 16f * 16f;
+
+            if (apart && Reaches(env, from, at))
+                firsts.Add(at);
+        }
+
+        List<Vector2> best = null;
+        var top = double.NegativeInfinity;
+
+        void Consider(List<Vector2> tried)
+        {
+            if (tried is not { Count: > 0 } || tried.Count <= keep)
+                return;
+
+            var worth = Score(env, tried);
+
+            if (worth > top)
+            {
+                top = worth;
+                best = tried;
+            }
+        }
+
+        foreach (var first in firsts)
+        {
+            Consider(Greedy(env, candidates, null, 1, first, prefix));
+
+            if (random != null)
+                Consider(Greedy(env, candidates, random, 3, first, prefix));
+        }
+
+        return best;
+    }
+
     /// <summary>The body of Greedy, wrapped so its allocation is attributed. See Phases.</summary>
+    /// <summary>The priced candidates of one greedy step, kept per thread because greedy runs on every worker.</summary>
+    [ThreadStatic] private static List<(int Index, Vector2 At, double Gain)> _priced;
+
     private static List<Vector2> GreedyInner(PlanEnvironment env, List<Vector2> candidates,
         Random random, int among, Vector2? first = null, List<Vector2> keep = null)
     {
@@ -3926,33 +4076,49 @@ internal static class Planner
             for (var i = 0; i < pick.Length; i++)
                 pick[i] = (Vector2.Zero, double.NegativeInfinity);
 
-            foreach (var candidate in candidates)
+            // **Priced first, and asked whether it reaches only in order of price, until the list is full.**
+            //
+            // This asked Reaches of every candidate before pricing it, and Reaches routes a wire whenever its
+            // cache misses. Measured on Craggy Peninsula, twenty explosives: 4.2 million reach questions and 1.6
+            // million wire searches in one solve, and the openings' 51 three-link rollouts - each a greedy build -
+            // took 5.4 seconds. Pricing is a coverage lookup; only the handful at the top of the price list can be
+            // chosen, so only they need the wire.
+            //
+            // **The same answer, not an approximation.** The list below keeps the best `among` reachable
+            // candidates by price, the earlier one first where two prices tie - which is what the insertion into
+            // it did, since a later equal price never displaced an earlier one. Sorting by price and then by
+            // position, and filling in that order until the list is full, reproduces it exactly.
+            var priced = _priced ??= new List<(int Index, Vector2 At, double Gain)>();
+
+            priced.Clear();
+
+            for (var c = 0; c < candidates.Count; c++)
             {
-                if (!Reaches(env, from, candidate) || !Spaced(env, chain, candidate))
+                var candidate = candidates[c];
+
+                // Says' own first test, so this rejects nothing Reaches would accept and prices only what is in
+                // range - without it every candidate on the site was priced every step, which offline, where a
+                // reach question is a lookup, cost more than the wires it saved. See Says.
+                if (Span(from, candidate) > env.Reach || !Spaced(env, chain, candidate))
                     continue;
 
                 // Priced with the deferral in mind, because this is the one place with a chain
                 // context: what has been taken already, and how many links are left to take
                 // anything with. See NewWeight's defer.
-                var gain = NewWeight(env, candidate, taken, env.Explosives - step - 1, true);
+                priced.Add((c, candidate, NewWeight(env, candidate, taken, env.Explosives - step - 1, true)));
+            }
 
-                // Kept in order, best first, over a list of four. An insertion sort over four
-                // entries beats sorting a few thousand candidates to read the top of the list.
-                for (var i = 0; i < pick.Length; i++)
-                {
-                    if (gain <= pick[i].Gain)
-                        continue;
+            priced.Sort(static (a, b) => b.Gain != a.Gain ? b.Gain.CompareTo(a.Gain) : a.Index.CompareTo(b.Index));
 
-                    for (var j = pick.Length - 1; j > i; j--)
-                        pick[j] = pick[j - 1];
-
-                    pick[i] = (candidate, gain);
-
-                    if (held < pick.Length)
-                        held++;
-
+            foreach (var (_, candidate, gain) in priced)
+            {
+                if (held == pick.Length)
                     break;
-                }
+
+                if (!Reaches(env, from, candidate))
+                    continue;
+
+                pick[held++] = (candidate, gain);
             }
 
             var choose = 0;
@@ -4131,27 +4297,162 @@ internal static class Planner
     }
 
     /// <summary>
-    /// Chains that go and fetch every marker the player insisted on, one per order to fetch them in.
+    /// The must-take tours that start at the detonator, scored, worked out once per solve and shared by every worker.
     ///
-    /// **This is the only thing in the search that can build a route to a distant requirement, and
-    /// without it the marks were decoration on a Grand site.** Nothing else can: greedy picks the
-    /// next link by what it adds now, and a marker six hundred grid away adds nothing to any link
-    /// within reach of the detonator, so it produces no pull at all until a chain happens to end up
-    /// near it. Remnants commits to an ORDER but demands each stop be one hop from the last, so it
-    /// silently skips anything that needs bridging. And Insisting moves a single link onto a missed
-    /// marker, which cannot be legal when the marker is two or three links past the end of the chain.
-    ///
-    /// Measured on the Grand site that prompted this: three marked remnants, the chain took one, and
-    /// the other two sat 179 and 214 grid beyond its last link against a reach of 108.
-    ///
-    /// So the route is CONSTRUCTED rather than discovered. Bridge towards the marker until a spot
-    /// that catches it is in reach, take the best such spot, then do the same for the next one, and
-    /// let greedy spend whatever explosives are left on the monsters in between.
-    ///
-    /// Every order while there are four or few enough for that to be twenty four chains; nearest
-    /// first beyond that, because the orderings are factorial and a player who has marked five
-    /// things has already said most of what they mean.
+    /// **They are the same for every worker**, because they start at the detonator rather than from a worker's own
+    /// chain - and each is a full construction. Built on the first worker to ask and handed to the rest; the lock
+    /// makes the others wait for it rather than build it again. Keyed on the environment and on the number of
+    /// candidates, since the opening passes the shortlist and a kick passes every candidate. Callers copy what
+    /// they take, so nothing here is changed by the polish that follows. See MustTakeTour.
     /// </summary>
+    private static List<(List<Vector2> Tour, int Held, double Worth)> FromDetonator(PlanEnvironment env,
+        List<Vector2> candidates)
+    {
+        var byCount = _fromDetonator.GetOrCreateValue(env);
+
+        var built = byCount.GetOrAdd(candidates.Count, _ =>
+            new Lazy<List<(List<Vector2> Tour, int Held, double Worth)>>(() =>
+            {
+                var tours = new List<(List<Vector2> Tour, int Held, double Worth)>();
+
+                foreach (var tour in Demanded(env, candidates))
+                    tours.Add((tour, Rate(env, tour).Held, Score(env, tour)));
+
+                return tours;
+            }, LazyThreadSafetyMode.ExecutionAndPublication));
+
+        return built.Value;
+    }
+
+    /// <summary>The shared detonator tours, per environment and candidate count. See FromDetonator.</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PlanEnvironment,
+        System.Collections.Concurrent.ConcurrentDictionary<int, Lazy<List<(List<Vector2> Tour, int Held, double Worth)>>>>
+        _fromDetonator = new();
+
+    /// <summary>
+    /// The points along a chain of <paramref name="links"/> links from which a fetch is tried: nought (the
+    /// detonator) and at most <see cref="FetchPointsPerChain"/> of the links after it, spread evenly and always
+    /// including the last.
+    ///
+    /// **Every link was tried, and on a twenty explosive site that was the whole window.** Each point is a full
+    /// construction - a bridge to the target and a greedy completion of the rest - once per visiting order.
+    /// Measured on Craggy Peninsula with two must-takes: 1.3 to 2.9 seconds per worker building them, against
+    /// 0.2 to 0.7 polishing the one chosen, and every worker ran nought rounds of search. See MustTakeTour.
+    /// </summary>
+    private static IEnumerable<int> FetchPoints(int links)
+    {
+        yield return 0;
+
+        if (links <= 1)
+            yield break;
+
+        var last = links - 1;
+        var count = Math.Min(FetchPointsPerChain, last);
+        var previous = 0;
+
+        for (var i = 1; i <= count; i++)
+        {
+            var k = (int)Math.Round(i * (double)last / count);
+
+            if (k <= previous)
+                continue;
+
+            previous = k;
+
+            yield return k;
+        }
+    }
+
+    /// <summary>
+    /// How many points after the detonator a fetch is tried from. Chosen, not measured: six keeps two must-takes
+    /// to fourteen constructions a worker where every link cost about forty. See FetchPoints.
+    /// </summary>
+    private const int FetchPointsPerChain = 6;
+
+    /// <summary>
+    /// The chain routed through one target it does not reach, fetched after whichever of its links scores best,
+    /// or null when no such route keeps every must-take the chain already holds.
+    ///
+    /// **For exploration, not for a requirement.** On Scorched Cay the search without a must-take peaked at
+    /// 8,625 over ten presses, while with the Divine Orb at (1105,568) marked - and fetched this way - it reached
+    /// 10,144; a chain holding the orb was available to the unmarked search too and it never found one. Every
+    /// worker converges on one route because nothing ever takes it far from where it started. This is the same
+    /// construction as MustTakeTour, pointed at a target a worker is told to try rather than one it must hold,
+    /// and unlike a must-take the result is only a starting point: the search may walk away from it.
+    ///
+    /// Scored on the objective, so a route that strands a held must-take loses to one that does not and the
+    /// requirement cannot be traded for exploration.
+    /// </summary>
+    internal static List<Vector2> TourThrough(PlanEnvironment env, List<Vector2> candidates,
+        List<Vector2> chain, int target)
+    {
+        if (env == null || candidates == null || target < 0 || target >= env.Targets.Count)
+            return null;
+
+        var held = chain is { Count: > 0 } ? Rate(env, chain).Held : 0;
+        var wants = new[] { target };
+        List<Vector2> best = null;
+        var top = double.NegativeInfinity;
+
+        foreach (var k in FetchPoints(chain?.Count ?? 0))
+        {
+            var prefix = k == 0 ? null : chain.GetRange(0, k);
+
+            foreach (var tour in Demanded(env, candidates, prefix, wants))
+            {
+                if (Rate(env, tour).Held < held)
+                    continue;
+
+                var worth = Score(env, tour);
+
+                if (worth > top)
+                {
+                    top = worth;
+                    best = tour;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// A rich target the chain does not reach, for the touring worker at <paramref name="rank"/> of
+    /// <paramref name="stride"/>, or -1 when none of that worker's targets is missing. Must-takes are left out;
+    /// MustTakeTour fetches those. Richest by the target's own worth, the same figure the enumerator anchors on.
+    /// See TourThrough.
+    ///
+    /// The site's targets are ranked once, richest first, and the worker takes positions rank, rank + stride,
+    /// rank + 2 x stride and so on, the first its chain misses. No two touring workers can therefore be sent to
+    /// the same target. Ranked against each worker's own misses instead, as this was, two workers whose chains
+    /// missed different things landed on the same target: with four touring workers on Scorched Cay, workers 1
+    /// and 3 were both sent through (625,817).
+    /// </summary>
+    internal static int RichestUnreached(PlanEnvironment env, List<Vector2> chain, int rank, int stride)
+    {
+        if (env == null || rank < 0)
+            return -1;
+
+        var missing = new HashSet<int>(Missing(env, chain ?? [], false, int.MaxValue));
+        var ranked = new List<int>();
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            if (!env.Targets[i].Must)
+                ranked.Add(i);
+        }
+
+        ranked.Sort((a, b) => WorthOfTarget(env.Targets[b]).CompareTo(WorthOfTarget(env.Targets[a])));
+
+        for (var k = rank; k < ranked.Count; k += Math.Max(1, stride))
+        {
+            if (missing.Contains(ranked[k]))
+                return ranked[k];
+        }
+
+        return -1;
+    }
+
     /// <summary>
     /// A chain that visits more of the must-takes than the one handed in, or null when there is no
     /// better one to be had.
@@ -4181,8 +4482,13 @@ internal static class Planner
     /// the rest take the others in turn, and fall back to the best when there are fewer orderings
     /// than threads.
     /// </param>
+    /// <param name="keepAtLeast">
+    /// How many leading links of <paramref name="chain"/> the caller would rather not lose - a seeded worker's
+    /// kept opening. Tours that keep them are preferred among those holding the most must-takes; when none of
+    /// those keeps them, the best tour is taken anyway and the caller has to release what it was keeping.
+    /// </param>
     internal static List<Vector2> MustTakeTour(PlanEnvironment env, List<Vector2> candidates,
-        List<Vector2> chain, int worker = 0)
+        List<Vector2> chain, int worker = 0, int keepAtLeast = 0)
     {
         if (env == null || env.Musts <= 0 || candidates == null)
             return null;
@@ -4192,10 +4498,32 @@ internal static class Planner
         if (had >= env.Musts)
             return null;
 
-        var found = new List<(List<Vector2> Tour, int Held, double Worth)>();
+        var found = new List<(List<Vector2> Tour, int Held, double Worth, int Kept)>();
 
-        foreach (var tour in Demanded(env, candidates))
-            found.Add((tour, Rate(env, tour).Held, Score(env, tour)));
+        foreach (var (tour, held, worth) in FromDetonator(env, candidates))
+            found.Add((new List<Vector2>(tour), held, worth, 0));
+
+        // **And the same fetch branching off the chain in hand, after each of its links.**
+        //
+        // Starting every tour at the detonator makes the first links a straight run to the must-take, and the
+        // rest of the chain whatever greedy finds from there. The search cannot repair that afterwards: every
+        // move that would take the mark later, or from another side, passes through chains that drop it, and
+        // dropping one costs more than the site is worth. So the choice of WHEN to fetch has to be made here.
+        // Keeping the first k links of the worker's own chain and fetching from the last of them offers every
+        // point along it; k of nought is the tour above, so this can only add better options. Measured on
+        // Scorched Cay before this: the mark held links one to eight on a straight run east, and the press
+        // median was 3,931 with the mark against 8,405 without it.
+        if (chain is { Count: > 1 })
+        {
+            foreach (var k in FetchPoints(chain.Count))
+            {
+                if (k == 0)
+                    continue;
+
+                foreach (var tour in Demanded(env, candidates, chain.GetRange(0, k)))
+                    found.Add((tour, Rate(env, tour).Held, Score(env, tour), k));
+            }
+        }
 
         if (found.Count == 0)
             return null;
@@ -4216,16 +4544,53 @@ internal static class Planner
         // a requirement is not a different opinion, it is a worse answer.
         var equal = found.FindAll(x => x.Held == top.Held);
 
+        // A seeded worker keeps its opening where some tour lets it, so the fetch does not undo the seeding.
+        if (keepAtLeast > 0 && equal.FindAll(x => x.Kept >= keepAtLeast) is { Count: > 0 } keeping)
+            equal = keeping;
+
         return equal[worker <= 0 ? 0 : worker % equal.Count].Tour;
     }
 
-    private static IEnumerable<List<Vector2>> Demanded(PlanEnvironment env, List<Vector2> candidates)
+    /// <summary>
+    /// Chains that go and fetch every marker the player insisted on, one per order to fetch them in.
+    ///
+    /// **This is the only thing in the search that can build a route to a distant requirement, and
+    /// without it the marks were decoration on a Grand site.** Nothing else can: greedy picks the
+    /// next link by what it adds now, and a marker six hundred grid away adds nothing to any link
+    /// within reach of the detonator, so it produces no pull at all until a chain happens to end up
+    /// near it. Remnants commits to an ORDER but demands each stop be one hop from the last, so it
+    /// silently skips anything that needs bridging. And Insisting moves a single link onto a missed
+    /// marker, which cannot be legal when the marker is two or three links past the end of the chain.
+    ///
+    /// Measured on the Grand site that prompted this: three marked remnants, the chain took one, and
+    /// the other two sat 179 and 214 grid beyond its last link against a reach of 108.
+    ///
+    /// So the route is CONSTRUCTED rather than discovered. Bridge towards the marker until a spot
+    /// that catches it is in reach, take the best such spot, then do the same for the next one, and
+    /// let greedy spend whatever explosives are left on the monsters in between.
+    ///
+    /// Every order while there are four or few enough for that to be twenty four chains; nearest
+    /// first beyond that, because the orderings are factorial and a player who has marked five
+    /// things has already said most of what they mean.
+    /// </summary>
+    /// <param name="prefix">
+    /// Links to keep at the head of every tour, fetching the must-takes from the last of them rather than from
+    /// the detonator. Null starts at the detonator. See MustTakeTour, which tries a prefix of every length.
+    /// </param>
+    /// <param name="wants">
+    /// The targets to fetch, or null for every must-take. See TourThrough, which fetches one that is not.
+    /// </param>
+    private static IEnumerable<List<Vector2>> Demanded(PlanEnvironment env, List<Vector2> candidates,
+        List<Vector2> prefix = null, IReadOnlyList<int> wants = null)
     {
         var found = new List<int>();
 
-        for (var i = 0; i < env.Targets.Count; i++)
-            if (env.Targets[i].Must)
-                found.Add(i);
+        if (wants != null)
+            found.AddRange(wants);
+        else
+            for (var i = 0; i < env.Targets.Count; i++)
+                if (env.Targets[i].Must)
+                    found.Add(i);
 
         if (found.Count == 0)
             yield break;
@@ -4246,9 +4611,15 @@ internal static class Planner
 
         foreach (var order in orders)
         {
-            var chain = new List<Vector2>();
+            var chain = prefix == null ? new List<Vector2>() : new List<Vector2>(prefix);
             var taken = new HashSet<int>();
             var from = env.Origin;
+
+            foreach (var at in chain)
+            {
+                Cover(env, at, taken);
+                from = at;
+            }
 
             foreach (var want in order)
             {
@@ -5808,11 +6179,13 @@ internal static class Planner
 
             foreach (var caught in covers.Of(point))
             {
-                // **A barrel takes everything its own blast reaches, and so does every barrel that
-                // reaches.** So what a link catches is not the coverage index alone: anything in it
-                // that detonates adds its closure to the same step, and a barrel inside that closure
-                // adds its own. Walked with a worklist rather than another loop over the site, since
-                // nearly every link catches no barrel at all and pays nothing for the possibility.
+                // **A barrel takes everything its own blast reaches, and there it stops.** So what
+                // a link catches is not the coverage index alone: anything in it that detonates adds
+                // what its own circle covers to the same step. A barrel inside THAT is content it
+                // catches and nothing more - these objects do not set each other off, which is why
+                // only the directly caught one is expanded below. Walked with a worklist rather than
+                // another loop over the site, since nearly every link catches no barrel at all and
+                // pays nothing for the possibility.
                 //
                 // The step is the LINK's, not the barrel's: the secondary blast happens when the
                 // explosive that set it off goes off, so everything it unearths comes up at that
@@ -5831,7 +6204,10 @@ internal static class Planner
 
                     var target = env.Targets[i];
 
-                    if (target.Sets is { Length: > 0 } sets)
+                    // Only the object the explosive itself reached. A barrel standing inside
+                    // another barrel's blast is left as content, because the second blast never
+                    // happens - see Planning.Chained.
+                    if (i == caught && target.Sets is { Length: > 0 } sets)
                     {
                         foreach (var also in sets)
                         {

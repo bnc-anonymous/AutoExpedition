@@ -45,6 +45,24 @@ internal static class BackgroundWork
 
     private static int _running;
 
+    /// <summary>How many of each job are running now, by name. See RunningJobs.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> RunningByJob =
+        new(StringComparer.Ordinal);
+
+    /// <summary>The jobs running now, by name and count, for a long gap between frames. See Spent.LongGaps.</summary>
+    public static string RunningJobs()
+    {
+        var said = new List<string>();
+
+        foreach (var (job, count) in RunningByJob)
+        {
+            if (count > 0)
+                said.Add(count == 1 ? job : $"{job} x{count}");
+        }
+
+        return said.Count == 0 ? "no background jobs" : string.Join(", ", said);
+    }
+
     /// <summary>How many jobs are in flight, which is what a dump taken mid-solve wants to say.</summary>
     public static int Running => Volatile.Read(ref _running);
 
@@ -57,6 +75,7 @@ internal static class BackgroundWork
         var from = Clock.ElapsedTicks;
 
         Interlocked.Increment(ref _running);
+        RunningByJob.AddOrUpdate(job, 1, static (_, count) => count + 1);
 
         try
         {
@@ -65,6 +84,7 @@ internal static class BackgroundWork
         finally
         {
             Interlocked.Decrement(ref _running);
+            RunningByJob.AddOrUpdate(job, 0, static (_, count) => count - 1);
 
             var took = (Clock.ElapsedTicks - from) * 1000d / Stopwatch.Frequency;
             var grew = GC.GetAllocatedBytesForCurrentThread() - had;
@@ -95,6 +115,25 @@ internal static class BackgroundWork
 
             return 0;
         });
+
+    /// <summary>
+    /// Starts a job on a thread of its own at below-normal priority.
+    ///
+    /// **Its own thread, because the job holds it for seconds**, and a pool thread held that long leaves other
+    /// pool work in the process queued while the pool grows. **Below normal, because the drawing thread must win.**
+    /// A cold Grand site ran up to 19 solver workers at once, as superseded solves wound down beside new ones, on
+    /// 16 logical processors, and the frames stalled 0.4 to 0.5 seconds with no stage of this plugin slow inside
+    /// them. A job at this priority still gets every processor the drawing thread and the game are not using.
+    /// </summary>
+    public static System.Threading.Tasks.Task<T> StartAtLowPriority<T>(Func<T> work,
+        CancellationToken token = default) =>
+        System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+
+                return work();
+            }, token, System.Threading.Tasks.TaskCreationOptions.LongRunning,
+            System.Threading.Tasks.TaskScheduler.Default);
 
     /// <summary>Starts the counts again. See Caches.Clear.</summary>
     public static void Forget()

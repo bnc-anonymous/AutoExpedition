@@ -40,21 +40,21 @@ internal static class Minimap
     /// Here as well as in the world because a Grand site is walked rather than seen: the barrel that
     /// matters to a chain is routinely off screen when the chain is being planned, and the map is
     /// where the whole site is visible at once.
+    ///
+    /// The setting and the site having been set off are both the caller's to check, so that the
+    /// coverage closure behind blown is not worked out for a surface that will draw nothing.
     /// </summary>
     public static void Barrels(Graphics graphics, AutoExpeditionSettings settings,
         List<Target> targets, HashSet<(int, int)> blown)
     {
         foreach (var target in targets)
         {
-            if (target.Kind == TargetKind.Barrel && target.Sets > 0f && !target.Spent &&
+            if (target.Sets > 0f && !target.Spent &&
                 blown?.Contains(((int)MathF.Round(target.Grid.X), (int)MathF.Round(target.Grid.Y)))
                     != true)
             {
-                if (settings.Display.ThePlan.ShowBarrels)
-                {
-                    graphics.DrawCircleOnMap(target.Grid, false, target.Sets,
-                        settings.Display.ThePlan.BarrelColour, 1f, Segments);
-                }
+                graphics.DrawCircleOnMap(target.Grid, false, target.Sets,
+                    settings.Display.ThePlan.BarrelColour, 1f, Segments);
             }
         }
     }
@@ -318,6 +318,59 @@ internal static class Minimap
 
             graphics.DrawCircleOnMap(target.Grid, false, 3.2f, colour, 1.5f, Segments);
             graphics.DrawCircleOnMap(target.Grid, false, 4.4f, colour, 1.5f, Segments);
+        }
+    }
+
+    /// <summary>
+    /// A line from the player to the remnant worth rolling, on whichever map is up.
+    ///
+    /// Drawn under the same condition as the world line - only while the advice is about the chain on
+    /// screen - so the two never point at different remnants. See Overlay's Rolls and
+    /// RerollDisplaySettings.RollLineOnMinimap.
+    /// </summary>
+    public static void Rolls(Graphics graphics, GameController gc, AutoExpeditionSettings settings)
+    {
+        if (!Rolling.Here.Fresh || Rolling.Here.Best is not { } best || best.Grid == Vector2.Zero ||
+            !Showing(gc))
+            return;
+
+        var at = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (at == Vector2.Zero)
+            return;
+
+        using var clip = graphics.MapSurfaceClip();
+
+        graphics.DrawLineOnMap(at, best.Grid, settings.Display.Remnants.Rerolls.RollLineThicknessOnMinimap.Value,
+            settings.Display.Remnants.Rerolls.RollColour);
+    }
+
+    /// <summary>
+    /// A line from the player to each remnant rich enough for a reward line, on whichever map is up.
+    ///
+    /// The same remnants the world lines go to, decided in one place. See Overlay.WantsRewardLine and
+    /// RemnantRewardSettings.LineOnMinimap.
+    /// </summary>
+    public static void RewardLines(Graphics graphics, GameController gc, List<Target> targets,
+        AutoExpeditionSettings settings, Valuation valuation)
+    {
+        if (targets == null || !Showing(gc))
+            return;
+
+        var at = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (at == Vector2.Zero)
+            return;
+
+        using var clip = graphics.MapSurfaceClip();
+
+        var thickness = settings.Display.Remnants.Rewards.LineThicknessOnMinimap.Value;
+        var colour = (Color)settings.Display.Remnants.Rewards.LineColour;
+
+        foreach (var target in targets)
+        {
+            if (Overlay.WantsRewardLine(target, settings, valuation, at))
+                graphics.DrawLineOnMap(at, target.Grid, thickness, colour);
         }
     }
 

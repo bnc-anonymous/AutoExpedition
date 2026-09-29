@@ -110,6 +110,53 @@ internal sealed class Planning
 
     private DateTime _until;
 
+    /// <summary>How many search workers are running now, across every solve including cancelled ones.</summary>
+    private static int _workersRunning;
+
+    /// <summary>
+    /// The slots solver workers take before they search, one per thread the settings allow, shared by every solve.
+    ///
+    /// **A new solve does not wait for the one it supersedes to stop** - Start only cancels it, and a worker notices
+    /// at its next check, which the must-take tour, the opening and the final ordering do not make. While scouting a
+    /// presolve pass is superseded every one to six seconds, so the two overlapped constantly: measured up to 19
+    /// workers at once against a setting of 8, on 16 logical processors, with the frames stalling. A worker now
+    /// waits here for a slot, and gives up waiting if its own solve is cancelled first.
+    ///
+    /// Replaced, not resized, when the thread setting changes; workers holding the old one release it as they
+    /// finish, so for one solve the two can overlap.
+    /// </summary>
+    private static SemaphoreSlim WorkerSlots(int threads)
+    {
+        lock (WorkerSlotsGate)
+        {
+            if (_workerSlots == null || _workerSlotCount != threads)
+            {
+                _workerSlots = new SemaphoreSlim(threads, threads);
+                _workerSlotCount = threads;
+            }
+
+            return _workerSlots;
+        }
+    }
+
+    private static readonly object WorkerSlotsGate = new();
+
+    private static SemaphoreSlim _workerSlots;
+
+    private static int _workerSlotCount;
+
+    /// <summary>Solver workers running right now, across every search still running. See Spent.LongGaps.</summary>
+    public static int WorkersRunning => Volatile.Read(ref _workersRunning);
+
+    /// <summary>
+    /// How many workers of an earlier search were still running when the last enumeration began.
+    ///
+    /// **A cancelled search does not stop at once.** Its workers notice the token at their next check, and a
+    /// must-take construction can run a second or two before it gets there - so a presolve pass that replaces
+    /// another can enumerate with eight workers still busy beside it. See Openings.GroundTicks.
+    /// </summary>
+    public static int RunningAtEnumeration { get; private set; }
+
     /// <summary>
     /// How much of the solve is left, in seconds, or zero when nothing is being solved.
     ///
@@ -154,6 +201,21 @@ internal sealed class Planning
     /// across the map. See Rehearsal.
     /// </summary>
     public static bool Rehearsing { get; private set; }
+
+    /// <summary>
+    /// Whether the solve running is a pass the continuous reroll mode asked for, which runs until a roll or the
+    /// action key rather than to a countdown. The score area says so instead of showing the pass's clock. See
+    /// Rehearsal.Continuing.
+    /// </summary>
+    public static bool RunningContinuous { get; private set; }
+
+    /// <summary>
+    /// When a solve last published a chain better than the one drawn, in UTC, or MinValue before any has. Read by
+    /// the score area in the continuous reroll mode, where the time since the last gain is what says whether the
+    /// search is still finding anything. A solve starts from the standing plan as its floor, so only a real gain
+    /// moves it; after a roll the first chain against the changed site does.
+    /// </summary>
+    public static DateTime LastGainAt { get; private set; } = DateTime.MinValue;
 
     /// <summary>
     /// The dig site the player has actually asked for a plan at, or nothing.
@@ -547,7 +609,17 @@ internal sealed class Planning
     /// <summary>Bumped whenever a better chain is published, so a reader knows to recompute.</summary>
     public int Found => _found;
 
-    public bool Searching => _search is { IsCompleted: false };
+    /// <summary>
+    /// Whether a search is running or has finished without Poll collecting it yet.
+    ///
+    /// **Until collected, not until complete.** It read false the moment the task completed, and every caller
+    /// that starts a solve when this is false runs later in the same tick than Poll - so a search finishing in
+    /// that gap was cancelled with its answer uncollected: the batch of repeated presses clears the plan first,
+    /// and a presolve pass or a reroll re-solve cancels in Start. Measured: 3 of 40 repeated presses on Craggy
+    /// Peninsula scored in the press history but reached neither the plan, the run log nor trials.csv, two of
+    /// them the best of their batch. Poll collects on the next tick, so this reads true for one tick longer.
+    /// </summary>
+    public bool Searching => _search != null;
 
     public bool Ready => Plan.Points.Count > 0;
 
@@ -667,6 +739,12 @@ internal sealed class Planning
 
         return true;
     }
+
+    /// <summary>
+    /// Puts a line on the status readout from outside, for something the player did rather than something
+    /// the solver decided. See the chain browser.
+    /// </summary>
+    public void Announce(string detail) => Say("", detail);
 
     public void Adopt(Plan plan)
     {
@@ -1459,13 +1537,7 @@ internal sealed class Planning
 
             // Read here, on the main thread, and carried on the environment. The search runs off the
             // main thread and must not reach into the settings tree. See SolverSettings.
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.VaryOpenings.Value, false),
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.VaryOperators.Value, true),
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.TearingMix.Value, "") ?? "",
-            false,
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ShareBest.Value, true),
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ShareNot.Value, "0") ?? "",
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.EstimateDetour.Value, false),
+                false,
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ShortlistRich.Value, 400),
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ShortlistSpread.Value, 200),
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ShortlistSparse.Value, 64f),
@@ -1473,13 +1545,17 @@ internal sealed class Planning
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.OpeningShakes.Value, 2),
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.RescueBelow.Value, 10f) / 100d,
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.RestartShakes.Value, 0),
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.AdoptedShake.Value, 3),
             shown,
             empowering,
             Names,
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.PermuteUpTo.Value, 0),
             Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.BridgeLinks.Value, 2),
-            Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.SlideBy.Value, 0f),
+            Draw: Draws,
+            OpeningChoices: Safe.Read(
+                () => settings.Solver.Advanced.DestroyAndRepair.OpeningChoices.Value, 5),
+            ReverseRuns: Safe.Read(
+                () => settings.Solver.Advanced.DestroyAndRepair.ReverseRuns.Value, true),
+            Relink: Safe.Read(
+                () => settings.Solver.Advanced.DestroyAndRepair.Relink.Value, true),
             OpeningMs: Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.OpeningMs.Value, 0),
             UseEnumeratedSolve: Safe.Read(() => settings.Solver.Advanced.UseEnumeratedSolve.Value, true));
     }
@@ -1814,13 +1890,6 @@ internal sealed class Planning
     private static (string Id, (int X, int Y) From)[] Names { get; set; }
 
     /// <summary>
-    /// Whether a spot will take an explosive: the ground allows it and nothing is standing there.
-    ///
-    /// Two sources because they answer different halves. Terrain describes the ground, and has so
-    /// far never said no to anything; obstacles describe what is standing on it, which is what the
-    /// game was actually refusing. Kept together so the planner asks one question.
-    /// </summary>
-    /// <summary>
     /// Whether aiming at a point lands the explosive on it. See Wire.Lands.
     ///
     /// Null when there is no ground model, which leaves Says on the straight line - the right answer
@@ -1829,6 +1898,18 @@ internal sealed class Planning
     private static Func<Vector2, Vector2, bool> Landing(Terrain terrain, float reach) =>
         terrain == null ? null : (from, to) => terrain.Aiming(from, to, reach, out _);
 
+    /// <summary>
+    /// Whether a spot will take an explosive, by the game's own rule: the ground model's no-placement volumes and
+    /// routable coarse cells. See Terrain.Placeable.
+    ///
+    /// **Scenery is not part of it.** Doodads were treated as solid discs of 3.8 grid - the same 41.3 world unit
+    /// bounds every one of them reports, so a default rather than a size - and a spot inside one was refused. The
+    /// placement routine, decoded in full (NOTES 1d, 0x141F5A6B0), tests no-placement volumes, the separation from
+    /// placed explosives, a route over the coarse grid and the reach along it, and no entity at all; the doodad
+    /// rule came from a correlation measured before that. On Scorched Cay it refused (941,517), 3.2 grid from a
+    /// doodad at (942,520), where the game places, and a player confirmed no doodad on that site blocks placement.
+    /// The doodads are still read, for the dump.
+    /// </summary>
     private static Func<Vector2, bool> Placeable(Terrain terrain, Obstacles blocking)
     {
         // **The model decides, and there is no list of exceptions.** Refusals used to be consulted
@@ -1840,8 +1921,7 @@ internal sealed class Planning
         if (terrain == null && blocking == null)
             return static _ => true;
 
-        return at => (terrain == null || terrain.Placeable(at)) &&
-                     (blocking == null || !blocking.Covers(at));
+        return at => terrain == null || terrain.Placeable(at);
     }
 
     /// <summary>
@@ -1962,7 +2042,7 @@ internal sealed class Planning
     /// arithmetic has something to work with, and a search still improving after ten minutes is a
     /// fault rather than a search.
     /// </summary>
-    private static readonly TimeSpan Unbounded = TimeSpan.FromMinutes(10);
+    internal static readonly TimeSpan Unbounded = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// How long a solve gets when it is only being asked to mend one link.
@@ -2009,20 +2089,23 @@ internal sealed class Planning
     /// </param>
     public string Start(GameController gc, AutoExpeditionSettings settings, Scan scan,
         Blast blast, Valuation valuation, CancellationToken zone, bool mend = false,
-        bool rehearsing = false, string cause = "the action key", bool looped = false)
+        bool rehearsing = false, string cause = "the action key", bool looped = false, bool continuous = false)
     {
         Asked = cause;
+
+        // Timed as a whole and at its environment build, because a start on a cold Grand site was seen stopping the
+        // game's thread for five seconds with no solver running. See Spent.LongGaps.
+        using var starting = Spent.On("Planning.Start");
 
         Planner.Unfetch();
         Planner.ForgetEnumeratedSolve();
         Repair.Undetour();
-        Repair.Unpermute();
-        Repair.Unslide();
 
         // A press takes over from a rehearsal rather than queueing behind it. Cancel below does the
         // work; this only has to record which kind of solve is now running, since the overlay shows
         // one and not the other.
         Rehearsing = rehearsing;
+        RunningContinuous = continuous;
 
         // **Nothing here records an ask, because eight of the nine things that start a search are
         // not one.**
@@ -2062,8 +2145,12 @@ internal sealed class Planning
         if (explosives <= 0)
             return Say(Detonator.FormattedExplosivesPlacedOutOfTotal(gc, "Spent"), "no explosives left");
 
-        var env = Build(gc, settings, scan, blast, valuation, true, true, out var why,
-            out var detail);
+        PlanEnvironment env;
+        string why;
+        string detail;
+
+        using (Spent.On("Planning.Start/Build"))
+            env = Build(gc, settings, scan, blast, valuation, true, true, out why, out detail);
 
         if (env == null)
             return Say(why, detail);
@@ -2129,6 +2216,7 @@ internal sealed class Planning
         {
             _counting = Detonator.DetonatorGridPosition(gc);
             _runs = 0;
+            ForgetSiteScores();
         }
 
         _runs++;
@@ -2352,6 +2440,26 @@ internal sealed class Planning
                 ? TimeSpan.FromMilliseconds(ceiling)
                 : Unbounded;
 
+        // **A continuous reroll pass runs its own length, as a fixed window.** Otherwise it is an ordinary
+        // presolve pass, stopped by the improvement window and the time cap, and at 8s it rarely beats a standing
+        // plan from the top of the distribution before the next pass starts over on a new draw. The window the
+        // pass would have had is kept for the shares taken of it. See RerollSettings.ContinuousPassMs.
+        var pressWindowMs = 0;
+
+        if (continuous && !mend)
+        {
+            var passMs = Detonator.ExplosiveCount(gc) >= Detonator.GrandExplosives
+                ? Safe.Read(() => settings.Solver.Reroll.ContinuousPassMsGrand.Value, 24000)
+                : Safe.Read(() => settings.Solver.Reroll.ContinuousPassMs.Value, 12000);
+
+            if (passMs > 0)
+            {
+                pressWindowMs = (int)settle.TotalMilliseconds;
+                settle = TimeSpan.FromMilliseconds(passMs);
+                budget = settle;
+            }
+        }
+
         var strategy = Safe.Read(() => settings.Solver.Advanced.Strategy.Value, SolverSettings.DestroyRepair);
 
         // What this solve is, for the trials log. All three were declared and never set - lost in a
@@ -2359,14 +2467,16 @@ internal sealed class Planning
         // from DateTime.MinValue: sixty four billion seconds in a column meant to say how long a
         // solve took. Nothing reads that file until somebody asks a question of it, which is how a
         // number that absurd sat there unnoticed.
-        _strategy = strategy;
-        _began = DateTime.UtcNow;
-        _level = Safe.Read(gc, static g => g.Area.CurrentArea.RealLevel, 0);
-
         // **One solve superseding another is an ending too**, and it is the one that used to
         // vanish: Start cancels whatever is running before it plans, so a pass stopped this way
-        // left no line at all.
+        // left no line at all. Before _began moves on, or the superseded run is filed as lasting
+        // nought milliseconds.
         CloseRun("superseded by a new solve");
+
+        _strategy = strategy;
+
+        _began = DateTime.UtcNow;
+        _level = Safe.Read(gc, static g => g.Area.CurrentArea.RealLevel, 0);
 
         {
             var where = Detonator.DetonatorGridPosition(gc);
@@ -2416,6 +2526,14 @@ internal sealed class Planning
         // until something beats it. Null only when there is nothing to keep.
         _live = _standing;
 
+        // **Where the score stands as this solve begins, noted as a score like any published one.** The history only
+        // heard from improvements, so a solve that could not beat the standing chain added nothing - and a site
+        // whose score had stopped climbing read as a site with no scores at all, which the reroll advice waits out
+        // to its longest wait rather than starting at once. Measured: two presolve passes that published nothing
+        // against a standing 15,144, and the advice "WAITING - no whole 8s window of scores yet". See SiteScoreRise.
+        if (_standing is { Count: > 0 })
+            NoteSiteScore(Planner.Plainly(env, _standing));
+
         var margin = MathF.Max(0f, settings.Solver.Timing.MinImprovement.Value);
 
         // The best score that has actually reached the screen, which starts at the standing plan's.
@@ -2436,6 +2554,7 @@ internal sealed class Planning
 
             shown = worth;
             _live = chain;
+            LastGainAt = DateTime.UtcNow;
             Interlocked.Increment(ref _found);
 
             // Recorded where the window is reset, so the two can never disagree about what counts
@@ -2446,6 +2565,8 @@ internal sealed class Planning
             // second pass affordable; the gate stays on Score so nothing about what counts as an
             // improvement is changed by recording it.
             var told = Planner.Rate(env, chain);
+
+            NoteSiteScore(told?.Plain ?? 0d);
 
             lock (_steps)
             {
@@ -2484,9 +2605,155 @@ internal sealed class Planning
         // Undercounts a search that fans out over several workers, since only the thread that runs
         // this delegate is counted. An undercount is still enough to say whether the search is the
         // order of magnitude that matters. See Spent, and the Solve line in the dump.
-        _search = Task.Run(() => MeasuredSearch(() => Solving.Across(env, threads, Better,
-            (n, publish) => Repair.Search(env, budget, settle, token, publish, n, seed),
-            "repair")), token);
+        // **What each worker is for, read once for the whole pool.** One line describes every worker, so a
+        // worker cannot be given two roles by two rules that do not know about each other. See ThreadRoles.
+        env = env with
+        {
+            RoundsPerWorker = Math.Max(0,
+                Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.RoundsPerWorker.Value, 0)),
+            StagnationKickPercent = Math.Max(0,
+                Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.StagnationKickPercent.Value, 50)),
+            StagnationKickRounds = Math.Max(0,
+                Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.StagnationKickRounds.Value, 500)),
+            PressWindowMs = pressWindowMs,
+            StallRestartMs = Math.Max(0,
+                Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.StallRestartMs.Value, 0)),
+            Roles = ThreadRoles.Read(
+                Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ThreadRoles.Value, ""),
+                Math.Max(1, Safe.Read(() => settings.Solver.Threads.Value, 8))),
+        };
+
+        // The environment the workers search under, roles included, so a reader of Env - the chain panel's list of
+        // which worker takes which opening - sees the same one. It was stored before the roles were attached.
+        _env = env;
+
+        // **The openings, worked out once for the whole pool.** Every worker would otherwise draw its own
+        // greedy opening and most of them would draw the same wrong one - see SolverSettings.ThreadRoles.
+        // Here rather than in a worker because it is the same answer for all of them and it is not cheap
+        // enough to do eight times.
+        // **Worked out when a worker asks for one, rather than on a switch of its own.** A line that gives no
+        // worker an enumerated opening is the same statement as switching the enumeration off, and two ways of
+        // saying it can disagree. See ThreadRoles.
+        // The tallies the dump reads are per solve, and the enumeration below resets them only when it runs.
+        Repair.ForgetOpeningTallies();
+
+        var wanted = false;
+
+        foreach (var role in env.Roles ?? [])
+            wanted |= role.Opening == ThreadRoles.Opens.Enumerated;
+
+        // Read here, on the game's thread, because the settings tree is not the search's to touch.
+        var openingLinks = Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.OpeningLinks.Value, 2);
+
+        var share = budget;
+        var settling = settle;
+
+        // **The enumeration runs on the solve's task, not on the game's thread.** It was here, before the task,
+        // and it costs one to two seconds on a Grand site - so every presolve pass whose marker set had changed
+        // froze the game for that long. Measured on Craggy Peninsula while scouting: 1,944ms enumerating, a
+        // worst tick of 2,299ms, eighteen passes about 2.4s apart. The workers already ask the ground from off
+        // the game's thread, so the enumeration can too; Openings.Generate takes a lock for passes that overlap.
+        // Its own thread at low priority, not a pool thread: it waits on the workers for the whole window. See
+        // BackgroundWork.StartAtLowPriority.
+        _search = BackgroundWork.StartAtLowPriority(() => MeasuredSearch(() =>
+        {
+            var run = env;
+
+            // **Only the workers that open on an enumerated opening wait for the enumeration.** It ran to
+            // completion before any worker started, so a worker told to continue, draw fresh or tour sat idle
+            // for it too. Measured on Craggy Peninsula, twenty explosives: 1,898ms of enumeration a press, with
+            // five of eight workers never reading what it produced.
+            // Read before the enumeration, for its Said line. See RunningAtEnumeration.
+            if (wanted)
+                RunningAtEnumeration = Volatile.Read(ref _workersRunning);
+
+            var enumerated = wanted
+                ? BackgroundWork.StartAtLowPriority(() =>
+                {
+                    // A pass superseded before its turn at the enumeration's lock has nobody left to seed.
+                    if (token.IsCancellationRequested)
+                        return env;
+
+                    Openings.Generate(env, openingLinks);
+
+                    var seeds = new List<List<Vector2>>();
+
+                    foreach (var opening in Openings.Last)
+                        seeds.Add(opening.Links);
+
+                    return seeds.Count > 0 ? env with { Openings = seeds } : env;
+                })
+                : null;
+
+            // A line where every worker takes an enumerated opening has nobody to run meanwhile, so the window
+            // waits for the enumeration as it did before any worker could start without it.
+            var independent = false;
+
+            for (var n = 0; n < threads; n++)
+                independent |= !Repair.TakesEnumeratedOpening(run, n);
+
+            if (enumerated != null && !independent)
+                run = enumerated.Result;
+
+            // **The improvement window starts now, when the first workers do, not when Start was called.**
+            // Expire cancels on _until, so with the window counted from Start an enumeration run before the
+            // workers spent it. Measured on Craggy Peninsula: 5.9s enumerating of an 8s window, and all eight
+            // workers cancelled with 4 to 5.5s of their own deadlines left, having run nought rounds. A DateTime is written in one piece on the 64-bit runtime this loads
+            // in, so the game's thread reading it for the countdown sees either value whole.
+            // Not for a search already superseded: Start cancels the one it replaces, and that one reaching here late
+            // would move the new search's countdown.
+            if (!token.IsCancellationRequested)
+                _until = DateTime.UtcNow + settle;
+
+            var slots = WorkerSlots(threads);
+
+            return Solving.Across(run, threads, Better,
+                (n, publish) =>
+                {
+                    var mine = run;
+
+                    // **Waits that end when the solve is cancelled.** A plain Result held a pool thread until the
+                    // enumeration finished, however long ago the solve was superseded - and while scouting a
+                    // presolve pass is superseded every one to six seconds, so the waiting workers of dead
+                    // passes piled up behind enumerations queued on one lock. Waited for before taking a worker
+                    // slot, so a worker idling on the enumeration does not hold one.
+                    if (enumerated != null && Repair.TakesEnumeratedOpening(run, n))
+                    {
+                        try
+                        {
+                            enumerated.Wait(token);
+                            mine = enumerated.Result;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            return Plan.Empty;
+                        }
+                    }
+
+                    // A slot of the thread count, shared with every solve still running. See WorkerSlots.
+                    try
+                    {
+                        slots.Wait(token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return Plan.Empty;
+                    }
+
+                    Interlocked.Increment(ref _workersRunning);
+
+                    try
+                    {
+                        return Repair.Search(mine, share, settling, token, publish, n, seed);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _workersRunning);
+                        slots.Release();
+                    }
+                },
+                "repair");
+        }), token);
 
         return Say("Solving path", $"planning {explosives} explosives over {env.Targets.Count} markers");
     }
@@ -2664,83 +2931,73 @@ internal sealed class Planning
     }
 
     /// <summary>
-    /// Fills in what each barrel detonates, following the chain from one to the next.
+    /// Fills in what each barrel detonates when an explosive reaches it.
     ///
-    /// **A barrel inside another barrel's radius goes off with it**, so the answer is a closure and
-    /// not a circle: two stood five grid apart on the site this was written for, and reaching either
-    /// takes both and everything either of them reaches. Walked with a worklist rather than
-    /// recursion, and each target entered once, so a ring of barrels cannot loop.
+    /// **One level deep: these objects do not set each other off.** ExpeditionIcons states it
+    /// plainly - an oil derrick going off beside a Faridun explosive leaves it intact, and only a
+    /// placed explosive triggers one. This walked a closure instead, on the reasoning that a barrel
+    /// inside another barrel's radius must go off with it, and nothing here ever tested that.
+    ///
+    /// A barrel found inside another barrel's circle is therefore listed as content it catches, like
+    /// any other marker, and its own circle is not added on top. See Planner, which stops the same
+    /// expansion one level down.
     ///
     /// The radius is the barrel's own - the game states it per object - plus the marker's extent, on
     /// the same reasoning every other catch uses: a blast takes a thing when it touches it rather
     /// than when it reaches its middle.
+    ///
+    /// **Which objects those are is decided by the radius, not by TargetKind.Barrel.** Only
+    /// ExplodingFill_BoomBarrel takes that kind, and a tileset states a blast on objects the
+    /// classifier has never heard of - FaridunExplosive and OilWell in Stagnant Basin - which fall
+    /// under Unknown and would otherwise contribute nothing but their own weight of one.
     /// </summary>
     private static void Chained(List<PlanTarget> targets, List<Target> content)
     {
+        // The radius each one goes off with, matched back to the scan by position - PlanTarget
+        // carries what the objective needs and this is the one thing it does not already have.
+        //
+        // Walked from the scan inward rather than over every plan target, because the handful that
+        // state a radius is much the shorter of the two lists.
+        var reach = new float[targets.Count];
         var barrels = new List<int>();
 
-        for (var i = 0; i < targets.Count; i++)
+        foreach (var known in content)
         {
-            if (targets[i].Kind == TargetKind.Barrel)
+            if (known.Sets <= 0f)
+                continue;
+
+            for (var i = 0; i < targets.Count; i++)
+            {
+                if (reach[i] > 0f || Vector2.Distance(known.Grid, targets[i].Grid) >= 1f)
+                    continue;
+
+                reach[i] = known.Sets;
                 barrels.Add(i);
+
+                break;
+            }
         }
 
         if (barrels.Count == 0)
             return;
 
-        // The radius each barrel goes off with, matched back to the scan by position - PlanTarget
-        // carries what the objective needs and this is the one thing it does not already have.
-        var reach = new float[targets.Count];
-
-        foreach (var i in barrels)
-        {
-            foreach (var known in content)
-            {
-                if (known.Kind == TargetKind.Barrel && Vector2.Distance(known.Grid, targets[i].Grid) < 1f)
-                {
-                    reach[i] = known.Sets;
-
-                    break;
-                }
-            }
-        }
-
-        var taken = new bool[targets.Count];
-        var work = new Stack<int>();
         var found = new List<int>();
 
         foreach (var start in barrels)
         {
-            if (reach[start] <= 0f)
-                continue;
-
-            Array.Clear(taken);
             found.Clear();
-            work.Clear();
-            work.Push(start);
-            taken[start] = true;
 
-            while (work.Count > 0)
+            for (var j = 0; j < targets.Count; j++)
             {
-                var from = work.Pop();
+                if (j == start)
+                    continue;
 
-                for (var j = 0; j < targets.Count; j++)
-                {
-                    if (taken[j])
-                        continue;
+                var span = reach[start] + targets[j].Radius;
 
-                    var span = reach[from] + targets[j].Radius;
+                if (Vector2.DistanceSquared(targets[start].Grid, targets[j].Grid) > span * span)
+                    continue;
 
-                    if (Vector2.DistanceSquared(targets[from].Grid, targets[j].Grid) > span * span)
-                        continue;
-
-                    taken[j] = true;
-                    found.Add(j);
-
-                    // A barrel caught by a barrel goes off in its turn.
-                    if (targets[j].Kind == TargetKind.Barrel && reach[j] > 0f)
-                        work.Push(j);
-                }
+                found.Add(j);
             }
 
             targets[start] = targets[start] with { Sets = found.ToArray() };
@@ -3027,10 +3284,68 @@ internal sealed class Planning
         ShownAt = Vector2.Zero;
     }
 
+    /// <summary>
+    /// The site score each time a solve at this site published a better chain, across solves, for asking how fast it
+    /// is still climbing. Cleared with the site. See SiteScoreRise.
+    /// </summary>
+    private static readonly List<(DateTime At, double Plain)> _siteScores = new();
+
+    /// <summary>Notes the site score a better chain reached. Called from the search's threads.</summary>
+    private static void NoteSiteScore(double plain)
+    {
+        lock (_siteScores)
+        {
+            if (_siteScores.Count > 0 && plain <= _siteScores[^1].Plain)
+                return;
+
+            if (_siteScores.Count >= 512)
+                _siteScores.RemoveAt(0);
+
+            _siteScores.Add((DateTime.UtcNow, plain));
+        }
+    }
+
+    private static void ForgetSiteScores()
+    {
+        lock (_siteScores)
+            _siteScores.Clear();
+    }
+
+    /// <summary>
+    /// How much the site score rose over the last window, as a fraction of where it stood at the window's start.
+    /// Positive infinity when nothing has been noted for a whole window yet, since a rise cannot be ruled out.
+    /// </summary>
+    internal static double SiteScoreRise(TimeSpan window)
+    {
+        lock (_siteScores)
+        {
+            if (_siteScores.Count == 0)
+                return double.PositiveInfinity;
+
+            var from = DateTime.UtcNow - window;
+            var before = -1;
+
+            for (var i = _siteScores.Count - 1; i >= 0 && before < 0; i--)
+            {
+                if (_siteScores[i].At <= from)
+                    before = i;
+            }
+
+            if (before < 0 || _siteScores[before].Plain <= 0d)
+                return double.PositiveInfinity;
+
+            return (_siteScores[^1].Plain - _siteScores[before].Plain) / _siteScores[before].Plain;
+        }
+    }
+
+    /// <summary>This site's improvement window in milliseconds: the "Time to improve" setting for its size.</summary>
+    internal static int ImprovementWindowMs(AutoExpeditionSettings settings, int links) => Settling(settings, links);
+
     /// <summary>Throws the plan away, for a new area or a new question.</summary>
     public void Forget()
     {
         Cancel();
+        ForgetSiteScores();
         Plan = Plan.Empty;
         _chain = [];
         _laid = 0;
@@ -3050,6 +3365,19 @@ internal sealed class Planning
         Planner.RuneTallyByRemnant.Clear();
         Planner.Chosen.Clear();
     }
+
+    /// <summary>
+    /// Which draw of the random numbers the next solve gets. See PlanEnvironment.Draw.
+    ///
+    /// **Bumped by whoever wants two solves to differ, and by nobody else.** Left alone it stays at
+    /// nought, which is the search this plugin has always run - every seed a constant plus the worker's
+    /// number, so a site's answer is reproducible to the decimal. Two things bump it: a batch measuring
+    /// whether a change helps, or its five presses are one press counted five times (see RepeatedPresses);
+    /// and the continuous reroll mode, before each pass past the one the presolve would have stopped on,
+    /// because a pass seeded from the same chain with the same numbers repeats the pass before it (see
+    /// Rehearsal.Continuing).
+    /// </summary>
+    public static int Draws { get; set; }
 
     /// <summary>Says one thing two ways: a word for the HUD, a sentence for the debug line.</summary>
     private string Say(string status, string detail)

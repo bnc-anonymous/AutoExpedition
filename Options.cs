@@ -1588,6 +1588,44 @@ internal static class Options
         if (here.Count == 1)
             return here[0];
 
+        // **The last explosive's blast first, then arm's reach.**
+        //
+        // Placing an explosive whose blast covers a remnant opens that remnant's window from wherever the
+        // player stands, and it is the more direct evidence of the two: the window appears as the explosive
+        // lands, on a remnant the blast plainly covers. Reach is about where the player stands, which a
+        // window opened this way says nothing about. Measured on Scorched Cay: two remnants fitted the
+        // fingerprint at 92.3 and 157.6 from the player, reach rejected both, and the run stopped to ask -
+        // while the explosive just placed at (369,758) was 36.8 from the first and over 200 from the second.
+        //
+        // **Only a remnant still waiting on a choice.** A blast from earlier on covers remnants whose windows
+        // were dealt with long ago; without this, walking up to a second remnant with the same fingerprint
+        // would hand its window to the first. A window a blast has just opened is on a remnant nothing has
+        // been picked for yet.
+        //
+        // The radius is the game's own figure, before the plugin's circle correction, plus the three grid of
+        // headroom Reach uses: the remnant's extent is about 2.25 and the correction is -2.25, so the raw
+        // radius is already the catch distance and the headroom covers rounding. Exactly one survivor, as
+        // everywhere here, or it falls through to reach. See Detonator.ExplosionRadius.
+        if (Detonator.LastExplosiveGridPosition(gc) is var last && last != Vector2.Zero)
+        {
+            var catches = Detonator.ExplosionRadius(gc) + 3f;
+            Target blasted = null;
+            var inBlast = 0;
+
+            foreach (var target in here)
+            {
+                if (Vector2.Distance(target.Grid, last) > catches ||
+                    !Safe.Read(() => Valuation.NothingChosen(target.Entity), false))
+                    continue;
+
+                blasted = target;
+                inBlast++;
+            }
+
+            if (inBlast == 1)
+                return blasted;
+        }
+
         Target only = null;
         var matches = 0;
 
@@ -1664,6 +1702,28 @@ internal static class Options
         // never needs this path, because it knows what it opened; only a hand-opened window
         // reaches here, and "I cannot tell" is a thing it is allowed to say.
         return matches == 1 ? only : null;
+    }
+
+    /// <summary>
+    /// How far a remnant is from the last explosive placed, against the distance its blast catches at, for the
+    /// dump line of a remnant Reach rejected. Offering takes the one remnant inside the blast with nothing chosen
+    /// yet, before it asks about reach. Empty when nothing is placed.
+    /// </summary>
+    private static string BlastSaid(GameController gc, Target target)
+    {
+        var last = Detonator.LastExplosiveGridPosition(gc);
+
+        if (last == Vector2.Zero)
+            return "";
+
+        var from = Vector2.Distance(target.Grid, last);
+        var catches = Detonator.ExplosionRadius(gc) + 3f;
+
+        var waiting = Safe.Read(() => Valuation.NothingChosen(target.Entity), false);
+
+        return $"; {from:0.#} from the last explosive at ({last.X:0},{last.Y:0}), " +
+               (from <= catches ? $"INSIDE its blast of {catches:0.#}" : $"outside its blast of {catches:0.#}") +
+               (waiting ? ", nothing chosen yet" : ", a reward already chosen");
     }
 
     /// <summary>
@@ -1807,7 +1867,7 @@ internal static class Options
                           $"window's {width}"
                         : Away(target, at) is var gone && gone >= 0f && gone > Reach
                             ? $"fixed rune matches but it is {gone:0.#} away, past the {Reach:0} a " +
-                              "window can be opened from"
+                              "window can be opened from" + BlastSaid(gc, target)
                             : "MATCHES";
 
             if (why == "MATCHES")
@@ -1888,9 +1948,10 @@ internal static class Options
     /// <summary>
     /// Which remnant this window belongs to.
     ///
-    /// The window says nothing about it, so it is identified by where the player is standing: the
-    /// window only opens by walking up to a remnant and interacting with it, so the remnant
-    /// underfoot is the one being looked at.
+    /// The window says nothing about it. It opens two ways - by interacting with a remnant, or by
+    /// placing an explosive whose blast covers one - so it is identified by what the run opened, then
+    /// by the fingerprint of the offered recipes, narrowed first by the last explosive's blast and
+    /// then by the player's reach. See Offering.
     ///
     /// It refuses to answer rather than guess. If a second remnant is nearly as close, no rune is
     /// named - "this combination passes on Opulent" taken from the wrong remnant's slots is worse

@@ -206,8 +206,10 @@ internal static class Overlay
         }
 
         // The barrels, whether or not there is a plan yet: they are the site's own blasts and knowing
-        // where they are is what shapes a chain. See Minimap.Barrels.
-        if (settings.Display.DrawOnMinimap)
+        // where they are is what shapes a chain. See Minimap.Barrels, and the world pass above for
+        // why the detonation ends it for both surfaces.
+        if (settings.Display.DrawOnMinimap && settings.Display.ThePlan.ShowBarrels &&
+            !Detonator.SetOffHere(gc))
             using (Spent.On("Minimap.Barrels"))
             {
                 Minimap.Barrels(graphics, settings, targets,
@@ -236,10 +238,30 @@ internal static class Overlay
                 }
         }
 
-        if (settings.Display.Remnants.Rewards.LineAbove.Value > 0f)
+        // The way to the remnant worth rolling, on the map. See Minimap.Rolls.
+        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.RollLineOnMinimap)
+            using (Spent.On("Minimap.Rolls"))
+            {
+                Minimap.Rolls(graphics, gc, settings);
+            }
+
+        // Worked out once for both surfaces, since the minimap asks the same question. See HideLineOnceCaught.
+        _remnantsUnderPlaced = settings.Display.Remnants.Rewards.HideLineOnceCaught
+            ? RemnantsUnderPlaced(gc, targets, blast.Radius(gc, settings) ?? 0f)
+            : null;
+
+        if (settings.Display.Remnants.Rewards.LineAbove.Value > 0f && settings.Display.Remnants.Rewards.LineInWorld)
             using (Spent.On("Lines"))
             {
                 Lines(graphics, gc, targets, settings, valuation, covered);
+            }
+
+        // The same reward lines on the map. See Minimap.RewardLines.
+        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rewards.LineAbove.Value > 0f &&
+            settings.Display.Remnants.Rewards.LineOnMinimap)
+            using (Spent.On("Minimap.RewardLines"))
+            {
+                Minimap.RewardLines(graphics, gc, targets, settings, valuation);
             }
 
         // **After the chain has gone off, which is what the group it sits in is named for.**
@@ -263,8 +285,12 @@ internal static class Overlay
                 PostExpeditionSettings.FromStart),
             PostExpeditionSettings.FromStart, StringComparison.Ordinal);
 
+        // **Or the site has been set off.** Coming back through a portal to a detonated site, the detonator panel
+        // is never filled in again - it reads 0 of 0 - so "the site is live" went false exactly when there was
+        // loot to walk to, and a shatterable remnant beside the player got no line. A site that has gone off is
+        // at least as live as one about to.
         var looting = settings.Automation.PostExpedition.Line &&
-                      (fromStart ? Detonator.PanelReady(gc) : Ending.ProbablyOver);
+                      (fromStart ? Detonator.PanelReady(gc) || Detonator.SetOffHere(gc) : Ending.ProbablyOver);
 
         if (looting)
             using (Spent.On("Loot"))
@@ -272,7 +298,7 @@ internal static class Overlay
                 Loot(graphics, gc, settings, scan, covered);
             }
 
-        if (settings.Display.Remnants.Rerolls.RollLine)
+        if (settings.Display.Remnants.Rerolls.RollLineInWorld)
             using (Spent.On("Rolls"))
             {
                 Rolls(graphics, gc, settings, covered);
@@ -404,7 +430,19 @@ internal static class Overlay
         // **Not inside the marker loop above**, which is where this was first put and never drew:
         // that loop is behind the two DEBUG switches, and a thing shown because the plan is shown
         // cannot live behind a switch for showing marker art. Its own pass, its own question.
-        if (settings.Display.DrawInWorld)
+        // **Nothing once the site has been set off.** A ring says "a blast here would give you this
+        // one for nothing", and pressing the detonator answers that question for every object in the
+        // site at once: the ones the chain reached have gone off, and the ones it did not can no
+        // longer be reached by anything, because no further explosive may be placed. Drawing either
+        // afterwards offers a choice that is no longer on the table.
+        //
+        // Before that moment the question is live and the per-object tests below answer it - Spent
+        // for one that has already blown, Blown for one an explosive already down will take.
+        //
+        // The switch is asked once here rather than per target, because the coverage closure behind
+        // Blown and the world position of each object are both paid for before anything is drawn.
+        if (settings.Display.DrawInWorld && settings.Display.ThePlan.ShowBarrels &&
+            !Detonator.SetOffHere(gc))
         {
             using var barrels = Spent.On("Barrel blasts");
 
@@ -412,8 +450,9 @@ internal static class Overlay
 
             foreach (var target in targets)
             {
-                if (target.Kind != TargetKind.Barrel || target.Sets <= 0f || target.Spent ||
-                    blown.Contains(Cell(target.Grid)))
+                // Asked of the radius rather than of the kind, because the objects that carry one
+                // are not all called barrels. See Target.Sets.
+                if (target.Sets <= 0f || target.Spent || blown.Contains(Cell(target.Grid)))
                     continue;
 
                 var where = target.Where(gc);
@@ -421,11 +460,8 @@ internal static class Overlay
                 if (where == Vector3.Zero)
                     continue;
 
-                if (settings.Display.ThePlan.ShowBarrels)
-                {
-                    graphics.DrawCircleInWorld(where, target.Sets * Detonator.GridToWorld,
-                        settings.Display.ThePlan.BarrelColour, 2f, 32, true);
-                }
+                graphics.DrawCircleInWorld(where, target.Sets * Detonator.GridToWorld,
+                    settings.Display.ThePlan.BarrelColour, 2f, 32, true);
             }
         }
 
@@ -1081,7 +1117,16 @@ internal static class Overlay
         var behind = false;
 
         // How many pixels a grid unit is worth on screen right now, for the sanity check below.
-        var scale = Scale(gc, camera, plan.Points[0]);
+        //
+        // **Measured where the player stands, not at the chain's first spot.** The yardstick exists to
+        // catch a point behind the camera projecting to the wrong place - and measured at the first
+        // spot, which on a chain laid across a Grand site can be hundreds of grid behind the camera, it
+        // was taken with exactly that projection. A wrong yardstick loosens the check it feeds, and a
+        // mirrored link was drawn diagonally across the screen with every explosive already placed.
+        // The player is always on screen, and the camera is near enough isometric that the scale there
+        // is the scale everywhere. The first spot stays as the fallback when the player cannot be read.
+        var standing = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var scale = Scale(gc, camera, standing != Vector2.Zero ? standing : plan.Points[0]);
 
         for (var i = 0; i < plan.Points.Count; i++)
         {
@@ -1973,7 +2018,7 @@ internal static class Overlay
     ///
     /// Drawn in the reroll highlight colour, so the line and the border it leads to are the same
     /// mark twice rather than two marks to learn. One pixel: it is a hint about where to go next,
-    /// not a route, and the chain's own polyline is already on the screen. See RollLine.
+    /// not a route, and the chain's own polyline is already on the screen. See RollLineInWorld.
     /// </summary>
     private static void Rolls(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         List<RectangleF> covered)
@@ -2040,12 +2085,26 @@ internal static class Overlay
         var toward = Toward(gc, camera, at, best.Grid, from);
         var trusted = toward == Vector2.Zero || Vector2.Dot(toward, Normal(ground - from)) > 0.5f;
 
-        var end = trusted && Inside(window, to, Edge)
+        // A projection the step disagrees with is off screen whatever it says - that is what a point
+        // behind the camera looks like.
+        var off = !trusted || !Inside(window, to, Edge);
+
+        // **Off screen, clipped along the ground bearing and never along the far projection.** This
+        // preferred the projection whenever the step agreed with it, which is the rule the reward line
+        // was fixed out of and for both of its reasons. The projection of a point near the camera
+        // plane swings about, so the endpoint jitters along the window edge; and the dot test only has
+        // to be wrong once - a bearing read at 0.51 against a mirrored projection hands the clip a
+        // point on the opposite side, and the line reverses. The bearing cannot mirror, so out here it
+        // is the only input. On screen the projection is the answer and is used unchanged.
+        var end = !off
             ? to
-            : Clip(window, from, trusted ? to : from + toward * (window.Width + window.Height));
+            : Clip(window, from,
+                toward != Vector2.Zero
+                    ? from + toward * (window.Width + window.Height)
+                    : to);
 
         if (end != Vector2.Zero && !Panels.Covers(covered, end))
-            graphics.DrawLine(from, end, settings.Display.Remnants.Rerolls.RollLineThickness.Value,
+            graphics.DrawLine(from, end, settings.Display.Remnants.Rerolls.RollLineThicknessInWorld.Value,
                 settings.Display.Remnants.Rerolls.RollColour);
     }
 
@@ -2591,7 +2650,19 @@ internal static class Overlay
                 whole && Rehearsal.Settled ? step : later));
         }
 
-        if (solving)
+        // **A continuous reroll pass has no end to count down to.** It runs until a roll restarts it or the key
+        // stops it, and a countdown that ran out and refilled every pass read as a solve finishing. The figure in
+        // brackets is how many seconds ago the plan last improved, which is what says whether it is still finding
+        // anything. See Planning.RunningContinuous.
+        if (solving && Planning.RunningContinuous)
+        {
+            var gain = Planning.LastGainAt == DateTime.MinValue
+                ? ""
+                : $" ({(DateTime.UtcNow - Planning.LastGainAt).TotalSeconds:0})";
+
+            readout.Line(($"Solving: until reroll{gain}", later));
+        }
+        else if (solving)
         {
             readout.Line(($"Solving: {left}", later));
             readout.Bar(along, later);
@@ -2604,7 +2675,16 @@ internal static class Overlay
         // is worth rolling" is a useful answer that used to look identical to never having asked.
         // Green only when the advice is about the chain currently on screen: a verdict computed
         // against a chain that has since been re-solved is stale, which is what Fresh means.
-        if (Rolling.Here.Skipped && settings.Display.ScoreArea.DrawReroll)
+        if (Rolling.Here.Waiting.Length > 0 && settings.Display.ScoreArea.DrawReroll)
+        {
+            // **Waiting says so, in the colour of work still to come.** The first advice at a site waits for its
+            // content to stop arriving and its score to stop climbing fast, and nothing on this line said anything
+            // was pending - so a wait read as the advice being off. The bar fills towards the longest wait, after
+            // which it starts regardless. See Rolling.HoldingFirstAdvice.
+            readout.Line(("Reroll: waiting", later));
+            readout.Bar(Rolling.Here.WaitProgress, later);
+        }
+        else if (Rolling.Here.Skipped && settings.Display.ScoreArea.DrawReroll)
         {
             // **The roll colour, because an unanswered question is not a clean bill of health.**
             // It reads in the same colour as "true" on purpose: both say there is a roll here you
@@ -2619,8 +2699,21 @@ internal static class Overlay
         }
         else if (Rolling.Here.Working && settings.Display.ScoreArea.DrawReroll)
         {
-            readout.Line(($"Reroll: {Rolling.Here.Through * 100f:0}%", later));
-            readout.Bar(Math.Clamp(Rolling.Here.Through, 0f, 1f), later);
+            // **Progress over the whole enumeration, not through the current round.** See
+            // Rolling.Progress.
+            //
+            // **Coloured by the standing advice**, in the same two colours as the finished line below:
+            // the roll colour while the last answer wants a remnant rolled, green while it wants none.
+            // Before any pass has answered there is no advice to colour by, so it stays in the colour
+            // of work still to come.
+            var wants = Rolling.Here.Runs == 0
+                ? later
+                : Rolling.Here.Rollable > 0
+                    ? (Color)settings.Display.Remnants.Rerolls.RollColour
+                    : step;
+
+            readout.Line(($"Reroll: {Rolling.Here.Progress * 100f:0}%", wants));
+            readout.Bar(Rolling.Here.Progress, wants);
         }
         else if (Rolling.Here.Runs > 0 && Rolling.Here.Fresh && settings.Display.ScoreArea.DrawReroll)
         {
@@ -2732,6 +2825,12 @@ internal static class Overlay
                     : Color.FromArgb(255, 255, 225, 120));
             }
         }
+
+        // **Where a batch of repeats has got to, because it is a minute of standing still.** Three
+        // eight second presses with the plan cleared between them looks identical to the plugin having
+        // stopped, and somebody waiting for it has nothing to read. See RepeatedPresses.
+        if (Dump.Repeats is { Running: true } batch)
+            readout.Right(batch.Said, Color.FromArgb(255, 255, 225, 120));
 
         // **One row higher than the anchor's own height, because the anchor changed rows.**
         //
@@ -2959,6 +3058,62 @@ internal static class Overlay
     /// of a pair five grid apart is as gone as the near one. Repeated until nothing new is added,
     /// which on any real site is two or three passes over a handful of barrels.
     /// </summary>
+    /// <summary>
+    /// The remnants an explosive already down will take, by cell, worked out once a frame for the reward lines.
+    /// Null when "Stop the line once a placed explosive covers it" is off. See RemnantsUnderPlaced.
+    /// </summary>
+    private static HashSet<(int, int)> _remnantsUnderPlaced;
+
+    /// <summary>Remnants seen covered by a placed explosive in this area, and which area that is. See RemnantsUnderPlaced.</summary>
+    private static readonly HashSet<(int, int)> _covered = new();
+
+    private static uint _coveredArea;
+
+    /// <summary>
+    /// The remnants within reach of an explosive that is already down: blast plus the remnant's own extent, the
+    /// same edge rule Blown uses for barrels and Planner.Catches uses for everything.
+    /// </summary>
+    ///
+    /// **Remembered for the area, not read fresh each frame.** A remnant stays covered once its explosive is down,
+    /// but the placed list is the detonator's, and a detonation or a trip out and back can leave it empty while
+    /// the remnant is still standing - which would bring the line straight back. Forgotten on a new area.
+    private static HashSet<(int, int)> RemnantsUnderPlaced(GameController gc, List<Target> targets, float blast)
+    {
+        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
+        if (area != _coveredArea)
+        {
+            _covered.Clear();
+            _coveredArea = area;
+        }
+
+        var under = _covered;
+        var placed = Detonator.PlacedExplosiveGridPositions(gc);
+
+        if (placed.Length == 0 || blast <= 0f)
+            return under;
+
+        foreach (var target in targets)
+        {
+            if (target.Kind != TargetKind.Remnant)
+                continue;
+
+            var edge = blast + Extents.Of(target);
+
+            foreach (var at in placed)
+            {
+                if (Vector2.Distance(at, target.Grid) <= edge)
+                {
+                    under.Add(Cell(target.Grid));
+
+                    break;
+                }
+            }
+        }
+
+        return under;
+    }
+
     internal static HashSet<(int, int)> Blown(GameController gc, AutoExpeditionSettings settings,
         List<Target> targets, float blast)
     {
@@ -2980,7 +3135,7 @@ internal static class Overlay
 
         foreach (var target in targets)
         {
-            if (target.Kind == TargetKind.Barrel && target.Sets > 0f && !target.Spent)
+            if (target.Sets > 0f && !target.Spent)
                 barrels.Add(target);
         }
 
@@ -3110,6 +3265,38 @@ internal static class Overlay
     // ------------------------------------------------------------------ rewards
 
     /// <summary>
+    /// Whether a remnant gets a reward line, on either surface: a remnant not yet spent, whose best
+    /// reward is worth at least "Draw a line to rewards above", and which stands within "Only to rewards
+    /// within" of the player.
+    ///
+    /// One rule for the world and the minimap, so the two never point at different remnants. See Lines
+    /// and Minimap.RewardLines.
+    /// </summary>
+    internal static bool WantsRewardLine(Target target, AutoExpeditionSettings settings, Valuation valuation,
+        Vector2 player)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Spent || target.Rewards.Count == 0)
+            return false;
+
+        if (_remnantsUnderPlaced != null && _remnantsUnderPlaced.Contains(Cell(target.Grid)))
+            return false;
+
+        var floor = settings.Display.Remnants.Rewards.LineAbove.Value *
+                    valuation.PerExalt(settings.Display.Prices.PriceIn.Value);
+
+        if (target.Rewards[0].Value < floor)
+            return false;
+
+        // The whole map's remnants exist from the moment the area loads, so without this the screen
+        // fills with lines to ground that has nothing to do with the site in front of you. Zero means
+        // no limit. See RemnantRewardSettings.LineWithin.
+        var reach = Safe.Read(() => settings.Display.Remnants.Rewards.LineWithin.Value, 0);
+
+        return reach <= 0 || player == Vector2.Zero ||
+               Vector2.DistanceSquared(player, target.Grid) <= (float)reach * reach;
+    }
+
+    /// <summary>
     /// A line from the player towards each remnant worth going to.
     ///
     /// Only the ones over the threshold. A line to every remnant is five lines across the screen
@@ -3146,29 +3333,12 @@ internal static class Overlay
 
         var here = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
 
-        var floor = settings.Display.Remnants.Rewards.LineAbove.Value * valuation.PerExalt(settings.Display.Prices.PriceIn.Value);
-        var thickness = settings.Display.Remnants.Rewards.LineThickness.Value;
-
-        // Squared, so the test per remnant is a subtraction and a compare. Zero means no limit.
-        var reach = Safe.Read(() => settings.Display.Remnants.Rewards.LineWithin.Value, 0);
-        var within = (float)reach * reach;
+        var thickness = settings.Display.Remnants.Rewards.LineThicknessInWorld.Value;
 
         foreach (var target in targets)
         {
-            if (target.Kind != TargetKind.Remnant || target.Spent || target.Rewards.Count == 0)
+            if (!WantsRewardLine(target, settings, valuation, here))
                 continue;
-
-            if (target.Rewards[0].Value < floor)
-                continue;
-
-            // The whole map's remnants exist from the moment the area loads, so without this the
-            // screen fills with lines to ground that has nothing to do with the site in front of you.
-            // See DisplaySettings.LineWithin.
-            if (within > 0f && here != Vector2.Zero &&
-                Vector2.DistanceSquared(here, target.Grid) > within)
-            {
-                continue;
-            }
 
             var world = target.Where(gc);
 

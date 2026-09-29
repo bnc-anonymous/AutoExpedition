@@ -113,20 +113,27 @@ internal enum TargetKind
     Scenery,
 
     /// <summary>
-    /// A barrel that explodes when a blast reaches it, setting off everything around it.
+    /// The named barrel, ExplodingFill_BoomBarrel, which explodes when a blast reaches it.
     ///
-    /// **It is worth nothing and changes everything, which is why it cannot be a weight.** The
-    /// barrel carries inherent_explosion_radius 60 against an explosive's 35, so catching one is a
-    /// second and larger detonation wherever it stands - and a second detonation is not a marker
-    /// worth more points, it is a blast the chain did not have to place. Four of them on one site is
-    /// a great deal of free radius, and a player uses them by clipping the edge of one deliberately.
+    /// **This kind is a name, not the mechanic.** What makes an object set off a second blast is
+    /// Target.Sets being non-nought, and several tilesets state that on objects this kind never
+    /// matches - FaridunExplosive at 80 and OilWell at 110 in Stagnant Basin, both filed under
+    /// Unknown. Everything that acts on a second blast - the closure, the rings, the already-blown
+    /// test - asks Sets rather than this kind, so the two lists are not the same length.
+    ///
+    /// **It is worth nothing and changes everything, which is why it cannot be a weight.** Catching
+    /// one is a second detonation wherever it stands, and a second detonation is not a marker worth
+    /// more points, it is a blast the chain did not have to place. A player uses them by clipping the
+    /// edge of one deliberately.
     ///
     /// **And they set each other off.** Two stood five grid apart in the site this was written for,
     /// so the first reaches the second, the second reaches whatever is around it, and so on - which
     /// makes the coverage a closure rather than a circle. See PlanTarget.Sets.
     ///
-    /// The radius is read from the state rather than assumed: the game states it per barrel, and
-    /// nothing says every tileset uses the same number.
+    /// The radius is read from the state rather than assumed: the game states it per object, and
+    /// nothing says every tileset uses the same number. It is larger than an explosive's own blast,
+    /// not smaller - 60 on the Gallows barrel and 110 on the Basin derrick against an explosive's
+    /// 34 to 37 - which is why clipping one is worth building a chain around. See Target.Sets.
     ///
     /// **Nothing highlights green for what a barrel will take.** The game lights up what an
     /// EXPLOSIVE catches, and a barrel's blast has not happened yet when the circle is up - so
@@ -842,10 +849,12 @@ internal sealed class Target
                          Kind == TargetKind.Remnant && State("activated") >= 6 ||
                          Kind == TargetKind.Sentry && State("activated") >= 1 ||
                          Kind == TargetKind.Entrance && State("expedition_detonated") >= 1 ||
-                         // A barrel that has already blown. The classifier refuses one at the
-                         // sweep, but a marker remembered from an earlier lap comes back without
-                         // being re-read, so the question has to be askable here too.
-                         Kind == TargetKind.Barrel && State("expedition_detonated") >= 1 ||
+                         // Anything with a blast of its own that has already blown - a barrel, or
+                         // one of the tileset explodables the sweep files under Unknown. The
+                         // classifier refuses one at the sweep, but a marker remembered from an
+                         // earlier lap comes back without being re-read, so the question has to be
+                         // askable here too. See Target.Sets.
+                         Sets > 0f && State("expedition_detonated") >= 1 ||
                          Kind == TargetKind.Strongbox &&
                          (State("expedition_detonated") >= 1 || State("opened") >= 1);
 
@@ -1194,33 +1203,69 @@ internal sealed class Target
     /// <summary>
     /// How far this thing's own explosion reaches, in grid units, or nought when it has none.
     ///
-    /// Read from inherent_explosion_radius, which the game states per object: sixty on a barrel,
-    /// nought on everything else in a dig site. See TargetKind.Barrel.
+    /// Read from inherent_explosion_radius, which the game states per object. Nought on almost
+    /// everything in a dig site, and non-nought is the game saying this object goes off on its own
+    /// and takes what stands near it - which is what the chain closure and the blast rings are
+    /// about. Measured in Stagnant Basin: 80 on FaridunExplosive, 110 on OilWell, nought on the
+    /// other 148 objects that stated one at all.
+    ///
+    /// **The unit is grid**, on ExpeditionIcons' evidence rather than on anything measured here. It
+    /// hard-codes 75 grid for the Gallows boom barrel and the Faridun explosive and 140 for the oil
+    /// derrick, beside an explosive's own 34 that it measured by touching circles - so an object's
+    /// own blast really is two to four times an explosive's, and the readings here of 60, 80 and 110
+    /// are the same figures in the same unit.
+    ///
+    /// **They do not agree exactly, and nothing here explains the gap.** That plugin uses one figure
+    /// for the two barrels where the game states 60 for the Gallows one and 80 for the Faridun, and
+    /// 140 for the derrick where the game states 110. Its base radius carries a note saying how it
+    /// was measured and these three do not, so they may be read off the screen rather than measured;
+    /// the state is the game's own number and reads every object rather than the three somebody
+    /// hard-coded. Worth settling, since 110 against 140 is a fifth of a derrick's blast.
     /// </summary>
     public float Sets
     {
         get
         {
-            // **Re-read while it is nought, like the states and the mods before it.**
+            // **Read once from a live entity, then latched - including a latch on nought.**
             //
             // A marker outlives the entity it was read from - Remembered writes the site to disk so
             // a reload does not cost a lap - and a field added after those files were written comes
             // back empty for every marker in them. Measured: eighty one barrels restored, every one
             // reporting a radius of nought, so every circle was drawn at nothing and the closure
-            // reached nothing either.
+            // reached nothing either. So a nought that came off the disk still has to be asked again.
             //
-            // Only while empty and only from a live entity, so this costs one read per barrel per
-            // area rather than one per frame. See TargetKind.Barrel.
-            if (_sets > 0f || Entity == null)
+            // A nought the state itself gave is a different thing and is kept, because this is asked
+            // of every target on every drawing frame rather than of the handful the classifier had
+            // already named barrels. Without the latch each of the several hundred objects that state
+            // a radius of nought would walk its state list once a frame to say so again.
+            if (_setsRead || Entity == null)
                 return _sets;
 
-            return _sets = MathF.Max(0f, State("inherent_explosion_radius"));
+            var stated = State("inherent_explosion_radius");
+
+            // -1 is the state absent or the component unreadable, which is not a radius of nought:
+            // keep asking until the entity answers one way or the other.
+            if (stated < 0)
+                return _sets;
+
+            _setsRead = true;
+
+            return _sets = stated;
         }
 
-        set => _sets = value;
+        set
+        {
+            _sets = value;
+
+            // A radius restored from disk is an answer; a nought from disk is the field never having
+            // been written, so it leaves the latch open for a live entity to settle.
+            _setsRead = value > 0f;
+        }
     }
 
     private float _sets;
+
+    private bool _setsRead;
 
     public string Words { get; set; } = "";
 
@@ -3323,9 +3368,10 @@ internal sealed class Scan
         // for the same contents at scenery and at 80 cannot both be right. Must-take an arena gate
         // and see what comes out; if it is the same single unique, this line belongs with the
         // entrances above rather than with the barrels.
-        // The barrel, before the scenery it would otherwise be filed with. Matched by name and
-        // then confirmed by the state, because the state is the thing that matters and a tileset
-        // that ships a barrel under another name should still be caught by it. See TargetKind.Barrel.
+        // The barrel, before the scenery it would otherwise be filed with. Matched by name, which
+        // catches ExplodingFill_BoomBarrel and nothing else - a tileset that ships a barrel under
+        // another name falls past here to Unknown, and is picked up for its blast by Target.Sets
+        // rather than by this kind. See TargetKind.Barrel.
         if (metadata.Contains("BoomBarrel", StringComparison.OrdinalIgnoreCase))
         {
             var barrel = new Target
@@ -3392,18 +3438,27 @@ internal sealed class Scan
         //
         // The ARENA gate is not here, and the difference is what is behind it rather than what it
         // looks like: rogue exiles, which are worth almost nothing, so it sits with the scenery.
-        // **Four of these five strings have never appeared in the game.** SubareaEntrance is on every
-        // entrance ever seen - twenty-two sightings - and GateBlocker, KaruiGateExplodable, BossCave
-        // and EncasedShrine are nought apiece. They are kept because this is the CLASSIFIER and an
-        // arm that never fires costs nothing here: the failure it guards against is an entrance the
-        // scan ignores, which is worse than a branch nobody takes. That is the opposite of the
-        // pricing chain these same four words used to drive, where never firing meant every entrance
-        // silently took one flat number. See Weighing.Entrance.
+        // **EncasedShrine was here and has been taken out, because one turned up and is not an
+        // entrance.** Digsite ships `Objects/EncasedShrine` wearing `precursorsulfurpile01.ao`: a
+        // sulfur pile 8.8 grid across on a 6x6 footprint, which a blast opens to reveal a shrine
+        // rather than a way through the ground. Classifying it here cost it two things - kind:Entrance
+        // weight 20 for anybody without a row of their own, and kind:Entrance size 188.04, so
+        // Extents.Of measured a 8.8 grid object at 17.30 and the planner credited a catch from four
+        // times its own radius away. It falls to Unknown now, which keeps its found: row in front of
+        // whoever has to price it and lets a size typed there be read. See Extents.Of for why the row
+        // and not the kind.
+        //
+        // **Two of the four that remain have never appeared in the game.** SubareaEntrance is on every
+        // sub-area entrance seen - twenty-two sightings - GateBlocker is the Prairie gate, and
+        // KaruiGateExplodable and BossCave are nought apiece. Those two are kept because this is the
+        // CLASSIFIER and an arm that never fires costs nothing here: the failure it guards against is
+        // an entrance the scan ignores, which is worse than a branch nobody takes. The shrine is what
+        // the other side of that bargain looks like, so a new string goes in only when something has
+        // been seen to be behind it. See Weighing.Entrance.
         if (metadata.Contains("SubareaEntrance", StringComparison.OrdinalIgnoreCase) ||
             metadata.Contains("GateBlocker", StringComparison.OrdinalIgnoreCase) ||
             metadata.Contains("KaruiGateExplodable", StringComparison.OrdinalIgnoreCase) ||
-            metadata.Contains("BossCave", StringComparison.OrdinalIgnoreCase) ||
-            metadata.Contains("EncasedShrine", StringComparison.OrdinalIgnoreCase))
+            metadata.Contains("BossCave", StringComparison.OrdinalIgnoreCase))
         {
             var entrance = new Target
             {
@@ -3606,8 +3661,8 @@ internal sealed class Scan
         return found.Count == 0 ? null : found.ToArray();
     }
 
-    /// <summary>The marker's model, lowercased, file name only.</summary>
-    private static string Art(Entity entity)
+    /// <summary>The marker's model, lowercased, file name only. Empty until the game has streamed the art in.</summary>
+    internal static string Art(Entity entity)
     {
         LeafCalls.ComponentReads++;
 

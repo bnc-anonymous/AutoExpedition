@@ -198,6 +198,74 @@ internal sealed class Scoring
     /// </summary>
     public string Dip { get; private set; } = "no re-solve seen yet";
 
+    /// <summary>
+    /// The live chain completed to the full explosive count, or null while that is still being worked out.
+    ///
+    /// **Completing a chain is not the same kind of question as valuing one**, so it is asked of the search's own
+    /// environment, which has the terrain and obstacle predicates; the scoring environment is built without them,
+    /// and Complete CHOOSES spots, so run against that it could credit links the game would never place. The origin
+    /// is the detonator, so the journey is charged as it is when the chain is scored. The environment is copied
+    /// only when the origin differs, because the planner caches coverage per environment object and a copy starts
+    /// those caches from nothing.
+    ///
+    /// One completion at a time, on a low-priority thread. A chain published while one is running waits for the
+    /// next tick after it finishes; the screen keeps the last figure meanwhile.
+    /// </summary>
+    private List<Vector2> CompletedLiveChain(List<Vector2> live, PlanEnvironment solid, Vector2 origin)
+    {
+        lock (_completionGate)
+        {
+            if (ReferenceEquals(_completedFrom, live))
+                return _completed;
+
+            if (_completingFrom != null)
+                return null;
+
+            _completingFrom = live;
+        }
+
+        var source = new List<Vector2>(live);
+        var from = solid.Origin == origin ? solid : solid with { Origin = origin };
+
+        BackgroundWork.StartAtLowPriority(() =>
+        {
+            var done = source;
+
+            try
+            {
+                done = BackgroundWork.Record("score completion", () => Planner.Complete(from, new List<Vector2>(source)));
+            }
+            catch (System.Exception)
+            {
+                // A completion that fails leaves the chain scored as it stands, which is what it was before this
+                // was done at all.
+            }
+            finally
+            {
+                lock (_completionGate)
+                {
+                    _completedFrom = live;
+                    _completed = done;
+                    _completingFrom = null;
+                }
+            }
+
+            return 0;
+        });
+
+        return null;
+    }
+
+    private readonly object _completionGate = new();
+
+    /// <summary>The live chain the last completion was for, and what it came to. See CompletedLiveChain.</summary>
+    private List<Vector2> _completedFrom;
+
+    private List<Vector2> _completed;
+
+    /// <summary>The live chain a completion is running for, or null when none is.</summary>
+    private List<Vector2> _completingFrom;
+
     private bool _searching;
     private double _before;
     private double _low;
@@ -264,6 +332,22 @@ internal sealed class Scoring
         if (chain is not { Count: > 0 } && placed.Length == 0 && Kept.Chain is { Count: > 0 })
             chain = Kept.Chain;
 
+        // **A short live chain is scored as it will be finished, and the finishing is done off the frame.** See
+        // the note further down on why a live chain is scored completed. The completion is a greedy build over every
+        // candidate, and done here it stopped the drawing for 150 to 920ms at a time on a cold Grand site. Until the
+        // completed chain is ready this returns early, so the score on screen stays at the last figure rather than
+        // the frame waiting for the next one.
+        if (planning.Searching && chain is { Count: > 0 } && planning.Env is { } solid &&
+            chain.Count < solid.Explosives)
+        {
+            var completed = CompletedLiveChain(chain, solid, Detonator.DetonatorGridPosition(gc));
+
+            if (completed == null)
+                return;
+
+            chain = completed;
+        }
+
         var runes = Combinations(scan, valuation, gc);
 
         // **The chain itself is part of the key, and leaving it out is why a score stayed blank.**
@@ -288,7 +372,12 @@ internal sealed class Scoring
         _runes = runes;
         Down = placed.Length;
 
-        var env = Planning.Build(gc, settings, scan, blast, valuation, false, false, out _, out _);
+        // Each costly step timed on its own, because the whole of Update was measured at 270ms on a Grand site and
+        // the table could not say which part. See Spent.
+        PlanEnvironment env;
+
+        using (Spent.On("Tick/Scoring.Update/Build"))
+            env = Planning.Build(gc, settings, scan, blast, valuation, false, false, out _, out _);
 
         if (env == null)
         {
@@ -326,28 +415,7 @@ internal sealed class Scoring
         //
         // Only while searching, and only when it is actually short. A finished plan has already been
         // completed by Poll and running it again would cost a greedy pass over every candidate for
-        // nothing.
-        if (planning.Searching && chain is { Count: > 0 } && chain.Count < env.Explosives)
-        {
-            // **Completing a chain is not the same kind of question as valuing one, and the
-            // environment above can only answer the second.**
-            //
-            // Build is asked for no terrain here on purpose - what a blast catches does not depend
-            // on the reach, and materialising the grid every tick to value a chain that already
-            // exists would be paid for nothing. But with no terrain and no obstacles every cell is
-            // placeable and every link reaches: Placeable is `_ => true` and Reachable answers
-            // Certainty.Yes. Complete CHOOSES spots, so run against that it could credit the number
-            // on screen with links the game would never place.
-            //
-            // The search's own environment has both predicates and is already built, so it costs
-            // nothing and answers as the search would. Only the predicates change - the origin stays
-            // the detonator, so the journey is charged exactly as it is below.
-            var solid = planning.Env;
-
-            if (solid != null)
-                chain = Planner.Complete(solid with { Origin = fair.Origin },
-                    new List<Vector2>(chain));
-        }
+        // nothing. The completion itself is done off the frame; see CompletedLiveChain, called above.
 
         // The right hand number: the chain the plan was solved FOR, scored with the combinations the
         // planner would take. Static, which is the point of it - it is the thing being compared
@@ -377,7 +445,10 @@ internal sealed class Scoring
         // Plain, not Total: a chain made to reach a required marker carries a term bigger than
         // the whole site, and a number on screen that triples because something was marked says
         // nothing about the chain. See Verdict.Held.
-        var ahead = intended.Count > 0 ? Planner.Rate(fair, intended) : null;
+        Verdict ahead;
+
+        using (Spent.On("Tick/Scoring.Update/Rate"))
+            ahead = intended.Count > 0 ? Planner.Rate(fair, intended) : null;
 
         LastChain = intended;
         Planned = ahead?.Plain ?? 0d;
@@ -415,9 +486,12 @@ internal sealed class Scoring
         // the remnants rather than the ones the planner would pick. That is what makes it move when
         // you change a rune - the whole reason to show two numbers is that they can disagree, and a
         // left hand side that quietly re-picked your rewards for you could not.
-        var down = placed.Length > 0
-            ? Planner.Rate(Chosen(fair, scan, valuation, gc), new List<Vector2>(placed))
-            : null;
+        Verdict down;
+
+        using (Spent.On("Tick/Scoring.Update/Placed"))
+            down = placed.Length > 0
+                ? Planner.Rate(Chosen(fair, scan, valuation, gc), new List<Vector2>(placed))
+                : null;
 
         Yours = down?.Plain ?? 0d;
         Known = true;

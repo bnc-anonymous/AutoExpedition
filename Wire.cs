@@ -67,6 +67,52 @@ internal sealed class Wire
     public int Known => _known.Count;
 
     /// <summary>
+    /// How many routed paths are held, which is the larger of the two caches and the one a cap has to count.
+    ///
+    /// Every miss adds one, whether or not a length is also asked for. Measured offline with these types: about
+    /// 155 bytes a path of two or three points and 187 at five, against 59 for a cached length - so the paths are
+    /// most of what the router holds. See MostPaths.
+    /// </summary>
+    public int Paths => Volatile.Read(ref _paths);
+
+    /// <summary>How many paths are stored, counted as they are added. ConcurrentDictionary.Count locks every bucket.</summary>
+    private int _paths;
+
+    /// <summary>Whether the router has stopped storing new routes. See MostPaths.</summary>
+    public bool Full => Volatile.Read(ref _paths) >= MostPaths;
+
+    /// <summary>
+    /// How many routed paths a router stores before it stops adding and only answers from what it holds.
+    ///
+    /// **A safety limit, not a working cap.** A router is kept across solves on one dig site and dropped when the
+    /// site changes, so it grows only with the distinct routes one site asks about. A path costs about 155 bytes
+    /// and its length another 59, measured offline, so four million is about 900MB - far above the 1.47 million
+    /// one solve on a twenty explosive Grand site built, and there to protect the game's process if a site ever
+    /// behaves unexpectedly. Benchmarked against the alternatives (8 threads, six million lookups): stopping when
+    /// full cost 90ns a lookup against 99 uncapped, where an exact least-recently-used order cost 554 through its
+    /// lock and two generations 166 with a lower hit rate. When full, the routes kept are the first asked for,
+    /// which are also the ones asked for most. Chosen, not measured in play; the dump reports where sites settle.
+    /// </summary>
+    internal const int MostPaths = 4_000_000;
+
+    /// <summary>
+    /// Roughly how much the two caches hold, in bytes, from the per-entry costs measured offline. An estimate, for
+    /// the dump: 59 a length, 155 a path of up to four points and 16 a point beyond.
+    /// </summary>
+    public long EstimatedBytes
+    {
+        get
+        {
+            var bytes = 59L * _known.Count;
+
+            foreach (var path in _bent.Values)
+                bytes += 155L + 16L * Math.Max(0, (path?.Count ?? 0) - 4);
+
+            return bytes;
+        }
+    }
+
+    /// <summary>
     /// How long the wire runs between two points, in grid units, or infinity when no route exists.
     /// This is the quantity the game compares against the reach.
     /// </summary>
@@ -77,7 +123,19 @@ internal sealed class Wire
         var bx = (int)MathF.Round(to.X);
         var by = (int)MathF.Round(to.Y);
 
-        return _known.GetOrAdd((ax, ay, bx, by), static (key, self) => self.Measure(key), this);
+        var pair = (ax, ay, bx, by);
+
+        if (_known.TryGetValue(pair, out var had))
+            return had;
+
+        var length = Measure(pair);
+
+        // Kept only while there is room. Past the limit it is still worked out and answered, just not stored.
+        // See MostPaths.
+        if (!Full)
+            _known.TryAdd(pair, length);
+
+        return length;
     }
 
     /// <summary>
@@ -231,14 +289,55 @@ internal sealed class Wire
     /// Whether aiming at a spot actually puts the explosive on it.
     ///
     /// The landing is an integer grid point in the game - the scaled offset is added to an integer
-    /// point at `0x141F5AD12` - so the test is whether it rounds back to the spot asked for.
+    /// point at `0x141F5AD12` - so the test is whether it rounds back to the spot asked for. A spot
+    /// up to half a cell past the budget therefore still takes the bomb, because the cut end rounds
+    /// forward onto it.
+    ///
+    /// **That half cell is only claimable where the wire is the straight line.** Where it bends, the
+    /// rounding is decided by the direction and length of the last segment, so predicting it needs the
+    /// game's own polyline rather than one that agrees with it about length - and a bend our Bend puts
+    /// in a different place, or a coarse cell it clips differently, moves the cut end by a whole cell
+    /// while leaving the total almost unchanged. Seen: aim (1584,1294) off (1500,1305), wire 90.5
+    /// against a budget of 90, this model landing it on the spot and the client landing it on
+    /// (1583,1295) - one cell diagonally, which cost a strongbox at (1610,1276) and stopped the run
+    /// with "Wrong spot".
+    ///
+    /// So on a bend the budget is the whole of the test. That refuses a link the game might have
+    /// taken, which costs a little reach; the other way round proposes a link it will not take, which
+    /// costs the run.
     /// </summary>
     public bool Lands(Vector2 from, Vector2 to, float reach)
     {
+        var wired = Length(from, to);
+
+        // **Inside the budget the walk never runs out, so the landing IS the point asked for** - see
+        // Landing's own tail. Taken here because Length is memoised per integer pair where Landing
+        // builds a polyline per call, and this is the hottest question in the plugin.
+        if (wired <= reach)
+            return true;
+
+        if (Bends(from, to))
+            return false;
+
         var at = Landing(from, to, reach);
 
         return (int)MathF.Round(at.X) == (int)MathF.Round(to.X) &&
                (int)MathF.Round(at.Y) == (int)MathF.Round(to.Y);
+    }
+
+    /// <summary>
+    /// Whether the routed wire is longer than the straight line between the same two cells.
+    ///
+    /// Measured against the rounded ends, because that is what Length routes between - comparing a
+    /// polyline over integer points with a distance between unrounded ones reads a bend where there
+    /// is none. A hundredth of a cell of slack for the float arithmetic of summing the segments.
+    /// </summary>
+    private bool Bends(Vector2 from, Vector2 to)
+    {
+        var a = new Vector2(MathF.Round(from.X), MathF.Round(from.Y));
+        var b = new Vector2(MathF.Round(to.X), MathF.Round(to.Y));
+
+        return Length(from, to) > Vector2.Distance(a, b) + 0.01f;
     }
 
     /// <summary>Whether the wire reaches - the routed length against the budget.</summary>
@@ -296,7 +395,9 @@ internal sealed class Wire
 
         var made = Route(from, to);
 
-        _bent[key] = made;
+        // Kept only while there is room; past the limit the path is still returned, just not stored. See MostPaths.
+        if (!Full && _bent.TryAdd(key, made))
+            Interlocked.Increment(ref _paths);
 
         return made;
     }

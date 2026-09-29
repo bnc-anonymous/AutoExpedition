@@ -147,6 +147,9 @@ internal static class Spent
                 tally.Bytes += grew;
                 tally.Hits++;
 
+                if (took >= SlowStageMs && _slowThisFrame.Count < SlowStagesKept)
+                    _slowThisFrame.Add((_stage, took));
+
                 if (took > tally.Worst)
                     tally.Worst = took;
             }
@@ -195,8 +198,151 @@ internal static class Spent
         LeafCalls.Forget();
     }
 
+    /// <summary>
+    /// One long gap between two frames, with what the process was doing across it. See LongGaps.
+    /// </summary>
+    /// <param name="When">When the gap ended, local time.</param>
+    /// <param name="Ms">How long the gap was.</param>
+    /// <param name="CollectingMs">How much of it the runtime spent paused for garbage collection.</param>
+    /// <param name="Collections">Collections of each generation that happened inside it.</param>
+    /// <param name="Solving">Solver workers running when it ended. See Planning.WorkersRunning.</param>
+    /// <param name="Enumerating">Whether an opening enumeration was in progress when it ended.</param>
+    /// <param name="PoolThreads">Thread pool threads when it ended.</param>
+    /// <param name="PoolQueued">Work items waiting for a pool thread when it ended.</param>
+    /// <param name="AllocatedKb">What the whole process allocated inside it.</param>
+    /// <param name="Slow">Timed stages that took over SlowStageMs inside it, outermost first as they closed last.</param>
+    /// <param name="OutOfFocus">Whether the game window was seen out of the foreground during it, when the host
+    /// does not draw at all.</param>
+    /// <param name="AreaChanged">Whether the area changed during it, which is a loading screen.</param>
+    /// <param name="Jobs">The background jobs running when it ended, by name. See BackgroundWork.RunningJobs.</param>
+    internal readonly record struct LongGap(DateTime When, double Ms, double CollectingMs,
+        (int Gen0, int Gen1, int Gen2) Collections, int Solving, bool Enumerating, int PoolThreads, long PoolQueued,
+        long AllocatedKb, string Slow, bool OutOfFocus, bool AreaChanged, string Jobs, string LastCollection);
+
+    /// <summary>
+    /// The most recent gen0 or gen1 collection as the runtime reports it: which generation, how long it stopped
+    /// the process, how much survived it and was promoted, and what gen1 held after it - with how many routes the
+    /// kept router holds. A long gen1 pause is paid in proportion to what survives, not to what is allocated,
+    /// so this says whether a pause came from garbage or from something being kept. For LongGap.
+    /// </summary>
+    private static string LastEphemeralCollection()
+    {
+        try
+        {
+            var info = GC.GetGCMemoryInfo(GCKind.Ephemeral);
+            var pause = info.PauseDurations.Length > 0 ? info.PauseDurations[0].TotalMilliseconds : 0d;
+            var gen1After = info.GenerationInfo.Length > 1 ? info.GenerationInfo[1].SizeAfterBytes : 0L;
+
+            return $"last ephemeral collection #{info.Index} gen{info.Generation} paused {pause:N0}ms, promoted " +
+                   $"{info.PromotedBytes / 1048576d:N0}MB, gen1 {gen1After / 1048576d:N0}MB after, heap " +
+                   $"{info.HeapSizeBytes / 1048576d:N0}MB; router holds {Terrain.KeptRouter?.Paths ?? 0:N0} paths";
+        }
+        catch (Exception e)
+        {
+            return $"last ephemeral collection unreadable ({e.GetType().Name})";
+        }
+    }
+
+    /// <summary>
+    /// Starts polling whether the game window is in the foreground, every 200ms on a timer thread.
+    ///
+    /// **Polled apart from the frames, because the host stops drawing while the game is in the background** - so
+    /// the frame after a gap always finds it in front again, and a gap spent tabbed out read exactly like a
+    /// freeze. Measured: a 19,587ms gap with nothing running, taken while the dump's reader was typing elsewhere.
+    /// </summary>
+    public static void WatchFocus(Func<bool> isForeground)
+    {
+        _isForeground = isForeground;
+        _focusTimer ??= new System.Threading.Timer(_ =>
+        {
+            try
+            {
+                if (_isForeground != null && !_isForeground())
+                    System.Threading.Interlocked.Exchange(ref _lastOutOfFocusTicks, DateTime.UtcNow.Ticks);
+            }
+            catch
+            {
+                // A focus reading that fails says nothing about focus; the gap is simply not marked.
+            }
+        }, null, 200, 200);
+    }
+
+    /// <summary>Notes an area change, so a gap spanning a loading screen can say so. See LongGap.AreaChanged.</summary>
+    public static void AreaChanged() =>
+        System.Threading.Interlocked.Exchange(ref _lastAreaChangeTicks, DateTime.UtcNow.Ticks);
+
+    private static Func<bool> _isForeground;
+
+    private static System.Threading.Timer _focusTimer;
+
+    private static long _lastOutOfFocusTicks;
+
+    private static long _lastAreaChangeTicks;
+
+    /// <summary>
+    /// Every gap between two frames longer than LongGapMs this session, most recent last, capped at LongGapsKept.
+    ///
+    /// **The frame table only covers the last 240 frames**, so a freeze was caught only if the dump was taken
+    /// within a few seconds of it - and when it was caught, the table could say that no stage was open across it
+    /// but not what the process was doing instead. Read at each frame are the collection count, the pause total
+    /// and the allocation total, which are counters the runtime keeps anyway, so the cost is a few reads a frame.
+    /// </summary>
+    public static IReadOnlyList<LongGap> LongGaps
+    {
+        get
+        {
+            lock (_longGaps)
+                return [.._longGaps];
+        }
+    }
+
+    private static readonly List<LongGap> _longGaps = [];
+
+    private const double LongGapMs = 250d;
+
+    /// <summary>A stage this slow inside one frame is named on a long gap. See LongGap.Slow.</summary>
+    private const double SlowStageMs = 50d;
+
+    private const int SlowStagesKept = 12;
+
+    /// <summary>Stages over SlowStageMs since the last frame, written under the Stages lock.</summary>
+    private static readonly List<(string Stage, double Ms)> _slowThisFrame = [];
+
+    private const int LongGapsKept = 30;
+
+    private static TimeSpan _pausedAtLastFrame = GC.GetTotalPauseDuration();
+
+    private static long _allocatedAtLastFrame = GC.GetTotalAllocatedBytes(false);
+
+    private static (int Gen0, int Gen1, int Gen2) _collectionsAtLastFrame =
+        (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
+
+    /// <summary>Whether a moment, in UTC ticks, fell inside the gap that has just ended, give or take a poll.</summary>
+    private static bool WithinGap(long ticks, double gapMs) =>
+        ticks > 0 && (DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc)).TotalMilliseconds <= gapMs + 250d;
+
+    private static string SlowStagesThisFrame()
+    {
+        lock (Stages)
+        {
+            if (_slowThisFrame.Count == 0)
+                return "no timed stage over 50ms";
+
+            var said = new List<string>();
+
+            for (var i = _slowThisFrame.Count - 1; i >= 0; i--)
+                said.Add($"{_slowThisFrame[i].Stage} {_slowThisFrame[i].Ms:N0}ms");
+
+            return string.Join(", ", said);
+        }
+    }
+
     public static void Frame()
     {
+        var pausedNow = GC.GetTotalPauseDuration();
+        var allocatedNow = GC.GetTotalAllocatedBytes(false);
+        var collectionsNow = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
+
         // **The frame itself, which is the only figure that can see a hang this plugin did not
         // cause.** Every stage measures code this plugin runs; a stop that lands in the host's loop,
         // or between Tick and Render, or in a collection nobody's stopwatch was open across, is
@@ -214,6 +360,30 @@ internal static class Spent
             if (apart > _widest)
                 _widest = apart;
 
+            if (apart > LongGapMs)
+            {
+                var gap = new LongGap(DateTime.Now, apart, (pausedNow - _pausedAtLastFrame).TotalMilliseconds,
+                    (collectionsNow.Item1 - _collectionsAtLastFrame.Gen0,
+                        collectionsNow.Item2 - _collectionsAtLastFrame.Gen1,
+                        collectionsNow.Item3 - _collectionsAtLastFrame.Gen2),
+                    Planning.WorkersRunning, Openings.Generating, System.Threading.ThreadPool.ThreadCount,
+                    System.Threading.ThreadPool.PendingWorkItemCount,
+                    (allocatedNow - _allocatedAtLastFrame) / 1024,
+                    SlowStagesThisFrame(),
+                    WithinGap(System.Threading.Interlocked.Read(ref _lastOutOfFocusTicks), apart),
+                    WithinGap(System.Threading.Interlocked.Read(ref _lastAreaChangeTicks), apart),
+                    BackgroundWork.RunningJobs(),
+                    LastEphemeralCollection());
+
+                lock (_longGaps)
+                {
+                    if (_longGaps.Count >= LongGapsKept)
+                        _longGaps.RemoveAt(0);
+
+                    _longGaps.Add(gap);
+                }
+            }
+
             if (apart > 50d)
                 _over50++;
             else if (apart > 20d)
@@ -221,6 +391,13 @@ internal static class Spent
         }
 
         _lastFrame = ticked;
+
+        lock (Stages)
+            _slowThisFrame.Clear();
+
+        _pausedAtLastFrame = pausedNow;
+        _allocatedAtLastFrame = allocatedNow;
+        _collectionsAtLastFrame = collectionsNow;
 
         lock (Stages)
         {

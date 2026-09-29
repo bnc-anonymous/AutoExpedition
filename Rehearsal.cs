@@ -96,6 +96,21 @@ internal sealed class Rehearsal
     /// </summary>
     public static bool Settled { get; private set; }
 
+    /// <summary>
+    /// Whether a presolve pass has ended with this site's content unchanged since it began - what Settled means,
+    /// without the presolve stopping. The test is the settle test: the pass was not cut short or reopened by a
+    /// change, and it either published no improvement or ended at least Quiet after the content last changed. An
+    /// improving chain does not hold it back once the content has been quiet that long, which a whole pass
+    /// almost always has; it is a statement about the content, not about the chain.
+    ///
+    /// **Settled is never set in the continuous reroll mode**, because there the pass that would have settled the
+    /// site is followed by another instead. So nothing could tell a site still being scouted, where every pass is
+    /// cut short by new markers, from one whose content has stopped arriving - and the reroll advice ran from the
+    /// first rough plan on, a pass of up to 2.8 seconds and 262MB each, advising on a site still being read.
+    /// Cleared wherever Settled is. See Rolling.Consider.
+    /// </summary>
+    public static bool ContentSettled { get; private set; }
+
     /// <summary>How many presolve passes this site has had. See Settled.</summary>
     public static int Passes { get; private set; }
 
@@ -108,6 +123,12 @@ internal sealed class Rehearsal
               $"{(_moved ? "moved" : "did NOT move")} the score" +
               (_done ? " (finished - nothing left to learn)" : "") +
               (_reopened ? " (re-opened - waiting on a pass against the new site)" : "") +
+              // The continuous reroll mode, which is what keeps this from finishing. See Continuing.
+              (Continuing
+                  ? $" (continuous reroll mode: solving on, {_rerollsLeft} remnant(s) still to roll, draw {Planning.Draws})"
+                  : _stoppedByPlayer
+                      ? $" (continuous reroll mode: stopped by {_stoppedBy})"
+                      : "") +
               // How many passes this did not dispatch because a roll's own solve had already
               // answered the site. Two solves per roll was five seconds of it. See Tick.
               (_rollsAnswered > 0
@@ -171,7 +192,9 @@ internal sealed class Rehearsal
             // publishing below the chain it was seeded with, so a fall can only be the scoring
             // changing - and a reader watching the number on screen has no way to tell an edited
             // weight from a search that went backwards.
-            if (now.After < before.After - 0.0001d)
+            // Not when the later run had no floor at all: a deleted plan or a cold press starts from nothing on
+            // purpose, and it falling below what came before is what it was asked to risk.
+            if (now.After < before.After - 0.0001d && now.Before > 0.0001d)
                 return now.Table != before.Table
                     ? $"RE-SCORED - run {now.Number} fell to {now.After:N1} from {before.After:N1} " +
                       $"across a reference table edit (rev {before.Table} to {now.Table}), so the " +
@@ -259,8 +282,110 @@ internal sealed class Rehearsal
     /// Told that a solve has been dispatched because a remnant was rolled.
     ///
     /// Called by the caller that dispatches it, and only when it started. See Tick for why.
+    ///
+    /// **A roll also turns the continuous reroll mode back on after the action key stopped it.** The key
+    /// means "that plan will do"; rolling another remnant afterwards changes the site that plan was
+    /// for, so the reason to stop has gone. See StopContinuing.
     /// </summary>
-    public void RemnantWasRolled() => _solvingARoll = true;
+    public void RemnantWasRolled()
+    {
+        _solvingARoll = true;
+        _stoppedByPlayer = false;
+    }
+
+    /// <summary>
+    /// Whether the continuous reroll mode is keeping the presolve going at this site, as of the last
+    /// tick with no search in flight.
+    ///
+    /// True while the mode is Continuous, the site has had at least one pass, the last plan is not
+    /// proved optimal, a remnant here is still unrolled, and the action key has not stopped it. Needs
+    /// the presolve switched on, since this is the presolve continuing rather than a solver of its own.
+    ///
+    /// **Unrolled remnants, not Liquid Verisium.** The plugin does not read how many the player holds,
+    /// so running out of them does not end this; the action key does. See RerollsLeft.
+    /// </summary>
+    public bool Continuing { get; private set; }
+
+    /// <summary>
+    /// Stops the continuous reroll mode at this site until a remnant is rolled, the site changes, or the action
+    /// key starts a solve here. See ResumeContinuing.
+    ///
+    /// Also called by both delete buttons, so deleting the plan does not start a search by itself.
+    ///
+    /// Called when the action key stops a search, or is pressed between two continuous passes. A pass
+    /// already in flight is the caller's to stop.
+    /// </summary>
+    public void StopContinuing(string by = "the action key")
+    {
+        _stoppedByPlayer = true;
+        _stoppedBy = by;
+        Continuing = false;
+    }
+
+    /// <summary>
+    /// Lets the continuous reroll mode run again at this site after the action key stopped it.
+    ///
+    /// Called when the action key starts a solve. The stop meant "that plan will do"; asking for a new plan says
+    /// the opposite. Without this the stop outlived the press: a site stopped once stayed stopped through a
+    /// fresh press, so the solve the press started ended, the reroll advice ran, and nothing searched while the
+    /// remnants were rolled.
+    /// </summary>
+    public void ResumeContinuing() => _stoppedByPlayer = false;
+
+    /// <summary>Whether the action key has stopped the continuous reroll mode here. See StopContinuing.</summary>
+    private bool _stoppedByPlayer;
+
+    /// <summary>What stopped it, for the presolve readout: the action key or a delete button.</summary>
+    private string _stoppedBy = "the action key";
+
+    /// <summary>
+    /// Whether the next pass is one the presolve would not have run, so it takes a new draw. See Tick.
+    /// </summary>
+    private bool _keptGoing;
+
+    /// <summary>
+    /// Whether one full pass is owed after the last roll in the continuous reroll mode. See Tick, where
+    /// the roll's own solve is counted.
+    /// </summary>
+    private bool _finalPass;
+
+    /// <summary>How many remnants at this site were unrolled and unspent at the last count. See RerollsLeft.</summary>
+    private int _rerollsLeft;
+
+    /// <summary>Marks the next pass as one the continuous reroll mode asked for. See Continuing.</summary>
+    private void KeepGoing()
+    {
+        if (!_keptGoing)
+            Reopening($"continuous reroll mode, {_rerollsLeft} remnant(s) still to roll");
+
+        _keptGoing = true;
+    }
+
+    /// <summary>
+    /// The remnants at this site that could still take a Liquid Verisium: not rolled, and not spent.
+    ///
+    /// Rolled is asked two ways because the live flag needs the entity loaded. WasRolled is the same
+    /// flag remembered by the scan, so a remnant rolled and then streamed out does not count as
+    /// rollable again. See Scan's roll detection.
+    /// </summary>
+    private static int RerollsLeft(System.Collections.Generic.List<Target> content)
+    {
+        var left = 0;
+
+        foreach (var target in content)
+        {
+            if (target.Kind != TargetKind.Remnant)
+                continue;
+
+            if (Safe.Read(() => target.Spent, false) || Safe.Read(() => target.Rerolled, false) ||
+                target.WasRolled)
+                continue;
+
+            left++;
+        }
+
+        return left;
+    }
 
     /// <summary>Why the question was last re-opened, and how many times since the last pass.</summary>
     private string _why;
@@ -302,6 +427,7 @@ internal sealed class Rehearsal
         _read = 0;
         _readable = 0;
         Settled = false;
+        ContentSettled = false;
         Passes = 0;
         _passes = 0;
         _markers = 0;
@@ -316,6 +442,10 @@ internal sealed class Rehearsal
         _why = null;
         _whys = 0;
         _ran = null;
+        _stoppedByPlayer = false;
+        _keptGoing = false;
+        _finalPass = false;
+        Continuing = false;
     }
 
     public void Tick(GameController gc, AutoExpeditionSettings settings, Scan scan,
@@ -345,6 +475,7 @@ internal sealed class Rehearsal
             _read = 0;
             _readable = 0;
             Settled = false;
+            ContentSettled = false;
             Passes = 0;
             _first = DateTime.UtcNow;
             Sighted = _first;
@@ -357,6 +488,10 @@ internal sealed class Rehearsal
             _why = null;
             _whys = 0;
             _ran = null;
+            _stoppedByPlayer = false;
+            _keptGoing = false;
+            _finalPass = false;
+            Continuing = false;
             }
 
         // **Arriving is a change to the problem, and it is the one change nothing could see.**
@@ -510,7 +645,9 @@ internal sealed class Rehearsal
         // the choice made no difference.
         if (here != _markers || shape != _shape)
         {
-            Reopening(here != _markers
+            var markersArrived = here != _markers;
+
+            Reopening(markersArrived
                 ? $"markers {here}, were {_markers}"
                 : "the rewards, the link count or the routing grid changed");
             _markers = here;
@@ -518,6 +655,12 @@ internal sealed class Rehearsal
             _revealed = DateTime.UtcNow;
             _done = false;
             Settled = false;
+
+            // Only for markers arriving, which is the site still being read. A roll changes the rewards and is
+            // a reason to solve again, not a reason to withhold the advice that asked for it.
+            if (markersArrived)
+                ContentSettled = false;
+
             _reopened = true;
 
             // **The pass in flight is stopped, not left to finish.**
@@ -544,6 +687,21 @@ internal sealed class Rehearsal
         if (planning.Searching)
             return;
 
+        // **The continuous reroll mode keeps solving until the player stops it or nothing is left to
+        // roll.** Otherwise a pass that fails to beat the standing chain settles the site, and only a
+        // change to the site - a marker, a price, a roll - opens it again. Between rolls the player is
+        // walking to the next remnant, and that time was spent solving nothing. See Continuing.
+        _rerollsLeft = RerollsLeft(content);
+        Continuing = Rolling.Mode(settings) == RerollSettings.Continuous && !_stoppedByPlayer &&
+                     _passes > 0 && !planning.ProvenBest && _rerollsLeft > 0;
+
+        if (_done && Continuing)
+        {
+            _done = false;
+            Settled = false;
+            KeepGoing();
+        }
+
         if (here < Enough || _done)
             return;
 
@@ -568,11 +726,27 @@ internal sealed class Rehearsal
         {
             _solvingARoll = false;
             _reopened = false;
-            _done = true;
-            Settled = true;
             _rollsAnswered++;
 
-            return;
+            // **Except after the last roll in the continuous reroll mode**, where one full pass follows.
+            // The roll's own solve has the short reroll window, and with nothing left to roll there is
+            // no later pass to improve on it - the player is walking back to the detonator. See
+            // Continuing.
+            if (Rolling.Mode(settings) == RerollSettings.Continuous && !_stoppedByPlayer &&
+                _rerollsLeft == 0)
+            {
+                _finalPass = true;
+                ContentSettled = true;
+                KeepGoing();
+            }
+            else
+            {
+                _done = true;
+                Settled = true;
+                ContentSettled = true;
+
+                return;
+            }
         }
 
         // **Wait for the remnants to be priced, because an unpriced site is the wrong problem.**
@@ -702,13 +876,23 @@ internal sealed class Rehearsal
         // it loaded than ever before, or you walking into it. Every one of those is a real change
         // and none of them can fire without something having actually happened.
 
-        if (_passes > 0 && !_cut && !_reopened && (drew == 0 ||
+        // In the continuous reroll mode the pass that would have settled the site is followed by
+        // another on a fresh draw instead. See Continuing.
+        if ((Continuing || _finalPass) && _passes > 0 && !_cut && !_reopened && (drew == 0 ||
+            DateTime.UtcNow - _revealed > TimeSpan.FromMilliseconds(Quiet)))
+        {
+            // The same conclusion the branch below reaches, and the next pass runs anyway. See ContentSettled.
+            ContentSettled = true;
+            KeepGoing();
+        }
+        else if (_passes > 0 && !_cut && !_reopened && (drew == 0 ||
             DateTime.UtcNow - _revealed > TimeSpan.FromMilliseconds(Quiet)))
         {
             _drew = drew;
             _spent = _launched == DateTime.MinValue ? 0d : (DateTime.UtcNow - _launched).TotalMilliseconds;
             _done = true;
             Settled = true;
+            ContentSettled = true;
 
             return;
         }
@@ -729,9 +913,24 @@ internal sealed class Rehearsal
         {
             _done = true;
             Settled = true;
+            ContentSettled = true;
 
             return;
         }
+
+        // A pass the presolve would not have run searches on the next draw, or it would repeat the
+        // pass before it: same chain, same seeds. See Planning.Draws.
+        // Captured before it is cleared: a pass the continuous reroll mode asked for runs its own length. See
+        // RerollSettings.ContinuousPassMs.
+        var continuousPass = _keptGoing;
+
+        if (_keptGoing)
+        {
+            Planning.Draws++;
+            _keptGoing = false;
+        }
+
+        _finalPass = false;
 
         _drew = drew;
         _before = worth;
@@ -784,7 +983,8 @@ internal sealed class Rehearsal
         planning.Start(gc, settings, scan, blast, valuation, zone, false, !asked,
             asked
                 ? $"a plan asked for here, and {_ran ?? "the site changed"}"
-                : $"the presolve - {_ran ?? "rehearsing this site"}");
+                : $"the presolve - {_ran ?? "rehearsing this site"}",
+            continuous: continuousPass);
     }
 
     /// <summary>

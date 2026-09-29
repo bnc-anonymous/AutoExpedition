@@ -104,6 +104,25 @@ internal sealed class Rolling
     /// </summary>
     public float Through { get; private set; }
 
+    /// <summary>
+    /// How far the whole enumeration has got, nought to one: the rounds already walked plus the share of
+    /// the current round done, over the rounds it takes to walk every arrangement.
+    ///
+    /// Through restarts at nought every round, so on a site needing five rounds a readout of Through
+    /// alone climbs to three quarters and falls back five times. This climbs once. The bound is taken
+    /// at the start of the pass rather than read from RoundsNeeded, which is only published when a pass
+    /// ends and so would belong to the previous chain during the first round of a new one.
+    /// See RoundsWalked and RoundsNeeded.
+    /// </summary>
+    public float Progress =>
+        Math.Clamp((_progressWalked + Through) / Math.Max(1, _progressNeeded), 0f, 1f);
+
+    /// <summary>The rounds walked when the running pass began. See Progress.</summary>
+    private int _progressWalked;
+
+    /// <summary>The rounds the running pass's chain needs in all. See Progress.</summary>
+    private int _progressNeeded = 1;
+
     /// <summary>Whether a pass is running now, for the readout.</summary>
     public bool Working => _working is { IsCompleted: false };
 
@@ -171,6 +190,78 @@ internal sealed class Rolling
 
     /// <summary>Why there is no advice, when there is none. For the dump and the overlay.</summary>
     public string Quiet { get; private set; } = "no plan solved yet";
+
+    /// <summary>
+    /// What the first reroll advice at this site is waiting for, or empty when it is not waiting. For the score
+    /// area's Reroll line. See HoldingFirstAdvice.
+    /// </summary>
+    public string Waiting { get; private set; } = "";
+
+    /// <summary>How far through the longest wait the first advice is, nought to one. See HoldingFirstAdvice.</summary>
+    public float WaitProgress { get; private set; }
+
+    /// <summary>What the score was doing when the first advice at this site started, for the dump.</summary>
+    public string StartedAt { get; private set; } = "not started at this site";
+
+    /// <summary>The site the first advice has started for, after which it is not held again there.</summary>
+    private Vector2? _adviceStartedFor;
+
+    /// <summary>When the site's content was first seen settled in the current stretch of it being so.</summary>
+    private DateTime _contentSettledSince = DateTime.MinValue;
+
+    /// <summary>What would be said about the score if the advice started now. See StartedAt.</summary>
+    private string _startedAtRise = "";
+
+    /// <summary>
+    /// Why the first reroll advice at this site should wait, or null when it may start.
+    ///
+    /// Waits first for the site's content to stop arriving, then for the site score to rise less than
+    /// StartAdviceBelowImprovement over one improvement window - or for StartAdviceAfterWindows windows to pass
+    /// since the content settled, whichever comes first, so a site whose score keeps climbing still gets advice.
+    /// </summary>
+    private string HoldingFirstAdvice(GameController gc, AutoExpeditionSettings settings)
+    {
+        if (!Rehearsal.ContentSettled)
+        {
+            _contentSettledSince = DateTime.MinValue;
+            WaitProgress = 0f;
+
+            return "the site's content is still arriving";
+        }
+
+        if (_contentSettledSince == DateTime.MinValue)
+            _contentSettledSince = DateTime.UtcNow;
+
+        var window = TimeSpan.FromMilliseconds(
+            Planning.ImprovementWindowMs(settings, Detonator.ExplosiveCount(gc)));
+        var windows = Math.Max(1, Safe.Read(() => settings.Solver.Reroll.StartAdviceAfterWindows.Value, 3));
+        var longest = window * windows;
+        var waited = DateTime.UtcNow - _contentSettledSince;
+
+        WaitProgress = (float)Math.Clamp(waited.TotalMilliseconds / Math.Max(1d, longest.TotalMilliseconds), 0d, 1d);
+
+        var rise = Planning.SiteScoreRise(window);
+        var below = Math.Max(0, Safe.Read(() => settings.Solver.Reroll.StartAdviceBelowImprovement.Value, 5)) / 100d;
+        var risen = double.IsPositiveInfinity(rise)
+            ? $"no whole {window.TotalSeconds:0.#}s window of scores yet"
+            : $"+{rise * 100d:0.#}% over the last {window.TotalSeconds:0.#}s";
+
+        if (rise < below)
+        {
+            _startedAtRise = $"started with the score at {risen}, under the {below * 100d:0.#}% asked for";
+
+            return null;
+        }
+
+        if (waited >= longest)
+        {
+            _startedAtRise = $"started after the longest wait of {windows} window(s), with the score at {risen}";
+
+            return null;
+        }
+
+        return $"the score is still rising, {risen}";
+    }
 
     /// <summary>
     /// How many blocks of arrangements the least-advanced remnant has had walked.
@@ -354,6 +445,11 @@ internal sealed class Rolling
     {
         Forget();
 
+        _adviceStartedFor = null;
+        _contentSettledSince = DateTime.MinValue;
+        Waiting = "";
+        WaitProgress = 0f;
+
         _failure = "";
         _failed = default;
     }
@@ -451,6 +547,9 @@ internal sealed class Rolling
     /// <summary>Which solve the standing advice was worked out after. See Consider.</summary>
     private int _after = -1;
 
+    /// <summary>How many remnants on this site had been rolled when the last pass was dispatched.</summary>
+    private int _rolledWhen = -1;
+
     /// <summary>
     /// Works out what to advise, once per solved plan.
     ///
@@ -476,6 +575,11 @@ internal sealed class Rolling
         // Whether anything may be drawn from this, worked out before the early returns so it is
         // answered on every frame rather than only on the frames that dispatch a pass. See Fresh.
         var mode = Mode(settings);
+
+        // Cleared every frame and set again only by the gate that is holding, so a return anywhere above the gate -
+        // the mode switched off, no plan, an explosive down - cannot leave "waiting" on the score area. It did: the
+        // dump read "rolling advice is off" beside a first advice still WAITING. See HoldingFirstAdvice.
+        Waiting = "";
 
         if (mode == RerollSettings.Off)
         {
@@ -519,6 +623,30 @@ internal sealed class Rolling
         }
 
         var site = Detonator.DetonatorGridPosition(gc);
+
+        // **The first advice at a site waits for the site and the score to settle.** A presolve plan made while
+        // markers are still arriving is a plan for part of the site, and one made while the score is still
+        // climbing fast is a plan that will not last - so advice weighed against either is about a chain about to
+        // be replaced. Once it has started it is not held again at this site: a roll makes the next solve jump,
+        // and that jump is the roll paying off. A plan the player asked for is advised on at once. See
+        // RerollSettings.StartAdviceBelowImprovement and Rehearsal.ContentSettled.
+        if (Planning.Rehearsing && !(_adviceStartedFor is { } started && Vector2.Distance(started, site) < 1f))
+        {
+            var holding = HoldingFirstAdvice(gc, settings);
+
+            if (holding != null)
+            {
+                Waiting = holding;
+                Nothing("waiting: " + holding);
+
+                return;
+            }
+
+            _adviceStartedFor = site;
+            StartedAt = _startedAtRise;
+        }
+
+        Waiting = "";
 
         // **Nothing to say once an explosive is down, and that is a decision rather than a gap.**
         //
@@ -615,7 +743,27 @@ internal sealed class Rolling
         var deepening = mode == RerollSettings.Continuous && Runs > 0 && !Stalled &&
                         RoundsWalked < RoundsNeeded;
 
-        if (!deepening && Vector2.Distance(_for, site) < 1f && _after == Planning.Solves)
+        // **A roll dispatches a pass at once, rather than waiting for a solve to finish.**
+        //
+        // Reported from a Grand site: roll a remnant, the readout says nothing is worth rolling, an
+        // eight second solve runs, and only when it ends does the advice name the next remnant. That
+        // is the gate below. It dispatches on a COMPLETED solve, so between the roll and the end of
+        // the search in flight the verdicts are the pre-roll ones - and Divert drops the remnant just
+        // rolled, so if it was the only one clearing the floor the answer becomes "none is advised"
+        // for the length of a solve.
+        //
+        // A roll changes what every other remnant's roll is worth, because runes do not stack, so the
+        // standing verdicts are the wrong answer rather than an old one. It also invalidates the
+        // accumulated rounds on its own - Gathering holds each remnant's offers - so refreshing now
+        // costs no deepening that the roll had not already spent. Measured cost of a pass on this
+        // site: 23ms over three remnants, with the arrangements re-used.
+        //
+        // Continuous only. The other modes drop the verdicts wholesale on a roll and re-solve - see
+        // the call site - so they have nothing to refresh.
+        var rolled = mode == RerollSettings.Continuous ? Rolled(scan, site) : 0;
+
+        if (!deepening && rolled == _rolledWhen && Vector2.Distance(_for, site) < 1f &&
+            _after == Planning.Solves)
             return;
 
         // **Not while the ground is still moving.**
@@ -647,6 +795,7 @@ internal sealed class Rolling
         _for = site;
         _plan = planning.Plan;
         _after = Planning.Solves;
+        _rolledWhen = rolled;
 
         var asking = ++_asked;
         _floored = "";
@@ -682,7 +831,9 @@ internal sealed class Rolling
         // walks an immutable list instead. See ShapesARollCouldProduce.
         var shapes = ShapesARollCouldProduce(valuation);
 
-        _working = Task.Run(() => BackgroundWork.Record("reroll advice", () =>
+        // Its own thread at low priority: a pass has been measured at 2.8 seconds and 262MB. See
+        // BackgroundWork.StartAtLowPriority.
+        _working = BackgroundWork.StartAtLowPriority(() => BackgroundWork.Record("reroll advice", () =>
         {
             try
             {
@@ -699,6 +850,8 @@ internal sealed class Rolling
 
                 Quiet = "the reroll pass failed: " + ex.Message;
             }
+
+            return 0;
         }));
     }
 
@@ -1214,6 +1367,9 @@ internal sealed class Rolling
         var fewest = int.MaxValue;
         var walkedBefore = RoundsWalked;
 
+        _progressWalked = walkedBefore;
+        _progressNeeded = RoundsToExhaust(shapes, settings);
+
         var baseline = Planner.Score(env, chain);
 
         // **The same rolls offered to every remnant, which is the whole of the fix.**
@@ -1513,10 +1669,10 @@ internal sealed class Rolling
     /// worse on a site with more remnants. The question this answers is whether the answer could
     /// have been had for free.
     ///
-    /// The free ranking is the one thing a roll certainly costs: the weight of the runes this
-    /// remnant is the chain's only source of, which vanish when it is replaced. Least destroyed
-    /// first. It uses the same BankedRunesReaching test the explanation uses, so the two cannot
-    /// drift apart.
+    /// The free ranking is the one thing a roll certainly costs: the weight of the runes the chain
+    /// credits to this remnant, which vanish when it is replaced. Least destroyed first. It calls the
+    /// same SolelySourcedWeight the advice is picked with and the explanation is worded from, so the
+    /// three cannot drift apart.
     ///
     /// **What it deliberately ignores** is everything that makes the enumeration expensive: where
     /// the remnant sits in the chain, so a rune that reaches one link counts the same as one that
@@ -1530,21 +1686,74 @@ internal sealed class Rolling
 
     private string _withoutScoring = "";
 
-    /// <summary>What a roll here certainly destroys: the weight of the runes nothing else carries.</summary>
+    /// <summary>
+    /// What a roll here certainly destroys: the weight of the runes this remnant is the chain's
+    /// credited source of.
+    ///
+    /// **Asked of the booking, not of the other remnants' rune lists.** PlanTarget.Runes is what a
+    /// remnant COULD propagate - every rune any of its combinations offers - so walking the other
+    /// remnants for a matching id answers "could something else supply this", and the question is
+    /// "does anything else actually supply it". The scoring has already decided: only the first source
+    /// of a rune is credited, and RuneTally.FirstSourced is that decision per remnant.
+    ///
+    /// The two come apart on a duplicate. Measured at (978,908): its own propagation is Opulent at 40
+    /// on a reach of 1,351.9, and two later remnants list Opulent among their candidates while neither
+    /// propagates it - (1138,984) takes Protective and (944,1139) takes Arcane. So the old test read
+    /// "destroys 0.0", the advice read "Opulent already carried elsewhere", and rolling it would have
+    /// thrown away the chain's only 40% rune.
+    ///
+    /// Falls back to the old test when no detailed pass has published a booking yet, or when a roll
+    /// has invalidated it - see Planner.RuneTallyOutOfDate. It is the weaker answer, and the
+    /// alternative is ranking every remnant at nought destroyed.
+    /// </summary>
     private static float SolelySourcedWeight(PlanEnvironment env, int index)
     {
+        var target = env.Targets[index];
+        var booked = Credited(target.Grid);
         var destroyed = 0f;
 
-        foreach (var (id, weight) in env.Targets[index].Runes ?? [])
+        foreach (var (id, weight) in target.Runes ?? [])
         {
             if (weight <= 0f || id == null)
                 continue;
 
-            if (!BankedRunesReaching(env, index, id))
+            if (booked == null
+                    ? !BankedRunesReaching(env, index, id)
+                    : booked.Contains(id, StringComparer.OrdinalIgnoreCase))
                 destroyed += weight;
         }
 
         return destroyed;
+    }
+
+    /// <summary>
+    /// Every rune the last detailed pass had reaching this remnant from elsewhere, or empty when there
+    /// is none to read. See Planner.RuneTally.Arriving.
+    /// </summary>
+    private static string[] Arriving(Vector2 grid)
+    {
+        if (Planner.RuneTallyOutOfDate)
+            return [];
+
+        return Planner.RuneTallyByRemnant.TryGetValue(
+            ((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y)), out var tally)
+            ? tally.Arriving ?? []
+            : [];
+    }
+
+    /// <summary>
+    /// The runes the last detailed pass credited to the remnant on this cell, or null when there is no
+    /// booking to read. See Planner.RuneTally.FirstSourced.
+    /// </summary>
+    private static string[] Credited(Vector2 grid)
+    {
+        if (Planner.RuneTallyOutOfDate)
+            return null;
+
+        return Planner.RuneTallyByRemnant.TryGetValue(
+            ((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y)), out var tally)
+            ? tally.FirstSourced ?? []
+            : null;
     }
 
     /// <summary>See RankingWithoutScoring.</summary>
@@ -1596,7 +1805,7 @@ internal sealed class Rolling
         foreach (var (i, gain, destroyed) in byCost)
         {
             text.Add($"        ({env.Targets[i].Grid.X:0},{env.Targets[i].Grid.Y:0}) " +
-                     $"destroys {destroyed:N1} weight of runes nothing else carries, " +
+                     $"destroys {destroyed:N1} weight of runes credited to it, " +
                      $"enumerated {gain:+#,##0.0;-#,##0.0;0}" +
                      (i == byGain[0].Index ? "   <- the enumerated pick" : ""));
         }
@@ -1611,8 +1820,8 @@ internal sealed class Rolling
     /// **The continuous mode cannot rank on the enumerated gain, because the gain lags.** Screening
     /// costs about 500ms a remnant and runs once per solve, so between solves the newest figures are
     /// seconds old and a remnant rolled in the meantime has none at all. What a roll destroys - the
-    /// weight of the runes nothing else on the chain carries - is arithmetic over target.Runes and
-    /// can be answered on any frame.
+    /// weight of the runes the chain credits to this remnant - is a lookup into the last detailed
+    /// pass's booking and can be answered on any frame. See SolelySourcedWeight.
     ///
     /// Measured on one site of six remnants, that ordering put the enumeration's own pick first, and
     /// the two disagreed on 2 of 15 pairs - both inside a group where three remnants destroy the same
@@ -1837,133 +2046,6 @@ internal sealed class Rolling
     private static float site(PlanEnvironment env) => env.Origin.X + env.Origin.Y;
 
     /// <summary>
-    /// What repositioning a remnant costs, and whether the position depends on the socket count.
-    ///
-    /// **Two readings, both needed before the pricing can value a roll at its best position.**
-    /// reroll_plan.md prices a roll as `worth(rolled) - worth(current)` with `worth` taken at the
-    /// remnant's best position rather than where it sits. The enumeration is already 1,856 scores
-    /// per remnant, so whether that is affordable turns on what a reposition costs against a score;
-    /// and caching the position per rune set - the only thing that makes it affordable - is sound
-    /// only if the position does not also depend on the socket count.
-    ///
-    /// Measured here rather than reasoned about, because the last design that was reasoned about
-    /// cost ten to twenty seconds a remnant.
-    ///
-    /// A reading, not a decision: nothing consults this.
-    /// </summary>
-    internal static string Positioning(PlanEnvironment env, List<Vector2> chain,
-        AutoExpeditionSettings settings)
-    {
-        if (env == null || chain is not { Count: > 0 })
-            return "no solved plan to measure against";
-
-        var index = -1;
-
-        for (var i = 0; i < env.Targets.Count; i++)
-            if (env.Targets[i].Kind == TargetKind.Remnant)
-            {
-                index = i;
-
-                break;
-            }
-
-        if (index < 0)
-            return "no remnant on this site";
-
-        var spots = Planner.Candidates(env, out _, out _);
-        var links = Math.Max(1, Safe.Read(() => settings.Solver.Reroll.RollSubstitutionLinks.Value, 1));
-        var known = new Dictionary<string, (float Weight, string Scope, float Local)>();
-        var random = new Random(1);
-        var was = env.Targets[index];
-
-        // Warm, so the first call's jitting is not the measurement.
-        Planner.Score(env, chain);
-        Planner.Restitched(env, chain, index, spots, links);
-
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-
-        for (var i = 0; i < Trials; i++)
-            Planner.Score(env, chain);
-
-        var scoring = clock.Elapsed.TotalMilliseconds * 1000d / Trials;
-
-        clock.Restart();
-
-        for (var i = 0; i < Trials; i++)
-            Planner.Restitched(env, chain, index, spots, links);
-
-        var placing = clock.Elapsed.TotalMilliseconds * 1000d / Trials;
-
-        // **Does the best order depend on how many sockets the remnant has?** Same runes, four
-        // socket counts, and the ordered chain compared. A difference means the position cannot be
-        // cached per rune set, and the cheap version of the plan's pricing is not available.
-        var runes = Rolls.Runes;
-        var differed = 0;
-        var tested = 0;
-        var targets = new List<PlanTarget>(env.Targets);
-
-        for (var r = 0; r < runes.Length && tested < Sampled; r++)
-        {
-            List<Vector2> first = null;
-
-            foreach (var (sockets, _) in Rolls.Sockets)
-            {
-                targets[index] = Built(was, settings, known, sockets, new[] { runes[r].Rune });
-
-                var order = Planner.Restitched(env with { Targets = targets }, chain, index, spots,
-                    links);
-
-                if (first == null)
-                {
-                    first = order;
-
-                    continue;
-                }
-
-                if (!Same(first, order))
-                {
-                    differed++;
-
-                    break;
-                }
-            }
-
-            tested++;
-        }
-
-        var many = 1856;
-        var cost = many * scoring / 1000d;
-
-        return $"one score {scoring:0.#}us, one reposition {placing:0.#}us " +
-               $"({(scoring > 0d ? placing / scoring : 0d):0.0}x a score) over {Trials} calls" +
-               $"\n    the enumeration is {many} scores a remnant = {cost:0.##}ms; " +
-               $"repositioning per rune set adds 464 x {placing:0.#}us = {464 * placing / 1000d:0.##}ms" +
-               $"\n    socket count changed the best order on {differed} of {tested} runes " +
-               (differed == 0
-                   ? "- the position can be cached per rune set"
-                   : "- the position CANNOT be cached per rune set");
-    }
-
-    /// <summary>Whether two chains are the same links in the same order.</summary>
-    private static bool Same(List<Vector2> a, List<Vector2> b)
-    {
-        if (a == null || b == null || a.Count != b.Count)
-            return false;
-
-        for (var i = 0; i < a.Count; i++)
-            if (a[i] != b[i])
-                return false;
-
-        return true;
-    }
-
-    /// <summary>How many calls each timing averages over. See Positioning.</summary>
-    private const int Trials = 40;
-
-    /// <summary>How many runes the socket-count comparison walks. See Positioning.</summary>
-    private const int Sampled = 12;
-
-    /// <summary>
     /// Which remnants get the expensive pass: the best few, plus one the chain does not reach.
     ///
     /// **Screening cannot rank a remnant the chain misses.** Holding the chain still, rolling one
@@ -2170,6 +2252,28 @@ internal sealed class Rolling
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// How many of this site's remnants have been rolled, which is the cheap signal that a roll has
+    /// happened since the last pass was dispatched. See Consider.
+    ///
+    /// Counted off the scan rather than taken from Scan.RollPending, which the tick consumes: in the
+    /// continuous mode it is consumed only once a search is not in flight, so a flag is true for as
+    /// long as nothing has looked and then false whether or not this had its turn. A count cannot be
+    /// missed and cannot be double-counted.
+    /// </summary>
+    private static int Rolled(Scan scan, Vector2 site)
+    {
+        var count = 0;
+
+        foreach (var target in Safe.Read(() => scan?.At(site), null) ?? new List<Target>())
+        {
+            if (target.Kind == TargetKind.Remnant && target.Rerolled)
+                count++;
+        }
+
+        return count;
     }
 
     private static Target Nearest(List<Target> scan, Vector2 grid)
@@ -2901,15 +3005,38 @@ internal sealed class Rolling
         bool settled, AutoExpeditionSettings settings)
     {
         var target = env.Targets[index];
+
+        // **Three groups, not two, because "not credited here" covers two different situations.**
+        // Splitting on the booking alone said "credited to another remnant" about runes nothing on the
+        // chain carries at all - true of (1328,1024)'s Vision and Volcanic, which no other remnant
+        // offers and which the combination taken there does not propagate. A rune the chain never
+        // sources is not covered elsewhere; it is simply not paying anything. See SolelySourcedWeight.
         var sole = new List<string>();
-        var shared = new List<string>();
+        var upstream = new List<string>();
+        var idle = new List<string>();
+
+        var booked = Credited(target.Grid);
+        var arriving = Arriving(target.Grid);
 
         foreach (var (id, weight) in target.Runes ?? [])
         {
             if (weight <= 0f || id == null)
                 continue;
 
-            (BankedRunesReaching(env, index, id) ? shared : sole).Add(id);
+            if (booked == null)
+            {
+                // No booking to read, so the weaker test: does any other remnant offer it.
+                (BankedRunesReaching(env, index, id) ? upstream : sole).Add(id);
+
+                continue;
+            }
+
+            if (booked.Contains(id, StringComparer.OrdinalIgnoreCase))
+                sole.Add(id);
+            else if (arriving.Contains(id, StringComparer.OrdinalIgnoreCase))
+                upstream.Add(id);
+            else
+                idle.Add(id);
         }
 
         var said = new List<string>();
@@ -2918,17 +3045,35 @@ internal sealed class Rolling
         // a statement about every other remnant in the environment, and when it looks wrong the
         // first question is which remnants it actually looked at - a remnant the chain cannot reach
         // is still in the list, one streamed out is not.
+        //
+        // Worded as the chain crediting it once a booking has been read, because that is the weaker
+        // and truer claim: another remnant may be able to offer the same rune, and the point is that
+        // on the chain as planned nothing else is credited with it.
         if (sole.Count > 0)
-            said.Add($"only source of {Names(sole)} among {Remnants(env)} remnants");
+        {
+            said.Add(booked == null
+                ? $"only source of {Names(sole)} among {Remnants(env)} remnants"
+                : $"the chain's credited source of {Names(sole)}");
+        }
 
-        if (shared.Count > 0)
-            said.Add($"{Names(shared)} already carried elsewhere");
+        if (upstream.Count > 0)
+        {
+            said.Add(booked == null
+                ? $"{Names(upstream)} already carried elsewhere"
+                : $"{Names(upstream)} already arrives from an earlier link, so a roll does not lose it");
+        }
+
+        if (idle.Count > 0)
+            said.Add($"offers {Names(idle)}, which the combination taken here does not propagate");
 
         // **Which duplicate to roll is not the obvious one.** Where two remnants carry the same
         // rune, rolling the EARLIER one keeps the rune - the later copy still supplies it - and puts
         // the new one on the link with the longest reach. Rolling the later one gains a rune that
         // reaches almost nothing.
-        if (shared.Count > 0 && Earliest(env, chain, index, shared))
+        //
+        // Asked only of the runes that do arrive from elsewhere. A rune nothing else sources has no
+        // copy to be the earlier of, and this said so about two of them.
+        if (upstream.Count > 0 && Earliest(env, chain, index, upstream))
             said.Add("and is the earlier copy, so a new rune here reaches furthest");
 
         // **What it is actually holding, which the rune list alone does not say.** The first

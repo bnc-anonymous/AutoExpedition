@@ -71,6 +71,16 @@ internal sealed class Insisted
     private readonly HashSet<(int X, int Y)> _offered = new();
 
     /// <summary>
+    /// The cells the threshold has had its say about since their remnant was rolled.
+    ///
+    /// A roll replaces what a remnant offers, so an offer made on the rewards it had before the roll is
+    /// an offer about a remnant that no longer exists. Without this second set a remnant priced at 80ex
+    /// on arrival and rolled into 1,468ex was never looked at again, because its cell was already in
+    /// _offered. A remnant can be rolled once, so one further offer is all it needs. See Automatic.
+    /// </summary>
+    private readonly HashSet<(int X, int Y)> _offeredAfterRoll = new();
+
+    /// <summary>
     /// The cells marked must take because of what a reward is WORTH, as opposed to by hand.
     ///
     /// **A must take on reward value is a statement about one reward, and the chain has to honour that
@@ -156,6 +166,7 @@ internal sealed class Insisted
         // Cleared too, so a reset is a genuine fresh start: the threshold gets to make its offer
         // again on a site somebody has deliberately wiped.
         _offered.Clear();
+        _offeredAfterRoll.Clear();
         _forReward.Clear();
     }
 
@@ -212,7 +223,12 @@ internal sealed class Insisted
     /// apart. The second one could not be argued with either: un-marking a remnant the threshold
     /// liked did nothing, because nothing was ever marked.
     ///
-    /// Only remnants whose reward can actually be read, and only ones this has never looked at.
+    /// Only remnants whose reward can actually be read, and only ones this has never looked at - with one
+    /// exception. A remnant that has been rolled since it was looked at gets one more look, because the
+    /// roll replaced its rewards. See _offeredAfterRoll.
+    ///
+    /// The second look does not overturn an avoid. An avoid is somebody's decision about this spot and a
+    /// roll does not revoke it; a take set by hand is already what the look would set.
     /// </summary>
     public void Automatic(Scan scan, AutoExpeditionSettings settings, Valuation valuation)
     {
@@ -227,8 +243,13 @@ internal sealed class Insisted
                 continue;
 
             // Nothing more to say about a cell that has had its offer, and saying it costs a
-            // read of the remnant's rewards on every tick for the rest of the site.
-            if (_offered.Contains(Cell(target.Grid)))
+            // read of the remnant's rewards on every tick for the rest of the site. A rolled
+            // remnant is asked against its own set, so an offer made before the roll does not
+            // count as one made after it.
+            var rolled = Safe.Read(() => target.Rerolled, false);
+            var considered = rolled ? _offeredAfterRoll : _offered;
+
+            if (considered.Contains(Cell(target.Grid)))
                 continue;
 
             // Worth is worked out BEFORE the cell is marked as considered, because a remnant read
@@ -245,7 +266,13 @@ internal sealed class Insisted
 
             var cell = Cell(target.Grid);
 
-            if (_offered.Add(cell) && worth >= above)
+            // A rolled remnant also counts as offered in the ordinary set, so nothing reading that set
+            // alone takes it for a cell nobody has looked at.
+            if (rolled)
+                _offered.Add(cell);
+
+            if (considered.Add(cell) && worth >= above &&
+                !(rolled && _cells.TryGetValue(cell, out var standing) && standing == Said.Avoid))
             {
                 _cells[cell] = Said.Take;
 
@@ -331,6 +358,7 @@ internal sealed class Insisted
         {
             _cells.Clear();
             _offered.Clear();
+            _offeredAfterRoll.Clear();
             _forReward.Clear();
         }
 

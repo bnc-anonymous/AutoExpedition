@@ -1,32 +1,27 @@
-﻿using ExileCore2;
-using ExileCore2.PoEMemory.MemoryObjects;
-using ExileCore2.Shared.Enums;
+using ExileCore2;
 using System.Collections.Generic;
 using System.Numerics;
 
 namespace AutoExpedition;
 
 /// <summary>
-/// Which of the chain's blasts have been fought out, so the route can stop showing them.
+/// Which of the chain's links have stopped being drawn, because the chain has been set off.
 ///
-/// A laid chain is a plan; a detonated chain is a list of jobs. Once the explosives have gone off
-/// the line on the ground stops meaning "put one here" and starts meaning "there are things alive
-/// over there" - and the useful version of that only shows the parts still true. So after
-/// detonation a link is dropped from the drawing when nothing it unearthed is left standing, and
-/// when the last one goes there is no line at all.
+/// A laid chain is a plan, and once it has gone off there is nothing left for the line to say: the explosives
+/// are spent and no further one may be placed. So every link stops drawing the moment the site is set off.
 ///
-/// **Cleared is defined as no live monster inside that blast's radius, and it is sticky.** Sticky
-/// because the alternative flickers: monsters wander, so an area that has been emptied can be
-/// walked back into by a straggler from the next blast along, and a segment that reappears after
-/// you have finished with it is worse than one that lingers. Once an area has been seen empty it
-/// stays cleared until the plan changes or the area does.
+/// **Not when the fighting is over.** This used to drop a link only once no live monster stood inside its blast,
+/// on the reading that a detonated chain is a list of jobs. That kept yellow lines across the screen through the
+/// whole fight, which read as a plan still to be placed.
 ///
-/// The radius is the blast's own, which is the right question: the monsters that came out of a
-/// blast are the ones standing in it. Anything that has walked further than that is somebody else's
-/// problem, and the next link along usually owns it.
+/// **Set off by either signal, and remembered.** The live read of the detonator needs its entity loaded, and it
+/// unloads as you walk into the site - it then reads -1, and this took that for "not set off", emptied the list,
+/// and brought every link back. Measured: "set off yes" latched and Detonated() = -1 in one dump, with the player
+/// 430 grid from the detonator. See Detonator.SetOffHere.
 ///
-/// Nothing here runs before detonation. While the chain is being laid every link is still to be
-/// placed and the whole route is worth seeing, which is what the placed-spot rules already handle.
+/// Per link rather than one switch, so a signal that says which explosive has gone off - the game's own
+/// ExpeditionExplosiveFuse entities are a candidate, not yet confirmed - can drop them one at a time without
+/// touching the callers.
 /// </summary>
 internal sealed class Cleared
 {
@@ -34,61 +29,35 @@ internal sealed class Cleared
     private uint _area;
     private int _links;
 
-    /// <summary>Whether this link has been fought out and should stop being drawn.</summary>
+    /// <summary>Whether this link has stopped being drawn.</summary>
     public bool Is(int index) => _done.Contains(index);
 
-    /// <summary>How many of the chain's blasts are finished with, for the readout.</summary>
+    /// <summary>How many of the chain's links have stopped being drawn, for the readout.</summary>
     public int Count => _done.Count;
 
-    /// <summary>
-    /// Looks at what is still alive around each link that is not already finished with.
-    ///
-    /// Only the unfinished ones are tested, so the work falls away as the site is cleared - by the
-    /// end this walks the monster list for nothing at all. It is one pass over the monsters per
-    /// link rather than a spatial index because a chain is five links and the alternative is an
-    /// index rebuilt every frame for a list that changes every frame.
-    /// </summary>
-    public void Observe(GameController gc, List<Vector2> points, float radius)
+    /// <summary>Marks every link finished once the site has been set off, and none before.</summary>
+    public void Observe(GameController gc, List<Vector2> points)
     {
-        if (points == null || points.Count == 0 || radius <= 0f)
+        if (points == null || points.Count == 0)
             return;
 
-        // A new plan is a new set of jobs. Judged on the count rather than the contents because a
-        // re-plan mid-site keeps the links it has already placed, and those keep their indices.
+        // A new plan is a new set of links. Judged on the count rather than the contents because a re-plan
+        // mid-site keeps the links it has already placed, and those keep their indices.
         if (points.Count != _links)
         {
             _done.Clear();
             _links = points.Count;
         }
 
-        // Before the chain goes off there is nothing to have cleared, and every link is still a
-        // placement rather than a fight.
-        if (Detonator.ExplosivesDetonated(gc) < 1)
+        if (!Detonator.SetOffHere(gc))
         {
             _done.Clear();
 
             return;
         }
 
-        if (_done.Count == points.Count)
-            return;
-
-        var monsters = Safe.Read(gc, static g =>
-            g.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Monster, out var of)
-                ? of
-                : null, null);
-
-        if (monsters == null)
-            return;
-
         for (var i = 0; i < points.Count; i++)
-        {
-            if (_done.Contains(i))
-                continue;
-
-            if (!Alive(monsters, points[i], radius))
-                _done.Add(i);
-        }
+            _done.Add(i);
     }
 
     public void AreaChange(uint areaHash)
@@ -100,23 +69,5 @@ internal sealed class Cleared
         }
 
         _area = areaHash;
-    }
-
-    /// <summary>Whether anything hostile is still standing inside this blast.</summary>
-    private static bool Alive(List<Entity> monsters, Vector2 at, float radius)
-    {
-        foreach (var monster in monsters)
-        {
-            if (!Safe.Read(monster, static e => e.IsAlive, false) ||
-                !Safe.Read(monster, static e => e.IsHostile, false))
-                continue;
-
-            var grid = Safe.Read(monster, static e => e.GridPos, Vector2.Zero);
-
-            if (grid != Vector2.Zero && Vector2.Distance(grid, at) <= radius)
-                return true;
-        }
-
-        return false;
     }
 }

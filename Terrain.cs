@@ -109,9 +109,106 @@ internal sealed class Terrain
         _grid = grid;
         _slab = slab;
 
-        var wire = slab == null ? null : new Wire(aim, slab);
+        var wire = slab == null ? null : Reused(aim, slab) ?? new Wire(aim, slab);
 
         _wire = wire != null && wire.Ready ? wire : null;
+
+        if (_wire != null)
+            Keep(aim, slab, _wire);
+    }
+
+    /// <summary>
+    /// The router the last snapshot built, and the grids it was built from, for the next snapshot to reuse.
+    ///
+    /// **A snapshot lives for one solve, and its router's cache died with it.** Every solve reads a new Terrain,
+    /// and a new Wire starts with nothing routed - so each presolve pass and each press on a site searched the same
+    /// pairs again. Measured on Craggy Peninsula, twenty explosives: 1.47 million wire searches in one solve, 70% of
+    /// questions missing the cache, and a segment tear or a reach move costing about 31ms an attempt against under
+    /// a millisecond and about seven on an ordinary site.
+    ///
+    /// A Wire's answers depend on nothing but the two grids it is given - see Wire's constructor and Measure - so
+    /// the same grids give the same answers, and reusing it cannot change any result. The grids are compared cell
+    /// for cell rather than trusted, because the coarse one is read live from the client each time.
+    /// </summary>
+    private static (int[][] Aim, Peek.Slab Slab, Wire Wire) _kept;
+
+    /// <summary>Guards _kept, since a snapshot can be taken from more than one thread.</summary>
+    private static readonly object KeptGate = new();
+
+
+    /// <summary>The router kept across solves, for the dump. Null when none is kept. See _kept.</summary>
+    internal static Wire KeptRouter
+    {
+        get
+        {
+            lock (KeptGate)
+                return _kept.Wire;
+        }
+    }
+
+
+
+    /// <summary>The kept router, when these grids are the ones it was built from and it is not full. See _kept.</summary>
+    private static Wire Reused(int[][] aim, Peek.Slab slab)
+    {
+        lock (KeptGate)
+        {
+            var (keptAim, keptSlab, wire) = _kept;
+
+            if (wire == null)
+                return null;
+
+            return SameSlab(keptSlab, slab) && SameGrid(keptAim, aim) ? wire : null;
+        }
+    }
+
+    private static void Keep(int[][] aim, Peek.Slab slab, Wire wire)
+    {
+        lock (KeptGate)
+            _kept = (aim, slab, wire);
+    }
+
+    /// <summary>
+    /// Drops the kept router, so the next snapshot routes from nothing. Called by a cold start, which promises to
+    /// forget the routed ground held in memory, and which the repeat batches rely on to make presses comparable.
+    /// See _kept.
+    /// </summary>
+    internal static void ForgetRouting()
+    {
+        lock (KeptGate)
+            _kept = default;
+    }
+
+    private static bool SameSlab(Peek.Slab a, Peek.Slab b)
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+
+        if (a == null || b == null || a.Wider != b.Wider || a.Higher != b.Higher || a.FromX != b.FromX ||
+            a.FromY != b.FromY || a.Bytes.Length != b.Bytes.Length)
+            return false;
+
+        return a.Bytes.AsSpan().SequenceEqual(b.Bytes);
+    }
+
+    private static bool SameGrid(int[][] a, int[][] b)
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+
+        if (a == null || b == null || a.Length != b.Length)
+            return false;
+
+        for (var y = 0; y < a.Length; y++)
+        {
+            if (ReferenceEquals(a[y], b[y]))
+                continue;
+
+            if (a[y] == null || b[y] == null || !a[y].AsSpan().SequenceEqual(b[y]))
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -165,13 +262,32 @@ internal sealed class Terrain
     /// <summary>Takes the snapshot, or null when the grid cannot be read.</summary>
     public static Terrain Read(GameController gc)
     {
-        var walkable = Safe.Read(() => gc.IngameState.Data.RawPathfindingData, null);
+        // Each part timed apart: the pathfinding grid is read whole out of the game, the coarse grid is read and
+        // checked, and the router is built new whenever the ground differs from the kept one. See Spent.LongGaps.
+        using var reading = Spent.On("Terrain.Read");
+
+        int[][] walkable;
+
+        using (Spent.On("Terrain.Read/Pathfinding"))
+            walkable = Safe.Read(() => gc.IngameState.Data.RawPathfindingData, null);
+
+        if (walkable == null || walkable.Length == 0)
+            return null;
 
         // The coarse routing grid is the rule itself rather than a reading of it, so take it whenever
         // the client has one. It is absent outside a dig site, which is when nothing asks anyway.
-        return walkable == null || walkable.Length == 0
-            ? null
-            : Learned(gc, new Terrain(walkable, Trusted(gc, Peek.Coarse(gc)), walkable));
+        Peek.Slab coarse;
+
+        using (Spent.On("Terrain.Read/Coarse"))
+            coarse = Trusted(gc, Peek.Coarse(gc));
+
+        Terrain made;
+
+        using (Spent.On("Terrain.Read/Router"))
+            made = new Terrain(walkable, coarse, walkable);
+
+        using (Spent.On("Terrain.Read/Learned"))
+            return Learned(gc, made);
     }
 
 
@@ -204,6 +320,28 @@ internal sealed class Terrain
     /// it threw the explosive 42 grid away to just outside its edge.
     /// </summary>
     public bool Forbids(Vector2 at) => _volumes.Forbids((int)at.X, (int)at.Y);
+
+    /// <summary>
+    /// Stopwatch ticks this thread has spent routing a direct aim, and in the clamp search for a stretched one, with how
+    /// many clamp searches ran. Per thread, so a caller can take the difference across its own calls while other threads
+    /// route at the same time. See Openings, which reports the enumeration's share.
+    /// </summary>
+    [ThreadStatic] internal static long DirectAimTicks;
+
+    /// <summary>See DirectAimTicks.</summary>
+    [ThreadStatic] internal static long SnapSearchTicks;
+
+    /// <summary>See DirectAimTicks.</summary>
+    [ThreadStatic] internal static int SnapSearches;
+
+    /// <summary>Clamp searches not run because the shortest route was already too long. See Aiming.</summary>
+    [ThreadStatic] internal static int ClampRuledOut;
+
+    /// <summary>
+    /// How far past the reach the shortest route may be and still have a clamp searched for: the half cell the cut end
+    /// rounds by, and some for this router's route differing from the game's. Three grid is chosen, not measured.
+    /// </summary>
+    private const float ClampSlack = 3f;
 
     /// <summary>
     /// Whether an explosive can be put on a spot, and where the cursor has to be to do it.

@@ -38,6 +38,20 @@ internal static class Caches
     /// </summary>
     public static bool WantedKeepingScan;
 
+    /// <summary>
+    /// The narrowest of the three: the plan in hand and the chain filed on disk, and nothing else.
+    ///
+    /// **For "solve that again" without paying for the site twice.** Everything worked out about the ground -
+    /// the routed answers, the snapped aims, the ground model, the readings taken here - is kept, so the next
+    /// solve starts with the same knowledge this one had and the two are comparable. What goes is the answer,
+    /// which is the only thing that would otherwise be inherited.
+    ///
+    /// The area is needed or the filed chain survives on disk and the next solve offers it back as a floor.
+    /// See Kept.ForgetAll and Kept.Offer.
+    /// </summary>
+    public static bool WantedPlanOnly;
+
+
 
     /// <summary>What the last clear threw away, so the button can say it happened.</summary>
     public static string Last { get; private set; } = "nothing cleared yet";
@@ -67,16 +81,6 @@ internal static class Caches
     /// </param>
     /// <param name="area">
     /// The area whose saved ground facts to delete, or nought to leave the file alone.
-    /// </param>
-    /// <param name="keepGround">
-    /// Whether the saved walkability facts survive, while the best chain filed beside them does not.
-    ///
-    /// **The two were one switch and they are not one thing.** Deleting the filed chain is the whole
-    /// point of forgetting: leave it and the next solve loads it straight back as its floor, so a
-    /// "cleared" site opens at exactly the score it opened at before and nothing has been reset. The
-    /// ground is the opposite - it is minutes of flooding, it is the same answer every time because
-    /// the terrain does not move, and keeping it makes two solves comparable rather than measuring
-    /// the router twice.
     /// </param>
     /// <summary>
     /// Deletes every site file the plugin has written, for every area it has seen.
@@ -121,14 +125,30 @@ internal static class Caches
         }
     }
 
+
+    /// <summary>
+    /// Throws away the plan and the chain on file, and leaves everything else exactly as it was.
+    ///
+    /// Deliberately not a call to Clear with more flags: Clear resets the readings, the counters and the
+    /// ground model as well, and a caller asking for the plan alone wants none of that. See WantedPlanOnly.
+    /// </summary>
+    public static void ForgetPlan(uint area)
+    {
+        Kept.ForgetAll(area);
+        Planning.Forgetting();
+
+        Last = "the plan and the chain on file";
+    }
+
     public static void Clear(Scan scan, Blast blast, Planning planning,
         Boundary boundary, Snap snap, Cleared cleared, Scouted scouted = null,
-        bool keepScan = false, uint area = 0, bool keepGround = false, bool keepRouting = false)
+        bool keepScan = false, uint area = 0)
     {
         var stamp = unchecked((uint)DateTime.UtcNow.Ticks);
 
         Unexpected.Forget();
         Extents.Forget();
+        Terrain.ForgetRouting();
         Missed.Here.AreaChange(stamp);
 
         // The best chain goes too. It is the strongest thing the plugin remembers about a site, so
@@ -179,6 +199,7 @@ internal static class Caches
         // plan that no longer exists, which reads as an answer rather than as a leftover.
         Rolling.Here.ForgetTheSite();
 
+
         // **What the plugin has read about the interface, and everything that measures itself.**
         //
         // These are not facts about the site, which is why they were missed when this button was
@@ -208,6 +229,6 @@ internal static class Caches
                (keepScan
                    ? ", and kept the markers"
                    : ", the scan, and every site file on disk - markers, ground, plans, scouting") +
-               (keepGround ? ", and kept the walkable ground" : "");
+               (keepScan ? ", and kept the walkable ground" : "");
     }
 }

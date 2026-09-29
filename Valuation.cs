@@ -775,6 +775,10 @@ internal sealed class Valuation
         {
             found.Add(new KeyValuePair<Expedition2Recipe, double>(settled, Value(settled)));
 
+            // Said here too, because the filter below does not run: left alone, the dump printed the
+            // accounting of whichever remnant was filtered last under this one.
+            FilterAccounting = $"rolled, so fixed to {Safe.Read(() => settled.Id, "?")} - the recipe filter is not run";
+
             return found;
         }
 
@@ -1175,7 +1179,20 @@ internal sealed class Valuation
     /// read did not really succeed at and treating it as the answer would silently reduce a
     /// remnant's whole option list to nothing.
     /// </summary>
-    public Expedition2Recipe Chosen(Expedition2EncounterData data)
+    public Expedition2Recipe Chosen(Expedition2EncounterData data) => ChosenRecipe(data);
+
+    /// <summary>
+    /// Whether nothing has been picked on this remnant yet, read straight off the encounter data.
+    ///
+    /// Static because it needs nothing but the entity, for a caller that has no Valuation to ask. False when the
+    /// data cannot be read, so an unreadable remnant is never taken for one waiting on a choice. See
+    /// Options.Offering, where a window opened by a blast is matched to the remnant still waiting.
+    /// </summary>
+    public static bool NothingChosen(Entity entity) =>
+        Data(entity) is { } data && ChosenRecipe(data) == null;
+
+    /// <summary>The body of Chosen, which reads no state of its own. See Chosen.</summary>
+    private static Expedition2Recipe ChosenRecipe(Expedition2EncounterData data)
     {
         var recipe = Safe.Read(() => data.SelectedRecipe, null);
 

@@ -1183,6 +1183,8 @@ internal sealed class Placement
 
     private void Arm(GameController gc, AutoExpeditionSettings settings)
     {
+        var fromLast = FromLastExplosive(gc);
+
         if (Detonator.Showing(gc))
         {
             Aim(gc, settings);
@@ -1190,9 +1192,18 @@ internal sealed class Placement
             return;
         }
 
+        // Too far from the last explosive, the game will not enter placement mode at all. See PlacementModeRange.
+        if (fromLast >= PlacementModeRange)
+        {
+            Give("Too far", $"you are {fromLast:0} grid from the last explosive - the game will not show the " +
+                            $"placement circle from {PlacementModeRange:0} or more; walk closer");
+
+            return;
+        }
+
         if (++_arms > 4)
         {
-            Give("No mode", "the placement circle would not come up");
+            Give("No mode", $"the placement circle would not come up ({fromLast:0} grid from the last explosive)");
 
             return;
         }
@@ -1220,6 +1231,32 @@ internal sealed class Placement
         Wait(Step.Toggling, Tapped);
         Say("Arming", $"showing the placement circle with {key}");
     }
+
+    /// <summary>
+    /// How far the player stands from the last explosive down, or from the detonator before any is, in grid.
+    /// </summary>
+    private static float FromLastExplosive(GameController gc)
+    {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var last = Detonator.LastExplosiveGridPosition(gc);
+
+        return player == Vector2.Zero || last == Vector2.Zero ? 0f : Vector2.Distance(player, last);
+    }
+
+    /// <summary>
+    /// How near the last explosive - or the detonator, before any is down - the player has to stand for the game
+    /// to enter placement mode, in grid. The placement key does nothing from this far or further.
+    ///
+    /// Measured by hand on Scorched Cay (Grand, reach 155, 2026-09-29): refused at 181 and 191, and 178 was
+    /// about the limit, so under 180 is the rule taken. Not yet known whether it scales with the map's
+    /// placement-distance modifier (MapExpeditionMaximumPlacementDistancePct, 44 on that map) or with the
+    /// reach; a site with a different reach will say.
+    /// </summary>
+    internal const float PlacementModeRange = 180f;
+
+    /// <summary>The player's distance from the last explosive against PlacementModeRange, for the dump.</summary>
+    internal static string PlacementReach(GameController gc) =>
+        $"you are {FromLastExplosive(gc):0} grid from the last explosive; placement mode needs under {PlacementModeRange:0}";
 
     /// <summary>
     /// Sends the cursor to the richest option in the combinations window.
@@ -1528,6 +1565,15 @@ internal sealed class Placement
         if (Detonator.ExplosivesInHand(gc) <= 0)
         {
             why = "no explosives left";
+
+            return Note(false, why, record);
+        }
+
+        // The game will not enter placement mode this far from the last explosive, so a press here would tap the
+        // key and nothing would come up. Yellow rather than green, however well the link itself reaches.
+        if (FromLastExplosive(gc) is var fromLast && fromLast >= PlacementModeRange)
+        {
+            why = $"you are {fromLast:0} grid from the last explosive - placement mode needs under {PlacementModeRange:0}";
 
             return Note(false, why, record);
         }

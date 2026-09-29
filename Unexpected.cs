@@ -236,6 +236,9 @@ internal static class Unexpected
         var inert = new HashSet<(int X, int Y)>();
         var wrote = new HashSet<(int X, int Y)>();
 
+        // Cells holding something this sweep could not read yet - art not streamed, or no longer valid.
+        var unreadable = new HashSet<(int X, int Y)>();
+
         // Which cell each entity is in THIS sweep, so the cells it used to be in can be dropped.
         // See Found.Who.
         var here = new Dictionary<uint, (int X, int Y)>();
@@ -294,6 +297,7 @@ internal static class Unexpected
                 if (path.Contains("EncasedMonster", StringComparison.OrdinalIgnoreCase))
                     continue;
 
+
                 var at = Safe.Read(entity, static e => e.GridPos, Vector2.Zero);
 
                 if (at == Vector2.Zero || Vector2.Distance(at, site) > range)
@@ -303,6 +307,25 @@ internal static class Unexpected
 
                 if (known.Contains(cell))
                     continue;
+
+                // **Not yet readable is not unknown.** The scan names a marker by its art, and the game
+                // streams a marker's art only once the player is near enough - so a marker first met from
+                // a distance cannot be classified yet, and the scan keeps coming back to it. Doubted here it
+                // drew a red line to every such marker, which went away the moment the player walked back
+                // into range and the art loaded. Measured on Scorched Cay: five ExpeditionMarkers 160 to
+                // 210 grid away, art blank, one of them no longer valid, all of them lined in red.
+                //
+                // An entity the host has stopped updating (IsValid false) says nothing about what is there,
+                // so it is skipped for the same reason. Noted, so a finding remembered from before is
+                // withdrawn as well. See the sweep below.
+                if (!Safe.Read(entity, static e => e.IsValid, false) ||
+                    path.EndsWith("/ExpeditionMarker", StringComparison.OrdinalIgnoreCase) &&
+                    Scan.Art(entity).Length == 0)
+                {
+                    unreadable.Add(cell);
+
+                    continue;
+                }
 
                 // **What a blast acts on carries inherent_explosion_radius**, and carrying
                 // glow_epk does not say that. Every ordinary strongbox in the zone carries
@@ -378,6 +401,15 @@ internal static class Unexpected
         // the full reach of a link to decide whether a blast is the planned one - so entities at that
         // distance are demonstrably loaded and readable. A cell that close with nothing in it is
         // empty, not unloaded. Anything further away keeps its finding.
+        // A finding remembered for a cell whose entity cannot be read yet was made the same way, from a marker
+        // whose art had not loaded. Withdrawn; the scan will name it once it can, and if it cannot then, this
+        // sweep will doubt it again. See the skip above.
+        foreach (var cell in unreadable)
+        {
+            if (!wrote.Contains(cell))
+                seen.Remove(cell);
+        }
+
         var eye = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
 
         if (eye != Vector2.Zero)

@@ -238,7 +238,8 @@ internal static class Dump
             said.Add($"{name} {tally.All} ({tally.Here} here, {tally.Live} loaded, {tally.Lit} lit)");
 
         // What the barrel drawing sees, since "no circles appeared" has several causes and the
-        // scan holding eighty one of them rules out only the first.
+        // scan holding eighty one of them rules out only the first. Counted by the radius rather
+        // than by the kind, so a tileset explodable filed under Unknown is in this list too.
         {
             var barrels = 0;
             var radius = 0f;
@@ -246,7 +247,7 @@ internal static class Dump
 
             foreach (var target in Scan?.Targets ?? new List<Target>())
             {
-                if (target.Kind != TargetKind.Barrel)
+                if (target.Sets <= 0f)
                     continue;
 
                 barrels++;
@@ -262,7 +263,8 @@ internal static class Dump
                 }
             }
 
-            b.AppendLine($"  barrels the drawing sees: {barrels}, largest radius {radius:0.#}, " +
+            b.AppendLine($"  objects with a blast of their own: {barrels}, " +
+                         $"largest radius {radius:0.#}, " +
                          (placed.Length > 0 ? placed : "none held"));
 
             // **Whether each one is still drawn, and the arithmetic that decided it.**
@@ -283,7 +285,7 @@ internal static class Dump
 
             foreach (var target in Scan?.Targets ?? new List<Target>())
             {
-                if (target.Kind != TargetKind.Barrel)
+                if (target.Sets <= 0f)
                     continue;
 
                 var nearest = float.MaxValue;
@@ -300,21 +302,27 @@ internal static class Dump
                     at = bomb;
                 }
 
-                var hidden = target.Spent || gone.Contains(Overlay.Cell(target.Grid));
+                // The detonation ends the drawing for every object at once, whatever the per-object
+                // tests say, so the verdict has to name it or the line claims a ring nobody can see.
+                var over = Detonator.SetOffHere(gc);
+                var hidden = over || target.Spent || gone.Contains(Overlay.Cell(target.Grid));
 
-                b.AppendLine($"    barrel ({target.Grid.X:0},{target.Grid.Y:0}) " +
+                b.AppendLine($"    {Short(target.Meta)} ({target.Grid.X:0},{target.Grid.Y:0}) " +
+                             $"radius {target.Sets:0.#} " +
                              (standing.Length == 0
                                  ? "no explosives down yet"
                                  : $"nearest explosive ({at.X:0},{at.Y:0}) at {nearest:0.#} grid " +
                                    $"vs blast {reach:0.#} + extent " +
                                    $"{Extents.Of(target):0.#}") +
                              $" - detonated {target.State("expedition_detonated")}, spent {target.Spent}" +
+                             (over ? ", site already set off" : "") +
                              $" -> {(hidden ? "NOT drawn" : "still drawn")}");
             }
         }
 
         var ran = Placement.Last;
 
+        b.AppendLine($"  distance for placement mode: {Placement.PlacementReach(gc)}");
         b.AppendLine("  what the last placement run said: " +
                      (ran.When == default
                          ? "nothing since the plugin loaded"
@@ -435,7 +443,7 @@ internal static class Dump
     private static void BoundsAgainstExtents(StringBuilder b, Scan scan)
     {
         b.AppendLine();
-        b.AppendLine("=== what Render.Bounds says, against the extent in use ===");
+        SectionHeader(b, "=== what Render.Bounds says, against the extent in use ===");
         b.AppendLine("  art / metadata                             bounds X    Y      Z" +
                      "   art radius   Positioned.Size   |  extent used   drawn z / ground z");
 
@@ -513,6 +521,9 @@ internal static class Dump
 
     /// <summary>The placement loop, so the dump can report the last thing it said. See Placement.Said.</summary>
     public static Placement Placement { get; set; }
+
+    /// <summary>The batch of cold presses, so the dump can say where one has got to.</summary>
+    public static RepeatedPresses Repeats { get; set; }
 
     /// <summary>The presolve, so its work can be judged. See Rehearsal.</summary>
     public static Rehearsal Rehearsal { get; set; }
@@ -663,6 +674,94 @@ internal static class Dump
         var player = Safe.Read(() => gc.Player, null);
         b.AppendLine($"player grid: {Describe(Safe.Read(() => player.GridPos, default))}");
 
+        // Where the summary of the section timings goes once they are known. See SectionHeader.
+        var timingsAt = b.Length;
+        var whole = System.Diagnostics.Stopwatch.StartNew();
+
+        _sectionTimes.Clear();
+        _entityTimes.Clear();
+        _sectionOpen = "(before the first section)";
+        _sectionClock = System.Diagnostics.Stopwatch.StartNew();
+
+        DescribeSections(b, gc, range);
+
+        CloseSectionTiming();
+
+        var slowest = _sectionTimes.OrderByDescending(x => x.Ms).Take(3)
+            .Select(x => $"{x.Ms:N0}ms {x.Section.Trim('=', ' ')}");
+
+        b.Insert(timingsAt,
+            $"this dump took {whole.Elapsed.TotalMilliseconds:N0}ms to build; slowest sections: " +
+            $"{string.Join("; ", slowest)} - every section's time is at the end{Environment.NewLine}");
+
+        b.AppendLine();
+        b.AppendLine("=== how long each section of this dump took to build ===");
+
+        foreach (var (section, ms) in _sectionTimes)
+            b.AppendLine($"  {ms,9:N0}ms  {section.Trim('=', ' ')}");
+
+        b.AppendLine($"  entities described: {_entityTimes.Count:N0} in {_entityTimes.Sum(x => x.Ms):N0}ms; the slowest:");
+
+        foreach (var (ms, entity) in _entityTimes.OrderByDescending(x => x.Ms).Take(5))
+            b.AppendLine($"    {ms,9:N1}ms  {entity}");
+    }
+
+    /// <summary>
+    /// Section timings for the dump being built, in the order the sections were written. See SectionHeader.
+    /// </summary>
+    private static readonly List<(string Section, double Ms)> _sectionTimes = new();
+
+    /// <summary>The section being written now, whose time is still running. See SectionHeader.</summary>
+    private static string _sectionOpen;
+
+    /// <summary>Time since the section being written was opened. See SectionHeader.</summary>
+    private static System.Diagnostics.Stopwatch _sectionClock;
+
+    /// <summary>
+    /// Writes a section's heading and closes the timing of the section before it.
+    ///
+    /// Every section is opened through here, so the time between two headings is the time the first one
+    /// took to build, including any unheaded lines written after it. The dump runs on the game's thread,
+    /// so a slow section is a frozen frame; this is what says which one. See Describe.
+    /// </summary>
+    private static void SectionHeader(StringBuilder b, string header)
+    {
+        CloseSectionTiming();
+
+        _sectionOpen = header;
+
+        b.AppendLine(header);
+    }
+
+    /// <summary>
+    /// Files the time since the last heading or part as a named part of the section being written.
+    ///
+    /// For a section too long to be one line of the timings: "terrain targeting grid" carries about a
+    /// thousand lines of plan readouts with no heading of their own, and measured at 9,964ms of a
+    /// 10,370ms dump with nothing to say which of them it was. Call after the part it names.
+    /// </summary>
+    private static void SectionPartTiming(string part)
+    {
+        if (_sectionClock == null)
+            return;
+
+        _sectionTimes.Add(($"    part: {part}", _sectionClock.Elapsed.TotalMilliseconds));
+        _sectionClock.Restart();
+    }
+
+    /// <summary>Files the time of the section being written and starts the clock for the next. See SectionHeader.</summary>
+    private static void CloseSectionTiming()
+    {
+        if (_sectionClock == null)
+            return;
+
+        _sectionTimes.Add((_sectionOpen ?? "(before the first section)", _sectionClock.Elapsed.TotalMilliseconds));
+        _sectionClock.Restart();
+    }
+
+    /// <summary>Every section of the dump, in the order they are written. See Describe.</summary>
+    private static void DescribeSections(StringBuilder b, GameController gc, int range)
+    {
         DetonatorSection(b, gc);
         Window(b, gc);
         Labels(b, gc);
@@ -684,7 +783,7 @@ internal static class Dump
     private static void DetonatorSection(StringBuilder b, GameController gc)
     {
         b.AppendLine();
-        b.AppendLine("=== detonator (IngameUi.ExpeditionDetonatorElement) ===");
+        SectionHeader(b, "=== detonator (IngameUi.ExpeditionDetonatorElement) ===");
 
         var element = Safe.Read(() => gc.IngameState.IngameUi.ExpeditionDetonatorElement, null);
 
@@ -850,9 +949,12 @@ internal static class Dump
 
         b.AppendLine();
         b.AppendLine($"  Detonated() = {said}" +
-                     (said < 1
-                         ? "  <- BELOW ONE, so Cleared does nothing and no link ever stops drawing"
-                         : "  - Cleared is free to run"));
+                     (Detonator.SetOffHere(gc)
+                         ? "  - set off (live or latched), so no link of the chain is drawn"
+                         : "  - not set off, so the chain is drawn") +
+                     (said < 1 && Detonator.SetOffHere(gc)
+                         ? "; the live read is below one because the detonator is not loaded, and the latch answers"
+                         : ""));
         b.AppendLine($"  Site() = {Describe(site)}, matched against icons within 3 grid units");
 
         // The same list Detonated reads, so the diagnostic and the thing it diagnoses cannot
@@ -921,7 +1023,7 @@ internal static class Dump
     /// </summary>
     private static void Window(StringBuilder b, GameController gc)
     {
-        b.AppendLine("=== combinations window (IngameUi.Expedition2Window) ===");
+        SectionHeader(b, "=== combinations window (IngameUi.Expedition2Window) ===");
 
         var window = Safe.Read(() => gc.IngameState.IngameUi.Expedition2Window, null);
 
@@ -1221,7 +1323,7 @@ internal static class Dump
     /// </summary>
     private static void Chores(StringBuilder b, GameController gc)
     {
-        b.AppendLine("=== the post-expedition pass ===");
+        SectionHeader(b, "=== the post-expedition pass ===");
 
         if (Settings == null || Scan == null)
         {
@@ -1472,7 +1574,7 @@ internal static class Dump
             }
         }
         b.AppendLine();
-        b.AppendLine("=== every visible label in the interface (find popups here) ===");
+        SectionHeader(b, "=== every visible label in the interface (find popups here) ===");
 
         var root = Safe.Read(() => gc.IngameState.IngameUi, null);
 
@@ -1580,7 +1682,7 @@ internal static class Dump
     /// </summary>
     private static void Labels(StringBuilder b, GameController gc)
     {
-        b.AppendLine("=== remnant ground labels (IngameUi.ItemsOnGroundLabels) ===");
+        SectionHeader(b, "=== remnant ground labels (IngameUi.ItemsOnGroundLabels) ===");
 
         var labels = Ground.Labels(gc);
 
@@ -1714,7 +1816,7 @@ internal static class Dump
     {
         Texts(b, gc);
         Chores(b, gc);
-        b.AppendLine("=== how far the chain is believed to range ===");
+        SectionHeader(b, "=== how far the chain is believed to range ===");
         b.AppendLine($"  predicted {Detonator.PlacementRange(gc):0.#} grid " +
                      $"(base {Detonator.BaseReach(gc):0.#}, map {Detonator.PlacementRangePct(gc):+0;-0;+0}%)");
         b.AppendLine($"  base is {(Detonator.Grand(gc) ? "GRAND" : "ordinary")} because the count is " +
@@ -1723,18 +1825,18 @@ internal static class Dump
         b.AppendLine("  (the game's own arithmetic, in integers, so it is the limit rather than " +
                      "an estimate of it - nothing measures it any more)");
         b.AppendLine();
-        b.AppendLine("=== what the reset button reaches ===");
+        SectionHeader(b, "=== what the reset button reaches ===");
         b.AppendLine("  " + ResetAll.Audit(Settings));
         b.AppendLine("  (a reset that misses something looks exactly like one that worked, so the");
         b.AppendLine("   count is the verdict - see ResetAll.Audit)");
         b.AppendLine();
-        b.AppendLine("=== how far the game streams entities in ===");
+        SectionHeader(b, "=== how far the game streams entities in ===");
         b.AppendLine("  " + (Streaming?.Describe() ?? "not wired up"));
         b.AppendLine("  (the scouting layer paints anything further than the range setting as unwalked;");
         b.AppendLine("   loads out to says the setting can go at least that high, drops from says it " +
                      "should not go higher)");
         b.AppendLine();
-        b.AppendLine("=== what the markers have unearthed so far ===");
+        SectionHeader(b, "=== what the markers have unearthed so far ===");
         b.AppendLine("  " + (Spawns?.Describe() ?? "not wired up"));
         b.AppendLine("  (written to dumps/spawns.csv when you leave the area, one row per marker)");
         b.AppendLine();
@@ -1742,7 +1844,7 @@ internal static class Dump
         // has been measured against the game's own verdicts and none of them is the placement rule, so
         // this reports the two vectors in the client's terrain struct that no project has ever
         // identified. Read-only - see Peek.
-        b.AppendLine("=== the terrain struct, past what ExileCore2 exposes ===");
+        SectionHeader(b, "=== the terrain struct, past what ExileCore2 exposes ===");
         b.AppendLine(Peek.Describe(gc));
 
         // **The game's own routing grid, which is the placement rule itself.** See Peek.Coarse. This
@@ -1752,7 +1854,7 @@ internal static class Dump
         // The engine's own finished search, which is the only way to see ITS g values rather than
         // infer them from where a bomb landed. See Peek.Searched.
         // What the boundary sweep has proved, and the spots it caught us out on. See Frontier.
-        b.AppendLine("=== the boundary sweep ===");
+        SectionHeader(b, "=== the boundary sweep ===");
         b.AppendLine($"  {Checked.Here.Count} spots put to the game here, {Checked.Here.Wrong} disagreed");
 
         foreach (var (x, y) in Checked.Here.Disagreed)
@@ -1762,16 +1864,16 @@ internal static class Dump
 
         // The engine's own terrain layers, decoded its way, against ExileCore2's arrays.
         // See Peek.Layered - this is the one link still taken on naming rather than reading.
-        b.AppendLine("=== the terrain layers as the engine reads them ===");
+        SectionHeader(b, "=== the terrain layers as the engine reads them ===");
         b.AppendLine(Peek.Layered(gc));
 
-        b.AppendLine("=== the game's own last A* search ===");
+        SectionHeader(b, "=== the game's own last A* search ===");
         b.AppendLine(Peek.Searched(gc));
 
-        b.AppendLine("=== the coarse routing grid (ClientExpedition+0x1A8, +0x38) ===");
+        SectionHeader(b, "=== the coarse routing grid (ClientExpedition+0x1A8, +0x38) ===");
         b.AppendLine(Coarse(gc));
         b.AppendLine();
-        b.AppendLine("=== authored no-placement volumes ===");
+        SectionHeader(b, "=== authored no-placement volumes ===");
 
         // **Through the reader that resolves the component, not the sweep that guessed at it.**
         // Forbidden.Describe walked the tile objects by hand and looked for the tag at a fixed
@@ -1781,36 +1883,36 @@ internal static class Dump
         // anything. Volumes resolves the component through the type's table and reports each stage.
         b.AppendLine(Volumes.Explain(gc, Detonator.DetonatorGridPosition(gc), Terrain.Span));
         b.AppendLine();
-        b.AppendLine("=== terrain targeting grid ===");
+        SectionHeader(b, "=== terrain targeting grid ===");
         b.AppendLine(Terrain.Describe(gc, scan?.Targets ?? new List<Target>(), Plan));
+        SectionPartTiming("Terrain.Describe");
         b.AppendLine("  (known good = under the detonator and every marker, which is ground content " +
                      "STANDS on, not");
         b.AppendLine("   ground an explosive may go on; game agreed = cells the placement indicator " +
                      "confirmed,");
         b.AppendLine("   which is the only placement evidence here; an explosive needs 4 or better)");
         b.AppendLine("  " + Terrain.Agreed(gc, scan?.Targets ?? new List<Target>()));
+        SectionPartTiming("Terrain.Agreed");
         b.AppendLine("  what the model believed about each explosive as it landed:");
         b.AppendLine("  " + Landed.Here.Describe());
+        SectionPartTiming("Landed.Describe");
         b.AppendLine("  " + Terrain.Clearance(gc));
+        SectionPartTiming("Terrain.Clearance");
         b.AppendLine("  " + Terrain.Aligns(gc));
+        SectionPartTiming("Terrain.Aligns");
         b.AppendLine("  " + Terrain.Puzzling(gc, scan?.Targets ?? new List<Target>()));
+        SectionPartTiming("Terrain.Puzzling");
 
         // **Where the routing model and the client disagreed**, which is the list to work from when
         // a run stops with "Wrong spot". Each line has everything needed to reproduce one by hand:
         // the explosive the game routes from, the cell the plan wanted, the cell the cursor was sent
         // to, and where the game put the explosive instead. See PlacementDisagreements.
         b.AppendLine("  placement model: " + PlacementDisagreements.Here.Describe());
+        SectionPartTiming("PlacementDisagreements");
 
 
         // What a Liquid Verisium is worth on each remnant, and on which one. The advice is built on
         // forty two observed outcomes, so the working matters more than the answer. See Rolling.
-        // What repositioning a remnant would cost, which is what decides whether a roll can
-        // be priced at its best position rather than where it sits. See Rolling.Positioning
-        // and reroll_plan.md. A reading; nothing consults it.
-        b.AppendLine("  repositioning: " + Safe.Read(
-            () => Rolling.Positioning(Env,
-                Chain == null ? null : new List<System.Numerics.Vector2>(Chain), Settings),
-            "not measured"));
         b.AppendLine($"  rolling: {Rolling.Here.Telling}");
         b.AppendLine($"    mode {Rolling.Mode(Settings)}" +
                      // Nothing walked is not progress to report, and the STALLED warning below is
@@ -1829,6 +1931,10 @@ internal static class Dump
         b.AppendLine("    " + (Rolling.Here.Best is { } best
             ? $"ROLL the remnant at ({best.Grid.X:0},{best.Grid.Y:0}) - {best.Why}"
             : "nothing advised: " + Rolling.Here.Quiet));
+        b.AppendLine("    the first advice at this site: " +
+                     (Rolling.Here.Waiting.Length > 0
+                         ? $"WAITING - {Rolling.Here.Waiting}, {Rolling.Here.WaitProgress * 100f:0}% of the longest wait"
+                         : Rolling.Here.StartedAt));
         if (Rolling.Here.Floored.Length > 0)
             b.AppendLine("    IMPOSSIBLE FIGURE CORRECTED: " + Rolling.Here.Floored);
 
@@ -1880,6 +1986,7 @@ internal static class Dump
         b.AppendLine("    " + Advising(gc, Scan));
         b.AppendLine("    every remnant weighed:");
         b.AppendLine(Rolling.Here.Verdicts());
+        SectionPartTiming("rolling verdicts");
         // **Printed as a share, because the absolute number says nothing about whether it is
         // reasonable.** It is a guess multiplied by however many runes a chain happens to carry, and
         // the only way to notice it has taken over the objective is to see what fraction of the
@@ -1979,6 +2086,7 @@ internal static class Dump
                          : $" - {Planner.Propagated - Planner.Pooled:+0.0;-0.0} from modifiers that multiply"));
 
         b.AppendLine($"  the Bait rune: {Curio.Describe()}");
+        SectionPartTiming("through Curio.Describe");
 
         // What each remnant's waves are wearing, in the form the overlay draws it. Here so the
         // arithmetic can be checked against the remnant rather than taken on trust - the bracket
@@ -2402,6 +2510,7 @@ internal static class Dump
         b.AppendLine($"  presolving this site: {Rehearsal?.Describe() ?? "not wired up"}");
         b.AppendLine($"  what the last solve did with the previous chain: {Planning.Seeded}");
         b.AppendLine($"  the best chain on file here: {Kept.Describe()}");
+        SectionPartTiming("through Kept.Describe");
         b.AppendLine($"  what the last solve did with it: {Planning.Filed}");
         b.AppendLine($"  how the score on screen is made up: {Scoring?.Breakdown ?? "not wired up"}");
         b.AppendLine($"  what that score was worked out over: {ScoringPool()}");
@@ -2426,7 +2535,6 @@ internal static class Dump
         b.AppendLine("  links the router did not reach: treated as walls, which is what the " +
                      "REFUSED UNROUTED count above cost");
         b.AppendLine($"  threads: {Solving.Spread}");
-        b.AppendLine($"  kicks that started from another thread's chain: {Solving.Migrations:N0}");
         b.AppendLine($"  threads that gave up on a dead chain: {Solving.Rescues:N0}");
         b.AppendLine($"  threads, per compared strategy: {Bakeoff.Threads}");
         // **What the search was configured to do, beside what it did.**
@@ -2436,24 +2544,71 @@ internal static class Dump
         // setting. Read back off the settings rather than remembered, so it says what was in force
         // rather than what anybody meant to put in force.
         b.AppendLine($"  what each press has been worth: {Planning.Climbed}");
+
+        // **Every press on this site, and the share of them that met the target.**
+        //
+        // Here rather than in a section of its own because it belongs beside the switches it is meant
+        // to be read against: a configuration is better than another when its distribution is, and
+        // both are on this page. See PressHistory.
+        // **Where the opening ends, counted rather than assumed.** See Solving.Openings.
+        b.AppendLine($"  the enumerated openings: {Openings.Said}");
+        b.AppendLine(Openings.Spelled());
+        b.AppendLine($"  forks the enumeration's prunes lost: {Openings.ForksSaid}");
+        OpeningsPanel(b);
+        b.AppendLine($"  keeping them: {Repair.KeepOpeningSaid}");
+        b.AppendLine($"  touring: {Repair.TouringSaid}");
+        b.AppendLine($"  refining: {Repair.RefiningSaid}");
+        b.AppendLine($"  tail rollouts: {Repair.RollingTailsSaid}");
+        // **The line as typed, then the table it was understood as.** Both, because they are different
+        // claims: the first says what the pool was configured to be and the second says what it became, and a
+        // word the parser could not place shows up as a difference between them. A dump with only the table
+        // cannot be checked against a settings file, and a dump with only the line cannot be read at all.
+        b.AppendLine("  thread roles, as typed:");
+        b.AppendLine($"    {Settings?.Solver.Advanced.DestroyAndRepair.ThreadRoles.Value}");
+        b.AppendLine("  thread roles, as understood:");
+        b.AppendLine(ThreadRoles.Said);
+
+        // **What the search actually leans by, which is the claim that decides anything.** A role naming an
+        // operator and a worker weighting it are two different statements. See Repair.LeaningsSaid.
+        b.AppendLine("  what each worker's role leans on, multiplied into every draw for the whole window:");
+        b.AppendLine(Repair.LeaningsSaid());
+
+        // **Read the next list against the one above.** A first link in one and not the other is an opening the
+        // search moved - by a shake, or by a tear that replaced link one - rather than an opening it was given.
+        b.AppendLine("  what each worker opened with, best first:");
+        b.AppendLine(Solving.Openings);
+
+        b.AppendLine($"  relinking the pool: {Solving.Relinking}");
+        b.AppendLine($"  reversing the relinked chain, since the plugin loaded: {Solving.RelinkReversal}");
+
+        // **What the pool is stuck on, which no counter could say.** See Solving.Divergence.
+        b.AppendLine("  the winning chain against the median worker's:");
+        b.AppendLine(Solving.Divergence);
+
+        b.AppendLine("  every solve here, as a distribution:");
+        b.AppendLine(PressHistory.Spelled());
         b.AppendLine($"  search switches: " +
-                     $"own opening per worker {Settings?.Solver.Advanced.DestroyAndRepair.VaryOpenings.Value}, " +
-                     $"vary tearing mix {Settings?.Solver.Advanced.DestroyAndRepair.VaryOperators.Value}, " +
-                     $"tearing mix [{Settings?.Solver.Advanced.DestroyAndRepair.TearingMix.Value}], " +
-                     $"share best {Settings?.Solver.Advanced.DestroyAndRepair.ShareBest.Value}, " +
-                     $"never adopt [{Settings?.Solver.Advanced.DestroyAndRepair.ShareNot.Value}], " +
-                     $"estimate detour {Settings?.Solver.Advanced.DestroyAndRepair.EstimateDetour.Value}, " +
+
+
                      $"bridge links {Settings?.Solver.Advanced.DestroyAndRepair.BridgeLinks.Value ?? -1}, " +
-                     $"slide by {Settings?.Solver.Advanced.DestroyAndRepair.SlideBy.Value ?? -1f:0.#}, " +
-                     $"permute up to {Settings?.Solver.Advanced.DestroyAndRepair.PermuteUpTo.Value ?? -1}, " +
+                     $"reverse runs {Settings?.Solver.Advanced.DestroyAndRepair.ReverseRuns.Value}, " +
                      $"accept slack {Settings?.Solver.Advanced.DestroyAndRepair.AcceptSlack.Value:0.#}%, " +
                      $"opening shakes {Settings?.Solver.Advanced.DestroyAndRepair.OpeningShakes.Value}, " +
+                     $"enumerated openings {Settings?.Solver.Advanced.DestroyAndRepair.OpeningLinks.Value} " +
+                     "link(s) deep, for the workers whose role asks for one, " +
                      $"opening cap {(Settings?.Solver.Advanced.DestroyAndRepair.OpeningMs.Value is > 0 and var ms ? $"{ms}ms" : "none")}, " +
-                     $"rescue below {Settings?.Solver.Advanced.DestroyAndRepair.RescueBelow.Value:0.#}% " +
+                     $"at a kick, restart if behind the pool by {Settings?.Solver.Advanced.DestroyAndRepair.RescueBelow.Value:0.#}% " +
                      $"(shaken {Settings?.Solver.Advanced.DestroyAndRepair.RestartShakes.Value}), " +
-                     $"adopted shake {Settings?.Solver.Advanced.DestroyAndRepair.AdoptedShake.Value}, " +
                      $"frozen prices {Settings?.Debug.FreezePrices.Value} ({Valuation.Freezer}), " +
+                     $"kick after no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StagnationKickPercent.Value ?? -1}% of the window " +
+                     $"or {Settings?.Solver.Advanced.DestroyAndRepair.StagnationKickRounds.Value ?? -1} rounds (0 = off), " +
+                     $"at a kick, restart if no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StallRestartMs.Value ?? -1}ms (0 = off), " +
+                     $"opening choices {Settings?.Solver.Advanced.DestroyAndRepair.OpeningChoices.Value ?? -1}, " +
+                     $"random draw {Planning.Draws}, " +
                      $"must take above {Settings?.Rewards.MustTakeAbove.Value ?? -1f:0.#}, " +
+                     (Settings?.Solver.Advanced.DestroyAndRepair.RoundsPerWorker.Value is > 0 and var budget
+                         ? $"MEASURING: {budget} rounds per worker rather than the clock, "
+                         : "") +
                      $"threads {Settings?.Solver.Threads.Value ?? -1}, " +
                      $"tear {Settings?.Solver.Advanced.DestroyAndRepair.TearLeast.Value ?? -1}-{Settings?.Solver.Advanced.DestroyAndRepair.TearMost.Value ?? -1}");
 
@@ -2461,8 +2616,6 @@ internal static class Dump
         b.AppendLine($"  published plans checked against the ceiling: {Planner.Bounds}");
         b.AppendLine($"  what the shortlist kept: {Repair.Listed}");
         b.AppendLine($"  the connective half of it: {Repair.Spreading}");
-        b.AppendLine($"  sliding the tail along the route: {Repair.Sliding}");
-        b.AppendLine($"  every ordering tried: {Repair.Permuting}");
         b.AppendLine($"  how far reach's bridges really walk: {Repair.Detoured}");
         b.AppendLine($"  bridges the reach operator built: {Planner.Fetches}");
         b.AppendLine($"  what asked for the last solve: {Planning.Asked}");
@@ -2493,6 +2646,7 @@ internal static class Dump
         }
 
         Known(b, gc);
+        SectionPartTiming("through Known");
 
         // The two numbers over the placement button. Both are what the site pays - insistence is
         // no longer inside them to be announced and subtracted. See Verdict.Plain.
@@ -2733,8 +2887,10 @@ internal static class Dump
             : "none - off, or the site has no families"));
         b.AppendLine();
         Spots(b);
+        SectionPartTiming("through Spots");
         b.AppendLine();
         Links(b, gc);
+        SectionPartTiming("Links");
         b.AppendLine();
         b.AppendLine("  scenery standing in the site, which no grid mentions:");
         b.AppendLine($"    {Obstacles.Read(gc, Detonator.DetonatorGridPosition(gc), 200f).Describe()}");
@@ -2762,7 +2918,9 @@ internal static class Dump
         }
         b.AppendLine();
         Strangers(b, gc, scan);
+        SectionPartTiming("through Strangers");
         BoundsAgainstExtents(b, scan);
+        SectionPartTiming("BoundsAgainstExtents");
     }
 
     /// <summary>
@@ -2806,7 +2964,7 @@ internal static class Dump
         if (bands.Count == 0)
             return;
 
-        b.AppendLine("=== the bands last drawn ===");
+        SectionHeader(b, "=== the bands last drawn ===");
         b.AppendLine("  how the tree of edge chains grows:");
         b.AppendLine(Planner.Fanned);
         b.AppendLine();
@@ -2837,7 +2995,7 @@ internal static class Dump
 
         var spots = Planner.Spots;
 
-        b.AppendLine("=== the best spots last drawn ===");
+        SectionHeader(b, "=== the best spots last drawn ===");
 
         if (spots.Count == 0)
         {
@@ -2903,6 +3061,67 @@ internal static class Dump
     }
 
     /// <summary>
+    /// What the chain panel's openings section shows, written out: how many openings each level of the enumeration
+    /// made at each stage, every opening with its branch and the workers it goes to, and the lost forks. Uses the
+    /// panel's own labelling, so the two cannot disagree. The workers come from the last solve's roles. See
+    /// ChainPanel.OpeningLabels and Openings.LevelCounts.
+    /// </summary>
+    private static void OpeningsPanel(StringBuilder b)
+    {
+        var levels = Openings.LastLevels;
+
+        if (levels.Count > 0)
+        {
+            b.AppendLine("  openings made at each link of the enumeration:");
+            b.AppendLine("    link  prefixes  discarded  forks lost  offered  rolled out  not rolled out  dominated  kept");
+
+            foreach (var level in levels)
+            {
+                b.AppendLine($"    {level.Level,4}  {level.Prefixes,8:N0}  {level.Discarded,9:N0}  " +
+                             $"{level.ForksLost,10:N0}  {level.Offered,7:N0}  {level.RolledOut,10:N0}  " +
+                             $"{level.NotRolledOut,14:N0}  {level.Dominated,9:N0}  {level.Kept,4:N0}");
+            }
+        }
+
+        var openings = Openings.Last;
+
+        if (openings.Count > 0)
+        {
+            var (branches, workers) = ChainPanel.OpeningLabels(Env, openings);
+
+            b.AppendLine("  the openings kept, best first - branch B.V is what the first link catches and, within " +
+                         "it, what the second catches; workers are the ones given it under the last solve's roles:");
+            b.AppendLine("       #  completed    takes  branch  workers   links");
+
+            for (var i = 0; i < openings.Count; i++)
+            {
+                var opening = openings[i];
+                var links = string.Join(" ", opening.Links.Select(at => $"({at.X:0},{at.Y:0})"));
+
+                b.AppendLine($"    {i + 1,4}  {opening.Completed,9:N0}  {opening.Caught,7:N0}  {branches[i],6}  " +
+                             $"{(workers[i].Length == 0 ? "-" : workers[i]),-8}  {links}  " +
+                             (opening.KeptFor.Length > 0
+                                 ? $"[catches {opening.Branch}; kept {opening.KeptFor}]"
+                                 : $"[first catches {opening.Branch}; second {opening.Variation}]"));
+            }
+        }
+
+        var forks = Openings.LastForks;
+
+        if (forks.Count > 0)
+        {
+            b.AppendLine($"  the lost forks kept to be drawn ({forks.Count}):");
+
+            foreach (var fork in forks)
+            {
+                b.AppendLine($"    ({fork.Discarded.X:0},{fork.Discarded.Y:0}) beaten by " +
+                             $"({fork.BeatenBy.X:0},{fork.BeatenBy.Y:0}), the only way to " +
+                             $"({fork.OnlyItReaches.X:0},{fork.OnlyItReaches.Y:0})");
+            }
+        }
+    }
+
+    /// <summary>
     /// What a blast would set off that nobody has agreed a price for.
     ///
     /// **Two different states used to be printed as one, under the wrong name.** The heading said
@@ -2918,7 +3137,7 @@ internal static class Dump
     /// </summary>
     private static void Strangers(StringBuilder b, GameController gc, Scan scan)
     {
-        b.AppendLine("=== things a blast would set off that nobody has priced ===");
+        SectionHeader(b, "=== things a blast would set off that nobody has priced ===");
 
         if (scan == null)
         {
@@ -2998,7 +3217,7 @@ internal static class Dump
     private static void MapStats(StringBuilder b, GameController gc)
     {
         b.AppendLine();
-        b.AppendLine("=== map stats mentioning expedition or explos ===");
+        SectionHeader(b, "=== map stats mentioning expedition or explos ===");
 
         foreach (var name in new[] { "MapStats", "MapStatsVisible" })
         {
@@ -3038,7 +3257,7 @@ internal static class Dump
     private static void Relics(StringBuilder b)
     {
         b.AppendLine();
-        b.AppendLine("=== which row each relic answered to ===");
+        SectionHeader(b, "=== which row each relic answered to ===");
 
         var seen = Safe.Read(() => Weighing.WeightAnsweredByCode(), null);
 
@@ -3070,7 +3289,7 @@ internal static class Dump
     private static void Guards(StringBuilder b)
     {
         b.AppendLine();
-        b.AppendLine("=== strongbox guards: the label against the modifiers ===");
+        SectionHeader(b, "=== strongbox guards: the label against the modifiers ===");
 
         var boxes = Scan?.Targets?
             .Where(t => t is { Kind: TargetKind.Strongbox })
@@ -3215,7 +3434,7 @@ internal static class Dump
     private static void WeightTable(StringBuilder b)
     {
         b.AppendLine();
-        b.AppendLine("=== where a frame goes ===");
+        SectionHeader(b, "=== where a frame goes ===");
         b.Append(Spent.Table());
         var leaves = LeafCalls.Over;
         var frames = Math.Max(1, Spent.Framed);
@@ -3275,6 +3494,15 @@ internal static class Dump
                      " - a cheaper reachability test is only worth building in proportion to the " +
                      "misses");
 
+        // **What the router kept across solves is holding, against its safety limit.** The per-route costs are
+        // measured offline, and the number of distinct routes a site settles at is what says whether the limit is
+        // ever reached - one solve here built 1.47 million. See Wire.MostPaths.
+        b.AppendLine(Terrain.KeptRouter is { } kept
+            ? $"  the router kept across solves: {kept.Paths:N0} paths and {kept.Known:N0} lengths, about " +
+              $"{kept.EstimatedBytes / 1048576d:N0}MB, against a limit of {Wire.MostPaths:N0} paths" +
+              (kept.Full ? " - FULL, new routes are worked out but no longer kept" : "")
+            : "  the router kept across solves: none yet");
+
         var scratching = Planner.Scratching;
 
         b.AppendLine($"  the scoring tally was reused {scratching.Hits:N0} times and rebuilt " +
@@ -3297,6 +3525,32 @@ internal static class Dump
                      "thread minus ours is this plugin's own, outside any stage");
 
         var collected = Spent.Collected;
+
+        var gaps = Spent.LongGaps;
+
+        b.AppendLine(gaps.Count == 0
+            ? "  long gaps between frames this session: none over 250ms"
+            : $"  long gaps between frames this session, over 250ms, most recent last ({gaps.Count} kept):");
+
+        foreach (var gap in gaps)
+        {
+            b.AppendLine($"    {gap.When:HH:mm:ss}  {gap.Ms,8:N0}ms  collecting {gap.CollectingMs:N0}ms " +
+                         $"({gap.Collections.Gen0}/{gap.Collections.Gen1}/{gap.Collections.Gen2} gen0/1/2), " +
+                         $"{gap.Solving} solver worker(s) running, " +
+                         $"{(gap.Enumerating ? "enumerating openings" : "not enumerating")}, " +
+                         $"pool {gap.PoolThreads} thread(s) with {gap.PoolQueued:N0} queued, " +
+                         $"{gap.AllocatedKb:N0}KB allocated by the process; {gap.LastCollection}; {gap.Slow}; " +
+                         $"running: {gap.Jobs}" +
+                         (gap.OutOfFocus ? "; THE GAME WAS OUT OF FOCUS during it" : "") +
+                         (gap.AreaChanged ? "; THE AREA CHANGED during it" : ""));
+        }
+
+        System.Threading.ThreadPool.GetMinThreads(out var poolMinimum, out _);
+
+        b.AppendLine($"  the thread pool as the dump was taken: {System.Threading.ThreadPool.ThreadCount} thread(s) against a minimum " +
+                     $"of {poolMinimum}, {System.Threading.ThreadPool.PendingWorkItemCount:N0} work item(s) queued - threads above " +
+                     "the minimum are added slowly, so a queue here while solves wait on each other is a stall for " +
+                     "anything else that needs a pool thread");
 
         b.AppendLine($"  garbage collections over that window: {collected.Gen0} gen0, " +
                      $"{collected.Gen1} gen1, {collected.Gen2} gen2, stopping the process for " +
@@ -3331,7 +3585,7 @@ internal static class Dump
                      $"{Forbidden.Radius:0} world");
         b.AppendLine();
 
-        b.AppendLine("=== the weight reference table, v1 beside v2 ===");
+        SectionHeader(b, "=== the weight reference table, v1 beside v2 ===");
 
         var ids = Wrt.Standing.Select(r => r.Key)
             .Concat(Wrt.Yours.Select(r => r.Key))
@@ -3536,7 +3790,7 @@ internal static class Dump
     private static void RuneTable(StringBuilder b, GameController gc)
     {
         b.AppendLine();
-        b.AppendLine("=== runes ===");
+        SectionHeader(b, "=== runes ===");
 
         var runes = Safe.Read(() => gc.Files.Expedition2Runes.EntriesList, null);
 
@@ -3610,7 +3864,7 @@ internal static class Dump
     private static void RemnantSlotsFromTheClient(StringBuilder b)
     {
         b.AppendLine();
-        b.AppendLine("=== what the client says about each remnant's slots ===");
+        SectionHeader(b, "=== what the client says about each remnant's slots ===");
         b.AppendLine("  Slots are the CLIENT's numbering, from zero. The weights table above numbers " +
                      "from one, so its slot 1 is this section's slot 0.");
         b.AppendLine("  A * on a slot means the game passes that slot's rune on; everything else is local.");
@@ -3659,7 +3913,7 @@ internal static class Dump
     private static void AtlasPassives(StringBuilder b, GameController gc)
     {
         b.AppendLine();
-        b.AppendLine("=== atlas passives ===");
+        SectionHeader(b, "=== atlas passives ===");
 
         var panel = Safe.Read(gc, static g => g.IngameState.IngameUi.AtlasTreePanel, null);
         var passives = Safe.Read(() => panel?.Passives, null);
@@ -4053,7 +4307,7 @@ internal static class Dump
             return;
 
         b.AppendLine();
-        b.AppendLine($"=== every recipe in the game ({recipes.Count}) ===");
+        SectionHeader(b, $"=== every recipe in the game ({recipes.Count}) ===");
         b.AppendLine("  len  id                                  reward                          runes by slot");
 
         var lines = new List<(int Needs, string Id, string Line)>();
@@ -4139,7 +4393,7 @@ internal static class Dump
         }
 
         b.AppendLine();
-        b.AppendLine($"=== rewards the price list values at nothing ({counted} of {recipes.Count} recipes) ===");
+        SectionHeader(b, $"=== rewards the price list values at nothing ({counted} of {recipes.Count} recipes) ===");
         b.AppendLine("  Grouped by ClassName, which with Metadata is what NinjaPricer's ComputeType reads.");
         b.AppendLine("  A class listed here is one it gives no ItemType to, so it prices nothing in it.");
 
@@ -4206,7 +4460,7 @@ internal static class Dump
     private static void RuneSlots(StringBuilder b, GameController gc)
     {
         b.AppendLine();
-        b.AppendLine("=== which runes may sit in which slot ===");
+        SectionHeader(b, "=== which runes may sit in which slot ===");
 
         var weights = Safe.Read(() => gc.Files.Expedition2RunesWeights.EntriesList, null);
 
@@ -4355,7 +4609,7 @@ internal static class Dump
         var all = Safe.Read(() => gc.EntityListWrapper.Entities?.ToList(), null) ?? new List<Entity>();
 
         b.AppendLine();
-        b.AppendLine($"=== entities ({all.Count} in the list) ===");
+        SectionHeader(b, $"=== entities ({all.Count} in the list) ===");
 
         // Anything at all with "expedition" in it, at any distance, because a controller or a
         // detonator can sit well outside the range a chest sweep would use.
@@ -4380,7 +4634,7 @@ internal static class Dump
         // stand for different content agree on every line here, then nothing in this dump
         // classifies them and the next place to look is the file tables.
         b.AppendLine();
-        b.AppendLine("=== markers, grouped by what might classify them ===");
+        SectionHeader(b, "=== markers, grouped by what might classify them ===");
 
         var markers = expedition
             .Where(x => Safe.Read(() => x.Metadata, "")?.EndsWith("ExpeditionMarker", StringComparison.Ordinal) == true)
@@ -4399,7 +4653,7 @@ internal static class Dump
         // The compact view, and the one to diff. Two dumps - the placement indicator over a cluster
         // in one and well away in the other - and whatever changed here is the highlight.
         b.AppendLine();
-        b.AppendLine("=== highlight candidates, one line each (diff two dumps to find the signal) ===");
+        SectionHeader(b, "=== highlight candidates, one line each (diff two dumps to find the signal) ===");
 
         foreach (var entity in expedition.Concat(chests).Concat(monsters))
         {
@@ -4419,9 +4673,23 @@ internal static class Dump
         b.AppendLine();
         b.AppendLine($"--- {title} ---");
 
+        var clock = new System.Diagnostics.Stopwatch();
+
         foreach (var entity in entities)
+        {
+            clock.Restart();
+
             Describe(b, entity);
+
+            _entityTimes.Add((clock.Elapsed.TotalMilliseconds,
+                $"[{Safe.Read(() => entity.Id, 0u)}] {Safe.Read(() => entity.Metadata, "")}"));
+        }
     }
+
+    /// <summary>
+    /// How long each entity took to describe, for the slowest few in the section timings. See SectionHeader.
+    /// </summary>
+    private static readonly List<(double Ms, string Entity)> _entityTimes = new();
 
     private static void Describe(StringBuilder b, Entity entity)
     {

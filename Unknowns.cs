@@ -309,9 +309,17 @@ internal static class Unknowns
             {
                 r.Seen = now;
 
-                // Filed before the kind was recorded, or filed off an effect that has no kind.
-                if (already.Kind == null && kind != TargetKind.Unknown)
-                    r.Kind = kind.ToString();
+                // **The cell records what the classifier says, so it is maintained rather than left
+                // as first written.** It used to be filled only when null, which is right for a row
+                // filed before the kind was recorded and wrong when a classifier rule changes: the
+                // sulfur pile's row kept saying Entrance after EncasedShrine was taken out of the
+                // entrance branch, and a stored cell that contradicts the code is the fault this table
+                // exists to prevent. Nothing scores off it - Weighing asks the target, not the row -
+                // so correcting it moves no answer.
+                var said = kind == TargetKind.Unknown ? null : kind.ToString();
+
+                if (already.Kind != said)
+                    r.Kind = said;
             });
 
             return;

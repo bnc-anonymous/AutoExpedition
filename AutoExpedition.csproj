@@ -15,6 +15,25 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!--
+      The harness is its own program with its own entry point, and the SDK's glob would otherwise compile it
+      into the plugin. Excluded by folder rather than by file, so a second harness source needs no change here.
+    -->
+    <Compile Remove="tools\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The offline harness under tools/offline references this assembly and calls into the solver, which is
+      internal throughout. It compiles none of these sources itself, so there is one implementation of the
+      search rather than a copy that can drift. It is a separate build output from the one the HUD compiles
+      into Plugins/Temp, so the two can be out of step: a change needs this project built for the harness and
+      the plugin reloaded for the game. See tools/offline/OfflineOpenings.csproj.
+    -->
+    <InternalsVisibleTo Include="OfflineOpenings" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Set the exileCore2Package environment variable to your ExileCore2 folder -->
     <Reference Include="ExileCore2">
       <HintPath>$(exileCore2Package)\ExileCore2.dll</HintPath>

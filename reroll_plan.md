@@ -164,6 +164,15 @@ ordinary window rather than the reroll loop's. **Implemented** - see `Planning.D
 pricing change rather than kept beside it. What survives of it is "the best position for this remnant,
 ordered", which is what `worth(r)` needs.
 
+**What a reposition costs, measured and then retired [2026-09-28].** `Rolling.Positioning` timed a score
+against a `Planner.Restitched` reposition and asked whether the socket count changes the best order. It ran in
+every dump and every reading gave the same answer: the socket count changed the best order on **0 of 12 runes**,
+so the position can be cached per rune set. Costs read: 252us a reposition against 54us a score on Scorched Cay
+(2026-09-27), 259us against 50us on Craggy Peninsula, and 1,154us against 68us on Scorched Cay (2026-09-28).
+It was deleted because it cost **10,200ms of a 10,831ms dump** on that last site, on the game's thread - almost
+all of it outside its own timers, in the candidate generation and the untimed warm-up calls, which were not
+measured apart. It was deleted in `7f455d1`; its parent has it, if the question needs asking again.
+
 ## What the enumeration does now [2026-09-25]
 
 It drew a socket count, how many slots propagate, and then **two runes independently** from a global

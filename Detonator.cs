@@ -655,6 +655,28 @@ internal static class Detonator
     public static bool SetOff(Vector2 at) =>
         _setOff.Contains(((int)MathF.Round(at.X), (int)MathF.Round(at.Y)));
 
+    /// <summary>
+    /// Whether the dig site being stood in has been set off, by either signal.
+    ///
+    /// **Both, because each one is blind in a case the other covers.** ExplosivesDetonated walks the
+    /// entity list for this site's detonator and returns -1 when it is not in it, so a spent site
+    /// whose detonator has unloaded reads as a site that was never set off - and that is the normal
+    /// state of affairs, because looting happens after the blasts and is spread across a dig site.
+    /// SetOff is the same question answered and remembered while the walk had the entity in hand, so
+    /// it survives walking away, and it knows nothing about a site first seen after the fact.
+    ///
+    /// The live read stays in front as the fast path for the site being stood on.
+    /// </summary>
+    public static bool SetOffHere(GameController gc)
+    {
+        if (ExplosivesDetonated(gc) >= 1)
+            return true;
+
+        var site = DetonatorGridPosition(gc);
+
+        return site != Vector2.Zero && SetOff(site);
+    }
+
     private static readonly HashSet<(int X, int Y)> _setOff = new();
 
     public static Vector2 DetonatorGridPosition(GameController gc)

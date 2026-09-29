@@ -1,4 +1,5 @@
-﻿using System;
+﻿using System.Text.RegularExpressions;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime;
@@ -50,7 +51,7 @@ namespace AutoExpedition;
 internal static class Migrated
 {
     /// <summary>Raise this and add a case below whenever a shipped value must reach saved files.</summary>
-    public const int Current = 12;
+    public const int Current = 14;
 
     /// <summary>
     /// The weights whose number the plan actually took from the settings file, and the table row
@@ -227,7 +228,7 @@ internal static class Migrated
             said.AddRange(CopiedFromPath(saved, "Display.Remnants.Lines.LineColour",
                 rewards?.LineColour, "the reward line colour"));
             said.AddRange(CopiedFromPath(saved, "Display.Remnants.Lines.LineThickness",
-                rewards?.LineThickness, "the reward line thickness"));
+                rewards?.LineThicknessInWorld, "the reward line thickness"));
             said.AddRange(CopiedFromPath(saved, "Display.Remnants.Rewards.ChosenColour",
                 rewards?.OverruledColour, "the warning colour"));
         }
@@ -260,6 +261,27 @@ internal static class Migrated
             said.AddRange(CopiedFromPath(saved, "Display.PlacementCircle.SnapshotMs",
                 settings?.Display?.PlacementCircle?.PanelCacheMs, "the panel cache interval"));
 
+
+        // **13 - each line to a remnant got a thickness per surface.** One thickness served the world
+        // and the minimap, and a line thick enough to read in the world covers the markers around it on
+        // the map. The saved value was the world's, so it goes there; the minimap starts at its default.
+        if (was < 13)
+        {
+            said.AddRange(CopiedFromPath(saved, "Display.Remnants.Rewards.LineThickness",
+                settings?.Display?.Remnants?.Rewards?.LineThicknessInWorld, "the reward line thickness"));
+            said.AddRange(CopiedFromPath(saved, "Display.Remnants.Rerolls.RollLineThickness",
+                settings?.Display?.Remnants?.Rerolls?.RollLineThicknessInWorld, "the reroll line thickness"));
+        }
+
+        // **14 - "hold=" in the thread roles became "keep-opening=".** The word did not say what was held, or
+        // that it only means anything to a worker given an enumerated opening. Rewritten in place rather than
+        // accepted as a second spelling, so the line has one word for it. See ThreadRoles.
+        if (was < 14 && settings?.Solver?.Advanced?.DestroyAndRepair?.ThreadRoles is { } roles &&
+            roles.Value is { } line && Regex.IsMatch(line, @"\bhold="))
+        {
+            roles.Value = Regex.Replace(line, @"\bhold=", "keep-opening=");
+            said.Add("renamed hold= to keep-opening= in the thread roles");
+        }
 
         settings.ConfigVersion = Current;
 
@@ -707,7 +729,49 @@ internal static class Section
 /// comparison somebody is actually making. The costs are relative on purpose: the absolute numbers
 /// move with the site and the dump reports the real ones per run, under "what the last run did".
 /// </summary>
-internal static class Mixes
+internal static class RoleEditor
+{
+    /// <summary>
+    /// Draws the thread roles as a box of several lines, one per worker, instead of the host's single-line
+    /// field.
+    ///
+    /// **The host's field has a fixed buffer and the line outgrew it.** Eight workers described in full is
+    /// over two hundred characters and it was being cut off, which silently changes the pool - the parser
+    /// then reads a truncated last entry and reports it, but the setting is already lost. Any grammar
+    /// eventually outgrows a fixed box, so the box is the thing to replace.
+    ///
+    /// One worker per line here, joined back with semicolons on the way in and split on the way out, so what
+    /// is stored is still the one line the parser and the dump expect. Blank lines are dropped, so a stray
+    /// newline is not a worker with no role.
+    /// </summary>
+    public static void Draw()
+    {
+        var settings = Dump.Settings;
+
+        if (settings == null)
+            return;
+
+        var said = settings.Solver.Advanced.DestroyAndRepair.ThreadRoles.Value ?? "";
+        var lines = said.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var box = string.Join("\n", lines);
+
+        ImGui.TextUnformatted("One worker per line: a tearing bias, then opening= and keep-opening=.");
+
+        // Roomy on purpose: the buffer is the thing that broke, so it is far larger than any pool needs.
+        if (ImGui.InputTextMultiline("###aeRoles", ref box, 4096,
+                new System.Numerics.Vector2(ImGui.GetContentRegionAvail().X - 20f,
+                    ImGui.GetTextLineHeight() * 10f)))
+        {
+            var back = box.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+            settings.Solver.Advanced.DestroyAndRepair.ThreadRoles.Value = string.Join("; ", back);
+        }
+
+        RoleWords.Draw();
+    }
+}
+
+internal static class RoleWords
 {
     public static void Draw()
     {
@@ -1178,6 +1242,22 @@ public class SolverSettings
     /// the measurement to take, and the range goes down to five. See Solving.
     /// </summary>
     [Menu("Threads")]
+    /// <summary>
+    /// **Eight is a ceiling by decision, not by measurement, and it is not to be raised.**
+    ///
+    /// A press scores the BEST of its workers, and they are not close. Measured over five cold presses
+    /// of one site in an eight second window: the winning worker reached 9,043 / 7,861 / 10,400 / 9,970
+    /// / 9,496 while the MEDIAN worker of the same press sat at 7,811 / 7,657 / 7,367 / 7,452 / 7,367.
+    /// Seven workers reliably find about 7,400 and one occasionally finds ten thousand, so a press is
+    /// worth whatever the luckiest of eight found - and the press that scored 7,861 is the one where
+    /// none of them found it.
+    ///
+    /// That makes more workers the most direct lever on the median, and it is deliberately refused: the
+    /// game wants these cores, a HUD plugin taking every one of them is not a trade a player should
+    /// have to make, and the search has to earn its result inside the budget it is given. So the lever
+    /// is **more attempts per worker** instead - see Repair's restart on stagnation, which is what that
+    /// decision points at.
+    /// </summary>
     public RangeNode<int> Threads { get; set; } = new RangeNode<int>(8, 5, 8);
 
     [Submenu(CollapsedByDefault = true)]
@@ -1518,6 +1598,11 @@ public class RerollSettings
     /// remnant the enumeration did. The enumerated figures still appear beside it and are what the
     /// display shows; they are not what chose.
     ///
+    /// In this mode the presolve does not stop when a pass fails to improve: it keeps solving, each
+    /// pass on a fresh draw, until the action key stops it or every remnant at the site has been
+    /// rolled - and then it ends when the pass in flight ends. A roll after the key has stopped it
+    /// starts it again. Needs Presolve switched on. See Rehearsal.Continuing.
+    ///
     /// **Off** dispatches nothing.
     /// </summary>
     [Menu("Mode")]
@@ -1547,6 +1632,27 @@ public class RerollSettings
     public RangeNode<int> CommittedWithin { get; set; } = new RangeNode<int>(0, 0, 200);
 
     /// <summary>
+    /// How little the site score may rise over one improvement window before the first reroll advice at a site
+    /// starts, as a percentage. Applies to presolve plans only, and only until the first advice at each site.
+    ///
+    /// The advice waits for the site's content to stop arriving first, and then for the score to stop climbing
+    /// fast: a presolve on a site whose content is all known already - a benchmark on a semi-cold start - is still
+    /// improving quickly, and advice weighed against its early chains is about chains that will not last. The
+    /// score is the site's own, without the must-take bonus, which is a constant and would swamp a percentage.
+    /// The window is the site's "Time to improve" setting. 5 is chosen; the dump reports the rise the advice
+    /// started at, so it can be checked.
+    /// </summary>
+    [Menu("Start advice below improvement (%)")]
+    public RangeNode<int> StartAdviceBelowImprovement { get; set; } = new RangeNode<int>(5, 0, 100);
+
+    /// <summary>
+    /// The longest the first reroll advice at a site waits for the score to stop climbing, in improvement windows,
+    /// counted from when the site's content stopped arriving. See StartAdviceBelowImprovement.
+    /// </summary>
+    [Menu("Start advice after at most (windows)")]
+    public RangeNode<int> StartAdviceAfterWindows { get; set; } = new RangeNode<int>(3, 1, 10);
+
+    /// <summary>
     /// The improvement window for the re-solve that follows a reroll, and for nothing else.
     ///
     /// **The loop is solve, suggest a roll, roll it, solve again - and its length is the whole of
@@ -1564,6 +1670,24 @@ public class RerollSettings
     /// </summary>
     [Menu("Time to improve after a reroll (ms)")]
     public RangeNode<int> LoopSolveMs { get; set; } = new RangeNode<int>(1000, 100, 10000);
+
+    /// <summary>
+    /// How long each pass of the continuous reroll mode runs, or nought for the length of an ordinary presolve
+    /// pass. A pass still ends early when a remnant is rolled or the site changes.
+    ///
+    /// Each pass starts on a new draw and keeps the standing plan as its floor, so a longer pass trades draws
+    /// for search depth. Within one pass the pool's best has been within 0.7-2.3% of its end by half way in
+    /// every 8s batch on Scorched Cay, which favours more draws; whether a longer pass does better has not been
+    /// measured, and this is the setting to measure it with. Three times the presolve window is chosen, not
+    /// measured. The kick, keep-opening and refine-after stay shares of the ordinary window, so a
+    /// long pass still kicks and releases openings on the usual clock.
+    /// </summary>
+    [Menu("Continuous pass length (ms, 0 = as a presolve pass)")]
+    public RangeNode<int> ContinuousPassMs { get; set; } = new RangeNode<int>(12000, 0, 600000);
+
+    /// <summary>The same on a Grand Expedition. See ContinuousPassMs.</summary>
+    [Menu("Continuous pass length in a Grand Expedition (ms, 0 = as a presolve pass)")]
+    public RangeNode<int> ContinuousPassMsGrand { get; set; } = new RangeNode<int>(24000, 0, 600000);
 
     /// <summary>
     /// The longest the reroll advice may take before it reports what it has.
@@ -1682,12 +1806,82 @@ public class AdvancedSolverSettings
 public class DestroyAndRepairSettings
 {
     /// <summary>
+    /// What each worker in the pool does, one entry per worker: its tearing bias, the opening it starts from,
+    /// how long it keeps that opening, and whether it takes the pool's best.
+    ///
+    /// **One line, because three settings used to describe a worker without knowing about each other.** A
+    /// tearing mix named an operator per worker, an independent-threads list named the workers that never
+    /// adopt, and a modulo in the search decided which drew their own opening - three rules indexing one
+    /// number. What came out was nobody's design: one worker was both the only segment-biased one and a hedge,
+    /// one operator was named twice, and three workers had no bias at all.
+    ///
+    /// See ThreadRoles for the grammar. Unreadable words are reported rather than ignored, and the dump prints
+    /// the table it understood, so a typo cannot quietly change the pool.
+    ///
+    /// **The shipped line, from the batches of 2026-09-29 on Scorched Cay** (Grand, 8s, draws 11-30 and 31-50).
+    /// Two workers each biased seg, reach and even, three touring, three on enumerated openings held for 30%
+    /// of the window. It scored a mean press maximum of 15,197 on draws 11-30, the highest of the day, with
+    /// no rel workers at all: taking rel out cost nothing measurable, while four reach-biased workers did
+    /// (14,991). The line it replaced held five openings for the whole window (keep-opening=100), and a pool
+    /// of those measured far worse (14,326). One Grand site; not yet measured on a regular one.
+    /// </summary>
+    [Menu("Thread roles")]
+    public TextNode ThreadRoles { get; set; } = new TextNode(
+        "even opening=continue; even opening=tour; even opening=enumerated keep-opening=30; " +
+        "reach opening=tour; reach opening=enumerated keep-opening=30; seg opening=fresh; seg opening=tour; " +
+        "seg opening=enumerated keep-opening=30");
+
+    /// <summary>
+    /// What the five names mean, behind a marker beside the field.
+    ///
+    /// **The second place in this plugin where a help icon earns itself.** The field takes five
+    /// words that mean nothing on sight, and the choice between them is a judgement about this site
+    /// - whether it is spread out enough for reach to have anywhere to go, whether worst is going to
+    /// find any dead weight to cut. That is five short comparisons, which is a table rather than a
+    /// sentence, and putting it in the field's own tooltip would make one settings row hold a page.
+    ///
+    /// Drawn SameLine so it sits against the field rather than under it: the settings parser gives
+    /// every property its own row, and a marker on its own row reads as another setting.
+    /// </summary>
+    [JsonIgnore]
+    public CustomNode ThreadRolesHelp { get; set; } = new CustomNode(RoleEditor.Draw);
+
+    /// <summary>
     /// The smallest run of links Destroy and repair tears out at once.
     ///
     /// One is cheap and finds the obvious rearrangement. It is also the only size that can be tried
     /// thousands of times in a window, which is why it stays the floor rather than being raised when
     /// the larger tears go in.
     /// </summary>
+    /// <summary>
+    /// Stop each worker after this many rounds instead of on the clock. Nought uses the clock, which is what a
+    /// real press does.
+    ///
+    /// **For measurement, because a press bounded by time is not reproducible and the whole pairing depends on
+    /// it.** Every seed in the search is a constant plus the worker's number plus the draw, so two batches on
+    /// draw five ought to build the identical chain - that is what common random numbers are for, and it is why
+    /// a batch walks the same draws every time. It does not happen: a press does however many rounds fit in its
+    /// window, and that count moves with everything else on the machine. Measured on one site, two batches at an
+    /// identical configuration over the same draws returned medians of 8,634 and 10,025, which is three times
+    /// the error a ten press median should have.
+    ///
+    /// With a round budget the work is the same every time, so a draw reproduces and a difference between two
+    /// configurations is the configuration.
+    ///
+    /// **Per worker, which is not the figure the press table prints.** That column is the pool's total, so an
+    /// eight second press reading 10,700 rounds did about 1,340 apiece; the per-worker count is the one in the
+    /// destroy and repair line, measured at 1,173 to 2,515 on a Grand site. A budget of 1,500 is about an eight
+    /// second press at the pace recently measured, and 2,500 is the pace of a faster session - setting it to the
+    /// pool total would be a press seven times longer than anybody is waiting for.
+    ///
+    /// **It does not make a press deterministic outright.** The band search and the opening are still bounded by
+    /// their own clocks, so a worker's starting chain can still differ; what this fixes is the improvement loop,
+    /// which is where the window goes. Leave it at nought for play - a round budget makes a press take as long
+    /// as it takes, which on a slow frame is longer than the window a player is waiting for.
+    /// </summary>
+    [Menu("(MEASUREMENT) Rounds per worker, 0 for the clock")]
+    public RangeNode<int> RoundsPerWorker { get; set; } = new RangeNode<int>(0, 0, 20000);
+
     [Menu("Smallest tear (links)")]
     public RangeNode<int> TearLeast { get; set; } = new RangeNode<int>(1, 1, 8);
 
@@ -1708,187 +1902,6 @@ public class DestroyAndRepairSettings
     /// </summary>
     [Menu("Largest tear (links)")]
     public RangeNode<int> TearMost { get; set; } = new RangeNode<int>(8, 1, 20);
-
-    /// <summary>
-    /// Give each thread a different appetite for the four ways of tearing.
-    ///
-    /// **The adaptive weights need wins to learn from, and cannot learn when there are none.** Each
-    /// worker ranks the destroys by what they return and starts them all equal - so with records
-    /// rare, every rate sits near the floor, the weights never separate, and eight workers
-    /// independently fail to find the same evidence. That is one non-experiment run eight times.
-    ///
-    /// Seeded instead: one worker in five stays balanced, and the rest lean hard on a single destroy
-    /// - seventy per cent to it and ten to each of the others - so the question "does this operator
-    /// suit this site" is asked in parallel rather than discovered slowly and separately. A parallel
-    /// portfolio, which is how solvers that cannot know the right configuration in advance usually
-    /// handle not knowing it.
-    ///
-    /// The bias is a prior, not a cage: Reweigh still runs, so a specialist that finds its operator
-    /// genuinely useless drifts back towards the others.
-    /// </summary>
-    [Menu("Vary the tearing mix per thread")]
-    public ToggleNode VaryOperators { get; set; } = new ToggleNode(true);
-
-    /// <summary>
-    /// Whether each worker seeds its own bands, or they all take the first one's.
-    ///
-    /// **The pool's openings are where its diversity has to come from, and they were shared.**
-    /// Off, every worker asks for worker nought's seeding and comes out with the same band
-    /// chain, so eight threads descend from one place - measured on a Grand site, all eight
-    /// built and finished on the identical score with nought improvements between them.
-    ///
-    /// **On, and measured worse, because the shake undoes it before anything reads it.** Seven
-    /// of eight workers each ran their own band search at about 1,770ms, so the openings really
-    /// did differ - and every worker still BUILT the identical 4,402, because a shaken opening
-    /// tears a third of the chain twice and eight different band chains arrive as eight equally
-    /// wrecked ones. The 1.3s a worker bought nothing and halved the rounds, 3,838 to 1,975, and
-    /// the site scored 20,092 against 23,517.
-    ///
-    /// So diversity wants to come from the shake or from the bands, not both, and the shake is
-    /// free. Off by default on that measurement rather than on the older one about window cost.
-    ///
-    /// Kept switchable because it is a property of the site rather than of the plugin: somewhere
-    /// the bands differ enough to survive a shake, this is the switch. See Repair.Banded.
-    /// </summary>
-    [Menu("Give each worker its own opening",
-        "Each search thread works out its own starting chain instead of\n" +
-        "sharing one. Finds more, and spends longer before it starts.")]
-    public ToggleNode VaryOpenings { get; set; } = new ToggleNode(false);
-
-    /// <summary>
-    /// Which destroy each thread favours, one entry per thread, in order.
-    ///
-    /// **The mix was four fixed variations on a cycle and there is no reason to think those are the
-    /// right four.** The four destroys suit different sites - reach finds most of the records on
-    /// some and none at all on others - and which of them is worth eight threads' attention is
-    /// exactly the question nobody can answer in advance. So it is written here rather than decided
-    /// in code.
-    ///
-    /// One entry per thread, comma separated, read in order; a thread with no entry of its own is
-    /// even. The names are <c>even</c>, <c>seg</c>, <c>worst</c>, <c>rel</c> and <c>reach</c> -
-    /// a random contiguous run, the links worth least, the links nearest a chosen one, and the one
-    /// that bridges to something the chain is missing.
-    ///
-    /// A bare name leans seventy per cent on it and spreads ten to each of the others. Follow it
-    /// with a colon and a number to say how hard: <c>reach:90</c> leans ninety, <c>seg:40</c> only
-    /// forty. The rest is always shared equally among the other three.
-    ///
-    /// <code>even, seg, worst, rel, reach, even, seg, worst</code>
-    ///
-    /// **A lean, not a rule.** Reweigh runs from the first round and moves these towards whatever is
-    /// actually returning, so a thread told to favour something useless drifts off it within a few
-    /// hundred rounds. Setting every thread to <c>even</c> is the same as switching the box above
-    /// off.
-    /// </summary>
-    [Menu("Tearing mix per thread")]
-    public TextNode TearingMix { get; set; } =
-        new TextNode("even, reach, rel, seg, reach");
-
-    /// <summary>
-    /// What the five names mean, behind a marker beside the field.
-    ///
-    /// **The second place in this plugin where a help icon earns itself.** The field takes five
-    /// words that mean nothing on sight, and the choice between them is a judgement about this site
-    /// - whether it is spread out enough for reach to have anywhere to go, whether worst is going to
-    /// find any dead weight to cut. That is five short comparisons, which is a table rather than a
-    /// sentence, and putting it in the field's own tooltip would make one settings row hold a page.
-    ///
-    /// Drawn SameLine so it sits against the field rather than under it: the settings parser gives
-    /// every property its own row, and a marker on its own row reads as another setting.
-    /// </summary>
-    [JsonIgnore]
-    public CustomNode TearingMixHelp { get; set; } = new CustomNode(Mixes.Draw);
-
-    /// <summary>
-    /// Let a stuck thread carry on from the best chain any thread has found.
-    ///
-    /// **Seven of eight threads spend the window arriving somewhere that is thrown away.** Measured
-    /// on one press from nothing: 3,422, 3,600, 4,198, 4,282, 4,336, 4,451, 4,488 and 5,222. The
-    /// answer is the best of them, so seven full eight second searches bought nothing, and two
-    /// finished below where a greedy opening starts. That is what independent multi-start costs -
-    /// it is the safest parallelism there is, and it is eight samples of one search rather than one
-    /// search eight times the size.
-    ///
-    /// Pressing again already fixes it, at the price of a press: the second solve inherits the
-    /// first's chain and improves on it, measured at +207 where a press from nothing gained nothing.
-    /// This is the same exchange without the wait - the thread at 3,422, at the moment it gives up
-    /// and kicks, starts again from the 5,222 instead of from its own.
-    ///
-    /// **Only at a kick**, where the chain was going to be thrown away regardless, so it costs no
-    /// search time. One thread in four never adopts, and nobody moves for a lead smaller than half a
-    /// per cent - between them that keeps the pool from collapsing onto a single answer, which would
-    /// lose exactly the diversity that found the good chain.
-    ///
-    /// **Off by default, because the answer is the MAX and sharing trades the tail for the median.**
-    ///
-    /// The argument above is sound and points the wrong way for this objective. Adopting rescues a
-    /// thread that has fallen into a bad chain - 3,071.9 is a trap two threads landed in on one press
-    /// and never left - and lifts it to about the leader's number. That raises the pool's mean and
-    /// its floor, both of which are discarded: only the best thread's chain is kept.
-    ///
-    /// What it costs is the chance of an outlier. Four of five threads abandon their own trajectory
-    /// at their first kick, so only the held-out one can still produce a surprise. Measured, an
-    /// adopter that went on to beat what it adopted was worth +30. The best press of the day was a
-    /// thread left alone reaching 4,936 against a baseline of 4,197 - worth +739, and it happened
-    /// once in two presses with sharing off and never in seven with it on.
-    ///
-    /// Two presses is not a proof and this is a judgement rather than a measurement: for an
-    /// objective that keeps the maximum, five independent samples beat one consensus and four
-    /// spectators. Turn it on for a steadier average - if a use ever appears that wants one.
-    /// </summary>
-    [Menu("Share the best chain between threads")]
-    public ToggleNode ShareBest { get; set; } = new ToggleNode(false);
-
-    /// <summary>
-    /// Threads that never adopt, comma separated, counted from nought.
-    ///
-    /// **A pool where everybody adopts is one search on several threads.** The answer kept is the
-    /// best of the workers, so what the pool needs is not the leader's chain repeated but a spread
-    /// of answers around it - and a worker that moves onto the incumbent every time it stalls stops
-    /// contributing a second opinion. Keeping some threads out is the hedge against that: if the
-    /// incumbent is a good-looking trap, somebody is still elsewhere, and when one of them finds
-    /// something better it publishes and the adopters move to IT.
-    ///
-    /// <code>0</code>
-    ///
-    /// The default is thread nought alone, which is the smallest honest hedge and the same rule the
-    /// tearing mix uses for its balanced thread - there is always one worker doing the ordinary
-    /// thing to compare against. Empty means everybody adopts. A number past the end of the pool is
-    /// ignored rather than an error.
-    ///
-    /// **It was a modulus and the modulus was an accident.** Every fourth thread was held out, which
-    /// reserves a quarter of an eight thread pool and two fifths of a five thread one - a fraction
-    /// that moved with the thread count for no reason anybody chose. Written down instead, so the
-    /// hedge is whatever it says and not whatever the arithmetic lands on.
-    ///
-    /// Honest note: the hedge has not paid yet. On the press where sharing first fired, the held-out
-    /// threads finished at 4,282.5 and 4,439.9 against a shared 4,490.8 - two workers that could
-    /// have been lifted and were not. It is insurance, and this is the field for deciding how much
-    /// of it to buy.
-    /// </summary>
-    [Menu("Independent threads")]
-    public TextNode ShareNot { get; set; } = new TextNode("0, 1");
-
-    /// <summary>
-    /// How hard a thread shakes a chain it has just taken from another thread.
-    ///
-    /// **A migration is only worth making if the worker ends up somewhere the leader is not.** The
-    /// pool already has the leader's answer; a second copy of it is worth nothing. What a stuck
-    /// worker can add is a DIFFERENT answer near a good one - and to find one it has to be thrown
-    /// far enough from the adopted chain that the local search cannot simply walk back to it.
-    ///
-    /// The ordinary kick shakes one to three times, each tearing about a third of the chain, and
-    /// that is tuned for perturbing a chain the worker found itself and knows the region of.
-    /// Measured on the first press where sharing fired, three adopters all finished on exactly
-    /// 4,490.8 - the adoption paid, since none of them reached that alone, but all three landed on
-    /// the same point rather than spreading around it.
-    ///
-    /// Three shakes is roughly the whole chain rebuilt once over. Lower is a cheaper move that stays
-    /// nearer what was adopted; higher approaches throwing the chain away, which is what kicking
-    /// from the record was written to avoid. Only has any effect with sharing on.
-    /// </summary>
-    [Menu("Shake strength after adopting")]
-    public RangeNode<int> AdoptedShake { get; set; } = new RangeNode<int>(2, 0, 10);
 
     /// <summary>
     /// How far below the best any thread may fall before it abandons its chain and starts again, as
@@ -1913,7 +1926,25 @@ public class DestroyAndRepairSettings
     /// Ten per cent sits well below the traps (a quarter down) and well above ordinary disagreement
     /// between healthy threads, which runs to about two.
     /// </summary>
-    [Menu("Restart threshold (% below best)")]
+    /// <summary>
+    /// **The property is the odd name out and has been left alone deliberately.** The label is
+    /// "At a kick, restart if behind the pool by (%)", the environment carries it as RestartThreshold and
+    /// the dump prints it in the label's words; this property still says RescueBelow because renaming it
+    /// abandons the value people have saved, where the label and the doc cost nothing to move. Rename
+    /// it in a change that says so and migrates the stored key.
+    ///
+    /// **Measured in the units of what the site pays, not of the score.** Solving.Behind takes the
+    /// margin against the plain figure - see _sharedPlain - so ten per cent here means ten per cent of
+    /// the content on offer. On a site with a held must-take that is far stronger than it used to be,
+    /// because the score is mostly the insistence ceiling: at 9,506 plain of 34,908 total, ten per
+    /// cent went from asking 3,490 points to asking 951, and thirteen restarts fired in one press
+    /// where every earlier press had none.
+    ///
+    /// **One of three settings that work as one mechanism.** The two kick settings decide when a worker is
+    /// interrupted; at each kick, this and "At a kick, restart if no progress for (ms)" decide whether the
+    /// interruption is a shake of its best chain or a restart from nothing, and either one being true restarts.
+    /// </summary>
+    [Menu("At a kick, restart if behind the pool by (%)")]
     public RangeNode<float> RescueBelow { get; set; } = new RangeNode<float>(10f, 0f, 50f);
 
     /// <summary>
@@ -1933,7 +1964,8 @@ public class DestroyAndRepairSettings
     /// because an opening is worth about thirty per cent of a finish. A restarted thread does not
     /// need a good chain. It needs one nobody else is standing on.
     ///
-    /// **Four by default, on the strongest result measured here.** Seven cold presses with the pair
+    /// **Four on the strongest result measured here; shipped at eight with the tuned defaults of 2026-09-24
+    /// (795ea5c), with the measurement for eight not recorded here.** Seven cold presses with the pair
     /// in force reached the site's better chain four times - 4,874, 4,874, 4,874 and 4,936 against
     /// 4,121, 4,130 and 4,151 - where every other configuration tried managed three in eighteen.
     /// Fisher's exact on that is about 0.04.
@@ -1948,6 +1980,52 @@ public class DestroyAndRepairSettings
     /// </summary>
     [Menu("Shake strength after restart")]
     public RangeNode<int> RestartShakes { get; set; } = new RangeNode<int>(8, 0, 20);
+
+    /// <summary>
+    /// How long a worker may go without progress before it is kicked, as a percentage of the improvement
+    /// window. Nought kicks on the round count alone. See StagnationKickRounds. A kick shakes the worker's best
+    /// chain, unless one of the two restart settings says to start again instead.
+    ///
+    /// The round count on its own ties the kick to how fast a worker runs. Measured on Craggy Peninsula, twenty
+    /// explosives: most workers ran 25 to 30ms a round, so 500 rounds was 12 to 15 seconds, longer than the eight
+    /// second window, and they took one or two kicks a press where the fastest took seventeen. The tear size
+    /// climbs towards the kick too, so those workers also rarely tried the larger tears.
+    ///
+    /// Whichever comes first kicks. 50 is chosen, not measured. Ignored while measuring with a round budget.
+    /// </summary>
+    [Menu("Kick after no progress (% of window)")]
+    public RangeNode<int> StagnationKickPercent { get; set; } = new RangeNode<int>(50, 0, 100);
+
+    /// <summary>
+    /// How many rounds a worker may run without progress before it is kicked, or nought to kick on the clock
+    /// alone. With both this and StagnationKickPercent at nought a worker is never kicked.
+    ///
+    /// A round is a different length of time on every site. Measured on Scorched Cay, fifteen explosives, 8s
+    /// fixed: workers ran 220 to 950 rounds a press, so 500 was half a press for one and never reached by
+    /// another. Whichever of this and the clock comes first kicks. 500 is the value the constant had; it was
+    /// chosen, not measured.
+    /// </summary>
+    [Menu("Kick after no progress (rounds, 0 = clock only)")]
+    public RangeNode<int> StagnationKickRounds { get; set; } = new RangeNode<int>(500, 0, 5000);
+
+    /// <summary>
+    /// How long a worker's current chain may go without improving before it is thrown away and the worker
+    /// starts again from a fresh construction, or nought for never on this account. Checked at the worker's
+    /// kicks, so it acts at the first kick after the time has passed. Its record is kept either way.
+    ///
+    /// For long solves - the continuous reroll mode with a long pass - where a worker that has settled would
+    /// otherwise be shaken and polished back to the same chain until the solve ends. The behind-the-pool
+    /// restart covers a worker that is far below the rest; this covers one that has simply stopped. The
+    /// worker continuing from the standing plan and refining workers are exempt, since staying on their chain
+    /// is what they are for. Not measured.
+    ///
+    /// **Close kin to a setting removed for not paying.** "Restart after barren kicks" restarted a worker after
+    /// a number of kicks without a record, and on ordinary 8s presses it did not pay; this is the same idea on
+    /// the clock, kept for long solves, which that measurement did not cover. Set it above the kick interval,
+    /// or every kick restarts and no worker is ever shaken.
+    /// </summary>
+    [Menu("At a kick, restart if no progress for (ms, 0 = off)")]
+    public RangeNode<int> StallRestartMs { get; set; } = new RangeNode<int>(0, 0, 60000);
 
     /// <summary>
     /// The most times a thread may shake its opening before searching, which is how different the
@@ -1983,7 +2061,8 @@ public class DestroyAndRepairSettings
     /// That is worth capping only if the tearing is worth more than the construction, which is a
     /// measurement rather than an opinion and has not been taken. On one site the opening produced
     /// the whole score and 290 rounds of tearing added 0.1%; on another the threads gained 4 to 6%
-    /// after opening. So the default is nought - behave as before - and this exists to find out.
+    /// after opening. It shipped at 2,000ms with the tuned defaults of 2026-09-24 (795ea5c); the
+    /// measurement that chose that figure is not recorded here.
     ///
     /// **The band search cannot be interrupted by it.** That pass takes a cancellation token rather
     /// than a clock, so a cap below its cost simply lands after it. The dump reports it separately
@@ -1996,38 +2075,27 @@ public class DestroyAndRepairSettings
     public RangeNode<int> OpeningShakes { get; set; } = new RangeNode<int>(2, 1, 12);
 
     /// <summary>
-    /// How far a slide nudges each link along the route, in grid units. Nought never slides.
+    /// How many near-best spots a randomised opening may choose among at each link. One is greedy.
     ///
-    /// **A compound move, because its parts are not worth making.** Two chains 96 points apart were
-    /// compared by hand: the last four links had each shifted a little further along the route, toward
-    /// where the next one used to be, and only the final link gained anything. Every step of that is
-    /// neutral or slightly worse alone, so single-link relocation refuses the first and never reaches
-    /// the fourth - and tear-and-rebuild misses it too, since the rebuild ranks a few candidates in a
-    /// window around the hole rather than displacing everything after it together.
+    /// **This is GRASP's restricted candidate list, and it is what the draw actually controls.** An
+    /// exploring worker builds its opening by taking the best `n` spots at each step and picking one at
+    /// random, so this number is the whole of the difference between eight workers opening in eight
+    /// places and eight workers opening in one.
     ///
-    /// So the whole displacement is offered as ONE move and judged on what it is worth as a whole,
-    /// which is the ejection-chain idea in its simplest useful form. Each link steps toward the one
-    /// that follows it and snaps to the nearest spot the site actually offers.
+    /// **Why it is the lever worth measuring.** Paired over the same ten draws, turning the barren
+    /// restart on left seven of ten presses bit-identical and moved the median by nothing - while the
+    /// draws themselves ranged from 7,879 to 10,493. The configuration is worth about nought and the
+    /// draw is worth 2,600, and what the draw feeds is this. The two best presses of that batch were
+    /// also the only two where the MEDIAN worker was high, 9,043 and 9,458 against the usual 7,400 - so
+    /// a good press is several workers opening in a good region rather than one getting lucky.
     ///
-    /// Eight grid is roughly a quarter of a blast radius - far enough to change what a link catches,
-    /// near enough that the chain stays legal. Four multiples of it are tried, from every starting
-    /// point in the tail, so the run length and the distance are both swept.
-    ///
-    /// **Nought by default, because it was measured and the move is simply not better.** Four presses
-    /// offered 1,232 slides and improved the chain NOUGHT times - and the implementation was doing what
-    /// it claimed: 241 of 272 slides in one press moved more than one link, three links on average, so
-    /// these were genuine compound displacements rather than single relocations dressed up as them.
-    ///
-    /// Which is worth knowing, because the move was not invented - it was OBSERVED, by eye, between two
-    /// chains 96 points apart. The conclusion is that the observation was of a difference rather than of
-    /// a cause: those four links ended up further along because the better chain happened to be built
-    /// that way, not because sliding there from the worse one was a move anything could have made.
-    ///
-    /// Kept on a switch rather than deleted, as the ordering pass was, in case a longer chain behaves
-    /// differently - a six link tail has little room to slide along. Sliding says whether it ever pays.
+    /// Five is the figure this has always used, as `1 + random.Next(5)`, so five changes nothing.
+    /// Larger means openings that differ more and are individually worse; the window is worth about
+    /// +217% over an opening, so worse-but-different has been the winning trade every time it has been
+    /// measured here. See Repair.Opening and expedition_solve_plan.md 7.
     /// </summary>
-    [Menu("Slide distance")]
-    public RangeNode<float> SlideBy { get; set; } = new RangeNode<float>(0f, 0f, 30f);
+    [Menu("Opening spots to choose among")]
+    public RangeNode<int> OpeningChoices { get; set; } = new RangeNode<int>(5, 1, 24);
 
     /// <summary>
     /// The fewest links a bridge may spend reaching for content the chain is missing.
@@ -2105,8 +2173,75 @@ public class DestroyAndRepairSettings
     /// pay for it. Watch "every ordering tried" in the dump: if it keeps reporting nought improved,
     /// this is dead weight and should go.
     /// </summary>
-    [Menu("Exhaustive ordering limit (links)")]
-    public RangeNode<int> PermuteUpTo { get; set; } = new RangeNode<int>(0, 0, 9);
+    /// <summary>
+    /// Whether the pool's best chain is walked towards the other workers' chains once they have all
+    /// finished, keeping the best chain found on the way.
+    ///
+    /// **Seven of eight results are thrown away every press.** Measured on this site, the winner and the
+    /// median worker had NOUGHT links in common out of fifteen, and the median collected 230 points more
+    /// content while scoring 2,438 less - so the discarded chains are not weak versions of the answer,
+    /// they are different answers. Path relinking is what combines two of those into a third that
+    /// neither worker would have found.
+    ///
+    /// With ALNS - which this plugin has - it is one of the two families that lead on the team
+    /// orienteering problem, which is the closest named form of this puzzle. The GRASP half of it was
+    /// already here in the randomised openings; this is the half that was missing.
+    ///
+    /// Runs after every worker has stopped, so it takes nothing from the search: about 120 scored chains
+    /// per pair at a measured 42us each, three pairs, a few tens of milliseconds on the end of a press.
+    ///
+    /// **On by default, measured on Scorched Cay (Grand, fifteen explosives, 8s, draws 1-10, 2026-09-29).**
+    /// It improved 6 of 10 presses by 1,836 in total, by its own count, with presses no longer: +813 on one
+    /// draw, taking it to 16,428, and 209 to 376 on four more. Its own count is the measurement rather than a
+    /// comparison of two batches, because it runs after the search and keeps its answer only when it scores
+    /// higher, so it cannot lower a press; on the draws where both batches' searches reproduced, the pool's
+    /// best before relinking matched the batch without it exactly. Not yet measured on a regular site.
+    /// </summary>
+    [Menu("Relink the best chain with the others")]
+    public ToggleNode Relink { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// How many links of the opening are enumerated.
+    ///
+    /// Two: a direction and the corridor out of it. The depth the pool actually agrees on is measured per
+    /// press - it has read 2 on one and 15 on another - and two is shallow enough that a wrong enumeration
+    /// costs little, since both links stay movable. Deeper commits more of the chain to a judgement made
+    /// without knowing the tail, and the cost grows with each level.
+    /// </summary>
+    [Menu("Enumerated opening links")]
+    public RangeNode<int> OpeningLinks { get; set; } = new RangeNode<int>(2, 1, 5);
+
+    /// <summary>
+    /// Whether a chain may be re-ordered by reversing a run of its links.
+    ///
+    /// **The chain's order is worth thousands and nothing in the search could change it.** Measured on
+    /// one press: the winning chain and the median worker's had nought links in common, the median
+    /// collected 230 points MORE content over 62 markers the winner missed, and scored 2,438 LESS. The
+    /// score is content plus propagation, propagation pays a rune over the monsters unearthed AFTER the
+    /// remnant carrying it, so a chain can take everything and arrange it so that nothing multiplies.
+    ///
+    /// The exhaustive setting below cannot answer this on a Grand site - it refuses any chain longer
+    /// than its limit, and fifteen links has 1.3 trillion orderings - so this is the 2-opt version: 105
+    /// reversals on a fifteen link chain, against a measured 42us a score.
+    ///
+    /// **Applied once, to the chain a worker hands back, and nowhere else.** It was first applied at the
+    /// opening and on every record, which is a different thing from refining an answer: a better chain
+    /// mid-search descends into a different basin afterwards, sometimes a worse one. Measured over ten
+    /// matched draws it produced the best result of the batch on two of them and cost 2,692 on a third,
+    /// net -1,130. As the last thing a worker does it can only add to what it returns.
+    ///
+    /// **On by default, on ten matched draws.** Net +1,347 against the same ten with it off, the median
+    /// press 9,459 to 9,764, presses reaching 10,000 three of ten to five of ten, and no time cost -
+    /// 8.2 to 8.4 seconds against 8.2 to 8.7. Two draws gained 663 and 1,333 and the rest were inside
+    /// the wall-clock jitter of a few hundred points. It is the only change measured this way that has
+    /// cleared that floor.
+    ///
+    /// Compared with PressHistory, which walks the same ten draws whatever the setting says, so the
+    /// comparison is press for press rather than distribution against distribution. Anything under about
+    /// 700 net over ten is jitter. See expedition_solve_plan.md section 7.
+    /// </summary>
+    [Menu("Reverse runs of links")]
+    public ToggleNode ReverseRuns { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// How far below its own record a search will follow a chain, as a percentage.
@@ -2197,51 +2332,6 @@ public class DestroyAndRepairSettings
     [Menu("Shortlist: initial spread spacing (grid)")]
     public RangeNode<float> ShortlistSparse { get; set; } = new RangeNode<float>(64f, 8f, 256f);
 
-    /// <summary>
-    /// Divide a reach's allowance by how much further this site's routes run than the straight line.
-    ///
-    /// **Two reach attempts in five are aimed somewhere the chain cannot get to, and it is knowable
-    /// before a hop is spent.** The operator admits a target when the straight line to it fits
-    /// inside the links it has left, then hands the job to the router, which walks a real route -
-    /// never shorter than the line and usually a good deal longer. Measured over one press: 4,494
-    /// bridges arrived, 535 were genuinely walled off by the ground, and 3,580 simply ran out of
-    /// explosives after 3.2 hops. Only the 535 are the site refusing; the rest are the test being
-    /// optimistic, each paying about 8.9ms - nearly a full attempt - to discover it.
-    ///
-    /// So the site is asked. Every bridge that arrives reports the links it really used against the
-    /// links the straight line predicted, and the running ratio tightens the admission test for
-    /// everything after it. Learnt rather than written down because it is a fact about the dig site:
-    /// open ground is near enough 1, a site of corridors nearer 2, and no constant suits both.
-    ///
-    /// Bounded to between 1 and 2.5, since below 1 it would admit more than a straight line can
-    /// justify and far above 2 it would refuse most of the site on a handful of awkward bridges.
-    ///
-    /// **Off, because a saving in search time is worth less than a target it refuses.** The estimate
-    /// is one average for the whole site applied to every pair, so a reach across open ground is
-    /// charged for the corridors somewhere else on the map, and a target the chain could genuinely
-    /// have reached is turned away before the router ever looks at it. What it buys back is time
-    /// inside a search that already stops on its own improvement window - so the time saved goes
-    /// into more attempts rather than a better answer, while a refused target is gone for that press.
-    ///
-    /// The note above called that risk theoretical on the grounds that this "cannot make a chain
-    /// worse". That holds only for attempts that were going to fail, and the estimate cannot tell
-    /// those apart from the ones that were not. A ratio measured per pair, from the routes already
-    /// walked between those two markers rather than from a site-wide average, would answer the
-    /// objection; until that exists this stays off, and the dump still prints the ratio it learnt.
-    /// </summary>
-    [Menu("Estimate route detour",
-        "Before spending hops to reach a distant marker, the search asks whether\n" +
-        "the chain could get there at all with the links it has left. The cheap\n" +
-        "answer is the straight line, and real routes bend around terrain, so the\n" +
-        "line says yes too often - 3,580 of 4,494 attempts in one measured press\n" +
-        "were doomed by distance, at 8.9ms each to find out. This divides the\n" +
-        "allowance by how much further this site's routes ran than the line\n" +
-        "predicted: open ground is near 1x, a site of corridors nearer 2x.\n" +
-        "\n" +
-        "Off by default. The figure is one average for the whole site, so it also\n" +
-        "refuses reaches that would have worked, and the time it saves goes into\n" +
-        "more attempts rather than a better chain.")]
-    public ToggleNode EstimateDetour { get; set; } = new ToggleNode(false);
 }
 
 /// <summary>
@@ -2993,10 +3083,46 @@ public class RemnantRewardSettings
     /// are working still gets a line and the rest of the map does not.
     /// </summary>
     [Menu("Only to rewards within (grid, 0 = any)")]
-    public RangeNode<int> LineWithin { get; set; } = new RangeNode<int>(500, 0, 2000);
+    public RangeNode<int> LineWithin { get; set; } = new RangeNode<int>(1000, 0, 2000);
 
-    [Menu("Line thickness")]
-    public RangeNode<int> LineThickness { get; set; } = new RangeNode<int>(3, 1, 5);
+    /// <summary>
+    /// Stops the line to a remnant once an explosive that is already down covers it, on both surfaces. The
+    /// line is there to say a remnant is worth walking to; once a bomb takes it, the reward is decided and the
+    /// line only points at ground the chain has already dealt with, for as long as the site lasts.
+    ///
+    /// Covered by the same test the barrels use - blast plus the remnant's own extent, from each explosive
+    /// down. See Overlay.RemnantsUnderPlaced.
+    /// </summary>
+    [Menu("Stop the line once a placed explosive covers it")]
+    public ToggleNode HideLineOnceCaught { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Draws the line towards each rich remnant in the world, from the player's feet, clipped to the
+    /// screen edge when the remnant is off screen. Which remnants get one is decided by the two settings
+    /// above. See Overlay.WantsRewardLine.
+    /// </summary>
+    [Menu("Draw line in world")]
+    public ToggleNode LineInWorld { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// How thick the reward lines are drawn in the world, in whole pixels.
+    ///
+    /// Two settings rather than one because the two surfaces are different scales: a line thick enough
+    /// to read against a lit dig site covers the markers around it on the minimap.
+    /// </summary>
+    [Menu("Line thickness in world")]
+    public RangeNode<int> LineThicknessInWorld { get; set; } = new RangeNode<int>(3, 1, 5);
+
+    /// <summary>
+    /// Draws the same lines on the minimap and the large map, from the player to each rich remnant.
+    /// The same remnants as the world lines. See Minimap.RewardLines.
+    /// </summary>
+    [Menu("Draw line on minimap")]
+    public ToggleNode LineOnMinimap { get; set; } = new ToggleNode(false);
+
+    /// <summary>How thick the reward lines are drawn on the map, in whole pixels. See LineThicknessInWorld.</summary>
+    [Menu("Line thickness on minimap")]
+    public RangeNode<int> LineThicknessOnMinimap { get; set; } = new RangeNode<int>(1, 1, 5);
 
     [Menu("Line colour")]
     public ColorNode LineColour { get; set; } = new ColorNode(Color.FromArgb(255, 190, 120, 255));
@@ -3027,7 +3153,7 @@ public class RerollDisplaySettings
     /// Named for what it does. It was "Show advice" under Rewards, which promised a good deal more
     /// than one border and sat in the menu next to the thresholds rather than next to the drawing.
     /// </summary>
-    [Menu("Highlight the remnant to reroll")]
+    [Menu("Highlight reroll button")]
     public ToggleNode HighlightRerolls { get; set; } = new ToggleNode(true);
 
     /// <summary>
@@ -3048,7 +3174,11 @@ public class RerollDisplaySettings
     public RangeNode<int> RollBorder { get; set; } = new RangeNode<int>(3, 1, 5);
 
     /// <summary>
-    /// Draws a thin line towards the remnant worth rolling.
+    /// Draws a line towards the remnant worth rolling, in the world. Off by default: the minimap line
+    /// answers "which way" without crossing the play area. See RollLineOnMinimap.
+    ///
+    /// A new property rather than the old RollLine with a new default, because a saved value outlives a
+    /// changed default - every settings file that had the old one on would have kept it on.
     ///
     /// **The border only helps once you are standing at the remnant.** It is drawn on the game's own
     /// Liquid Verisium button, which exists on a remnant's label and so appears only when you are
@@ -3063,24 +3193,36 @@ public class RerollDisplaySettings
     /// Clipped to the edge of the screen when the remnant is behind you, like the loot line, so it
     /// says which way to walk rather than vanishing.
     /// </summary>
+    [Menu("Draw line in world")]
+    public ToggleNode RollLineInWorld { get; set; } = new ToggleNode(true);
+
     /// <summary>
-    /// How thick the line to the next planned reroll is drawn.
+    /// How thick the line to the next planned reroll is drawn in the world.
     ///
-    /// It was one pixel and not a setting, on the reasoning that the line is a hint about where to
-    /// go rather than a route. True, and not a reason to fix it: one pixel disappears against a lit
-    /// dig site, and the border it leads to has had a thickness of its own all along.
+    /// Three pixels by default, because a thinner line gets lost against a lit dig site. Separate from
+    /// the minimap's, because a line thick enough to read in the world covers the markers around it on
+    /// the map. See RollLineThicknessOnMinimap.
     ///
     /// Whole pixels, like every other line thickness here bar the plan's three. A line is drawn a
     /// pixel at a time, so a fractional setting offers a choice the screen cannot show.
     /// </summary>
-    [Menu("Line thickness")]
-    public RangeNode<int> RollLineThickness { get; set; } = new RangeNode<int>(3, 1, 5);
-
-    [Menu("Draw a line to it")]
-    public ToggleNode RollLine { get; set; } = new ToggleNode(true);
+    [Menu("Line thickness in world")]
+    public RangeNode<int> RollLineThicknessInWorld { get; set; } = new RangeNode<int>(3, 1, 5);
 
     /// <summary>
-    /// What a roll is worth, as one figure beside the Liquid Verisium button.
+    /// Draws the line towards the remnant worth rolling on the minimap and the large map, from the player
+    /// to the remnant, in the highlight colour. See Minimap.Rolls.
+    /// </summary>
+    [Menu("Draw line on minimap")]
+    public ToggleNode RollLineOnMinimap { get; set; } = new ToggleNode(false);
+
+    /// <summary>How thick the line to the next planned reroll is drawn on the map. See RollLineThicknessInWorld.</summary>
+    [Menu("Line thickness on minimap")]
+    public RangeNode<int> RollLineThicknessOnMinimap { get; set; } = new RangeNode<int>(1, 1, 5);
+
+    /// <summary>
+    /// The reroll expected value - what a roll is worth, as one figure beside the Liquid Verisium button
+    /// of the remnant the advice picks.
     ///
     /// In the yellow the game borders a propagating slot in, because runes are all the comparison
     /// measures: both sides of it are scored with the reward set aside. See Rolling.Enumerated.
@@ -3093,15 +3235,15 @@ public class RerollDisplaySettings
     /// both misnamed and in the one group a player turns off wholesale.
     /// </summary>
 
-    [Menu("Show its expected value")]
+    [Menu("Show reroll expected value")]
     public ToggleNode RollFigures { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// The same figure on every remnant that has a verdict, rather than on the next one.
+    /// The reroll expected value on every remnant that has a verdict, rather than on the advised one only.
     ///
     /// **Off, because the advice is one remnant at a time and this is not advice.** Rolling changes
     /// the site, so which remnant is worth rolling next is not knowable until this one has been
-    /// rolled and the chain solved again - see RollLine, which draws one line for the same reason.
+    /// rolled and the chain solved again - see RollLineInWorld, which draws one line for the same reason.
     /// A number on every label is a reading of the site rather than a recommendation, and it is
     /// worth having while deciding whether the advice is sane.
     ///
@@ -3109,7 +3251,7 @@ public class RerollDisplaySettings
     /// the advice says to KEEP has an expected value too, and it is usually negative, which is the
     /// half of the argument the other setting never shows.
     /// </summary>
-    [Menu("Show expected value on every remnant")]
+    [Menu("Show reroll expected value on all remnants")]
     public ToggleNode RollFiguresAll { get; set; } = new ToggleNode(true);
 }
 
@@ -3625,25 +3767,23 @@ public class RecordingSettings
             DumpFolder.Open();
     });
 
-
     /// <summary>
-    /// One switch over everything that watches the game and writes a file while you play.
+    /// Writes every remnant seen to dumps/remnants.csv.
     ///
-    /// **These are the settings whose cost is paid whether or not anything is on screen.** Each of
-    /// them walks some part of the game every frame or every sweep and appends to a file, and each
-    /// was reached by a different switch in a different place - the remnant census under the spawn
-    /// heading, the spawn log beside it, and the streaming log under no switch at all, so there was
-    /// no way to turn them all off and no way to be sure they were.
+    /// The only route to knowing what a reroll is worth. A roll replaces the whole remnant, so its
+    /// value depends on the distribution of remnants the game generates - and the game does not
+    /// expose the weights, so the only way to have that number is to count them.
     ///
-    /// They are evidence being gathered rather than anything the plugin acts on: nothing reads
-    /// these files back. So they are worth having on while the evidence is wanted and worth
-    /// turning off while the frame time is being measured, and until now the second was not
-    /// possible in one move.
+    /// Passive and cheap: a handful of rows per dig site, appended on the sweep it already does,
+    /// no reading the game has not already done. Each row says whether the remnant came with the
+    /// map or came out of a roll, so the two can be compared rather than assumed equal.
     ///
-    /// Off gates all of them regardless of their own switch. On leaves each to its own.
+    /// Its own switch in its own section rather than behind debug mode, because the people whose
+    /// readings are wanted are not the people who play with debug drawing on. See RecordingSettings.
     /// </summary>
-    [Menu("Record anything to disk while playing")]
-    public ToggleNode Recording { get; set; } = new ToggleNode(false);
+    [Menu("Record remnants seen")]
+    public ToggleNode Census { get; set; } = new ToggleNode(false);
+
 
     /// <summary>
     /// Writes when each marker's entity loads and unloads to dumps/streaming.csv.
@@ -3670,23 +3810,6 @@ public class RecordingSettings
     /// </summary>
     [Menu("Watch for the expedition complete banner")]
     public ToggleNode WatchFinished { get; set; } = new ToggleNode(false);
-
-    /// <summary>
-    /// Writes every remnant seen to dumps/remnants.csv.
-    ///
-    /// The only route to knowing what a reroll is worth. A roll replaces the whole remnant, so its
-    /// value depends on the distribution of remnants the game generates - and the game does not
-    /// expose the weights, so the only way to have that number is to count them.
-    ///
-    /// Passive and cheap: a handful of rows per dig site, appended on the sweep it already does,
-    /// no reading the game has not already done. Each row says whether the remnant came with the
-    /// map or came out of a roll, so the two can be compared rather than assumed equal.
-    ///
-    /// Its own switch in its own section rather than behind debug mode, because the people whose
-    /// readings are wanted are not the people who play with debug drawing on. See RecordingSettings.
-    /// </summary>
-    [Menu("Record remnants seen")]
-    public ToggleNode Census { get; set; } = new ToggleNode(false);
 
     /// <summary>
     /// Count what each marker unearths, and write it to dumps/spawns.csv.
@@ -3858,33 +3981,44 @@ public class DebugSettings
             ImGui.TextUnformatted("Set for your account - RESTART EXILECORE2 for it to take effect.");
         }
 
-        if (ImGui.Button("Turn on server collection###gcServerOn"))
-            HostCollection.UseServer();
+        // **One button carrying its own state, and inert unless ctrl is held.**
+        //
+        // Two buttons meant the row changed shape depending on whether anything had been written, so what was
+        // there to click moved. One button that reads ON or OFF says what the setting is and what pressing it
+        // does, and greying it out without ctrl shows the guard rather than swallowing the click: every other
+        // control here changes something the plugin owns and can undo, while this writes DOTNET_gcServer to
+        // the Windows account, where it outlives ExileCore2 and applies to every .NET program started after.
+        var ctrl = ImGui.GetIO().KeyCtrl;
 
-        if (ImGui.IsItemHovered())
+        ImGui.BeginDisabled(!ctrl);
+
+        if (ImGui.Button($"Enable GC Server: {(asked ? "ON" : "OFF")}###gcServer"))
+        {
+            if (asked)
+                HostCollection.Restore();
+            else
+                HostCollection.UseServer();
+        }
+
+        ImGui.EndDisabled();
+
+        // Hover has to be allowed while disabled, or the one tooltip that explains the guard is the one
+        // tooltip that never shows.
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
             ImGui.SetTooltip(
-                "Writes DOTNET_gcServer=1 to your account's environment variables.\n\n" +
-                "Highly recommended: it is the single largest thing outside this plugin\n" +
-                "that decides what its allocation costs in frame time.\n\n" +
-                "Takes effect next time ExileCore2 starts, and applies to every .NET\n" +
+                (ctrl ? "" : "HOLD CTRL to use this." + "\n\n") +
+                (asked
+                    ? "Set for your account now. Pressing this removes DOTNET_gcServer, so the" + "\n" +
+                      "runtime chooses as it did before this was ever set." + "\n\n"
+                    : "Pressing this writes DOTNET_gcServer=1 to your account's environment" + "\n" +
+                      "variables." + "\n\n" +
+                      "Highly recommended: it is the single largest thing outside this plugin" + "\n" +
+                      "that decides what its allocation costs in frame time." + "\n\n") +
+                "Takes effect next time ExileCore2 starts, and applies to every .NET" + "\n" +
                 "program you start afterwards.");
         }
 
-        if (!HostCollection.Written)
-            return;
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Undo###gcServerOff"))
-            HostCollection.Restore();
-
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip(
-                "Removes DOTNET_gcServer from your account, so the runtime chooses as it\n" +
-                "did before this was ever set. Takes effect next time ExileCore2 starts.");
-        }
     });
 
     [JsonIgnore]
@@ -3908,20 +4042,31 @@ public class DebugSettings
     /// invites the opposite mistake too: pressing this to clear a weight it will not clear. What
     /// goes is what the plugin worked out by standing here.
     ///
-    /// **Two buttons, one nested inside the other.** "Delete caches and plan" is the whole of it,
-    /// every site file for every area included; "Delete plan" is the same clear with the markers
-    /// and the saved ground kept, so a site can be re-solved from cold without walking it again.
-    /// The second is a strict subset of the first - the same call, with two flags set. See Caches.
+    /// **Three buttons, each clearing less than the one above it.** "Delete all site data" is the
+    /// whole of it, every site file for every area included; "Delete plan and ground" keeps the
+    /// markers, the scouting layer and the saved ground, so a site can be re-solved from cold without
+    /// walking it again; "Delete plan" drops only the plan and the chain on file. See Caches.
     /// </summary>
     [JsonIgnore]
     public CustomNode ForgetRoutingUi { get; set; } = new CustomNode(() =>
     {
-        if (ImGui.Button("Delete caches and plan###deleteCache"))
+
+        // **Three buttons, because "start again" means three different things and one of them was missing.**
+        //
+        // The narrow one exists for the ordinary case: solve that again without the last answer in hand. The
+        // middle one is for a fair second measurement - everything the plugin worked out goes, so the next
+        // solve begins with what this one began with, but the markers and the scouting layer stay because
+        // those took a lap of the site to collect and nothing about the search is learnt from them. The wide
+        // one is for arriving fresh.
+        //
+        // One per line, from the one that clears the most to the one that clears the least.
+        if (ImGui.Button("Delete all site data (true cold start)###deleteCache"))
             Caches.Wanted = true;
 
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("Everything the plugin worked out by standing here, including\n" +
+            ImGui.SetTooltip("TRUE COLD START: everything the plugin worked out by standing here,\n" +
+                             "including\n" +
                              "every site file on disk - the markers, the walkable ground,\n" +
                              "the filed chains and the scouting layer - for every area,\n" +
                              "not just this one.\n" +
@@ -3930,23 +4075,37 @@ public class DebugSettings
                              "edited rows and every object the plugin has filed all stay.");
         }
 
-        ImGui.SameLine();
-
-        if (ImGui.Button("Delete plan###forgetWorkingOut"))
+        if (ImGui.Button("Delete plan and ground (cold start)###forgetWorkingOut"))
             Caches.WantedKeepingScan = true;
 
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("The plan, the best chain on file and every reading taken here -\n" +
-                             "but NOT the markers, the walkable ground saved on disk, or the\n" +
-                             "routed ground held in memory, so the next solve searches the\n" +
-                             "same site from cold without another lap of it AND without\n" +
-                             "paying to learn the terrain over again.\n" +
-                             "Everything this does, the button to the left also does.");
+            ImGui.SetTooltip("COLD START: everything the plugin worked out standing here - the" + "\n" +
+                             "plan, the chain on" + "\n" +
+                             "file, the routed ground held in memory, the snapped aims and every" + "\n" +
+                             "reading taken." + "\n\n" +
+                             "NOT the markers, the scouting layer, or the walkable ground saved to" + "\n" +
+                             "disk - those took a lap of the site to collect, or minutes of flooding," + "\n" +
+                             "and the terrain does not move, so the search learns" + "\n" +
+                             "nothing from having them." + "\n\n" +
+                             "So the next solve searches the same site as though it had never been" + "\n" +
+                             "solved, without another lap. Use this between two solves you mean to" + "\n" +
+                             "compare fairly.");
         }
 
+        if (ImGui.Button("Delete plan (warm start)###forgetPlanOnly"))
+            Caches.WantedPlanOnly = true;
 
-        ImGui.SameLine();
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("WARM START: the plan in hand and the chain filed on disk, and" + "\n" +
+                             "nothing else." + "\n\n" +
+                             "Everything worked out about the ground stays - the routed answers," + "\n" +
+                             "the snapped aims, the ground model, the readings taken here - so" + "\n" +
+                             "the next solve starts knowing what this one knew." + "\n\n" +
+                             "This is the one to use between two solves you mean to compare.");
+        }
+
         ImGui.TextDisabled(Caches.Last);
     });
 
@@ -4563,6 +4722,78 @@ public class DebugSettings
     /// </summary>
     [Menu("Cold solve comparison key")]
     public HotkeyNodeV2 ColdHotkey { get; set; } = new HotkeyNodeV2(Keys.None);
+
+    /// <summary>
+    /// Presses the CURRENT search over the same cold site several times, and reports the spread.
+    ///
+    /// **Repeated presses of the action key are not repeated samples.** A solve inherits the previous
+    /// plan as a floor and the site's best chain off disk, so three presses measure one search and two
+    /// continuations of it - measured on a Basin site as 9,506, then 9,506, then 9,506, every repeat
+    /// adding nothing at all. This clears the plan and the best chain between presses and keeps the
+    /// markers and the routed ground, which is the same fairness the bake-off uses between strategies.
+    ///
+    /// Where the comparison key above runs each ticked STRATEGY once, this runs one strategy several
+    /// times. They answer different questions: which search is better, against how reliable a search
+    /// is. The second is the one that says whether a change helped, because this search is randomised
+    /// and a single press of it is a sample from a wide distribution - measured on one site as 7,875 to
+    /// 10,701 with nothing changed but the seed.
+    ///
+    /// Read the answer in the dump under "every solve here, as a distribution". Unbound, like every
+    /// other investigation key: a batch is several windows of standing still.
+    /// </summary>
+    /// <summary>
+    /// Steps through the chains every worker of the last press produced, drawing each one as the plan.
+    ///
+    /// **Because "eight distinct chains" is not the same claim as "eight different ideas".** The distinct
+    /// count compares chains for exact equality, so two routes differing in one link are two - and on this
+    /// site it reads 7.8 of 8 while the scores cluster at about 7,400, which is what a set of variations on
+    /// one route looks like. Whether they share a pattern is a question the eye answers in a second and a
+    /// coordinate list never does.
+    ///
+    /// **Browsing adopts.** The chain shown becomes the plan, so it draws with its links, its blast
+    /// circles and the markers it catches, exactly as the solver's own answer does - and a placement run
+    /// started while browsing would place what is on screen. The next solve replaces it either way.
+    ///
+    /// Unbound by default, like the other investigation keys.
+    /// </summary>
+    [Menu("Worker chains window key")]
+    public HotkeyNodeV2 BrowseHotkey { get; set; } = new HotkeyNodeV2(Keys.None);
+
+    /// <summary>
+    /// Whether the worker chains window is open. Toggled by the key above, and by its own cross.
+    ///
+    /// Kept in the settings like the reference table's switch, so the window survives a reload and the key
+    /// and the cross are one statement rather than two. See ChainPanel.
+    /// </summary>
+    [Menu("Show the worker chains window")]
+    public ToggleNode ShowChains { get; set; } = new ToggleNode(false);
+
+    [Menu("Repeat the same solve key")]
+    public HotkeyNodeV2 RepeatHotkey { get; set; } = new HotkeyNodeV2(Keys.None);
+
+    /// <summary>
+    /// How many presses the key above takes.
+    ///
+    /// Three is enough to see a spread and not enough to measure a median. Ten is the figure the solver
+    /// plan asks for before a change may be called an improvement, and on a Grand site at eight seconds
+    /// that is about a minute and a half of standing still.
+    /// </summary>
+    [Menu("Presses per batch")]
+    public RangeNode<int> RepeatCount { get; set; } = new RangeNode<int>(10, 1, 20);
+
+    /// <summary>
+    /// Which draw of the random numbers a batch starts from. Nought walks 1 upwards.
+    ///
+    /// **Because tuning on ten draws and then judging on the same ten is how a search gets overfitted to
+    /// them.** Every change measured on this site was accepted or rejected on draws 1 to 10, and the two
+    /// that were kept were kept because they helped THOSE ten. A hold-out batch on draws nobody optimised
+    /// against is the check on that, and it is the same check any fitted model needs.
+    ///
+    /// Set it to 10 for a batch of draws 11 to 20, compare the distribution with the tuned one, and a
+    /// median that holds up says the gain is a property of the site rather than of the ten draws.
+    /// </summary>
+    [Menu("First draw of a batch")]
+    public RangeNode<int> RepeatFrom { get; set; } = new RangeNode<int>(0, 0, 200);
 
     /// <summary>
     /// Which searches the key above compares, ticked one by one.

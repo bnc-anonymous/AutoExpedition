@@ -47,21 +47,10 @@ internal static class Ending
     /// </summary>
     public static void Watch(GameController gc, Scan scan, Plan plan)
     {
-        // **Latched, because the detonator entity goes away and the live read then says no.**
-        //
-        // ExplosivesDetonated walks the entity list for this site's detonator and returns -1 when it
-        // is not in it - which is below one, so a spent site whose detonator has unloaded reads as a
-        // site that was never set off. That is precisely the stretch this flag exists for: looting
-        // happens after the blasts, spread across a dig site, and walking away from the machine is
-        // the normal way to do it.
-        //
-        // Detonator.SetOff is the same question already answered and remembered, recorded while the
-        // walk had the entity in hand - see its own comment, which was written for a detonator that
-        // will not be loaded by the time somebody asks. The live read stays in front of it as the
-        // fast path for the site you are standing on.
-        var site = Detonator.DetonatorGridPosition(gc);
-
-        if (Detonator.ExplosivesDetonated(gc) < 1 && !(site != Vector2.Zero && Detonator.SetOff(site)))
+        // Latched as well as read live, because the detonator entity goes away and the live read then
+        // says no - which is the stretch this flag exists for, since looting happens after the blasts
+        // and walking away from the machine is the normal way to do it. See Detonator.SetOffHere.
+        if (!Detonator.SetOffHere(gc))
         {
             ProbablyOver = false;
             Says = "the chain has not been set off";

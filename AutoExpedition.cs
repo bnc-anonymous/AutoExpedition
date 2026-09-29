@@ -44,6 +44,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     private readonly Correlate _correlate = new();
     private readonly Snap _snap = new();
     private readonly Cleared _cleared = new();
+
+    /// <summary>The batch of cold presses, when one is being measured. See RepeatedPresses.</summary>
+    private readonly RepeatedPresses _repeats = new();
+
     private readonly Boundary _boundary = new();
 
     /// <summary>Which of a Grand site has been walked near enough to load. See Scouted.</summary>
@@ -193,7 +197,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         //
         // Following an already-learned path stays cheap and unconditional, so a banner seen while
         // the path works is still counted.
-        if (!Settings.Recording.Recording || !Settings.Recording.WatchFinished)
+        if (!Settings.Recording.WatchFinished)
             return;
 
         var idle = Safe.Read(() => Detonator.ExpeditionsNeverStarted(GameController), 0);
@@ -280,6 +284,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
     public override bool Initialise()
     {
+        // Whether the game is in front, polled off the frames so a long gap can say it was spent tabbed out. See
+        // Spent.WatchFocus.
+        Spent.WatchFocus(() => GameController.Window.IsForeground());
+
         // **The only collection setting a plugin can reach.**
         //
         // Whether the runtime collects in workstation or server mode is fixed when the process
@@ -304,6 +312,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // The table has to be up before the migration can ask it what a weight now ships as.
         Wrt.Home = ConfigDirectory;
         Wrt.Source = DirectoryFullName;
+
+        // Beside the dumps, because a snapshot is read by the same people reading those and an offline run
+        // wants both from one folder. See Layout.
+        Layout.Folder = Path.Combine(ConfigDirectory, "dumps", "layouts");
         Wrt.Load();
 
         // Where the weights used to live. Named rather than derived inside Migrated so the one
@@ -360,15 +372,20 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         Dump.Spawns = _spawns;
         Dump.Scoring = _scoring;
         Dump.Placement = _placement;
+        Dump.Repeats = _repeats;
         Dump.Rehearsal = _rehearsal;
         Dump.Streaming = _streaming;
 
         // ListNode choices are not serialised, so they have to be supplied on every start or the
         // dropdown comes up empty with a saved value it cannot show.
         Settings.Display.Prices.PriceIn.SetListValues(new List<string> { "Exalted", "Divine", "Chaos" });
-        // From the one array that also drives the comparison, so a seventh search appears in both
-        // the day it is written. These were two literals in two files, in two different orders.
-        Settings.Solver.Advanced.Strategy.SetListValues(SolverSettings.Comparable.ToList());
+        // One search to choose.
+        Settings.Solver.Advanced.Strategy.SetListValues(new List<string> { SolverSettings.DestroyRepair });
+
+        // The checkbox is left as saved rather than set from the old choice: it ships on, and a player who
+        // unticked it while the exploit strategy was selected was asking for exploits off.
+        if (Settings.Solver.Advanced.Strategy.Value != SolverSettings.DestroyRepair)
+            Settings.Solver.Advanced.Strategy.Value = SolverSettings.DestroyRepair;
         Settings.Display.PlacementCircle.Unreachable.SetListValues(PlacementCircleSettings.WhenUnreachable.ToList());
         Settings.Solver.Reroll.Mode.SetListValues(RerollSettings.Modes.ToList());
         Settings.Automation.PostExpedition.LineFrom.SetListValues(
@@ -377,6 +394,8 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         Register(Settings.ActionHotkey);
         Register(Settings.TableHotkey);
         Register(Settings.Debug.ColdHotkey);
+        Register(Settings.Debug.RepeatHotkey);
+        Register(Settings.Debug.BrowseHotkey);
         Register(Settings.Debug.DumpHotkey);
         Register(Settings.Debug.FrontierHotkey);
         Register(Settings.Debug.CorrelateHotkey);
@@ -522,18 +541,34 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
 
         // The same, minus the site itself. See Caches.WantedKeepingScan.
+        // **The narrowest button, handled first because it is the one that must not do anything else.**
+        // See Caches.WantedPlanOnly.
+        if (Caches.WantedPlanOnly)
+        {
+            Caches.WantedPlanOnly = false;
+
+            // Deleting the plan is not asking for a new one: nothing searches until the action key does. See
+            // Rehearsal.StopContinuing.
+            _rehearsal.StopContinuing("deleting the plan");
+
+            Caches.ForgetPlan(Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
+        }
+
         if (Caches.WantedKeepingScan)
         {
             Caches.WantedKeepingScan = false;
 
+            // As the plan-only button: nothing searches until the action key does.
+            _rehearsal.StopContinuing("deleting the plan and ground");
+
             // The area IS passed, so the filed best chain goes - without that the next solve loads
-            // it back as its floor and nothing has been forgotten. The ground facts are kept by the
-            // flag beside it. See Caches.Clear's keepGround.
+            // it back as its floor and nothing has been forgotten. The ground facts are kept because
+            // the scan is: they live in the same site files, and only a full clear deletes those.
             //
-            // **And the routing stays, for the same reason the bake-off's clear keeps it.** This
-            // button means "forget the plan", and the floods are not a plan - they are the terrain,
-            // derived from the very ground facts kept on the line above. Dropping them kept the
-            // input and threw away the cache built from it.
+            // **This button means "cold start", so what the solver derived goes and what the site cost
+            // to learn stays.** The floods are the terrain, derived from the very ground facts kept on
+            // the line above, and the terrain does not move - so they are kept too, and only the plan,
+            // the aims and the readings are dropped.
             //
             // It was not free. Measured on the first press after one: 2,588ms of preflood before a
             // worker started, openings of 5.7 to 7.3 seconds against about 3 warm, and 168,870 of
@@ -543,9 +578,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             // six a worse story about the ground.
             Caches.Clear(_scan, _blast, _planning, _boundary, _snap, _cleared,
                 keepScan: true,
-                area: Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u),
-                keepGround: true,
-                keepRouting: true);
+                area: Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
         }
 
         // The best-spots button, answered where the site is in scope. See Planner.Wanted.
@@ -737,7 +770,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // After the sweep, so Live means "the game has it as of this sweep". Every frame rather
         // than on the sweep's own rhythm would measure the same transitions repeatedly, since
         // nothing reattaches an entity between sweeps.
-        if (_scan.Swept && Settings.Recording.Recording && Settings.Recording.RecordStreaming)
+        if (_scan.Swept && Settings.Recording.RecordStreaming)
         {
             _streaming.Observe(this,
                 Safe.Read(GameController, static g => g.Player.GridPos, Vector2.Zero), _scan.Targets);
@@ -748,7 +781,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // guessed, and it is on the sweep's rhythm because nothing here changes faster than that.
         // No longer behind the debug switch as well: a recording is a recording whether or not the
         // overlay is drawing, and pairing the two meant turning the drawing on to gather evidence.
-        if (Settings.Recording.Recording && Settings.Recording.Census)
+        if (Settings.Recording.Census)
             _census.Observe(this, GameController, _scan, _valuation);
 
         // What each marker actually turns into. Every frame rather than on the sweep, because a
@@ -757,7 +790,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // still standing.
         // Tested here rather than only inside Observe, which read it after a walk of the monster
         // list had already been paid for.
-        if (Settings.Recording.Recording && Settings.Recording.RecordSpawns)
+        if (Settings.Recording.RecordSpawns)
             using (Spent.On("Tick/Spawns.Observe"))
                 _spawns.Observe(this, GameController, _scan, Settings, _valuation,
                     _blast.Radius(GameController, Settings) ?? 0f);
@@ -775,7 +808,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // **An edited weight is a different question, so the answer is thrown away and asked again.**
         // Without this the score and every number over the ground kept the values they were solved
         // with, and only a manual solve showed your own edit. See Planning.Stale.
-        if (!_planning.Searching && _planning.Stale(Settings))
+        // Not during a batch of repeats: the clear between presses moves the reference table's own
+        // revision, so this would fire between every pair and add a press nobody counted. See
+        // RepeatedPresses.
+        if (!_planning.Searching && !_repeats.Running && _planning.Stale(Settings))
         {
             _planning.Start(GameController, Settings, _scan, _blast, _valuation,
                 ZoneCancellationToken, cause: "the reference table or a weight changed");
@@ -827,6 +863,13 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // **Not in the continuous mode, where the whole point is that the solver keeps going.**
         // There the advice stands while a search runs and says which chain it was weighed against,
         // so nothing is waiting on this search to end. See RerollSettings.Mode.
+        // **Nothing is re-solved for a roll at a site that has been set off.** Coming back through a portal
+        // reloads every remnant, and the ones already rolled read as rolls again - so the site that had just been
+        // detonated was planned afresh, on an assumed five explosives because the panel had not filled in yet.
+        // The signal is taken and dropped, so it does not fire later either.
+        if (_scan.RollPending && Detonator.SetOffHere(GameController))
+            _scan.TakeRolled();
+
         if (_scan.RollPending && _planning.Searching && Planning.Rehearsing && !_placement.Busy &&
             Rolling.Mode(Settings) != RerollSettings.Continuous)
             _planning.Stop("a remnant was rolled");
@@ -847,7 +890,23 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         if (_scan.RollPending)
             Planner.RuneTallyOutOfDate = true;
 
-        if (!_planning.Searching && !_placement.Busy && _scan.TakeRolled())
+        // **In the continuous mode a roll takes over the search rather than queueing behind it.**
+        //
+        // The guard on Searching defers the roll's re-solve until whatever is running has finished,
+        // and in this mode something is nearly always running - so the search in flight spends its
+        // whole budget on the site as it was BEFORE the roll, and only then does the question the roll
+        // asked get started. Reported from a Grand site as "solve, reroll, solve, reroll", with an
+        // eight second wait on each side of the roll instead of one.
+        //
+        // Start already does the right thing with a search in flight: it cancels it and takes over,
+        // which is how a press behaves, and the pass it cancels has published its best so the new one
+        // is seeded from it. Nothing is lost that the roll had not already invalidated.
+        //
+        // Still not while a placement run is going: that is the half of the cycle where advice and
+        // re-solving are both out of place. See Rolling.Consider.
+        var takesOver = Rolling.Mode(Settings) == RerollSettings.Continuous;
+
+        if ((takesOver || !_planning.Searching) && !_placement.Busy && _scan.TakeRolled())
         {
             // **The advice is dropped as well as re-solved, because the plan may not change.** Consider
             // recomputes once per plan, keyed on the plan's identity - and a re-solve that fails to
@@ -1000,7 +1059,8 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // which it was.
         var waited = _solveWanted && DateTime.UtcNow - _solveAskedAt > Waiting;
 
-        if (_solveWanted && !_planning.Searching && !_coldWanted && !_bakeoff.Running)
+        if (_solveWanted && !_planning.Searching && !_coldWanted && !_bakeoff.Running &&
+            !_repeats.Running)
         {
             _solveWanted = false;
 
@@ -1024,7 +1084,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         //
         // The chain in hand is the one being placed and nothing may replace it until the ground is
         // clear again.
-        if (!_coldWanted && !_bakeoff.Running && down <= 0)
+        // **Nor during a batch of repeats.** A presolve is a search, Planning.Start cancels whatever
+        // is in flight to take over, and a press cut off halfway is not a sample of anything. See
+        // RepeatedPresses.
+        if (!_coldWanted && !_bakeoff.Running && !_repeats.Running && down <= 0)
             _rehearsal.Tick(GameController, Settings, _scan, _blast, _valuation, _planning,
                 _placement, ZoneCancellationToken);
 
@@ -1064,6 +1127,48 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // host - so the cost is eight times whatever that costs, sixty times a second, for an
         // answer that is almost always no. Whether that is worth anything is a measurement.
         using var keys = Spent.On("Tick/Keys");
+
+        // **Opens the window listing the pool's chains.** A cycle key was the first version of this: a
+        // list is better because the scores sit beside each other and a chain can be chosen rather than
+        // stepped past. See ChainPanel.
+        if (Settings.Debug.BrowseHotkey.PressedOnce())
+            ChainPanel.Toggle();
+
+        // **The same search, several times, over the same cold site.** Reuses the cold key's sweep
+        // wait below - the scan is emptied by the clear and the markers only come back on the next
+        // sweep, so solving immediately searches a site the plugin has just forgotten. See
+        // RepeatedPresses and PressHistory.
+        // **Read once into a local, because PressedOnce CONSUMES the press.** Asking it twice in one
+        // tick means the second question is answered no whatever the key did, so the pair of branches
+        // below - stop a running batch, or start one - between them swallowed every press and started
+        // nothing. The same trap Scan.RollPending exists to avoid.
+        var repeat = Settings.Debug.RepeatHotkey.PressedOnce();
+
+        // Pressed again while one is running: stop rather than start a second, since two batches
+        // interleaved measure neither.
+        if (repeat && _repeats.Running)
+        {
+            _repeats.Abandon("the key was pressed again");
+            _coldWanted = false;
+        }
+        else if (repeat && !_placement.Busy && !_bakeoff.Running)
+        {
+            // **The area, because without it the filed chain survives on disk.**
+            //
+            // Kept.ForgetAll clears the chain it holds and deletes the file only when it is told which
+            // area to delete; with nought it does the first and not the second. Kept.Load then re-reads
+            // that file at the start of the next solve - its own guard is "same area, same site, do
+            // nothing", and forgetting resets the area so the guard no longer holds - and offers it as a
+            // floor. So a batch cleared memory and handed press two press one's answer, which is
+            // precisely the continuation this exists to prevent. See Kept.Load and Kept.Offer.
+            Caches.Clear(_scan, _blast, _planning, _boundary, _snap, _cleared, keepScan: true,
+                area: Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
+
+            _repeats.Begin(Settings.Debug.RepeatCount.Value, Settings.Debug.RepeatFrom.Value);
+
+            _coldWanted = true;
+            _coldAt = DateTime.UtcNow;
+        }
 
         // Solve from cold, the baseline way.
         //
@@ -1131,6 +1236,11 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             if (_bakeoff.Running)
                 return;
 
+            // So does a batch of repeats, and it starts its own first press rather than falling into
+            // the single solve below - which would run one press outside the batch's counting.
+            if (_repeats.Running)
+                return;
+
             // Forced around the call and put back: Planning reads the strategy as it starts, so the
             // dropdown is only wrong for the instant it takes to launch the search.
             var chosen = Settings.Solver.Advanced.Strategy.Value;
@@ -1145,6 +1255,36 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // the bake-off's path, which was fine while F3 was the only thing that started one - and
         // would have wedged the moment the preflood did, because everything below waits on it being
         // null and nothing else would ever have set it so.
+        // **One press after another of the same search, each from the same cold state.**
+        //
+        // The routing stays, as it does between the bake-off's strategies and for the same measured
+        // reason: each solve floods ground and keeps it, so a press late in a batch would inherit what
+        // its predecessors paid for. The markers stay too, or each press would search a different site.
+        if (_repeats.Running && !_coldWanted && !_planning.Searching)
+        {
+            _repeats.Tick(() =>
+            {
+                // The area for the same reason as at the key press: the filed chain has to go, or every
+                // press after the first starts from the one before it. See Kept.ForgetAll.
+                Caches.Clear(_scan, _blast, _planning, _boundary, _snap, _cleared,
+                    keepScan: true,
+                    area: Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
+
+                // **A different draw each press, or the batch measures one search five times.** Every
+                // seed in the search is a constant plus the worker's number, so without this the five
+                // presses are identical by construction - measured, spread nought over five. See
+                // PlanEnvironment.Draw.
+                Planning.Draws++;
+
+                _planning.Start(GameController, Settings, _scan, _blast, _valuation,
+                    ZoneCancellationToken, cause: "a repeated cold press");
+
+                return _planning.Searching;
+            });
+
+            return;
+        }
+
         // One strategy after another, each with the window it would get alone.
         if (_bakeoff.Running && !_coldWanted)
         {
@@ -1160,11 +1300,13 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 //
                 // The markers are kept, as ever: forgetting those would have each strategy search a
                 // different site, which is a worse unfairness than the one being fixed.
-                // The routing stays. See Caches.Clear's keepRouting - the site is learnt once
-                // before the run, and every strategy then gets the same complete answer rather than
-                // the same crippled one.
+                // **Nothing here clears routing, and nothing ever did.** Reach answers come from the
+                // game's own coarse grid and from Wire's per-call search, whose working state is thread
+                // static - the plugin holds no routing cache to keep or drop. Clear took a keepRouting flag
+                // that its body never read, and three call sites passed it with comments saying the routing
+                // stays, which was true only because there was nothing to lose.
                 Caches.Clear(_scan, _blast, _planning, _boundary, _snap,
-                    _cleared, keepScan: true, keepRouting: true);
+                    _cleared, keepScan: true);
 
                 var chosen = Settings.Solver.Advanced.Strategy.Value;
 
@@ -1217,7 +1359,17 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             // somebody using it.
             if (down <= 0 && _planning.Searching && _planning.Stop())
             {
-                // Nothing else this press. Stopping IS the action.
+                // Nothing else this press. Stopping IS the action - and it stops the continuous
+                // reroll mode too, or the presolve would start the next pass half a second later.
+                _rehearsal.StopContinuing();
+            }
+            // **Between two passes of the continuous reroll mode the key still means stop.** There is
+            // half a second between one pass ending and the next starting, and a press landing in it
+            // would otherwise go on to the placement branch below and start laying explosives -
+            // which is what the second press is for, not the first. See Rehearsal.Continuing.
+            else if (down <= 0 && _rehearsal.Continuing)
+            {
+                _rehearsal.StopContinuing();
             }
             // **An open combinations window outranks everything, and a remnant standing on its own
             // is why that matters.** Maps are full of remnants attached to no expedition at all: you
@@ -1236,6 +1388,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             {
                 _planning.Start(GameController, Settings, _scan, _blast, _valuation,
                     ZoneCancellationToken, cause: "the action key");
+
+                // Asking for a plan undoes an earlier stop. See Rehearsal.ResumeContinuing.
+                _rehearsal.ResumeContinuing();
             }
             else
                 _placement.Begin(GameController, Settings, _planning);
@@ -1374,9 +1529,19 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
     public override void AreaChange(AreaInstance area)
     {
+        Spent.AreaChanged();
+
+        // Timed whole, so a long gap across a map load can say whether this plugin's handling of it was the cost.
+        using var changing = Spent.On("AreaChange");
+
         var hash = Safe.Read(() => area.Hash, 0u);
 
         _scan.AreaChange(hash, real: true);
+
+        // A different site is a different problem, and a median across two of them describes neither.
+        PressHistory.Forget();
+        _repeats.Abandon("the area changed");
+
         _correlate.AreaChange(hash);
         _snap.AreaChange(hash);
         _cleared.AreaChange(hash);
@@ -1426,6 +1591,11 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         if (!Settings.Enable)
             return;
 
+        // The whole of Render up to the frame mark, so a stall in a part with no stage of its own - a panel, a
+        // settings window - is still named on a long gap. Closed just before Spent.Frame, which is where the gap is
+        // measured. See Spent.LongGaps.
+        var rendering = Spent.On("Render");
+
         // **First, above every guard about being at a dig site.**
         //
         // It is a reference, and a reference you can only read while standing at a live expedition
@@ -1435,6 +1605,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // Read it in a hideout, read it with the inventory up. See Catalogue.
         using (Spent.On("Catalogue.Draw"))
             Catalogue.Draw(GameController, Settings, _scan);
+
+        using (Spent.On("ChainPanel.Draw"))
+            ChainPanel.Draw(GameController, Settings, _planning);
 
         var ui = Safe.Read(() => GameController.IngameState.IngameUi, null);
 
@@ -1563,8 +1736,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Cleared.Observe"))
         {
-            _cleared.Observe(GameController, _planning.Plan.Points,
-                _blast.Radius(GameController, Settings) ?? 0f);
+            _cleared.Observe(GameController, _planning.Plan.Points);
         }
 
         using (Spent.On("Overlay.Draw"))
@@ -1574,6 +1746,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 covered);
         }
 
+        rendering.Dispose();
         Spent.Frame();
 
         if (!Settings.Debug.ShowOverlay)
