@@ -10899,6 +10899,13 @@ internal static class Planner
                 tagged[k][s] = 0f;
         }
 
+        // **Past the tags in use, nothing.** The buffer is kept per thread across environments, so one built for a
+        // site with more scoped tags left arrays here sized for an older, shorter chain, and Suffix, which walks the
+        // whole buffer, indexed past their end: after a reroll on a Grazed Prairie site (2026-10-06) every score
+        // threw. Suffix skips a null entry.
+        for (var k = scoped.Length; k < tagged.Length; k++)
+            tagged[k] = null;
+
         return tagged;
     }
 
