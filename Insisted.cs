@@ -123,6 +123,42 @@ internal sealed class Insisted
 
     private uint _area;
 
+    /// <summary>
+    /// The marker the chain must take last, or null: the chain's final explosive is the one whose blast catches it, and
+    /// nothing is placed after. One per area. It is also a must take - marking it sets Take - and Planner.Settle counts
+    /// that must take held only when the final link catches it, so the ranking that puts every must take first also
+    /// puts this ending first. See IsTakenLast.
+    ///
+    /// Asked for by players who want a remnant last for Gaining Traction, which the scoring already weighs: when they
+    /// believe it weighs it wrongly for them, this lets them overrule it.
+    /// </summary>
+    private (int X, int Y)? _takenLast;
+
+    /// <summary>Whether this marker is the one the chain must take last. See _takenLast.</summary>
+    public bool IsTakenLast(Vector2 grid) => _takenLast is { } last && last == Cell(grid);
+
+    /// <summary>
+    /// Makes this marker the one the chain takes last, or clears that when it already is. Marking it also marks it must
+    /// take and moves the mark off any other marker; clearing it leaves the must take standing. Answers whether it is
+    /// taken last now.
+    /// </summary>
+    public bool ToggleTakenLast(Vector2 grid)
+    {
+        var cell = Cell(grid);
+
+        if (_takenLast == cell)
+        {
+            _takenLast = null;
+
+            return false;
+        }
+
+        _takenLast = cell;
+        _cells[cell] = Said.Take;
+
+        return true;
+    }
+
     public int Count => _cells.Count;
 
     /// <summary>Whether the chain has been told to take this marker.</summary>
@@ -156,12 +192,21 @@ internal sealed class Insisted
         else
             _cells[cell] = next;
 
+        // A mark changed by hand is the player's from then on, not the threshold's, so it no longer pins a reward. See
+        // MarkedForRewardValue.
+        _forReward.Remove(cell);
+
+        // Avoiding it or dropping the must take ends it being taken last too. See _takenLast.
+        if (next != Said.Take && _takenLast == cell)
+            _takenLast = null;
+
         return next;
     }
 
     public void Clear()
     {
         _cells.Clear();
+        _takenLast = null;
 
         // Cleared too, so a reset is a genuine fresh start: the threshold gets to make its offer
         // again on a site somebody has deliberately wiped.
@@ -211,7 +256,12 @@ internal sealed class Insisted
         }
 
         foreach (var cell in gone ?? [])
+        {
             _cells.Remove(cell);
+
+            if (_takenLast == cell)
+                _takenLast = null;
+        }
     }
 
     /// <summary>
@@ -352,14 +402,61 @@ internal sealed class Insisted
     /// </summary>
     private const string Boss = "Metadata/Monsters/VaalBossStatue/VaalStatueBossSTANDALONEExpedition";
 
+    /// <summary>
+    /// What was said in each area recently left, by area hash, oldest first. A portal to town and back
+    /// returns to the same instance under the same hash, and without this the marks would be wiped on the
+    /// way out and the value threshold would make its offer again on the way back - re-marking a remnant
+    /// somebody had unmarked by hand, and forgetting every must avoid.
+    /// </summary>
+    private readonly List<(uint Area, AreaMarks Marks)> _areasLeft = new();
+
+    /// <summary>How many areas' marks are kept for a return. A town trip needs one; the rest is slack.</summary>
+    private const int AreasRemembered = 8;
+
+    /// <summary>One area's marks and threshold offers, held while the player is elsewhere. See _areasLeft.</summary>
+    private sealed record AreaMarks(
+        Dictionary<(int X, int Y), Said> Cells,
+        HashSet<(int X, int Y)> Offered,
+        HashSet<(int X, int Y)> OfferedAfterRoll,
+        HashSet<(int X, int Y)> ForReward,
+        (int X, int Y)? TakenLast);
+
     public void AreaChange(uint areaHash)
     {
         if (areaHash != _area)
         {
+            _areasLeft.RemoveAll(x => x.Area == _area);
+
+            if (_cells.Count > 0 || _offered.Count > 0 || _offeredAfterRoll.Count > 0)
+            {
+                _areasLeft.Add((_area, new AreaMarks(new(_cells), new(_offered), new(_offeredAfterRoll),
+                    new(_forReward), _takenLast)));
+
+                if (_areasLeft.Count > AreasRemembered)
+                    _areasLeft.RemoveAt(0);
+            }
+
             _cells.Clear();
             _offered.Clear();
             _offeredAfterRoll.Clear();
             _forReward.Clear();
+            _takenLast = null;
+
+            var back = _areasLeft.FindIndex(x => x.Area == areaHash);
+
+            if (back >= 0)
+            {
+                var marks = _areasLeft[back].Marks;
+
+                foreach (var (cell, said) in marks.Cells)
+                    _cells[cell] = said;
+
+                _offered.UnionWith(marks.Offered);
+                _offeredAfterRoll.UnionWith(marks.OfferedAfterRoll);
+                _forReward.UnionWith(marks.ForReward);
+                _takenLast = marks.TakenLast;
+                _areasLeft.RemoveAt(back);
+            }
         }
 
         _area = areaHash;
@@ -383,7 +480,8 @@ internal sealed class Insisted
 
         foreach (var (cell, what) in _cells)
         {
-            said.Add($"({cell.X},{cell.Y}) {what.ToString().ToLowerInvariant()} " +
+            said.Add($"({cell.X},{cell.Y}) {what.ToString().ToLowerInvariant()}" +
+                     (_takenLast == cell ? " and TAKEN LAST" : "") + " " +
                      Taken(plan, cell.X, cell.Y));
 
             if (said.Count == 8)

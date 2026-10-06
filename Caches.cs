@@ -131,11 +131,23 @@ internal static class Caches
     ///
     /// Deliberately not a call to Clear with more flags: Clear resets the readings, the counters and the
     /// ground model as well, and a caller asking for the plan alone wants none of that. See WantedPlanOnly.
+    ///
+    /// The plan in memory goes as well as the one on file. Forgetting only the filed chain left the
+    /// score and the drawn route in place, so the button appeared to do nothing.
     /// </summary>
-    public static void ForgetPlan(uint area)
+    public static void ForgetPlan(uint area, Planning planning)
     {
+        Planner.ClearDrawnSpots();
         Kept.ForgetAll(area);
         Planning.Forgetting();
+        Rolling.Here.ForgetTheSite();
+        planning?.Forget();
+
+        // The remnant orders are a plan too; the ground they were built on stays, as everything about the ground does
+        // here. See RemnantOrder.ForgetOrders.
+        RemnantOrder.ForgetOrders();
+        Planning.CancelOrderSearch();
+        Repair.ForgetSpotSearched();
 
         Last = "the plan and the chain on file";
     }
@@ -144,6 +156,8 @@ internal static class Caches
         Boundary boundary, Snap snap, Cleared cleared, Scouted scouted = null,
         bool keepScan = false, uint area = 0)
     {
+        Planner.ClearDrawnSpots();
+
         var stamp = unchecked((uint)DateTime.UtcNow.Ticks);
 
         Unexpected.Forget();
@@ -158,6 +172,17 @@ internal static class Caches
 
         // And what the presses climbed to, which is a statement about that floor. See Planning.Climb.
         Planning.Forgetting();
+
+        // And the remnant orders with the ground they were built on, which holds the router's answers. See
+        // RemnantOrder.ForgetGround.
+        RemnantOrder.ForgetGround();
+        Planning.CancelOrderSearch();
+
+        // And which chains the exhaustive spot search has finished with. See Repair.ForgetSpotSearched.
+        Repair.ForgetSpotSearched();
+
+        // And the solves' timelines, so the dump's history starts at the clear. See Solving.PastTimelinesSaid.
+        Solving.ForgetPastTimelines();
 
         // **Every site's files, not just this one's.**
         //

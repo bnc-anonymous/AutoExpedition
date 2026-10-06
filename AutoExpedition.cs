@@ -62,6 +62,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     /// <summary>Solves the site before the first press asks for it. See Rehearsal.</summary>
     private readonly Rehearsal _rehearsal = new();
 
+    /// <summary>Whether the game's placement tool was on offer last tick, so its arrival can be noticed. See Tick.</summary>
+    private bool _toolWasShowing;
+
     /// <summary>How many explosives were down last frame, so a landing can be noticed.</summary>
     private int _wereDown;
 
@@ -78,6 +81,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     /// <summary>Whether a run is waiting on a new plan before carrying on. See Placement.Resume.</summary>
     private readonly Census _census = new();
     private readonly Spawns _spawns = new();
+
+    /// <summary>The live chain last checked against a batch's target, so each is scored once. See RepeatStopAtScore.</summary>
+    private List<System.Numerics.Vector2> _repeatChecked;
+
     /// <summary>A cold solve asked for and waiting on the sweep to find the site again.</summary>
     private bool _coldWanted;
 
@@ -340,6 +347,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         _scan = new Scan(GameController) { Home = ConfigDirectory };
         _scouted.Home = ConfigDirectory;
         Kept.Home = ConfigDirectory;
+
+        // A reload part way through a map does not see an area change, so the area in hand is read now. See
+        // Placement.LoadSetByPlacement.
+        Placement.LoadSetByPlacement(Safe.Read(() => GameController.Area.CurrentArea.Hash, 0u));
         Unknowns.Home = ConfigDirectory;
         Unknowns.Load();
         Marks.Home = ConfigDirectory;
@@ -414,28 +425,101 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     /// old question, and replacing it without being asked would throw away a chain that may be
     /// halfway placed.
     /// </summary>
-    private void Insist()
+    /// <summary>When the must-take key was last pressed, or MinValue once acted on. See MarksSettle.</summary>
+    private DateTime _marksChangedAt = DateTime.MinValue;
+
+    /// <summary>
+    /// How long the must-take marks must stay as they are before the site is solved again with them. The key cycles must
+    /// take, must avoid and nothing, so going from must take to nothing passes through must avoid, and solving on each
+    /// press would plan around a mark nobody wanted. 1000 ms, chosen so that cycling a mark with several taps of the key
+    /// lands on the one wanted before a solve starts; not measured.
+    ///
+    /// **A solve, whatever was running.** The plan and the line under each remnant are worked out against the marks a
+    /// solve started with, and they waited for the solve in hand to end - a press's whole window, or a continuous pass's
+    /// - before showing a mark. Starting a solve supersedes the one running and keeps its best chain, and each worker
+    /// carries its own chain over, so little is lost. See WorkerChains.
+    /// </summary>
+    private static readonly TimeSpan MarksSettle = TimeSpan.FromMilliseconds(1000);
+
+    /// <summary>
+    /// Solves the site again once the must-take marks have stood for MarksSettle. Not once an explosive is down, since a
+    /// solve then interrupts placing (todo section 0), and it does not resume continuous solving the action key stopped.
+    /// </summary>
+    private void SolveAfterMarks(int down)
     {
-        var target = Insisted.Under(GameController, _scan.Targets);
-
-        if (target == null)
-        {
-            DebugWindow.LogMsg("[AutoExpedition] no marker under the cursor to mark", 3f);
-
+        if (_marksChangedAt == DateTime.MinValue || DateTime.UtcNow - _marksChangedAt < MarksSettle)
             return;
-        }
 
-        var said = Insisted.Here.Cycle(target.Grid);
+        _marksChangedAt = DateTime.MinValue;
 
-        DebugWindow.LogMsg(
-            $"[AutoExpedition] {target.Label} at ({target.Grid.X:0},{target.Grid.Y:0}) " +
-            said switch
-            {
-                Insisted.Said.Take => "MUST BE TAKEN - press the action key to plan around it",
-                Insisted.Said.Avoid => "MUST BE AVOIDED - press the action key to plan around it",
-                _ => "is back to whatever the weights say",
-            }, 3f);
+        if (down > 0 || _placement.Busy || Detonator.ExplosivesInHand(GameController) <= 0 ||
+            Detonator.DetonatorGridPosition(GameController) == Vector2.Zero)
+            return;
+
+        _planning.Start(GameController, Settings, _scan, _blast, _valuation, ZoneCancellationToken,
+            cause: Planning.MustTakeChangedCause);
     }
+
+    private void Insist(Target target)
+    {
+        // No message either way: the mark shows as rings in the world and on the minimap, and a line in the HUD's log
+        // corner for every press read as debugging output.
+        if (target == null)
+            return;
+
+        Insisted.Here.Cycle(target.Grid);
+
+        // A solve with the new marks once they stop changing. See MarksSettle.
+        _marksChangedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Makes the marker under the key the one the chain takes last, or clears that. See Insisted.ToggleTakenLast.
+    /// </summary>
+    private void ToggleTakenLast(Target target)
+    {
+        if (target == null)
+            return;
+
+        Insisted.Here.ToggleTakenLast(target.Grid);
+        _marksChangedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// A bar centred under the cursor while the must take key is held on a marker, full when the key goes down and empty
+    /// when the hold marks it taken last, in the must take green. At the cursor warnings' height. See DebugSettings.TakeLastHoldMs.
+    /// </summary>
+    private void DrawTakeLastHold()
+    {
+        if (_insistDownAt == DateTime.MinValue || _insistHeld || _insistTarget == null)
+            return;
+
+        var holdMs = Math.Max(1, Settings.Debug.TakeLastHoldMs.Value);
+        var left = 1f - (float)Math.Clamp((DateTime.UtcNow - _insistDownAt).TotalMilliseconds / holdMs, 0d, 1d);
+        var cursor = Safe.Read(() => new Vector2(GameController.IngameState.MousePosX, GameController.IngameState.MousePosY),
+            Vector2.Zero);
+
+        if (cursor == Vector2.Zero)
+            return;
+
+        // Centred under the pointer, at the cursor warnings' height.
+        const float wide = 80f;
+        const float high = 6f;
+        var at = new Vector2(cursor.X - wide / 2f, cursor.Y + 44f);
+
+        Graphics.DrawBox(new ExileCore2.Shared.RectangleF(at.X - 1f, at.Y - 1f, wide + 2f, high + 2f), Color.Black);
+        Graphics.DrawBox(new ExileCore2.Shared.RectangleF(at.X, at.Y, wide * left, high),
+            Color.FromArgb(230, (Color)Settings.Display.ThePlan.StepColour));
+    }
+
+    /// <summary>When the must take key went down, or MinValue while it is up. See DebugSettings.TakeLastHoldMs.</summary>
+    private DateTime _insistDownAt = DateTime.MinValue;
+
+    /// <summary>The marker under the cursor when the key went down.</summary>
+    private Target _insistTarget;
+
+    /// <summary>Whether this press has already been taken as a hold.</summary>
+    private bool _insistHeld;
 
     /// <summary>
     /// A hotkey the game never hears about is a hotkey that silently never fires: Input only tracks
@@ -496,6 +580,11 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         using (Spent.On("Tick/Options.Closed"))
             Options.Closed(GameController);
 
+        // The map's rarity and pack modifiers shape remnant waves before anything prices a remnant. A changed map bumps
+        // the table's revision once; an unchanged one costs a few stat reads. See Weighing.MapForRemnantWaves.
+        using (Spent.On("Tick/MapForRemnantWaves"))
+            TableGrammar.SetMapForRemnantWaves(Safe.Read(() => Weighing.MapForRemnantWaves(GameController), default));
+
 
 
 
@@ -551,7 +640,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             // Rehearsal.StopContinuing.
             _rehearsal.StopContinuing("deleting the plan");
 
-            Caches.ForgetPlan(Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
+            Caches.ForgetPlan(Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u), _planning);
         }
 
         if (Caches.WantedKeepingScan)
@@ -579,23 +668,23 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Caches.Clear(_scan, _blast, _planning, _boundary, _snap, _cleared,
                 keepScan: true,
                 area: Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
+
+            // And nothing solves again until the player asks, so the next press is the first solve. The full clear
+            // does not hold: it stands for arriving fresh, where the presolve is meant to run. See
+            // Planning.HeldAfterColdStart.
+            Planning.HeldAfterColdStart = true;
         }
 
-        // The best-spots button, answered where the site is in scope. See Planner.Wanted.
-        if (Planner.Wanted >= 0)
+        // The edge points button, answered where the site is in scope. See Planner.EdgePointsPending.
+        if (Planner.EdgePointsPending)
         {
-            var asked = Planner.Wanted;
+            Planner.EdgePointsPending = false;
 
-            Planner.Wanted = -1;
-
-            // The same view the planner has: what is LEFT, thrown from where the next explosive
-            // goes. So a spot whose markers an earlier blast already took is worth what it is still
-            // worth, which is usually nothing - the rings answer "where should the next one go"
-            // rather than "what was this site worth before anyone touched it".
-            Planner.Rank(
-                Planning.Build(GameController, Settings, _scan, _blast, _valuation, true, true, out _, out _),
-                asked, Settings.Solver.Advanced.CandidateSpots.SpotSpread.Value, Planner.PerKind, Planner.Paired,
-                Settings.Solver.Advanced.CandidateSpots.SpotSlack.Value / 100f, Settings.Solver.Advanced.CandidateSpots.LeanHeavy.Value);
+            // The same environment the planner would solve now, thrown from where the next explosive
+            // goes, so the rings answer "where should the next one go" rather than "what was this
+            // site worth before anyone touched it".
+            Planner.ComputeEdgePointsForDrawing(
+                Planning.Build(GameController, Settings, _scan, _blast, _valuation, true, true, out _, out _));
         }
 
         // Where the player has been, and what the scan has met, for the scouting layer.
@@ -673,7 +762,8 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 }
 
                 _scouted.Wanted(GameController, markers, elsewhere,
-                    Settings.Display.UnscoutedGround.MarkerRadius.Value, grand);
+                    Settings.Display.UnscoutedGround.MarkerRadius.Value, grand,
+                    Detonator.DetonatorGridPosition(GameController));
             }
         }
 
@@ -687,6 +777,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Tick/Scan.Price"))
             _scan.Price(_valuation, Settings.Debug.SweepMs.Value);
+
+        // Which remnants belong to no dig site, from what a picked recipe does to them. See Scan.SettleLoneRemnants.
+        using (Spent.On("Tick/Scan.Lone"))
+            _scan.SettleLoneRemnants(entity => _valuation?.ChosenName(entity) ?? "");
 
         using (Spent.On("Tick/Told"))
             Told();
@@ -782,7 +876,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // No longer behind the debug switch as well: a recording is a recording whether or not the
         // overlay is drawing, and pairing the two meant turning the drawing on to gather evidence.
         if (Settings.Recording.Census)
+        {
             _census.Observe(this, GameController, _scan, _valuation);
+            RemnantOffers.Flush(this);
+        }
 
         // What each marker actually turns into. Every frame rather than on the sweep, because a
         // monster that dies between two sweeps is a monster that never appeared as far as a sampled
@@ -793,7 +890,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         if (Settings.Recording.RecordSpawns)
             using (Spent.On("Tick/Spawns.Observe"))
                 _spawns.Observe(this, GameController, _scan, Settings, _valuation,
-                    _blast.Radius(GameController, Settings) ?? 0f);
+                    _blast.Radius(GameController, Settings) ?? 0f, _planning);
 
         // Taken whenever the indicator happens to be up, and kept twice over: for this map, and -
         // with the map's modifiers divided out - for every map after it. It cannot be read at all
@@ -955,7 +1052,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         using (Spent.On("Tick/Rolling.Consider"))
             using (Spent.On("Tick/Rolling.Consider"))
                 Rolling.Here.Consider(GameController, Settings, _scan, _planning, _valuation,
-                _placement.Busy || down != _wereDown, down);
+                _placement.Busy || down != _wereDown || _repeats.Running, down);
 
         // What the plan is worth against what is actually down. Recomputed only when one of the
         // three things it depends on moves, which is not often.
@@ -1087,9 +1184,35 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // **Nor during a batch of repeats.** A presolve is a search, Planning.Start cancels whatever
         // is in flight to take over, and a press cut off halfway is not a sample of anything. See
         // RepeatedPresses.
+        // When each step of arriving happened, for the dump; each test runs only until its step is stamped. See SiteArrival.
+        if (!SiteArrival.Noted(SiteArrival.Step.DetonatorEntity) &&
+            Detonator.DetonatorGridPositionFromEntity(GameController) != Vector2.Zero)
+            SiteArrival.Note(SiteArrival.Step.DetonatorEntity);
+
+        if (!SiteArrival.Noted(SiteArrival.Step.FirstMarkers) && _scan.Targets.Count > 0)
+            SiteArrival.Note(SiteArrival.Step.FirstMarkers);
+
         if (!_coldWanted && !_bakeoff.Running && !_repeats.Running && down <= 0)
             _rehearsal.Tick(GameController, Settings, _scan, _blast, _valuation, _planning,
                 _placement, ZoneCancellationToken);
+
+        // **The ground is asked again when the placement tool appears, and the plan re-solved if it no longer
+        // holds.** A plan made on the approach can be overtaken by the ground: the Runed Monoliths of a stone
+        // circle are written into the ground the game routes over only once they rise, and on Caldera a link
+        // planned before that was put 4 grid short while its ring read green. The tool appearing is the moment
+        // the player is in range to act, so it is the moment to check - once, on its arrival, not every frame.
+        // See Planning.StillHolds.
+        var toolShowing = Detonator.Placeable(GameController);
+
+        if (toolShowing && !_toolWasShowing && _planning.Ready && !_planning.Searching && !_placement.Busy &&
+            !Detonator.SetOffHere(GameController) &&
+            !_planning.StillHolds(GameController, Settings, _scan, _blast, _valuation, out var broken))
+        {
+            _planning.Start(GameController, Settings, _scan, _blast, _valuation, ZoneCancellationToken,
+                cause: $"the ground changed under the plan - {broken}");
+        }
+
+        _toolWasShowing = toolShowing;
 
         // **What is already true about the explosives on the ground, without being asked.**
         //
@@ -1164,7 +1287,14 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Caches.Clear(_scan, _blast, _planning, _boundary, _snap, _cleared, keepScan: true,
                 area: Safe.Read(GameController, static g => g.Area.CurrentArea.Hash, 0u));
 
-            _repeats.Begin(Settings.Debug.RepeatCount.Value, Settings.Debug.RepeatFrom.Value);
+            _repeats.Begin(Settings.Debug.RepeatCount.Value, Settings.Debug.RepeatFrom.Value,
+                Settings.Debug.RepeatStopAtScore.Value);
+
+            // **A batch measures presses and nothing else.** The reroll advice is skipped while it runs (see the
+            // Rolling call), and the continuous reroll mode is stopped as the action key stops it - so the batch's
+            // last press is where it ends, rather than handing over to "Solving: until reroll". The action key
+            // starts it again. See Rehearsal.StopContinuing.
+            _rehearsal.StopContinuing("a batch of repeated presses");
 
             _coldWanted = true;
             _coldAt = DateTime.UtcNow;
@@ -1246,7 +1376,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             var chosen = Settings.Solver.Advanced.Strategy.Value;
 
             _planning.Start(GameController, Settings, _scan, _blast, _valuation,
-                ZoneCancellationToken, cause: "the cold solve comparison");
+                ZoneCancellationToken, cause: "the cold solve comparison", askedByPlayer: true);
 
             Settings.Solver.Advanced.Strategy.Value = chosen;
         }
@@ -1260,6 +1390,29 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // The routing stays, as it does between the bake-off's strategies and for the same measured
         // reason: each solve floods ground and keeps it, so a press late in a batch would inherit what
         // its predecessors paid for. The markers stay too, or each press would search a different site.
+        // A batch press that has reached its target stops there, keeping what it found, and the next one starts.
+        // See DebugSettings.RepeatStopAtScore.
+        //
+        // **Only a chain this press's own search published.** A solve's live chain starts as the standing one, carried
+        // from before the press, and reading that stopped the first presses of every batch at once - counted as
+        // reaching the target with nought rounds run and a pool best of 9,131 against a target of 9,751.
+        //
+        // Nor the standing chain republished: a solve publishes it once as it begins, which a time test alone let
+        // through - press 1 of the next batch again stopped at 1.2 s on 9,751 with a pool best of 9,131.
+        if (_repeats.Running && _repeats.Target > 0d && _planning.Searching &&
+            Planning.LastGainAt > _repeats.PressStarted &&
+            _planning.Live is { Count: > 0 } live && !ReferenceEquals(live, _repeatChecked) &&
+            !(_planning.Standing is { } standing && System.Linq.Enumerable.SequenceEqual(standing, live)))
+        {
+            _repeatChecked = live;
+
+            if (_planning.Env != null && Planner.Plainly(_planning.Env, live) >= _repeats.Target)
+            {
+                _repeats.Reached();
+                _planning.Stop("the batch's target score was reached");
+            }
+        }
+
         if (_repeats.Running && !_coldWanted && !_planning.Searching)
         {
             _repeats.Tick(() =>
@@ -1277,7 +1430,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 Planning.Draws++;
 
                 _planning.Start(GameController, Settings, _scan, _blast, _valuation,
-                    ZoneCancellationToken, cause: "a repeated cold press");
+                    ZoneCancellationToken, cause: "a repeated cold press", askedByPlayer: true);
 
                 return _planning.Searching;
             });
@@ -1313,13 +1466,15 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 Settings.Solver.Advanced.Strategy.Value = name;
 
                 _planning.Start(GameController, Settings, _scan, _blast, _valuation,
-                    ZoneCancellationToken, cause: $"the bake-off, trying {name}");
+                    ZoneCancellationToken, cause: $"the bake-off, trying {name}", askedByPlayer: true);
 
                 Settings.Solver.Advanced.Strategy.Value = chosen;
             });
 
             return;
         }
+
+        SolveAfterMarks(down);
 
         if (Settings.ActionHotkey.PressedOnce() && !_placement.Busy)
         {
@@ -1357,7 +1512,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             //
             // Stopping is the right answer for somebody waiting on a plan. It is the wrong one for
             // somebody using it.
-            if (down <= 0 && _planning.Searching && _planning.Stop())
+            //
+            // **So with explosives down it still stops when there is no plan to use.** With none in hand
+            // the press fell through to the start below and restarted the very solve it was meant to end -
+            // after a reload mid-run, every press threw the search away and began it again. Stopping keeps
+            // the best chain reached, so the next press places from it.
+            if ((down <= 0 || !_planning.Ready) && _planning.Searching && _planning.Stop())
             {
                 // Nothing else this press. Stopping IS the action - and it stops the continuous
                 // reroll mode too, or the presolve would start the next pass half a second later.
@@ -1387,7 +1547,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 (!_planning.Ready && !spent) || !Settings.Automation.On(Settings.Automation.PreExpedition.Enable))
             {
                 _planning.Start(GameController, Settings, _scan, _blast, _valuation,
-                    ZoneCancellationToken, cause: "the action key");
+                    ZoneCancellationToken, cause: "the action key", askedByPlayer: true);
 
                 // Asking for a plan undoes an earlier stop. See Rehearsal.ResumeContinuing.
                 _rehearsal.ResumeContinuing();
@@ -1407,8 +1567,33 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // switched on - while the marks it makes are drawn unconditionally, so the feature looked
         // wired up and simply never fired. It is a playing key, pressed every session to tell the
         // planner the one thing it cannot work out for itself. It belongs with the action key.
+        //
+        // **A tap cycles the mark on release; a hold marks it taken last.** The tap waits for the key to come up so the
+        // two can be told apart. The marker is the one under the cursor when the key went down. See DebugSettings.TakeLastHoldMs.
         if (Settings.InsistHotkey.PressedOnce())
-            Insist();
+        {
+            _insistDownAt = DateTime.UtcNow;
+            _insistTarget = Insisted.Under(GameController, _scan.Targets);
+            _insistHeld = false;
+        }
+
+        if (_insistDownAt != DateTime.MinValue)
+        {
+            if (!Settings.InsistHotkey.IsPressed())
+            {
+                if (!_insistHeld)
+                    Insist(_insistTarget);
+
+                _insistDownAt = DateTime.MinValue;
+                _insistTarget = null;
+            }
+            else if (!_insistHeld &&
+                     DateTime.UtcNow - _insistDownAt >= TimeSpan.FromMilliseconds(Settings.Debug.TakeLastHoldMs.Value))
+            {
+                _insistHeld = true;
+                ToggleTakenLast(_insistTarget);
+            }
+        }
 
         Dump.Plan = _planning.Plan;
         Dump.Chain = _planning.Chain;
@@ -1419,6 +1604,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                              ? 0
                              : Placement.PlacedOf(GameController, _planning.Plan));
         Dump.Env = _planning.Env;
+        Dump.BlastScores = _planning.BlastScores;
 
         // **The dump key answers to nothing but itself.**
         //
@@ -1536,10 +1722,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         var hash = Safe.Read(() => area.Hash, 0u);
 
+        SiteArrival.Entered();
         _scan.AreaChange(hash, real: true);
 
         // A different site is a different problem, and a median across two of them describes neither.
         PressHistory.Forget();
+        Placement.LoadSetByPlacement(hash);
         _repeats.Abandon("the area changed");
 
         _correlate.AreaChange(hash);
@@ -1607,11 +1795,24 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Catalogue.Draw(GameController, Settings, _scan);
 
         using (Spent.On("ChainPanel.Draw"))
-            ChainPanel.Draw(GameController, Settings, _planning);
+            ChainPanel.Draw(GameController, Settings, _planning, _scan);
 
         var ui = Safe.Read(() => GameController.IngameState.IngameUi, null);
 
         if (ui == null)
+            return;
+
+        // The world drawing is cut off at the edge of an open side panel and around the Escape menu, so the plan and the
+        // debug drawing stop painting over them. The score area is not; see Overlay.Draw and
+        // DisplaySettings.HideBehindPanels.
+        var clearOfPanels = Settings.Display.HideBehindPanels
+            ? Panels.ClearOfPanels(GameController)
+            : new RectangleF(-1e5f, -1e5f, 2e5f, 2e5f);
+
+        // **Nothing clear, so nothing drawn.** Clipping to an empty rectangle did not stop the drawing: with the Escape
+        // menu open and the clip at 0x0 (2026-10-06), the overlay still painted over the menu. So an empty answer
+        // returns here instead, before anything on the screen is drawn, as Panels.Hidden does for a full screen panel.
+        if (clearOfPanels.Width <= 0f || clearOfPanels.Height <= 0f)
             return;
 
         // Before the panel gate below, and before the dig-site test: the combinations window is
@@ -1623,15 +1824,33 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         }
 
 
+        // Before the dig-site test, because a warning such as No input or Busy is not about a dig site.
+        using (Spent.On("CursorWarning.Draw"))
+            CursorWarning.Draw(Graphics, GameController, Settings);
+
+        DrawTakeLastHold();
+
+        // Before the dig-site test, because Bond's rares fight in the encounters after it.
+        if (Settings.Display.Remnants.Propagation.BondRuneRadius && !Panels.Hidden(GameController))
+        {
+            using (Spent.On("BondTransfer.Draw"))
+            using (Graphics.BeginRectClip(clearOfPanels, true))
+                BondTransfer.Draw(Graphics, GameController, Settings.Display.Remnants.Rewards.OverruledColour);
+        }
+
         // Nothing else to draw outside a dig site. The detonator element is the cheapest test for
         // that - it exists only where there is an encounter to detonate.
         if (Detonator.Info(GameController) == null)
             return;
 
+        SiteArrival.Note(SiteArrival.Step.DetonatorPanel);
+
         // Only for the panels that leave no world visible behind them. A window covering part of
         // the screen is handled by skipping what it covers, not by blanking the lot.
         if (Panels.Hidden(GameController))
             return;
+
+        SiteArrival.Note(SiteArrival.Step.FirstDraw);
 
         // Snapshotted once per area rather than per frame: reading the grid materialises the whole
         // of it, and only the diagnostics consult it. It goes slightly stale as remnants are spent
@@ -1704,14 +1923,18 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 _scan.Confirm(Detonator.DetonatorGridPosition(GameController));
                 // Every marker that lights up or goes dark, with how far away it was. Written to a
                 // file as it goes, because the useful session is the one that ends unexpectedly.
-                _boundary.Observe(indicator, _scan.Targets,
-                    Detonator.BlastRadius(GameController, Settings.Debug.CircleCorrection.Value) ?? 0f);
+                // Behind Data collection's switch. See RecordingSettings.CollectMarkerEdges.
+                if (Settings.Recording.CollectMarkerEdges)
+                {
+                    _boundary.Observe(indicator, _scan.Targets,
+                        Detonator.BlastRadius(GameController, Settings.Debug.CircleCorrection.Value) ?? 0f);
 
-                if (_boundary.Count >= 20)
-                    _boundary.Save(this);
+                    if (_boundary.Count >= 20)
+                        _boundary.Save(this);
 
-                // Writes the per-art conclusion the moment another art is well enough measured.
-                _boundary.Summarise(this);
+                    // Writes the per-art conclusion the moment another art is well enough measured.
+                    _boundary.Summarise(this);
+                }
                 _snap.Observe(indicator);
 
                 // **And what the game states outright about where the indicator is standing.**
@@ -1736,14 +1959,14 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Cleared.Observe"))
         {
-            _cleared.Observe(GameController, _planning.Plan.Points);
+            _cleared.Observe(GameController, _planning.Plan.Points, Settings.Debug.ScoutReach.Value);
         }
 
         using (Spent.On("Overlay.Draw"))
         {
             Overlay.Draw(Graphics, GameController, Settings, _scan, _snap, _valuation,
                 _boundary, _planning, _placement, _blast, _scoring, _spawns, _cleared, _scouted,
-                covered);
+                covered, clearOfPanels);
         }
 
         rendering.Dispose();

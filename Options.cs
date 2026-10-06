@@ -410,6 +410,10 @@ internal static class Options
             landing = found;
         }
 
+        // Every option, visible or scrolled away, for the offers file. See RemnantOffers.
+        if (Safe.Read(() => settings.Recording.Census.Value, false))
+            RemnantOffers.Note(gc, mine ?? Whose(gc, scan), options.Select(o => Safe.Read(() => o?.Recipe, null)));
+
         var chosen = Pick(gc, settings, valuation, scan, plan);
         var rows = new List<(RectangleF Rect, double Value, string Waves, int Index)>();
         var index = -1;
@@ -461,9 +465,9 @@ internal static class Options
                 // is where the arithmetic lives now - this used to carry a second version of it and the
                 // two disagreed on screen. The row actually taken must come out equal to RuneTallyByRemnant, and the
                 // diagnostic below says so rather than assuming it.
-                var tally = Planner.RuneTallyOfOption(runes, priced.Locals, priced.Carrying);
+                var tally = Planner.RuneTallyOfOption(runes, priced.Locals, priced.Carrying, priced.SlotRunes);
 
-                line = Propagation.Waves(tally.Sockets, tally.Inherited, tally.Wasted, tally.FirstSourced);
+                line = Propagation.RunesOnWaves(tally);
 
                 // The row the planner took, by recipe where both sides know it. Names alone put
                 // the TAKEN marker on whichever same-named row came first. See Priced.
@@ -473,12 +477,12 @@ internal static class Options
                                 : string.Equals(named, took.Reward, StringComparison.OrdinalIgnoreCase));
 
                 _drew.Add($"[{index}] \"{named ?? "(unnamed)"}\" -> " +
-                          $"holds {priced.Locals?.Length ?? 0} local + " +
+                          $"holds {Planner.RunesInLocals(priced.Locals)} local + " +
                           $"{priced.Carrying?.Length ?? 0} propagating, " +
                           $"arriving [{string.Join(" ", runes.Arriving ?? [])}]" +
                           (taken
-                              ? $"  TAKEN - ground says \"{Propagation.Waves(runes)}\"" +
-                                (Propagation.Waves(runes) == line ? " (agrees)" : " (DISAGREES)")
+                              ? $"  TAKEN - ground says \"{Propagation.RunesOnWaves(runes)}\"" +
+                                (Propagation.RunesOnWaves(runes) == line ? " (agrees)" : " (DISAGREES)")
                               : "") +
                           $"  drawn \"{line}\"");
             }
@@ -569,7 +573,11 @@ internal static class Options
         // WantedAt.
         var wantedAt = chosen.Index >= 0 ? chosen.Index : WantedAt;
 
-        if (richestAt >= 0 && richestAt != wantedAt)
+        // A rolled remnant's combination cannot be changed, so neither border is advice: the pick is
+        // drawn in the warning colour and the richest border is left off.
+        var rolled = (mine ?? Whose(gc, scan))?.Rerolled == true;
+
+        if (!rolled && richestAt >= 0 && richestAt != wantedAt)
         {
             graphics.DrawFrame(richest, settings.Display.Remnants.RuneshapeCombinationsWindow.RichestColour,
                 settings.Display.Remnants.RuneshapeCombinationsWindow.BestOptionThickness.Value);
@@ -591,7 +599,10 @@ internal static class Options
                 : default;
 
         if (pick.Width > 0f)
-            graphics.DrawFrame(pick, settings.Display.Remnants.RuneshapeCombinationsWindow.PickColour,
+            graphics.DrawFrame(pick,
+                rolled
+                    ? settings.Display.Remnants.Rewards.OverruledColour
+                    : settings.Display.Remnants.RuneshapeCombinationsWindow.PickColour,
                 settings.Display.Remnants.RuneshapeCombinationsWindow.BestOptionThickness.Value);
 
         // **Why there is no green border, written where the green border would have been.**

@@ -193,7 +193,6 @@ internal static class Scorecard
             Route(text, "THE PLAN", fair, whole);
             Route(text, "WHAT IS PLACED", fair, placed);
             Legal(text, fair, placed, gc);
-            Rivals(text, fair, gc, plan.Points.Count > 0 ? plan.Points.Count : placed.Count);
 
             if (whole.Count > 0 && placed.Count > 0)
             {
@@ -380,63 +379,6 @@ internal static class Scorecard
         text.Add("");
     }
 
-
-    /// <summary>
-    /// Runs the other search and traces its answer through the beam.
-    ///
-    /// **So a diagnosis costs a keypress rather than a hand-laid chain.** The trace needs a chain
-    /// known to be good, and the only one available used to be one the player placed themselves -
-    /// which meant every reading cost a dig site. The two searches disagree by tens of points on
-    /// their own, so the loser's answer is a perfectly good specimen to ask about, and it is free.
-    ///
-    /// The environment is the site with nothing placed and the full complement of explosives: the
-    /// question both searches were originally given.
-    /// </summary>
-    private static void Rivals(List<string> text, PlanEnvironment env, GameController gc, int links)
-    {
-        if (links <= 0)
-            return;
-
-        var asked = env with
-        {
-            Explosives = links,
-            Origin = Detonator.DetonatorGridPosition(gc),
-            Placed = null,
-        };
-
-        var restarts = Planner.Search(asked, TimeSpan.FromMilliseconds(1500), TimeSpan.Zero, 0d,
-            System.Threading.CancellationToken.None, null);
-
-        if (restarts.Points.Count == 0)
-            return;
-
-        var beam = Beam.Search(asked, TimeSpan.FromMilliseconds(1500), TimeSpan.Zero,
-            System.Threading.CancellationToken.None, null);
-
-        text.Add("");
-        text.Add("THE TWO SEARCHES, ON THE SAME QUESTION");
-        text.Add($"  restarts {Planner.Judge(asked, restarts.Points).Total,10:N1}   " +
-                 $"over {restarts.Points.Count} links");
-        text.Add($"  beam     {(beam.Points.Count > 0 ? Planner.Judge(asked, beam.Points).Total : 0d),10:N1}   " +
-                 $"over {beam.Points.Count} links");
-
-        // Whichever did better is the specimen: follow it through the beam and see where it goes.
-        var better = beam.Points.Count > 0 &&
-                     Planner.Judge(asked, beam.Points).Total >= Planner.Judge(asked, restarts.Points).Total
-            ? null
-            : restarts.Points;
-
-        if (better == null)
-        {
-            text.Add("  the beam already matches or beats the restarts, so there is nothing to trace");
-
-            return;
-        }
-
-        text.Add("");
-        text.Add("WHERE THE BEAM LOSES THE RESTARTS ANSWER");
-        text.AddRange(Beam.Trace(asked, better));
-    }
 
     /// <summary>
     /// Whether the planner could have produced this chain at all, link by link.

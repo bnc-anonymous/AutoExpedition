@@ -40,7 +40,8 @@ internal static class Trials
         Vector2 site, Plan plan, int markers, int remnants, int rares, int explosives,
         double seconds, string detail)
     {
-        if (plugin == null || plan == null)
+        // Behind Data collection's switch. See RecordingSettings.CollectSolveTrials.
+        if (plugin == null || plan == null || !Safe.Read(() => plugin.Settings.Recording.CollectSolveTrials.Value, true))
             return;
 
         try

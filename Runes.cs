@@ -72,23 +72,46 @@ internal static class Runes
     ///
     /// Empty where the target is monsters, because that is what an empty scope has always meant and
     /// what every caller still tests for. See Tags.Monsterly, where minus one is that case.
+    ///
+    /// **Every chain-wide effect, joined by commas**, as Tags.Scope reads them. This returned the first and
+    /// stopped, so a row reaching rare and magic monsters - Oath's "rare_monster.count *= +100%,
+    /// magic_monster.count *= +100%" - propagated its rare half and silently dropped the magic one.
     /// </summary>
     public static string Scope(string id)
     {
+        var parts = new List<string>(2);
+
         foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _))
         {
-            if (string.Equals(effect.Target, Tags.Known[Tags.Monsters],
-                    StringComparison.OrdinalIgnoreCase) ||
+            // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+            if (effect.Own)
+                continue;
+
+            // An effect on other runes' magnitude is a lift, not a carry reaching things of its target tag, whichever
+            // tag names the runes it lifts. See Weighing.Lift and EmpowerableRune.
+            if (string.Equals(effect.Attribute, TableGrammar.Magnitude, StringComparison.Ordinal) ||
                 string.Equals(effect.Target, Tags.Known[Tags.Runes],
                     StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // One on every monster makes the rune unscoped, which is what an empty scope means.
+            if (string.Equals(effect.Target, Tags.Known[Tags.Monsters], StringComparison.OrdinalIgnoreCase))
                 return "";
 
-            return effect.Target + "=" +
-                   TableGrammar.Precise(effect.Share * 100f);
+            parts.Add(effect.Target + "=" + TableGrammar.Precise(effect.Share * 100f));
         }
 
-        return "";
+        return string.Join(", ", parts);
     }
+
+    /// <summary>
+    /// What this rune is worth as a share of every monster it reaches - its Weight - or nought where it is scoped, since
+    /// a scoped rune is paid through its scope alone. What the propagated-rune lookups read, so the planner's unscoped
+    /// booking cannot pay a scoped rune again on every monster. Bond, Oath and Time were paid both ways once their rows
+    /// were scoped to rare monsters (2026-10-01). See Propagation.Carried, which already skipped them for the total.
+    /// </summary>
+    public static float UnscopedWeight(string id) =>
+        Scoped(id) ? 0f : Weight(id);
 
     /// <summary>Whether this rune reaches something other than monsters. See Scope.</summary>
     public static bool Scoped(string id) =>
@@ -110,8 +133,23 @@ internal static class Runes
     /// </summary>
     public static float Weight(string id)
     {
-        foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _))
-            return effect.Share * 100f;
+        var effects = TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _);
+
+        // **Its share before its lift**, so a rune that adds and lifts - Rebirth - is weighed by what it adds and lifts
+        // through its effect number. A rune that only lifts - Power - answers with its lift, which is what booking it has
+        // always carried into the amplifiers' group. See Weighing.LiftsOfRune.
+        foreach (var effect in effects)
+        {
+            // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+            if (!effect.Own && !Weighing.IsLiftEffect(effect))
+                return effect.Share * 100f;
+        }
+
+        foreach (var effect in effects)
+        {
+            if (!effect.Own)
+                return effect.Share * 100f;
+        }
 
         return 0f;
     }

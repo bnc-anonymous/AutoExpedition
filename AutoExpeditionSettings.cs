@@ -51,7 +51,7 @@ namespace AutoExpedition;
 internal static class Migrated
 {
     /// <summary>Raise this and add a case below whenever a shipped value must reach saved files.</summary>
-    public const int Current = 14;
+    public const int Current = 20;
 
     /// <summary>
     /// The weights whose number the plan actually took from the settings file, and the table row
@@ -244,10 +244,10 @@ internal static class Migrated
             said.AddRange(Unanchored(settings, saved));
 
         // 9 - the flat blast circle switch was called AvoidHugging, which named neither the
-        // circles nor what it does to them. See PlanDisplaySettings.FlatBlastCircles.
+        // circles nor what it does to them. See PlanDisplaySettings.FlatCircles.
         if (was < 9)
             said.AddRange(CopiedFromPath(saved, "Display.ThePlan.AvoidHugging",
-                settings?.Display?.ThePlan?.FlatBlastCircles, "the flat blast circle switch"));
+                settings?.Display?.ThePlan?.FlatCircles, "the flat blast circle switch"));
 
         // 10 - colouring the reachable links green moved from the placement circle to the plan,
         // which is what it is about. See PlanDisplaySettings.ColourInRangeAsNext.
@@ -282,6 +282,97 @@ internal static class Migrated
             roles.Value = Regex.Replace(line, @"\bhold=", "keep-opening=");
             said.Add("renamed hold= to keep-opening= in the thread roles");
         }
+
+        // **15 - the wave radius default went from 25 to 120 grid.** Measured over 7242 wave monsters tied to one
+        // remnant by their runes: 2.8% spawned within 25 grid of it, the median 56, 92% within 120. A file still at the
+        // old default moves; a value somebody chose stays.
+        if (was < 15 && settings?.Recording?.WaveRadius is { } radius && Math.Abs(radius.Value - 25f) < 0.01f)
+        {
+            radius.Value = 120f;
+            said.Add("raised the wave radius from the old default 25 to 120 grid");
+        }
+
+        // **16 - the flat blast circle switch became the flat circle switch.** It flattens the must take, must avoid and
+        // take last rings too, so FlatBlastCircles named only half of it. See PlanDisplaySettings.FlatCircles.
+        if (was < 16)
+            said.AddRange(CopiedFromPath(saved, "Display.ThePlan.FlatBlastCircles",
+                settings?.Display?.ThePlan?.FlatCircles, "the flat circle switch"));
+
+        // **17 - the last remnant order worker holds remnants descending.** Added to a line where no worker holds remnants
+        // yet and the last worker opens on remnant orders, which is the shipped line and the reorderings of it; a line
+        // built otherwise is left as it was. See ThreadRoles.RemnantsHeld.Descending.
+        if (was < 17 && settings?.Solver?.Advanced?.DestroyAndRepair?.ThreadRoles is { } line17 &&
+            line17.Value is { } typed17 && !typed17.Contains("remnants=", StringComparison.OrdinalIgnoreCase))
+        {
+            var workers17 = typed17.Split(';');
+
+            if (workers17.Length > 0 && workers17[^1].Contains("opening=remnant-order", StringComparison.OrdinalIgnoreCase))
+            {
+                workers17[^1] = workers17[^1].TrimEnd() + " remnants=descending";
+                line17.Value = string.Join(";", workers17);
+                said.Add("the last remnant order worker now holds remnants descending");
+            }
+        }
+
+        // **18 - the edge point step default went from 7 to 0 grid.** A file still at the old default moves; a value
+        // somebody chose stays. See CandidateSpotSettings.EdgePointStepGrid.
+        if (was < 18 && settings?.Solver?.Advanced?.CandidateSpots?.EdgePointStepGrid is { } edgeStep && edgeStep.Value == 7)
+        {
+            edgeStep.Value = 0;
+            said.Add("lowered the edge point step from the old default 7 to 0 grid");
+        }
+
+        // **19 - defaults moved to the player's (2026-10-06).** Numbers and text still at the old default move; a value
+        // somebody chose stays. Switches do not move, since one left at its default cannot be told from one chosen.
+        if (was < 19)
+        {
+            const string rolesBefore19 =
+                "even opening=continue; even opening=refine; even opening=remnant-order; reach opening=remnant-order; " +
+                "seg opening=remnant-order; even opening=remnant-order; reach opening=remnant-order; seg opening=remnant-order remnants=descending";
+            var fresh = new AutoExpeditionSettings();
+
+            if (settings?.Solver?.Advanced?.DestroyAndRepair?.ThreadRoles is { } roles19 &&
+                string.Equals(roles19.Value?.Trim(), rolesBefore19, StringComparison.Ordinal))
+            {
+                roles19.Value = fresh.Solver.Advanced.DestroyAndRepair.ThreadRoles.Value;
+                said.Add("reordered the thread roles to the new default");
+            }
+
+            if (settings?.Rewards?.MustTakeAbove is { } mustTake && Math.Abs(mustTake.Value - 400f) < 0.01f)
+            {
+                mustTake.Value = 2000f;
+                said.Add("raised must take above from the old default 400 to 2000 exalts");
+            }
+
+            if (settings?.Rewards?.PointWorth is { } pointWorth && Math.Abs(pointWorth.Value - 0.5f) < 0.001f)
+            {
+                pointWorth.Value = 0.67f;
+                said.Add("raised the point worth from the old default 0.5 to 0.67");
+            }
+
+            if (settings?.Rewards?.Overrides is { } overrides &&
+                string.Equals(overrides.Value?.Trim(), "Unique Belt=1", StringComparison.Ordinal))
+            {
+                overrides.Value = fresh.Rewards.Overrides.Value;
+                said.Add("replaced the manual price overrides, still at the old default, with the new list");
+            }
+
+            if (settings?.Display?.Remnants?.Rewards?.LineAbove is { } lineAbove && Math.Abs(lineAbove.Value - 400f) < 0.01f)
+            {
+                lineAbove.Value = 600f;
+                said.Add("raised the reward line threshold from the old default 400 to 600 exalts");
+            }
+
+            if (settings?.Recording?.WaveRadius is { } waveRadius && Math.Abs(waveRadius.Value - 120f) < 0.01f)
+            {
+                waveRadius.Value = 300f;
+                said.Add("raised the wave radius from the old default 120 to 300 grid");
+            }
+        }
+
+        // **20 - the take last hold time moved under Debug.** See DebugSettings.TakeLastHoldMs.
+        if (was < 20)
+            said.AddRange(CopiedFromPath(saved, "TakeLastHoldMs", settings?.Debug?.TakeLastHoldMs, "the take last hold time"));
 
         settings.ConfigVersion = Current;
 
@@ -729,6 +820,39 @@ internal static class Section
 /// comparison somebody is actually making. The costs are relative on purpose: the absolute numbers
 /// move with the site and the dump reports the real ones per run, under "what the last run did".
 /// </summary>
+/// <summary>
+/// The manual price overrides as a box of one entry a line, growing with the entries, in place of the host's single-line
+/// field. Stored one entry a line; a value saved comma separated is shown split, and saved back one a line on the first
+/// edit. Blank lines are dropped. See RewardSettings.Overrides.
+/// </summary>
+internal static class PriceOverrideEditor
+{
+    public static void Draw()
+    {
+        var settings = Dump.Settings;
+
+        if (settings == null)
+            return;
+
+        var entries = (settings.Rewards.Overrides.Value ?? "")
+            .Split(new[] { ',', '\n' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var box = string.Join("\n", entries);
+
+        ImGui.TextUnformatted("Manual price overrides: one per line, reward name=exalts.");
+
+        // A line more than the entries, so there is always room to type the next one.
+        var height = ImGui.GetTextLineHeightWithSpacing() * (Math.Max(3, entries.Length) + 1) + 6f;
+
+        if (ImGui.InputTextMultiline("###aeOverrides", ref box, 8192,
+                new System.Numerics.Vector2(ImGui.GetContentRegionAvail().X - 20f, height)))
+        {
+            var back = box.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+            settings.Rewards.Overrides.Value = string.Join("\n", back);
+        }
+    }
+}
+
 internal static class RoleEditor
 {
     /// <summary>
@@ -987,7 +1111,11 @@ public class AutoExpeditionSettings : ISettings
         "Press while hovering an expedition entity to cycle through three\n" +
         "states: \"Must take\" (green), \"Must avoid\" (red), and no preference.\n" +
         "This applies only to the thing you marked, not every occurrence of\n" +
-        "it. Can be used to force the solver to path a certain way.")]
+        "it. Can be used to force the solver to path a certain way.\n" +
+        "\n" +
+        "Hold it (Debug > Take last hold time) to make the thing the chain's\n" +
+        "last: the final explosive is the one that catches it, and nothing\n" +
+        "is placed after. Hold it again to clear that. It is also a must take.")]
     public HotkeyNodeV2 InsistHotkey { get; set; } = new HotkeyNodeV2(Keys.F3);
 
     /// <summary>
@@ -1178,9 +1306,14 @@ public class AutoExpeditionSettings : ISettings
     public SolverSettings Solver { get; set; } = new SolverSettings();
 
     /// <summary>
+    /// The Data collection section: every switch for what the plugin writes to its dumps folder as evidence.
     /// Independent of Debug, so a tester can gather readings without playing with debug drawing on.
-    /// See RecordingSettings.
+    ///
+    /// **Named Data collection on screen, Recording in code.** Settings are saved under the property's name, so
+    /// renaming the property would drop every saved switch; the label and the text moved first, and the property is
+    /// left for a change that migrates the saved file. See CLAUDE.md, rule 3.
     /// </summary>
+    [Menu("Data collection")]
     [Submenu(CollapsedByDefault = true)]
     public RecordingSettings Recording { get; set; } = new RecordingSettings();
 
@@ -1615,9 +1748,8 @@ public class RerollSettings
     /// that refuses to divert is harder to notice than one that diverts too readily, so the
     /// readier behaviour is the one to try first and tighten if it reads badly.
     ///
-    /// Compared on what a roll destroys, not on the enumerated gain, so both sides of the
-    /// comparison are the same quantity. A challenger that has not been enumerated yet has no gain
-    /// to compare. See Rolling.
+    /// Compared on the enumerated gain: a challenger moves the advice when its gain is more than the
+    /// advised remnant's by this share of it. Only remnants with a gain are candidates. See Rolling.Divert.
     /// </summary>
     [Menu("Diversion margin (%)")]
     public RangeNode<int> DiversionMargin { get; set; } = new RangeNode<int>(0, 0, 100);
@@ -1665,8 +1797,7 @@ public class RerollSettings
     /// the first at a site, so the key stopped honouring its own setting after you had pressed it
     /// once.
     ///
-    /// A second, with a second for the reroll advice after it, is a two second round trip. See
-    /// RollSolveMs.
+    /// A second, with the reroll advice after it, is about a second's round trip.
     /// </summary>
     [Menu("Time to improve after a reroll (ms)")]
     public RangeNode<int> LoopSolveMs { get; set; } = new RangeNode<int>(1000, 100, 10000);
@@ -1685,67 +1816,18 @@ public class RerollSettings
     [Menu("Continuous pass length (ms, 0 = as a presolve pass)")]
     public RangeNode<int> ContinuousPassMs { get; set; } = new RangeNode<int>(12000, 0, 600000);
 
-    /// <summary>The same on a Grand Expedition. See ContinuousPassMs.</summary>
+    /// <summary>
+    /// The same on a Grand Expedition. See ContinuousPassMs.
+    ///
+    /// Pass length was not what held continuous mode back. Measured offline on one Frigid Bluffs layout (2026-10-03),
+    /// seeded with a 39,179 east-first plan: six 24s passes stalled at 42,205 while each worker but the first restarted
+    /// every pass, and reached 45,403 by the fourth pass once each worker carried its own chain over. A 48s pass also
+    /// got there, by giving the restarted workers enough time in one pass, which the carry makes unnecessary. See
+    /// Repair.Search's own.
+    /// </summary>
     [Menu("Continuous pass length in a Grand Expedition (ms, 0 = as a presolve pass)")]
     public RangeNode<int> ContinuousPassMsGrand { get; set; } = new RangeNode<int>(24000, 0, 600000);
 
-    /// <summary>
-    /// The longest the reroll advice may take before it reports what it has.
-    ///
-    /// **It was bounded by how much work it had, not by how long that took.** The deep pass
-    /// re-solves the chain once per sampled outcome for every remnant on its shortlist, so its cost
-    /// follows the size of the site - which is exactly when you least want to wait for it. The
-    /// shortlist is worked through best-first, so stopping early costs the least promising
-    /// candidates and the line says how many it reached.
-    /// </summary>
-    [Menu("Maximum time for reroll advice (ms)")]
-    public RangeNode<int> RollSolveMs { get; set; } = new RangeNode<int>(1000, 100, 15000);
-
-    /// <summary>
-    /// Works a simple site out exactly before searching it, and hands the answer over as a floor.
-    ///
-    /// **Nine or ten things of two kinds is not a search problem.** What matters on such a site is
-    /// which kind goes first - content does not care what order it is taken in, propagation cares
-    /// about nothing else - and once that is decided the chain follows: cover each kind as cheaply
-    /// as you can, in that order. So the kinds are permuted, each order is built greedily, and the
-    /// best is kept. Three kinds at most, because the work is a permutation of them and a dig with
-    /// four is not the sparse case this is for.
-    ///
-    /// **It was written for one map and then could not be reached.** The solve lived inside the
-    /// restart search, so with Destroy and Repair selected - the default, and the one that wins the
-    /// bake-offs - it never ran: every dump on that strategy reports "working it out rather than
-    /// searching: has not run". It runs before the search now, whichever search that is.
-    ///
-    /// A floor and not an answer. Reaching the right chain and proving it is the right chain are
-    /// different things, so the search carries on from it rather than stopping - which costs a pass
-    /// over a handful of candidates and can only start it higher.
-    ///
-    /// Here as a switch so the two can be compared on the map that prompted it: turn it off and see
-    /// what the search makes of the same site on its own.
-    /// </summary>
-    /// <summary>
-    /// How many links a reroll's worth may disturb when it is priced, from one to three.
-    ///
-    /// **The one knob that decides whether reroll advice is usable on a Grand site.** Pricing a roll
-    /// means asking what the chain could do with the rolled remnant in it, and the old answer was
-    /// Planner.Improve - any spot, any order, six rounds of every link against every candidate. Per
-    /// sampled outcome, per candidate remnant, that is ten to twenty seconds for one remnant's advice
-    /// with the player standing still.
-    ///
-    /// One link replaces a single spot with one that catches the rolled remnant and re-orders the
-    /// chain. That covers the case the roll usually creates and costs about forty five trials.
-    ///
-    /// Two lets the following link move as well, which is what recovers a remnant the reach cannot
-    /// otherwise get to - and a remnant off the route is usually off it for exactly that reason. It
-    /// costs one link's worth of candidates on top, so a few thousand trials.
-    ///
-    /// Three is offered so the cost can be seen rather than guessed at, and should not be used: the
-    /// trials multiply again, which is the loop this setting exists to escape.
-    ///
-    /// See Planner.Restitched.
-    /// </summary>
-    [Menu("Reroll restructure depth (links)")]
-    public RangeNode<int> RollSubstitutionLinks { get; set; } = new RangeNode<int>(1, 1, 3);
 }
 
 
@@ -1774,9 +1856,8 @@ public class AdvancedSolverSettings
     /// a player five ways to get a worse answer and cost every reader of this code the question of
     /// which one mattered.
     ///
-    /// The band search survives as a component rather than a mode - destroy and repair opens from
-    /// it - and so does the beam, which the score card still runs to show its working. See Edges
-    /// and Beam.
+    /// The beam survives as a component rather than a mode: the score card traces a chain through
+    /// it to show where it is lost. See Beam.Trace.
     ///
     /// Every mode scores with the identical objective, so a score from one means the same as a
     /// score from another.
@@ -1794,9 +1875,6 @@ public class AdvancedSolverSettings
 
     [Submenu(CollapsedByDefault = true)]
     public CandidateSpotSettings CandidateSpots { get; set; } = new CandidateSpotSettings();
-
-    [Submenu(CollapsedByDefault = true)]
-    public BandSearchSettings BandSearch { get; set; } = new BandSearchSettings();
 }
 
 /// <summary>
@@ -1823,13 +1901,28 @@ public class DestroyAndRepairSettings
     /// of the window. It scored a mean press maximum of 15,197 on draws 11-30, the highest of the day, with
     /// no rel workers at all: taking rel out cost nothing measurable, while four reach-biased workers did
     /// (14,991). The line it replaced held five openings for the whole window (keep-opening=100), and a pool
-    /// of those measured far worse (14,326). One Grand site; not yet measured on a regular one.
+    /// of those measured far worse (14,326). One Grand site; not yet measured on a regular one. That line was
+    /// "even opening=continue; even opening=tour; even opening=enumerated keep-opening=30; reach opening=tour;
+    /// reach opening=enumerated keep-opening=30; seg opening=fresh; seg opening=tour; seg opening=enumerated
+    /// keep-opening=30".
+    ///
+    /// **Replaced on 2026-10-04 by two workers on the pool's best and six on remnant orders.** On a Frigid Bluffs site
+    /// every chain above 70,000 came from a remnant order or from the pool's best searched exhaustively, and the
+    /// touring and enumerated workers ended at 55-58,000. Not yet measured on the benchmark set.
+    ///
+    /// **The last holds remnants descending since 2026-10-06** - every remnant must take, then every one but one, then
+    /// but two - for the sites whose best chain holds them all. Four such workers lost on Stagnant Basin, where the best
+    /// chain leaves remnants out (8,465 at 10 s against 8,820), so it is one, chosen by the player and being measured.
+    /// See Repair.SearchDescendingRemnants.
+    ///
+    /// **The order is the player's since 2026-10-06**: the two even order workers first, so the two order workers that
+    /// wait for the orders (Repair.OrderWorkersWaiting) both open even, then the reach pair and the seg pair. Not
+    /// measured against the order before it, which interleaved even, reach and seg.
     /// </summary>
     [Menu("Thread roles")]
     public TextNode ThreadRoles { get; set; } = new TextNode(
-        "even opening=continue; even opening=tour; even opening=enumerated keep-opening=30; " +
-        "reach opening=tour; reach opening=enumerated keep-opening=30; seg opening=fresh; seg opening=tour; " +
-        "seg opening=enumerated keep-opening=30");
+        "even opening=continue; even opening=refine; even opening=remnant-order; even opening=remnant-order; " +
+        "reach opening=remnant-order; reach opening=remnant-order; seg opening=remnant-order; seg opening=remnant-order remnants=descending");
 
     /// <summary>
     /// What the five names mean, behind a marker beside the field.
@@ -1845,6 +1938,20 @@ public class DestroyAndRepairSettings
     /// </summary>
     [JsonIgnore]
     public CustomNode ThreadRolesHelp { get; set; } = new CustomNode(RoleEditor.Draw);
+
+    /// <summary>
+    /// Builds the remnant orders on the threads of the first two workers that open on them, which wait for them, when
+    /// there are none for the ground yet; the other order workers start at once on their own openings and take orders
+    /// as they are published. A worker given an order searches its chain with windows of two and three stops before
+    /// its usual moves. Off, the orders are built on one thread in the background and every worker takes them as they
+    /// arrive. On by default. See Repair.OrderWorkersWaiting.
+    ///
+    /// After a reset on a Frigid Bluffs site (2026-10-04) the background build took 19.4 s and the workers climbed on
+    /// fallback openings meanwhile; split between the threads of the waiting workers, the same build took 2.3 s
+    /// offline where one thread took 3.2 s. See RemnantOrder.SearchAcrossThreads and ExhaustiveSpotSearch.
+    /// </summary>
+    [Menu("Remnant orders first")]
+    public ToggleNode RemnantOrdersFirst { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// The smallest run of links Destroy and repair tears out at once.
@@ -1874,9 +1981,9 @@ public class DestroyAndRepairSettings
     /// second press at the pace recently measured, and 2,500 is the pace of a faster session - setting it to the
     /// pool total would be a press seven times longer than anybody is waiting for.
     ///
-    /// **It does not make a press deterministic outright.** The band search and the opening are still bounded by
-    /// their own clocks, so a worker's starting chain can still differ; what this fixes is the improvement loop,
-    /// which is where the window goes. Leave it at nought for play - a round budget makes a press take as long
+    /// **It does not make a press deterministic outright.** What it fixes is the improvement loop, which is where
+    /// the window goes; the opening's own cap is lifted while it is in force (see Repair.Search), and anything else
+    /// bounded by wall clock can still make two presses differ. Leave it at nought for play - a round budget makes a press take as long
     /// as it takes, which on a slow frame is longer than the window a player is waiting for.
     /// </summary>
     [Menu("(MEASUREMENT) Rounds per worker, 0 for the clock")]
@@ -2053,8 +2160,8 @@ public class DestroyAndRepairSettings
     /// The longest the opening may take, in milliseconds. Nought lets it finish.
     ///
     /// **The opening had no clock at all, which is why this is a new cap rather than an exposed
-    /// one.** It builds a chain four ways - the last solve's answer, the band search, four greedy
-    /// starts, then a polish - and returns when it has finished, not when it has spent a share of
+    /// one.** It builds a chain three ways - the last solve's answer, four greedy starts, then a
+    /// polish - and returns when it has finished, not when it has spent a share of
     /// anything. Measured on a Grand site: four to eight seconds, against an improvement window of
     /// eight.
     ///
@@ -2063,10 +2170,6 @@ public class DestroyAndRepairSettings
     /// the whole score and 290 rounds of tearing added 0.1%; on another the threads gained 4 to 6%
     /// after opening. It shipped at 2,000ms with the tuned defaults of 2026-09-24 (795ea5c); the
     /// measurement that chose that figure is not recorded here.
-    ///
-    /// **The band search cannot be interrupted by it.** That pass takes a cancellation token rather
-    /// than a clock, so a cap below its cost simply lands after it. The dump reports it separately
-    /// as the shared band time.
     /// </summary>
     [Menu("Opening timeout (ms, 0 = unlimited)")]
     public RangeNode<int> OpeningMs { get; set; } = new RangeNode<int>(2000, 0, 20000);
@@ -2335,89 +2438,43 @@ public class DestroyAndRepairSettings
 }
 
 /// <summary>
-/// Which cells the search may consider putting an explosive on.
-///
-/// **Called "spot families" before, which named the code and not the thing.** SeedFamilies is
-/// the record these fill in; what they decide is how many candidate spots each pair of markers,
-/// each rare and each remnant contributes, and how far apart they have to be. See
-/// Planner.Families.
+/// Which edge points toward neighbours the search's shortlist is offered, on top of the richest and most spread
+/// spots it takes by score. SeedFamilies is the record these fill in. See Repair.Shortlist and
+/// Planner.EdgePointsTowardNeighbours.
 /// </summary>
 public class CandidateSpotSettings
 {
-    [Menu("High-value markers only")]
-    public ToggleNode LeanHeavy { get; set; } = new ToggleNode(true);
+    /// <summary>
+    /// Whether points on the catch edge of each heavy marker, leading towards each heavy marker or rare in reach, are
+    /// offered. Heavy is the openings' test - worth ten ordinary markers, counting what it passes on and its switches -
+    /// so it is usually the remnants and relics, can be a rich chest, and late in a chain can be a rare. Measured on
+    /// one site (2026-09-30): of the ten links of the two best chains found there before these were offered, seven
+    /// sat exactly on one of its 79 points and the rest within 7 grid, and offering them took the median press from
+    /// 9,131 to 9,895. See Planner.EdgePointsTowardNeighbours.
+    /// </summary>
+    [Menu("Heavy edge points")]
+    public ToggleNode HeavyEdgePoints { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// How many candidate spots each remnant contributes on its own account.
-    ///
-    /// Nought means a remnant is only ever caught from a spot some other marker offered, which is
-    /// most of them on a busy site and none of them on a sparse one. Three gives the search
-    /// somewhere to stand for each remnant whatever else is nearby.
+    /// Whether points on the catch edge of each rare, leading towards each heavy marker or rare in reach, are offered,
+    /// so a rare standing far from heavy content still gets points leading to what is in reach. Independent of Heavy
+    /// edge points. Not yet measured. See Planner.EdgePointsTowardNeighbours.
     /// </summary>
-    [Menu("Spots per remnant (0 = none)")]
-    public RangeNode<int> SpotsPerRemnant { get; set; } = new RangeNode<int>(3, 0, 10);
-
-    [Menu("Spots per rare")]
-    public RangeNode<int> SpotsPerRare { get; set; } = new RangeNode<int>(3, 0, 10);
-
-    [Menu("Spots per pair")]
-    public RangeNode<int> SpotsPerPair { get; set; } = new RangeNode<int>(3, 0, 10);
-
-    [Menu("Spot worth tolerance (%)")]
-    public RangeNode<float> SpotSlack { get; set; } = new RangeNode<float>(2f, 0f, 20f);
-
-    [Menu("Band width (cells)")]
-    public RangeNode<int> CellsPerBand { get; set; } = new RangeNode<int>(6, 2, 24);
+    [Menu("Rare edge points")]
+    public ToggleNode RareEdgePoints { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// How far apart two drawn spots must be, in grid units, before they count as different answers.
-    ///
-    /// Nought means the game's own minimum spacing, which is the honest default: two explosives
-    /// closer than that cannot both exist, so anything nearer is an alternative to a spot already
-    /// listed rather than a spot of its own. Without spreading at all, the top dozen positions on a
-    /// site are the same blast nudged a unit at a time.
-    ///
-    /// Worth turning up to see the shape of the site in fewer, further-apart rings, and down to see
-    /// how much better the exact position is than its neighbours. It was a blast radius, hard-coded,
-    /// which was wide enough that the list became "the best spot in each area" and padded itself out
-    /// with ground worth nothing.
+    /// How much nearer a neighbour an edge point must end to be worth a point of its own, in grid. Within one direction,
+    /// a point catching less is kept only if it ends this much nearer than the richer point before it; across
+    /// directions, a point is folded into another catching exactly the same markers if that one ends within this of it
+    /// towards every neighbour it leads to. Nought keeps every trade of content for distance. Nought is the default:
+    /// against seven it was level or slightly ahead at 10 s over four Grand sites and two draws (2026-10-06, offline -
+    /// Frigid 76,791/74,964 against 73,543/74,160, Grazed 11,917/11,849 against 11,821/11,833), for more points (719
+    /// against 298 on Stagnant Basin). Seven had been chosen, not measured. It was a percentage of the blast radius,
+    /// under another name so a saved percentage is not read as grid. See Planner.EdgePointsTowardNeighbours.
     /// </summary>
-    [Menu("Minimum spot spacing (grid)")]
-    public RangeNode<float> SpotSpread { get; set; } = new RangeNode<float>(0f, 0f, 90f);
-}
-
-/// <summary>
-/// The band search's own settings.
-///
-/// **It was a mode and is now a component.** Edge only offered it as a way to play; what it is
-/// good for is opening, which is where destroy and repair uses it. These shape that opening and
-/// nothing here picks a search any more.
-/// </summary>
-public class BandSearchSettings
-{
-    /// <summary>
-    /// How many links the band search plans, or nought for the whole chain.
-    ///
-    /// **Nought, because there is no upper limit to write down.** It shipped at one - plan the next
-    /// bomb and stop - which is a diagnostic rather than a way to play, and it could not be raised
-    /// past fifteen because fifteen was the top of its slider. A dig site's explosive count is not
-    /// fixed: map and atlas modifiers add to it, so any number typed here is a cap that a modifier
-    /// can walk past. Nought asks for however many the detonator says are left.
-    ///
-    /// One still means the next bomb only, and is still the quickest way to see what a single link
-    /// is worth. Anything between is a cap for a site whose tree is too wide to walk to the end.
-    ///
-    /// Renamed from EdgeLinks so a saved one is discarded rather than quietly keeping the old
-    /// diagnostic behaviour under a setting that now reads as unlimited.
-    /// </summary>
-    [Menu("Links to plan (0 = all)")]
-    public RangeNode<int> EdgeChainLinks { get; set; } = new RangeNode<int>(0, 0, 30);
-
-    [Menu("Branches per step (0 = every option)")]
-    public RangeNode<int> EdgeBranches { get; set; } = new RangeNode<int>(0, 0, 12);
-
-    [Menu("Lookahead links (0 = all)")]
-    public RangeNode<int> EdgeHorizon { get; set; } = new RangeNode<int>(0, 0, 8);
+    [Menu("Edge point step (grid)")]
+    public RangeNode<int> EdgePointStepGrid { get; set; } = new RangeNode<int>(0, 0, 10);
 }
 
 public class AutomationSettings
@@ -2632,6 +2689,18 @@ public class DisplaySettings
     [Menu("Draw score area")]
     public ToggleNode DrawScore { get; set; } = new ToggleNode(true);
 
+    /// <summary>
+    /// Cuts the plan and the debug drawing off at the edge of an open side panel, such as the inventory, the character
+    /// sheet or the stash, so nothing is painted over them, and draws nothing on the screen while the Escape menu is
+    /// open, since where the menu sits cannot be read.
+    ///
+    /// The HUD draws on top of the game and cannot go behind a panel, so this clips to the largest band of the screen
+    /// the panels leave clear; see Panels.ClearOfPanels. The score area is not clipped: it sits low enough that no panel
+    /// reaches it. Neither are the Runeshape Combinations prices, the warning under the cursor or the reference windows.
+    /// </summary>
+    [Menu("Hide behind panels")]
+    public ToggleNode HideBehindPanels { get; set; } = new ToggleNode(true);
+
     [Submenu(CollapsedByDefault = true)]
     public PlanDisplaySettings ThePlan { get; set; } = new PlanDisplaySettings();
 
@@ -2761,7 +2830,9 @@ public class PlanDisplaySettings
     public RangeNode<float> ReadyThickness { get; set; } = new RangeNode<float>(1f, 1f, 5f);
 
     /// <summary>
-    /// Whether a blast circle is drawn flat at the middle's height rather than following the ground.
+    /// Whether the circles drawn in the world - the blast circles, and the must take, must avoid and take last rings -
+    /// lie flat at their middle's height rather than following the ground. The argument below is the blast circles';
+    /// the marks follow the same switch so the two always look alike.
     ///
     /// **A blast is not a shape on the ground, and hugging it is a pretty lie.** Planner.Catches is
     /// a distance between two grid positions - height plays no part in it at all - so the terrain
@@ -2777,8 +2848,8 @@ public class PlanDisplaySettings
     /// is too much, nothing has measured what a player would call steep, and a guessed threshold
     /// that flattens the wrong circles is worse than either picture on its own.
     /// </summary>
-    [Menu("Draw blast circles without terrain elevation")]
-    public ToggleNode FlatBlastCircles { get; set; } = new ToggleNode(true);
+    [Menu("Draw circles without terrain elevation")]
+    public ToggleNode FlatCircles { get; set; } = new ToggleNode(true);
 }
 
 /// <summary>
@@ -2798,6 +2869,18 @@ public class ScoreAreaSettings
 
     [Menu("Draw bombs in score area")]
     public ToggleNode DrawBombs { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Placement warnings - Walk closer, Refused, Choose and the rest - written under the mouse cursor instead of on the
+    /// score area's last line, where they went unnoticed. Off puts them back in the score area. See CursorWarning.
+    /// </summary>
+    [Menu("Cursor warnings", "Show placement warnings under the mouse cursor\n" +
+        "instead of in the score area.")]
+    public ToggleNode CursorWarnings { get; set; } = new ToggleNode(true);
+
+    /// <summary>How long a cursor warning stays up, in seconds. A new placement run clears it sooner. See CursorWarnings.</summary>
+    [Menu("Cursor warning duration (s)")]
+    public RangeNode<int> CursorWarningSeconds { get; set; } = new RangeNode<int>(4, 1, 30);
 
     /// <summary>
     /// How far to move the score area from where it sits by default, relative to the middle of the
@@ -2865,7 +2948,7 @@ public class PlacementCircleSettings
     /// <summary>
     /// The art file each of those entities is drawn from, written beside it.
     ///
-    /// Off by default: it is how the content taxonomy was worked out - chestmarker3 is rare,
+    /// On by default since 2026-10-06, the player's choice. It is how the content taxonomy was worked out - chestmarker3 is rare,
     /// chestmarker2 is magic, elitemarker is a rare monster - and once that is settled it is a
     /// wall of file names over the dig site. It stays because the taxonomy is the sort of thing a
     /// patch quietly changes, and the way to notice is to be able to look.
@@ -2878,7 +2961,7 @@ public class PlacementCircleSettings
     /// feature had two vocabularies and neither pointed at the other. See DebugSettings.ShowArtNames.
     /// </summary>
     [Menu("Show entity art names")]
-    public ToggleNode ShowArtNames { get; set; } = new ToggleNode(false);
+    public ToggleNode ShowArtNames { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// When to mark ground the chain cannot reach, and content a blast did not get.
@@ -3066,7 +3149,7 @@ public class RemnantRewardSettings
     /// other drawing can say anything at all.
     /// </summary>
     [Menu("Draw a line to rewards above (exalts)")]
-    public RangeNode<float> LineAbove { get; set; } = new RangeNode<float>(400f, 0f, 500f);
+    public RangeNode<float> LineAbove { get; set; } = new RangeNode<float>(600f, 0f, 5000f);
 
     /// <summary>
     /// How far away a remnant may be and still get a line, in grid units. Zero means any distance.
@@ -3225,7 +3308,7 @@ public class RerollDisplaySettings
     /// of the remnant the advice picks.
     ///
     /// In the yellow the game borders a propagating slot in, because runes are all the comparison
-    /// measures: both sides of it are scored with the reward set aside. See Rolling.Enumerated.
+    /// measures: both sides of it are scored with the reward set aside. See Rolling.ScoreRollOutcomes.
     ///
     /// It was three figures - a total, a rune half and a reward half - which said one thing three
     /// times once the reward left the comparison.
@@ -3286,6 +3369,31 @@ public class PropagationDisplaySettings
     /// </summary>
     [Menu("Propagating rune text")]
     public ColorNode PassColour { get; set; } = new ColorNode(Color.FromArgb(255, 255, 205, 90));
+
+    /// <summary>
+    /// A rune this remnant propagates that an earlier remnant in the chain already propagates, in the line under the
+    /// remnant: its socket adds nothing to the waves after it. See Overlay.Remnants.
+    /// </summary>
+    [Menu("Upstream duplicate colour")]
+    public ColorNode UpstreamDuplicateColour { get; set; } = new ColorNode(Color.FromArgb(255, 235, 90, 90));
+
+    /// <summary>
+    /// A rune this remnant is the first to propagate that a later remnant in the chain propagates as well, with the
+    /// combination the plan takes there, in the line under the remnant. See Overlay.Remnants.
+    /// </summary>
+    [Menu("Downstream duplicate colour")]
+    public ColorNode DownstreamDuplicateColour { get; set; } = new ColorNode(Color.FromArgb(255, 255, 150, 50));
+
+    /// <summary>
+    /// A ring around each rare monster carrying the Bond rune, at the range within which it can pass a modifier on
+    /// to, and heal, another rare when it dies. 80, from the stat's own name, drawn as grid cells until the unit
+    /// is measured. Purple while another rare is inside it, the warning colour while none is. See BondTransfer.
+    ///
+    /// Moved here from Display and renamed from BondTransferRadius, so a value saved under the old name is not
+    /// carried over. Off by default since 2026-10-06.
+    /// </summary>
+    [Menu("Draw Bond Rune radius (Rare Monsters may transfer a Mod on death, 80 units)")]
+    public ToggleNode BondRuneRadius { get; set; } = new ToggleNode(false);
 }
 
 /// <summary>
@@ -3435,6 +3543,19 @@ public class UnscoutedDisplaySettings
     public ColorNode UnscoutedColour { get; set; } = new ColorNode(Color.FromArgb(70, 255, 60, 60));
 
     /// <summary>
+    /// How far above the ground the unscouted layer is drawn on the large map, in world units, so its edges meet the
+    /// walls the map outlines rather than the ground at their foot.
+    ///
+    /// The map draws a wall at its top, which on screen stands above the ground it encloses, so a layer drawn at ground
+    /// height ran past the outline at the bottom of each area and stopped short of it at the top. Placed at ground height
+    /// two ways - through GridToMap and as Radar places its map - the layer agreed with both to the pixel and still sat
+    /// about 5 px low on an Exhumed Ruins site (2026-10-05). A hundred lined it up with the outlines by eye there. The
+    /// small map is not moved. See Wash.CornersAboutPlayer.
+    /// </summary>
+    [Menu("Unscouted height offset (world units)")]
+    public RangeNode<int> UnscoutedHeightOffset { get; set; } = new RangeNode<int>(100, -300, 300);
+
+    /// <summary>
     /// How far around a marker there is still ground worth searching, in grid units.
     ///
     /// **A marker points at more of the site, it does not vouch for what is beside it.** Expedition
@@ -3579,7 +3700,20 @@ public class RewardSettings
     /// was optimising for. A display setting must not change what the plugin chooses.
     /// </summary>
     [Menu("Weight-to-price balance when choosing rewards")]
-    public RangeNode<float> PointWorth { get; set; } = new RangeNode<float>(0.5f, 0f, 5f);
+    public RangeNode<float> PointWorth { get; set; } = new RangeNode<float>(0.67f, 0f, 5f);
+
+    /// <summary>
+    /// A remnant reward worth less than this counts for nothing in the plan, the reward choice and the reroll advice,
+    /// so those choices are made on runes and the chain alone.
+    ///
+    /// Most of an expedition's value is in what the monsters drop: chains on Grand sites drop several divines, at
+    /// about 700 exalts each, against rewards of a few exalts that decided between two recipes with the same
+    /// propagating rune - Ancient Rune of Retaliation at 14.8ex was taken over Ancient Rune of Dueling at 6.7ex, which
+    /// put one more distinct rune on the remnant's waves. A reward worth building the chain around is above this and
+    /// usually a must take as well. In exalts. 100 is chosen, not measured; nought counts every reward.
+    /// </summary>
+    [Menu("Ignore rewards below (exalts)")]
+    public RangeNode<float> IgnoreRewardsBelow { get; set; } = new RangeNode<float>(100f, 0f, 2000f);
 
     /// <summary>
     /// Marks a rich remnant must take for you, exactly as the key would, and then leaves it alone.
@@ -3600,7 +3734,7 @@ public class RewardSettings
     /// that much is worth building the chain around. Nought switches it off, and the key still works.
     /// </summary>
     [Menu("Automatically set Must Take on rewards >= (exalts)")]
-    public RangeNode<float> MustTakeAbove { get; set; } = new RangeNode<float>(400f, 0f, 500f);
+    public RangeNode<float> MustTakeAbove { get; set; } = new RangeNode<float>(2000f, 0f, 5000f);
 
     /// <summary>
     /// What a Liquid Verisium costs you, in exalts.
@@ -3654,7 +3788,7 @@ public class RewardSettings
     /// </summary>
 
     /// <summary>
-    /// Prices the plugin cannot look up, written down by hand. "name=value", comma separated.
+    /// Prices the plugin cannot look up, written down by hand. "name=value", one a line.
     ///
     /// Some rewards have no price and never will: a recipe offering a generic "Unique Belt" has no
     /// item behind it for poe.ninja to have an opinion about, and the same goes for uncut gems,
@@ -3672,22 +3806,30 @@ public class RewardSettings
     /// specifically. Values are in exalts, and multiply by the reward count the same way a
     /// looked-up price does.
     ///
-    /// One entry is shipped. The generic unique rewards are worth very little and the belt is the
-    /// best of them, so naming the belt alone says the whole of it: the others stay at nothing and
-    /// the belt wins wherever it is offered against them. An exalt is enough to stop it reading as
-    /// EMPTY without pulling a chain towards it, which is the job.
+    /// The generic unique rewards are worth very little and the belt is the best of them, so naming the
+    /// belt alone says the whole of them: the others stay at nothing and the belt wins wherever it is
+    /// offered against them. An exalt is enough to stop it reading as EMPTY without pulling a chain
+    /// towards it. The other shipped entries are the player's own prices (2026-10-06), chosen, not
+    /// looked up.
     ///
     /// This replaced a preference list that named unpriced rewards in order. An order says the belt
     /// beats the ring and cannot say by how much, so it could break a tie and never weigh against
     /// anything else. A price can.
     ///
-    /// A saved file keeps whatever it already holds, so the four entries shipped before this stay
-    /// put for anybody who has run the plugin. See ConfigVersion for when that is worth overriding,
-    /// and this is not one of those: the numbers changed, the question did not.
+    /// A saved file keeps whatever it already holds, except one still at the belt alone, the default
+    /// before these, which migration 19 moves to them. See ConfigVersion.
+    ///
+    /// **One entry a line**, edited in a box that grows with them (PriceOverrideEditor); the single-line field is hidden.
+    /// Commas still separate entries, so a value saved comma separated reads the same. Shipped with the player's list
+    /// since 2026-10-06.
     /// </summary>
-    [Menu("Manual price overrides",
-        "Comma separated.")]
-    public TextNode Overrides { get; set; } = new TextNode("Unique Belt=1");
+    [IgnoreMenu]
+    public TextNode Overrides { get; set; } = new TextNode(
+        "Unique Belt=1\nAldur's Legacy=350001\nPerfect Flux=25001\nAldur's Saga=200001\nWarding Rune of Disintegration=20");
+
+    /// <summary>The overrides as a box of one entry a line. See Overrides and PriceOverrideEditor.</summary>
+    [JsonIgnore]
+    public CustomNode OverridesUi { get; set; } = new CustomNode(PriceOverrideEditor.Draw);
 
 }
 
@@ -3768,50 +3910,6 @@ public class RecordingSettings
     });
 
     /// <summary>
-    /// Writes every remnant seen to dumps/remnants.csv.
-    ///
-    /// The only route to knowing what a reroll is worth. A roll replaces the whole remnant, so its
-    /// value depends on the distribution of remnants the game generates - and the game does not
-    /// expose the weights, so the only way to have that number is to count them.
-    ///
-    /// Passive and cheap: a handful of rows per dig site, appended on the sweep it already does,
-    /// no reading the game has not already done. Each row says whether the remnant came with the
-    /// map or came out of a roll, so the two can be compared rather than assumed equal.
-    ///
-    /// Its own switch in its own section rather than behind debug mode, because the people whose
-    /// readings are wanted are not the people who play with debug drawing on. See RecordingSettings.
-    /// </summary>
-    [Menu("Record remnants seen")]
-    public ToggleNode Census { get; set; } = new ToggleNode(false);
-
-
-    /// <summary>
-    /// Writes when each marker's entity loads and unloads to dumps/streaming.csv.
-    ///
-    /// **This ran under no setting at all.** It is on the sweep's rhythm rather than every frame,
-    /// which is why it never showed up as a cost worth chasing, but it is a file being appended to
-    /// while you play and there was no way to stop it short of unloading the plugin.
-    /// </summary>
-    [Menu("Record when marker entities load and unload")]
-    public ToggleNode RecordStreaming { get; set; } = new ToggleNode(false);
-
-    /// <summary>
-    /// Watches for the "Expedition Complete" banner and warns if sites are still unplaced.
-    ///
-    /// **The most expensive thing in here per look.** The banner lives at no fixed place in the
-    /// interface, so when the written-down path stops reaching it the only way to find it again is
-    /// to walk everything visible - measured at 29.8ms for one search, which is two dropped frames,
-    /// and it landed in the worst frame the whole plugin reported.
-    ///
-    /// It is already held back as far as it can be: it only looks while detonators are untouched,
-    /// which is the only state the warning could fire in, and it backs off to fifteen seconds while
-    /// searches come up empty. What it buys is one warning about a game bug, so it is worth being
-    /// able to say no to it outright. See Finished.Showing.
-    /// </summary>
-    [Menu("Watch for the expedition complete banner")]
-    public ToggleNode WatchFinished { get; set; } = new ToggleNode(false);
-
-    /// <summary>
     /// Count what each marker unearths, and write it to dumps/spawns.csv.
     ///
     /// The weights in this plugin are judgement over most of their range - an elite marker is worth
@@ -3832,26 +3930,175 @@ public class RecordingSettings
     /// otherwise unanswerable. Nothing reads the file yet - it is evidence being gathered, and the
     /// weights stay as they are until there is enough of it to say something.
     /// </summary>
-    [Menu("Record what markers spawn")]
+    [Menu("Collect dig site spawns",
+        "Writes, in the dumps folder: spawns.csv and arrivals.csv - what each\n" +
+        "dig site's markers and remnants unearth, monster by monster. The\n" +
+        "switches below add to it, and need it on.")]
     public ToggleNode RecordSpawns { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether the spawn census writes every counted monster's death to dumps/deaths.csv - what a drop rate is out of.
+    /// Deaths are still watched while drops or Bond transfers are collected, since those are credited to them; this only
+    /// decides whether the file is written. Needs Collect dig site spawns. See Spawns.Deaths.
+    /// </summary>
+    [Menu("Collect monster deaths",
+        "Writes, in the dumps folder: deaths.csv - each monster's death, where\n" +
+        "and when. Needs \"Collect dig site spawns\".")]
+    public ToggleNode CollectMonsterDeaths { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether the spawn census records drops of the currencies named below to dumps/drops.csv. Needs Collect dig site
+    /// spawns. See Spawns.Drops.
+    /// </summary>
+    [Menu("Collect currency drops",
+        "Writes, in the dumps folder: drops.csv - each drop of the currencies\n" +
+        "named below, with the monster or remnant that dropped it. Needs\n" +
+        "\"Collect dig site spawns\".")]
+    public ToggleNode CollectCurrencyDrops { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// The currencies whose drops the spawn census collects while Collect currency drops is on, by base name, separated
+    /// by ";". Empty collects none.
+    ///
+    /// Each drop goes to dumps/drops.csv with where and when it appeared and the monster most likely to have dropped
+    /// it: the nearest death within a few grid in the seconds before. One that lands at a remnant as it completes - its
+    /// reward, or what it drops when it shatters - is credited to that remnant and to no monster. Every death of a monster the census counted goes to dumps/deaths.csv, which is what
+    /// a drop rate is out of, and arrivals.csv carries each monster's id so its rarity and modifiers can be joined to
+    /// both. See Spawns.Drops and Spawns.Deaths.
+    ///
+    /// A few currencies rather than everything: their worth is stable and their names are unambiguous.
+    ///
+    /// **Verisium as a measure of what a remnant's waves brought.** It drops only from a remnant, in stacks of up to
+    /// 1000, more of it the more monsters were killed in that remnant's waves (reported from play, not yet measured);
+    /// three or four full stacks mark a remnant whose waves were big. So per remnant it checks how many monsters the
+    /// plan expected there against how many came, and whether rares count for more than the rest.
+    /// </summary>
+    [Menu("Currencies to collect",
+        "The currencies Collect currency drops records, by base name,\n" +
+        "separated by ;. Writes no file of its own.")]
+    public TextNode DropsToRecord { get; set; } = new TextNode("Chaos Orb; Orb of Annulment; Divine Orb; Verisium");
+
+    /// <summary>
+    /// Whether the spawn census watches what Bond moves, writing dumps/bond_deaths.csv and dumps/bond_gains.csv. It re-reads
+    /// every counted monster's affixes four times a second while a Bond monster lives, which is its only cost. Needs
+    /// Collect dig site spawns. See Spawns.BondTransfers.
+    /// </summary>
+    [Menu("Collect Bond transfers",
+        "Writes, in the dumps folder: bond_deaths.csv and bond_gains.csv - each\n" +
+        "Bond monster's death and every modifier a monster gains near one.\n" +
+        "Needs \"Collect dig site spawns\".")]
+    public ToggleNode CollectBondTransfers { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// How often, in milliseconds, Collect Bond transfers re-reads every counted monster's affixes while a Bond monster
+    /// lives. A gain is credited to the nearest Bond death in the 1.5 seconds before the read that saw it, so when
+    /// several Bond monsters die together a slower read leaves more deaths able to claim one gain; the candidates
+    /// column of bond_gains.csv counts them. 60 is about two server ticks. See Spawns.BondTransfers.
+    /// </summary>
+    [Menu("Bond transfer read interval (ms)",
+        "How often affixes are re-read while a Bond monster lives. Shorter tells\n" +
+        "apart transfers from deaths close together in time, at the cost of more reads.")]
+    public RangeNode<int> BondTransferReadMs { get; set; } = new RangeNode<int>(60, 16, 500);
+
+    /// <summary>
+    /// What the spawn census has seen at this dig site - monsters unearthed, seen dying, vanished, and drops recorded -
+    /// live, the same line the dump prints. See Spawns.Describe.
+    /// </summary>
+    [JsonIgnore]
+    public CustomNode SpawnCensusStatusUi { get; set; } = new CustomNode(() =>
+        ImGui.TextWrapped("Spawn census: " + (Safe.Read(() => Dump.Spawns?.Describe(), null) ?? "not running")));
+
+    /// <summary>
+    /// Writes every remnant seen to dumps/remnants.csv.
+    ///
+    /// The only route to knowing what a reroll is worth. A roll replaces the whole remnant, so its
+    /// value depends on the distribution of remnants the game generates - and the game does not
+    /// expose the weights, so the only way to have that number is to count them.
+    ///
+    /// Passive and cheap: a handful of rows per dig site, appended on the sweep it already does,
+    /// no reading the game has not already done. Each row says whether the remnant came with the
+    /// map or came out of a roll, so the two can be compared rather than assumed equal.
+    ///
+    /// Its own switch in its own section rather than behind debug mode, because the people whose
+    /// readings are wanted are not the people who play with debug drawing on. See RecordingSettings.
+    /// </summary>
+    [Menu("Collect remnants seen",
+        "Writes, in the dumps folder: remnants.csv and remnant_offers.csv -\n" +
+        "every remnant seen and the combinations it offered.")]
+    public ToggleNode Census { get; set; } = new ToggleNode(false);
 
     /// <summary>
     /// How far from a remnant a monster still counts as one of its waves, in grid units.
     ///
-    /// A remnant does not unearth its monsters all at once - as far as anyone has watched, it holds
-    /// the next wave back until the last one is dead, so a time window cannot bound it and any
-    /// number chosen for one would be wrong in both directions. Space can bound it: waves arrive at
-    /// the remnant, and remnants are far apart compared with markers - the three in a recent site
-    /// were fifty four, a hundred and sixty eight and a hundred and seventy three grid from each
-    /// other, where markers sit ten apart.
+    /// A remnant does not unearth its monsters all at once - it holds the next wave back until the
+    /// last one is dead - so a time window cannot bound it. Space bounds it, loosely: waves arrive
+    /// around the remnant, not at it.
     ///
-    /// Twenty five is well inside the nearest of those and well outside the remnant itself. It is
-    /// deliberately generous: a wave that spawns a little wide is a wave, and the cost of counting
-    /// a passing map monster is one row that the names column will expose.
+    /// **300 by default since 2026-10-06, the player's choice; 120 was the measured one.** It widens what is recorded,
+    /// and a monster between two remnants goes to the nearer.
+    ///
+    /// **120, measured** (2026-10-01): of 7242 wave monsters tied to one remnant by their rune modifiers over 16
+    /// runs, 2.8% spawned within 25 grid of it - the old default - the median 56, 90% within 101 and 92% within
+    /// 120. Remnants on one site sit 50 to 85 grid from their nearest neighbour, so radii overlap; a monster is
+    /// credited to the nearer remnant. dumps/arrivals.csv keeps every arrival's position and time either way, so the
+    /// attribution can be redone afterwards at any radius. This radius also widens what the census records at all:
+    /// a monster this near a remnant is kept even when it is further than the site limit from every explosive. See
+    /// Spawns.NearRemnant.
     /// </summary>
-    [Menu("Count remnant waves within (grid)")]
-    public RangeNode<float> WaveRadius { get; set; } = new RangeNode<float>(25f, 5f, 80f);
+    [Menu("Count remnant waves within (grid)",
+        "How far from a remnant a monster counts as one of its waves in\n" +
+        "spawns.csv and arrivals.csv. Writes no file of its own.")]
+    public RangeNode<float> WaveRadius { get; set; } = new RangeNode<float>(300f, 5f, 400f);
 
+    /// <summary>
+    /// Whether each finished solve writes a line to dumps/trials.csv - strategy, site, score and time - so strategies
+    /// can be compared on the same site afterwards. Nothing in the plugin reads the file. Off by default: it is for
+    /// comparing solver strategies, not something a tester needs. See Trials.
+    /// </summary>
+    [Menu("Collect solve trials", "Writes, in the dumps folder: trials.csv - a line per finished solve.")]
+    public ToggleNode CollectSolveTrials { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether the plugin notes how far from the placement circle each marker lights up and goes dark, writing
+    /// dumps/marker_extent.csv and its per-art summary. Nothing in the scoring reads them. Off by default: it is for
+    /// tuning the blast circle, not something a tester needs. See Boundary.
+    /// </summary>
+    [Menu("Collect marker edge readings",
+        "Writes, in the dumps folder: marker_extent.csv and marker_extent.txt -\n" +
+        "how far from the placement circle each marker lights up and goes dark.")]
+    public ToggleNode CollectMarkerEdges { get; set; } = new ToggleNode(false);
+
+
+
+    /// <summary>
+    /// Writes when each marker's entity loads and unloads to dumps/streaming.csv.
+    ///
+    /// **This ran under no setting at all.** It is on the sweep's rhythm rather than every frame,
+    /// which is why it never showed up as a cost worth chasing, but it is a file being appended to
+    /// while you play and there was no way to stop it short of unloading the plugin.
+    /// </summary>
+    [Menu("Collect marker loading",
+        "Writes, in the dumps folder: streaming.csv - when marker entities\n" +
+        "load and unload.")]
+    public ToggleNode RecordStreaming { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Watches for the "Expedition Complete" banner and warns if sites are still unplaced.
+    ///
+    /// **The most expensive thing in here per look.** The banner lives at no fixed place in the
+    /// interface, so when the written-down path stops reaching it the only way to find it again is
+    /// to walk everything visible - measured at 29.8ms for one search, which is two dropped frames,
+    /// and it landed in the worst frame the whole plugin reported.
+    ///
+    /// It is already held back as far as it can be: it only looks while detonators are untouched,
+    /// which is the only state the warning could fire in, and it backs off to fifteen seconds while
+    /// searches come up empty. What it buys is one warning about a game bug, so it is worth being
+    /// able to say no to it outright. See Finished.Showing.
+    /// </summary>
+    [Menu("Watch for the expedition complete banner",
+        "Writes no file. Warns in the log when more Expedition Complete\n" +
+        "banners show than dig sites were started.")]
+    public ToggleNode WatchFinished { get; set; } = new ToggleNode(false);
 }
 
 public class DebugSettings
@@ -3981,6 +4228,7 @@ public class DebugSettings
             ImGui.TextUnformatted("Set for your account - RESTART EXILECORE2 for it to take effect.");
         }
 
+
         // **One button carrying its own state, and inert unless ctrl is held.**
         //
         // Two buttons meant the row changed shape depending on whether anything had been written, so what was
@@ -4017,6 +4265,25 @@ public class DebugSettings
                       "that decides what its allocation costs in frame time." + "\n\n") +
                 "Takes effect next time ExileCore2 starts, and applies to every .NET" + "\n" +
                 "program you start afterwards.");
+        }
+
+        // Beside the collector because it is the same kind of fact: how the host runs this plugin, read from the
+        // running copy rather than from a file. See CompiledBuild.
+        ImGui.TextUnformatted(CompiledBuild.Optimised
+            ? "Compiled optimised: ON."
+            : "Compiled optimised: OFF - the solver runs several times slower.");
+
+        ImGui.SameLine();
+        ImGui.TextDisabled("(?)");
+
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "ExileCore2 compiles this plugin itself when it loads it. Unless the project\n" +
+                "asks for optimisation, the JIT optimiser is left off, and the solver runs\n" +
+                "several times slower - measured at about five times on one Grand site.\n\n" +
+                "The project asks for it, so this should read ON. OFF means the plugin was\n" +
+                "built some other way; reloading it from the source folder should fix it.");
         }
 
     });
@@ -4082,7 +4349,9 @@ public class DebugSettings
         {
             ImGui.SetTooltip("COLD START: everything the plugin worked out standing here - the" + "\n" +
                              "plan, the chain on" + "\n" +
-                             "file, the routed ground held in memory, the snapped aims and every" + "\n" +
+                             "file, the chain each worker carries to the next solve, the" + "\n" +
+                             "remnant orders and the ground they were built on, the" + "\n" +
+                             "routed ground held in memory, the snapped aims and every" + "\n" +
                              "reading taken." + "\n\n" +
                              "NOT the markers, the scouting layer, or the walkable ground saved to" + "\n" +
                              "disk - those took a lap of the site to collect, or minutes of flooding," + "\n" +
@@ -4090,7 +4359,10 @@ public class DebugSettings
                              "nothing from having them." + "\n\n" +
                              "So the next solve searches the same site as though it had never been" + "\n" +
                              "solved, without another lap. Use this between two solves you mean to" + "\n" +
-                             "compare fairly.");
+                             "compare fairly." + "\n\n" +
+                             "Nothing solves after it - no presolve, no continuous solving, no" + "\n" +
+                             "re-solve for a roll - until the action key is pressed, so that press" + "\n" +
+                             "is the first solve.");
         }
 
         if (ImGui.Button("Delete plan (warm start)###forgetPlanOnly"))
@@ -4098,8 +4370,9 @@ public class DebugSettings
 
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("WARM START: the plan in hand and the chain filed on disk, and" + "\n" +
-                             "nothing else." + "\n\n" +
+            ImGui.SetTooltip("WARM START: the plan in hand, the chain filed on disk, the" + "\n" +
+                             "chain each worker carries to the next solve and the remnant" + "\n" +
+                             "orders, and nothing else." + "\n\n" +
                              "Everything worked out about the ground stays - the routed answers," + "\n" +
                              "the snapped aims, the ground model, the readings taken here - so" + "\n" +
                              "the next solve starts knowing what this one knew." + "\n\n" +
@@ -4252,32 +4525,9 @@ public class DebugSettings
     public ToggleNode ShowBlastRadius { get; set; } = new ToggleNode(false);
 
     /// <summary>
-    /// Rings the richest spots on the site, as the search ranks them.
-    ///
-    /// What a blast at each position would catch with nothing else placed, which is the measure the
-    /// anchor seeds are built from. Useful for arguing with the planner: if a spot you would have
-    /// used is not ringed, the disagreement is about what things are worth rather than about the
-    /// search, and the weights are the place to look.
-    ///
-    /// A button rather than a switch because it is a question you ask, not a mode you sit in - and
-    /// the number beside it is the answer's length. Nought turns it off, which is why there is no
-    /// second button.
-    ///
-    /// Worked out when you press it, not when you solve. It needs no plan and no search - only the
-    /// markers, the reach and the ground - so asking about a site you have just walked into is a
-    /// fair question and it now gets an answer. It costs a pass over every candidate against every
-    /// marker, which is why it happens on a press rather than on a frame.
-    /// </summary>
-    [Menu("Spots to draw")]
-    public RangeNode<int> SpotCount { get; set; } = new RangeNode<int>(3, 0, 40);
-
-    /// <summary>
-    /// Reads the count from the setting above rather than keeping its own.
-    ///
-    /// It kept its own, as a plain ImGui field behind the button, and the value never moved off
-    /// eight - so the button always asked for eight however the box was edited. A RangeNode is the
-    /// framework's own control, it persists between sessions, and it cannot get out of step with
-    /// what the button sends.
+    /// The button that draws the edge points toward neighbours, and the edge point step beside it. Worked out on
+    /// the tick after the press, from the markers, the reach and the ground, so it needs no plan. See
+    /// Planner.ComputeEdgePointsForDrawing.
     /// </summary>
     [JsonIgnore]
     public CustomNode DrawSpotsUi { get; set; }
@@ -4375,8 +4625,24 @@ public class DebugSettings
     [Menu("(DEBUG) ...or at these fixed spots, as \"x,y; x,y\"")]
     public TextNode MarkSpots { get; set; } = new TextNode("");
 
+    /// <summary>
+    /// Spots added to every worker's shortlist whatever they score, as "x,y; x,y" or pasted from a dump as
+    /// "(x,y) (x,y)". For testing whether the search finds a known chain once its spots are on offer. A spot the
+    /// ground refuses is left out and named in the dump's shortlist line. Empty for none. See Repair.Shortlist.
+    /// </summary>
+    [Menu("(DEBUG) Always shortlist these spots, as \"x,y; x,y\"")]
+    public TextNode ForcedShortlistSpots { get; set; } = new TextNode("");
+
     [Menu("Flag unknown blast targets")]
     public ToggleNode ShowUnexpected { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// A red line from the player to each unknown blast target, as well as its name. Off by default: the name written
+    /// on the object is enough to find it, and the lines cross the screen on a site with several. Needs Flag unknown
+    /// blast targets on. See Overlay.Unknown.
+    /// </summary>
+    [Menu("Draw lines to unknown blast targets")]
+    public ToggleNode ShowUnexpectedLines { get; set; } = new ToggleNode(false);
 
     /// <summary>
     /// Writes under each marker what the planner thinks it is worth, and why.
@@ -4411,9 +4677,10 @@ public class DebugSettings
     /// runs moved to 4,459 on a price update, which is ten times the run-to-run noise and had
     /// nothing to do with the change being tested at the time.
     ///
-    /// Ticked, the prices stay exactly as they were when it was ticked. Everything downstream - the
-    /// reward list, the must-take threshold, the reroll advice - goes on reading them and cannot
-    /// tell the difference, which is the point: it freezes the question rather than the answer.
+    /// Ticked, the prices stay exactly as the stored prices have them - the last prices read before it was ticked, kept
+    /// in last_prices.tsv, which is not written while this is on. Everything downstream - the reward list, the
+    /// must-take threshold, the reroll advice - goes on reading them and cannot tell the difference, which is the
+    /// point: it freezes the question rather than the answer. See Valuation.StorePrices.
     ///
     /// For measuring only. A frozen price is a stale price, and the plan built on it is worth what
     /// the prices said an hour ago.
@@ -4534,6 +4801,43 @@ public class DebugSettings
         "\n" +
         "25%% chance to add an additional Runic Modifier")]
     public ToggleNode DoubleOrNothingDouble { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Whether the atlas notable "Gaining Traction" is allocated: a remnant's waves carry more magic and rare packs for
+    /// each remnant completed in the map before it. On, the scoring grows a remnant's magic and rare waves with its
+    /// place in the chain, at the rates in the table's Gaining Traction row (fitted to recorded waves per rarity, where
+    /// the node text says 50 for both); see Weighing.GainingTractionRates and Planner.TractionScales.
+    ///
+    /// **Asked rather than detected, though it can be read.** AtlasStats reads the node's stat from the atlas, and a
+    /// read that silently stopped working would change every plan with nothing to say why. So the scoring follows this
+    /// checkbox, and the dump sets what the atlas reads beside it and says when the two disagree.
+    /// </summary>
+    [Menu("Gaining Traction (Atlas node)",
+        "Verisium Remnants have 50%% increased Monster Rarity per Remnant\n" +
+        "Completed in Area\n" +
+        "\n" +
+        "On: a remnant's magic and rare waves are valued higher the more\n" +
+        "remnants the chain has completed before it, at the rates in the\n" +
+        "table's Gaining Traction row - what recorded waves fit best. The\n" +
+        "dump says whether your atlas has the node, to check this against.")]
+    public ToggleNode GainingTraction { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Whether the map's own increased number of rare and magic monsters - its modifiers, tablets and atlas, as
+    /// AtlasStats.MapMonsterIncreases reads them - is where a row's "increased number of rare monsters" starts. On, a
+    /// relic's +50% adds to the map's total, so on a map at 186% it counts as 50 / 286 more rather than half as many
+    /// again: the game adds increases to one stat together. Off, each row's increase counts alone.
+    ///
+    /// Rests on the map's increases reaching expedition monsters; over 13 recorded maps, rares per remnant wave rose in
+    /// proportion (slope 1.07 +- 0.45 on a log scale). The remnant wave row is scaled by the map whatever this says,
+    /// because its counts are written for a map with no modifiers. See NOTES.md, "The wave row and the map",
+    /// PlanEnvironment.IncreaseBaseOfGroup and Weighing.RemnantWaveScales.
+    /// </summary>
+    [Menu("Map increases to rare and magic monsters",
+        "On: a relic's or rune's increased number of rare or magic monsters\n" +
+        "adds to the map's own (modifiers, tablets, atlas), so it is worth\n" +
+        "less on a map that already has many. Off: each counts alone.")]
+    public ToggleNode MapMonsterIncreases { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// Plan as though the rewards were not there, so the route is decided by runes and monsters.
@@ -4796,6 +5100,17 @@ public class DebugSettings
     public RangeNode<int> RepeatFrom { get; set; } = new RangeNode<int>(0, 0, 200);
 
     /// <summary>
+    /// The plain score at which a press of the batch is stopped and the next one started, or nought to run every
+    /// press its full window.
+    ///
+    /// For asking how often, and how fast, a search reaches a chain already known to exist - a batch against a
+    /// target measures that in the time the hits take rather than ten full windows. The dump says how many
+    /// presses reached it and after how long. Plain, as the score area shows it, without must-take insistence.
+    /// </summary>
+    [Menu("Stop a press at this score (0 for never)")]
+    public RangeNode<int> RepeatStopAtScore { get; set; } = new RangeNode<int>(0, 0, 100000);
+
+    /// <summary>
     /// Which searches the key above compares, ticked one by one.
     ///
     /// **Six strategies is six windows, and most of the time the question is about two of them.** A
@@ -4900,6 +5215,17 @@ public class DebugSettings
         "unfamiliar marker art.")]
     public HotkeyNodeV2 CorrelateHotkey { get; set; } = new HotkeyNodeV2(Keys.None);
 
+    /// <summary>
+    /// How long the must take key is held on a marker to make the chain take it last, rather than cycle its mark. A tap
+    /// cycles the mark when the key comes up, so the hold can be told apart from it; a bar under the cursor empties
+    /// over the hold. See Insisted.ToggleTakenLast.
+    ///
+    /// Under Debug since 2026-10-06, as a timing few need to change; it was at the root of the settings, and
+    /// migration 20 carries a saved value over.
+    /// </summary>
+    [Menu("Take last hold time (ms)")]
+    public RangeNode<int> TakeLastHoldMs { get; set; } = new RangeNode<int>(750, 300, 3000);
+
     public DebugSettings()
     {
         ComparedUi = new CustomNode(() =>
@@ -4934,74 +5260,25 @@ public class DebugSettings
 
         DrawSpotsUi = new CustomNode(() =>
         {
-            if (ImGui.Button($"Draw {SpotCount.Value} best spots###drawSpots"))
+            if (ImGui.Button("edges toward neighbours###drawTowardNeighbours"))
             {
-                Planner.PerKind = null;
-                Planner.Paired = false;
-                Planner.Family = false;
-                Planner.Shaped = false;
-                Planner.Wanted = SpotCount.Value;
+                Planner.TowardNeighbours = true;
+                Planner.EdgePointsPending = true;
             }
 
+            // The Candidate spots setting itself, not a copy, so what is drawn is what the search is offered. Moving
+            // it while the edge points are drawn draws them again at the new step.
             ImGui.SameLine();
+            ImGui.SetNextItemWidth(140f);
 
-            if (ImGui.Button($"per remnant###drawPerRemnant"))
+            var step = Root.Solver.Advanced.CandidateSpots.EdgePointStepGrid.Value;
+
+            if (ImGui.SliderInt("edge point step (grid)###drawEdgePointStep", ref step, 0, 10))
             {
-                Planner.PerKind = TargetKind.Remnant;
-                Planner.Paired = false;
-                Planner.Family = false;
-                Planner.Shaped = false;
-                Planner.Wanted = SpotCount.Value;
-            }
+                Root.Solver.Advanced.CandidateSpots.EdgePointStepGrid.Value = step;
 
-            ImGui.SameLine();
-
-            if (ImGui.Button($"per rare###drawPerRare"))
-            {
-                Planner.PerKind = TargetKind.Elite;
-                Planner.Paired = false;
-                Planner.Family = false;
-                Planner.Shaped = false;
-                Planner.Wanted = SpotCount.Value;
-            }
-
-            ImGui.SameLine();
-
-            // No count in the label: this view's size is the site's, one ring per pair of heavy
-            // markers, and a number in front of it would only suggest otherwise.
-            if (ImGui.Button("between pairs###drawPairs"))
-            {
-                Planner.PerKind = null;
-                Planner.Family = false;
-                Planner.Shaped = false;
-                Planner.Paired = true;
-                Planner.Wanted = SpotCount.Value;
-            }
-
-            ImGui.SameLine();
-
-            if (ImGui.Button("all families###drawFamilies"))
-            {
-                Planner.PerKind = null;
-                Planner.Paired = false;
-                Planner.Shaped = false;
-                Planner.Family = true;
-                Planner.Counts = (Root.Solver.Advanced.CandidateSpots.SpotsPerPair.Value, Root.Solver.Advanced.CandidateSpots.SpotsPerRare.Value,
-                    Root.Solver.Advanced.CandidateSpots.SpotsPerRemnant.Value);
-                Planner.Wanted = SpotCount.Value;
-            }
-
-            ImGui.SameLine();
-
-            if (ImGui.Button("regions###drawRegions"))
-            {
-                Planner.PerKind = null;
-                Planner.Paired = false;
-                Planner.Family = false;
-                Planner.Shaped = true;
-                Planner.Counts = (Root.Solver.Advanced.CandidateSpots.SpotsPerPair.Value, Root.Solver.Advanced.CandidateSpots.SpotsPerRare.Value,
-                    Root.Solver.Advanced.CandidateSpots.SpotsPerRemnant.Value);
-                Planner.Wanted = SpotCount.Value;
+                if (Planner.TowardNeighbours)
+                    Planner.EdgePointsPending = true;
             }
 
             ImGui.SameLine();

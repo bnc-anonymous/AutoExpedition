@@ -127,8 +127,46 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     string[] Named = null,
     // What identifies each entry, same order again. A name is not an identity - see
     // Weighing.RecipeIdsOfTarget - so the marker saying which row was taken matches on this.
-    string[] Recipes = null)
+    string[] Recipes = null,
+    // The rare and magic wave worth each entry adds over the remnant's own recipe, same order, for Gaining Traction.
+    // See Weighing.MagicAndRareWavesOfChoices.
+    (float Rare, float Magic)[] MagicAndRareWavesOfChoices = null,
+    // What each entry's runes do to this remnant's own waves - the table's "own" effects - same order, or null for
+    // none. Anything replacing Choices replaces this with it. See Weighing.OwnEffectsOfChoices and OwnOfChoice.
+    (int Tag, bool Count, float Factor, float WaveShare)[][] OwnEffectsOfChoices = null,
+    // The lift each entry's recipe holds in any slot, per amplifier class - 1 on the rune class for a Power rune - same
+    // order, or null for none. Anything replacing Choices replaces this with it. See Weighing.HeldLiftOfChoices and
+    // HeldLiftsOfChoice.
+    float[][] HeldLiftOfChoices = null,
+    // The share of this remnant's own waves each entry's propagated runes are on, same order, or null for all of them.
+    // Anything replacing Choices replaces this with it. See Weighing.CarriedWaveSharesOfChoices and WaveShareOfCarried.
+    (string Id, float Share)[][] CarriedWaveSharesOfChoices = null,
+    // How many waves this remnant brings, or nought when not known. See Weighing.WavesOfRemnant and
+    // ShareOfWavesPassedLift.
+    int WaveCount = 0,
+    // The rune in each slot of each entry's recipe, in slot order, same order as Choices, or null when not known.
+    // Anything replacing Choices replaces this with it. See Weighing.SlotRunesOfChoices and SlotRunesOfChoice.
+    string[][] SlotRunesOfChoices = null,
+    // The monsters each entry's runes add to this remnant's waves - the table's "per" effects - same order, or null
+    // for none. Anything replacing Choices replaces this with it. See Weighing.CreatedOfChoices and CreatedByOwnEffects.
+    (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[][] CreatedOfChoices = null,
+    // What Gaining Traction multiplies this remnant's normal, magic and rare waves by, by remnants completed before it,
+    // or null for the environment's own rule. See Weighing.TractionByBeforeOfTarget and Planner.TractionScalesOfTarget.
+    (float Normal, float Magic, float Rare)[] TractionByBefore = null)
 {
+    /// <summary>The rune in each slot of combination c's recipe, or null when not known. See Propagation.RunesPerWave.</summary>
+    public string[] SlotRunesOfChoice(int c) =>
+        SlotRunesOfChoices is { } all && c >= 0 && c < all.Length ? all[c] : null;
+
+    /// <summary>
+    /// The share of this remnant's waves a lift passed in from an earlier link reaches: all but the first. Measured on 15
+    /// remnants receiving Power on 6 maps (2026-10-02): the monsters of wave 1 carried their runes plain, every wave from
+    /// the second on carried them empowered (98% of 454 monsters on waves 3-8). Waves 1 and 2 carry the same runes, and
+    /// the split between them is read from timing - the plain ones arrived first, the empowered about 3 s later. One
+    /// with an unknown wave count gets all of them.
+    /// </summary>
+    public float ShareOfWavesPassedLift => WaveCount >= 2 ? (WaveCount - 1f) / WaveCount : 1f;
+
     /// <summary>
     /// What this target files into the tag and class pools: its OWN weight under its own tags, and
     /// each part of what it is made of under the tags of the row that earned it.
@@ -268,6 +306,332 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     private float? _monstersUnearthed;
 
     /// <summary>
+    /// What this remnant's rare and magic wave monsters are worth, each tier apart, and how much of each is monsters for
+    /// the pools runes pay on: its Parts carrying the rare or magic tag. Nought on anything but a remnant. The shares
+    /// Gaining Traction scales - see Planner.TractionScales and Planner.Settle.
+    /// </summary>
+    ///
+    /// **Worked out on every read, not cached.** A record compares and hashes by every field, private ones included,
+    /// so a cache filled on one thread changes the target's hash under a collection another thread keyed on it: the
+    /// edge points' names threw KeyNotFoundException on every solve once workers filled this during another's build
+    /// (2026-10-01). It is a sum over a handful of parts.
+    public (float Rare, float Magic, float RareMonsters, float MagicMonsters) MagicAndRareWaves
+    {
+        get
+        {
+            var (rare, magic, rareMonsters, magicMonsters) = (0f, 0f, 0f, 0f);
+
+            if (Kind == TargetKind.Remnant)
+            {
+                foreach (var (mask, part, _) in Parts ?? [])
+                {
+                    if (part <= 0f)
+                        continue;
+
+                    var monster = (mask & (1L << Tags.Monsters)) != 0L;
+
+                    if ((mask & (1L << Tags.Rares)) != 0L)
+                    {
+                        rare += part;
+                        rareMonsters += monster ? part : 0f;
+                    }
+                    else if ((mask & (1L << Tags.Magics)) != 0L)
+                    {
+                        magic += part;
+                        magicMonsters += monster ? part : 0f;
+                    }
+                }
+            }
+
+            return (rare, magic, rareMonsters, magicMonsters);
+        }
+    }
+
+    /// <summary>
+    /// What Gaining Traction adds to combination c through the waves it has over the remnant's own recipe, at the given
+    /// scales; negative for a combination with fewer. Nought without the scales or the list. See Planner.Settle.
+    /// </summary>
+    public float TractionOfChoice(int c, float magicScale, float rareScale) =>
+        MagicAndRareWavesOfChoices is { } changes && c >= 0 && c < changes.Length
+            ? changes[c].Rare * (rareScale - 1f) + changes[c].Magic * (magicScale - 1f)
+            : 0f;
+
+    /// <summary>
+    /// The factors combination c's "own" effects put on one of this remnant's wave parts: on its worth (count and
+    /// weight effects both) and on its number (count effects only). One and one without any. See Planner.Settle's
+    /// payout, which scales each part by these.
+    /// </summary>
+    public (float Worth, float Many) OwnFactorsOfPart(int c, long mask) => OwnFactorsOfPart(c, mask, 0d);
+
+    /// <summary>
+    /// The same, with the bonuses among the "own" effects lifted by an empowering rate passed in from earlier links: a
+    /// factor above one becomes 1 + (factor - 1)(1 + lift x reach), a factor below one is left alone.
+    ///
+    /// **The reach is the share of the effect's waves the lift is on.** A passed-in lift misses wave 1 (see
+    /// ShareOfWavesPassedLift). A rune in slot 1 or 2 is on every wave, so the lift reaches all but one of them; a rune
+    /// in slot 3 or later only starts on its own slot's wave, so the lift reaches all of them. Cutting both by the
+    /// wave-1 share understated Time in slot 4 of 5 by a fifth.
+    ///
+    /// **Power doubles a rune's bonuses and not its penalties** (user, 2026-10-05): Bond's +34% normal monsters become
+    /// +68% where a Power reaches them, while its -78% magic and -67% rare monsters stay as they are. The doubling is
+    /// the rule, not a measurement: 2 runs hold Bond with Power. See Planner.Settle's payout, which passes the rune
+    /// class's lift at this remnant.
+    /// </summary>
+    /// <summary>
+    /// The lift passed in from earlier links that combination c's own effects take: none when it holds the empowering
+    /// rune itself, since the two do not stack and its own already applies; otherwise all of it. See Best and
+    /// Planner.PredictedWavesOf, which must agree.
+    /// </summary>
+    public static double PassedLiftOfChoice(PlanEnvironment env, float[] heldLifts, double passedLift)
+    {
+        var holdsPower = passedLift > 0d && env.Amplified is { RuneClass: >= 0 } amplified &&
+                         heldLifts is { } liftsHeld && amplified.RuneClass < liftsHeld.Length &&
+                         liftsHeld[amplified.RuneClass] > 0f;
+
+        return holdsPower ? 0d : passedLift;
+    }
+
+    public (float Worth, float Many) OwnFactorsOfPart(int c, long mask, double lift)
+    {
+        if (OwnEffectsOfChoices is not { } all || c < 0 || c >= all.Length || all[c] is not { } effects)
+            return (1f, 1f);
+
+        var (worth, many) = (1f, 1f);
+
+        foreach (var (tag, count, factor, waveShare) in effects)
+        {
+            if ((mask & (1L << tag)) == 0L)
+                continue;
+
+            var reach = waveShare < 1f ? lift : lift * ShareOfWavesPassedLift;
+            var lifted = factor > 1f && reach > 0d ? (float)(1d + (factor - 1d) * (1d + reach)) : factor;
+
+            worth *= lifted;
+
+            if (count)
+                many *= lifted;
+        }
+
+        return (worth, many);
+    }
+
+    /// <summary>
+    /// What combination c's "own" effects change in the worth of this remnant's own waves, at the given Gaining
+    /// Traction scales: the change on each wave part, and on the rare and magic waves the combination has over the
+    /// remnant's recipe. Nought without such effects. Content counts the waves at face value through Weight, Gaining
+    /// Traction's bonus and TractionOfChoice; this is the difference the effects make to all three. See Planner.Settle.
+    /// </summary>
+    public float OwnOfChoice(int c, float magicScale, float rareScale) => OwnOfChoice(c, magicScale, rareScale, 0d);
+
+    /// <summary>The same with the bonuses lifted by an empowering rate reaching these waves. See OwnFactorsOfPart.</summary>
+    public float OwnOfChoice(int c, float magicScale, float rareScale, double lift)
+    {
+        if (OwnEffectsOfChoices is not { } all || c < 0 || c >= all.Length || all[c] == null)
+            return CreatedByOwnEffects(c, magicScale, rareScale, lift);
+
+        var change = 0f;
+        var (rareMask, magicMask) = (0L, 0L);
+
+        foreach (var (mask, part, _) in Parts ?? [])
+        {
+            var rare = (mask & (1L << Tags.Rares)) != 0L;
+            var magic = !rare && (mask & (1L << Tags.Magics)) != 0L;
+
+            if (rare && rareMask == 0L)
+                rareMask = mask;
+
+            if (magic && magicMask == 0L)
+                magicMask = mask;
+
+            var (worth, _) = OwnFactorsOfPart(c, mask, lift);
+
+            if (part > 0f && worth != 1f)
+                change += part * (rare ? rareScale : magic ? magicScale : 1f) * (worth - 1f);
+        }
+
+        if (MagicAndRareWavesOfChoices is { } waves && c < waves.Length)
+        {
+            if (rareMask != 0L)
+                change += waves[c].Rare * rareScale * (OwnFactorsOfPart(c, rareMask, lift).Worth - 1f);
+
+            if (magicMask != 0L)
+                change += waves[c].Magic * magicScale * (OwnFactorsOfPart(c, magicMask, lift).Worth - 1f);
+        }
+
+        return change + CreatedByOwnEffects(c, magicScale, rareScale, lift);
+    }
+
+    /// <summary>
+    /// What the monsters combination c's "per" effects add to this remnant's waves are worth at face value, all of
+    /// them. Added to content by OwnOfChoice; the payout lifts each by the shares reaching its row. See CreatedOfEntry.
+    /// </summary>
+    /// <param name="lift">A lift passed in from earlier links, taken as a bonus is. See OwnFactorsOfPart.</param>
+    public float CreatedByOwnEffects(int c, float magicScale, float rareScale, double lift)
+    {
+        if (CreatedOfChoices is not { } all || c < 0 || c >= all.Length || all[c] is not { } created)
+            return 0f;
+
+        var worth = 0f;
+
+        foreach (var entry in created)
+            worth += CreatedOfEntry(c, entry, magicScale, rareScale, lift);
+
+        return worth;
+    }
+
+    /// <summary>
+    /// What one "per" effect of combination c adds, at face value: so many of its row for each monster of the counted
+    /// tag on this remnant's waves, as they are scored - Gaining Traction and the other own effects' counts included -
+    /// at the row's worth apiece.
+    ///
+    /// **Built for the Death rune's merge** (2026-10-05): slain normal and magic monsters merge into a Runemarked rare,
+    /// so what drives it is how many normals and magics there are, and what it adds is a row of its own. See
+    /// TableGrammar.Effect.Per and NOTES, "Death merges".
+    /// </summary>
+    public float CreatedOfEntry(int c, (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment) entry, float magicScale, float rareScale,
+        double lift) =>
+        entry.WorthEach > 0f ? CreatedCountOfEntry(c, entry, magicScale, rareScale, lift) * entry.WorthEach : 0f;
+
+    /// <summary>
+    /// How many monsters of its row one "per" effect of combination c adds: CreatedOfEntry before the worth apiece. The
+    /// prediction the census records reads this, so it counts what the scoring pays. See Planner.PredictedWavesOf.
+    /// </summary>
+    public float CreatedCountOfEntry(int c, (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment) entry, float magicScale, float rareScale,
+        double lift)
+    {
+        var (source, rate, waveShare, _, _, _, empowerment) = entry;
+
+        if (source < 0 || rate <= 0f || Parts is not { Length: > 0 } parts)
+            return 0f;
+
+        var counted = 0f;
+        var (magicWorth, magicMany) = (0f, 0f);
+
+        foreach (var (mask, part, many) in parts)
+        {
+            var rare = (mask & (1L << Tags.Rares)) != 0L;
+            var magic = !rare && (mask & (1L << Tags.Magics)) != 0L;
+
+            if ((mask & (1L << source)) != 0L)
+                counted += many * (rare ? rareScale : magic ? magicScale : 1f) * OwnFactorsOfPart(c, mask, lift).Many;
+
+            if (magic)
+            {
+                magicWorth += part;
+                magicMany += many;
+            }
+        }
+
+        // The magic waves this combination has over the remnant's own recipe, as monsters. See
+        // MagicAndRareWavesOfChoices, which keeps their worth.
+        if (source == Tags.Magics && MagicAndRareWavesOfChoices is { } waves && c < waves.Length &&
+            magicWorth > 0f && magicMany > 0f)
+            counted += waves[c].Magic * magicScale / (magicWorth / magicMany);
+
+        if (counted <= 0f)
+            return 0f;
+
+        var reach = waveShare < 1f ? lift : lift * ShareOfWavesPassedLift;
+
+        // **Plain and empowered rates weighed by the waves a passed-in Power reaches**, rather than one rate lifted: the
+        // share is the lift's reach, at most every wave. See Weighing.CreatedOfRunes.
+        if (empowerment != 0)
+        {
+            var empoweredShare = Math.Clamp(lift, 0d, 1d) * (waveShare < 1f ? 1d : ShareOfWavesPassedLift);
+
+            return (float)(rate * (empowerment == 2 ? empoweredShare : 1d - empoweredShare)) * counted;
+        }
+
+        return (float)(rate * (1d + reach)) * counted;
+    }
+
+    /// <summary>
+    /// The lift combination c holds in any of its slots, per amplifier class as fractions - 1 on the rune class for a
+    /// Power rune - or null for none.
+    ///
+    /// **A held Power empowers what its remnant propagates, from whichever slot.** Measured across the recordings
+    /// (2026-10-01): remnants holding Power in an ordinary slot sent every propagated rune down the chain in its
+    /// empowered form - Death, Soul, Vision, Celestial, Adaptive, Moon, Toxic and Stone, over 0 plain monsters to
+    /// several hundred empowered - where the model lifted only that remnant's own waves. See Planner.Settle's booking
+    /// and Best, which double the beneficial runes such a combination propagates.
+    /// </summary>
+    public float[] HeldLiftsOfChoice(int c) =>
+        HeldLiftOfChoices is { } all && c >= 0 && c < all.Length ? all[c] : null;
+
+    /// <summary>
+    /// The share of this remnant's own waves rune id, propagated by combination c, is on: one for a rune in either of
+    /// the first two slots or with nothing known, less for a later slot - slot k of n is on n - k + 1 of n waves. A
+    /// propagating rune reaches every wave of the remnants after its own, but its own remnant's waves only from its
+    /// slot onward, as an ordinary slot's does. See Propagation.WaveShareOfSlot and Planner.Settle's booking.
+    /// </summary>
+    public float WaveShareOfCarried(int c, string id)
+    {
+        if (CarriedWaveSharesOfChoices is not { } all || c < 0 || c >= all.Length || all[c] is not { } shares)
+            return 1f;
+
+        foreach (var (rune, share) in shares)
+        {
+            if (string.Equals(rune, id, StringComparison.OrdinalIgnoreCase))
+                return share;
+        }
+
+        return 1f;
+    }
+
+    /// <summary>
+    /// The weight of this remnant's own waves under a tag, with Gaining Traction's extra at the given scales: what a
+    /// booking from this remnant reaches on its own waves. Monsters for no tag; nought for a tag no wave carries.
+    /// See WaveShareOfCarried.
+    /// </summary>
+    public float OwnWavesOfTag(int tag, float magicScale, float rareScale)
+    {
+        var waves = MagicAndRareWaves;
+
+        if (tag < 0 || tag == Tags.Monsters)
+            return MonstersUnearthed + (magicScale - 1f) * waves.MagicMonsters + (rareScale - 1f) * waves.RareMonsters;
+
+        if (tag == Tags.Rares)
+            return waves.RareMonsters * rareScale;
+
+        if (tag == Tags.Magics)
+            return waves.MagicMonsters * magicScale;
+
+        if (tag == Tags.Normals)
+            return MathF.Max(0f, MonstersUnearthed - waves.MagicMonsters - waves.RareMonsters);
+
+        return 0f;
+    }
+
+    /// <summary>
+    /// What this remnant's normal wave monsters are worth, and how much of that is monsters for the pools runes pay on:
+    /// its Parts carrying neither the rare nor the magic tag. Nought on anything but a remnant. See MagicAndRareWaves.
+    /// </summary>
+    public (float Normal, float NormalMonsters) NormalWaves
+    {
+        get
+        {
+            var (normal, monsters) = (0f, 0f);
+
+            if (Kind == TargetKind.Remnant)
+            {
+                foreach (var (mask, part, _) in Parts ?? [])
+                {
+                    if (part <= 0f || (mask & MagicOrRare) != 0L)
+                        continue;
+
+                    normal += part;
+                    monsters += (mask & (1L << Tags.Monsters)) != 0L ? part : 0f;
+                }
+            }
+
+            return (normal, monsters);
+        }
+    }
+
+    /// <summary>The rare and magic tags together, as a mask. See MagicAndRareWaves.</summary>
+    internal static readonly long MagicOrRare = (1L << Tags.Rares) | (1L << Tags.Magics);
+
+    /// <summary>
     /// The same choice on the greedy pass's cruder terms.
     ///
     /// Greedy has not chosen the rest of the chain yet, so it values propagation by the explosives
@@ -312,15 +676,18 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
         // above counts an object's own scoped carries through Spreading; this one counted only the
         // flat half, so a remnant whose best combination reaches chests looked worth nothing extra
         // to open with. The two halves of the same estimate disagreed.
-        foreach (var choice in Choices)
+        // **And what its runes' "own" effects do to its waves**, at face value, as greedy has no chain position to
+        // scale them by. See OwnOfChoice.
+        for (var c = 0; c < Choices.Length; c++)
         {
+            var choice = Choices[c];
             var reach = 0f;
 
             foreach (var (_, _, percent, _) in choice.Spread ?? [])
                 reach += percent;
 
             most = MathF.Max(most,
-                choice.Reward + (choice.Carries + reach) * downstream + choice.Local);
+                choice.Reward + (choice.Carries + reach) * downstream + choice.Local + OwnOfChoice(c, 1f, 1f));
         }
 
         return most;
@@ -339,6 +706,14 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
 
     /// <summary>Whether the player has said to leave this alone. See Insisted.</summary>
     public bool Shunned => Weight < 0f;
+
+    /// <summary>
+    /// How many must takes holding this one counts as: one, except the marker taken last in a search that holds
+    /// remnants the player did not mark, which counts two, so that breaking it costs more than leaving out one of the
+    /// remnants added. Settle and the incremental tally count it; PlanEnvironment.Musts is the sum over the must takes.
+    /// See Repair.HeldEnvironment.
+    /// </summary>
+    public int MustWeight { get; init; } = 1;
 
     /// <summary>
     /// The best combination for this remnant, given what the chain catches from here onwards.
@@ -361,7 +736,8 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     /// leaving it to be inferred from the rune counts afterwards. See Planner.Picked.
     /// </param>
     public (float Reward, float Carries, float Local, (string Id, float Worth)[] Locals, string[] Runes, (string Id, int Tag, float Percent, bool Flat)[] Spread) Best(float downstream, float local,
-        PlanEnvironment env, float[][] sums, int at, int distinct, out int chose)
+        PlanEnvironment env, float[][] sums, int at, int distinct, out int chose, float magicScale = 1f,
+        float rareScale = 1f, double passedLift = 0d)
     {
         chose = -1;
 
@@ -397,6 +773,9 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
                     reach += percent * Planner.Reach(env, tag, sums, null, at, downstream);
             }
 
+            // What the combination's scoped runes reach, before the lifts below add to it. See passedLift.
+            var spreadReach = reach;
+
             // **Ranked on what the chain would actually gain, not on what the combination holds.**
             //
             // A rune an earlier link already sends here earns nothing when the chain is scored, so
@@ -416,8 +795,53 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
 
             var held = Planner.DiscountedForDuplicates(env, this, choice.Locals, choice.Local, at, distinct);
 
-            var worth = choice.Reward +
-                        (float)((carried * downstream + held * local + reach) / 100d);
+            // **And what the lifts it holds add to what it propagates.** A held Power sends the beneficial runes it
+            // carries down the chain empowered, so they count again by the lift; any class's held lift the same. See
+            // HeldLiftsOfChoice.
+            //
+            // Not for a rune an earlier link already sends: monsters carry one copy of each rune, the earlier one,
+            // and an earlier plain copy stays plain downstream however the later sender is lifted. Measured on 4
+            // maps (2026-10-02): a rune sent plain and then again by a remnant holding Power reached the remnants
+            // after it empowered on 1 monster of 170, and only where those remnants had Power themselves.
+            var heldLifts = HeldLiftsOfChoice(c);
+
+            if (heldLifts != null)
+            {
+                foreach (var (id, weight) in Planner.WeightsOfChosenRunes(this, choice.Runes) ?? [])
+                {
+                    var factor = Planner.HeldFactorOfEffect(env, id, heldLifts);
+
+                    if (weight > 0f && factor > 1d && !Planner.IsRuneAlreadySentTo(env, this, id, at, distinct))
+                        reach += (factor - 1d) * weight * downstream;
+                }
+
+                foreach (var (id, tag, percent, _) in choice.Spread ?? [])
+                {
+                    var factor = Planner.HeldFactorOfEffect(env, id, heldLifts);
+
+                    if (percent > 0f && factor > 1d && !Planner.IsRuneAlreadySentTo(env, this, id, at, distinct))
+                        reach += (factor - 1d) * percent * Planner.Reach(env, tag, sums, null, at, downstream);
+                }
+            }
+
+            // **And what an amplifier it propagates lifts**: each class's lift on the shares already booked that the
+            // class lifts, from this link on. Only for a rune that adds as well - a pure amplifier is weighed by its lift
+            // as a carry, as Power always has been. See Planner.AmplifierWorthAt.
+            foreach (var id in choice.Runes ?? [])
+                reach += Planner.AmplifierWorthAt(env, id, heldLifts, at, sums, downstream, distinct);
+
+            // **And a Power passed in from earlier links, as the payout counts it.** It lifts every rune this
+            // combination sends down the chain and, from wave 2 on, the runes it keeps and the bonuses among their own
+            // effects; not the reward. Ranked without it, a remnant receiving Power weighed its runes at half what the
+            // payout then paid for them, against a reward the lift does not touch. Not for a combination holding a Power
+            // itself, whose own is counted already and does not stack with it. See Settle's PowerPassedTo.
+            var passed = PassedLiftOfChoice(env, heldLifts, passedLift);
+            var onOwnWaves = passed * ShareOfWavesPassedLift;
+
+            var worth = choice.Reward + TractionOfChoice(c, magicScale, rareScale) +
+                        OwnOfChoice(c, magicScale, rareScale, passed) +
+                        (float)((carried * downstream * (1d + passed) + held * local * (1d + onOwnWaves) +
+                                 reach + spreadReach * passed) / 100d);
 
             // **What each option was ranked at, kept only when somebody is reading.** The winner
             // was published and the comparison thrown away, so a remnant taking an option worth
@@ -462,21 +886,131 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
 /// the planner did before it asked.
 /// </param>
 /// <summary>
-/// How many spots to build per content family when seeding, and how to pick them.
+/// Which edge points toward neighbours the shortlist is offered, and how they are spaced.
 ///
 /// Carried on the environment rather than read from settings inside the search, because the search
 /// runs on a background thread and the settings window is on another - a slider dragged mid-solve
 /// would otherwise change the question halfway through answering it.
 /// </summary>
-/// <param name="Edges">
-/// Whether the search may use only the bands' edges, and nothing else on the site.
-/// </param>
-/// <param name="PerBand">
-/// How many cells of each band the search may use, beyond the ones it picks for a reason.
-/// </param>
-internal sealed record SeedFamilies(int Pairs, int Rares, int Remnants, float Spread, float Slack,
-    bool Heavy, int PerBand = 6, int Links = 1, int Branches = 4,
-    int Horizon = 0);
+internal sealed record SeedFamilies
+{
+    /// <summary>Whether heavy markers start edge points. See CandidateSpotSettings.HeavyEdgePoints.</summary>
+    public bool HeavyEdgePoints { get; init; } = true;
+
+    /// <summary>Whether rares start edge points. See CandidateSpotSettings.RareEdgePoints.</summary>
+    public bool RareEdgePoints { get; init; } = true;
+
+    /// <summary>The edge point step, in grid. See CandidateSpotSettings.EdgePointStepGrid.</summary>
+    public float EdgePointStepGrid { get; init; } = 0f;
+}
+
+/// <summary>
+/// How amplifier runes lift other runes' shares on one dig site, indexed by amplifier class - the tags in
+/// Weighing.AmplifierTags, "rune" for Power and "spawner_rune" for a rune lifting the spawners.
+///
+/// A share an amplifier lifts is filed in a twin of its group, one twin per set of classes lifting it, and the payout
+/// adds a group and its twins into one sum with each twin's part multiplied by its classes' factors. With nothing
+/// lifted the twins are empty and the arithmetic is the plain group's. See Planner.Multiplied.
+///
+/// An amplifier can itself be lifted: Rebirth, tagged rune, has its lift multiplied by Power's. Its lift is
+/// booked against its own effect number and accumulated per class down the chain. See AmplifiedByOfClass.
+/// </summary>
+internal sealed record Amplification(
+    // How many classes there are: Weighing.AmplifierTags().Length when the site was built.
+    int Classes,
+    // By effect number: what it lifts each class by, as fractions, or null for none. See Weighing.LiftsOfRune.
+    float[][] LiftsOfEffect,
+    // By effect number: the classes lifting its share or its lift, as a mask. See Weighing.AmplifiedClassesOfRune.
+    long[] MaskOfEffect,
+    // By group: the classes lifting the shares filed in it - nought for a plain group.
+    long[] MaskOfGroup,
+    // By group: the plain group a twin adds into, or -1 for a plain group.
+    int[] PlainOfGroup,
+    // By group: the twins adding into this plain group, or null.
+    int[][] TwinsOfGroup,
+    // By plain group times (1 shifted by Classes) plus a mask: the twin for that set of classes, or -1.
+    int[] TwinOfGroupAndMask,
+    // By class: the classes lifting that class's own lift, as a mask.
+    long[] AmplifiedByOfClass,
+    // Which class is the one aimed at every rune - Power's - or -1 where none is. Own effects' bonuses are lifted by it.
+    // See PlanTarget.OwnFactorsOfPart.
+    int RuneClass = -1,
+    // By group: how much of its classes' lift reaches the shares filed in it, 1 for all of it; null where every group
+    // takes all of it. Below 1 for a rune whose row writes its share "plain" and "empowered". See LiftedFactorOfGroup.
+    double[] ReachOfGroup = null)
+{
+    /// <summary>
+    /// What the shares filed in group g are multiplied by, given the factor of each set of classes: its classes' factor,
+    /// with only the reached part of the lift where ReachOfGroup says less than all - 1 + (factor - 1) x reach, so a
+    /// share whose rune is lifted x1.2 by a Power that doubles others gets 1.2. See Weighing.PowerFactorOfRune.
+    /// </summary>
+    public double LiftedFactorOfGroup(int g, double[] factors)
+    {
+        var factor = factors[MaskOfGroup[g]];
+
+        return ReachOfGroup is { } reach && g >= 0 && g < reach.Length ? 1d + (factor - 1d) * reach[g] : factor;
+    }
+
+    /// <summary>The group shares of this plain group lifted by these classes are filed in: the plain group itself for none.</summary>
+    public int TwinOf(int plain, long mask)
+    {
+        if (mask == 0L || plain < 0)
+            return plain;
+
+        var at = plain * (1 << Classes) + (int)mask;
+
+        return at >= 0 && at < TwinOfGroupAndMask.Length && TwinOfGroupAndMask[at] >= 0 ? TwinOfGroupAndMask[at] : plain;
+    }
+
+    /// <summary>
+    /// Each class's lift with the lifts lifting it applied, into effective: a class's raw lift times one plus each
+    /// lifting class's effective lift, in passes so a chain of two resolves. A cycle settles at the raw lifts' order.
+    /// </summary>
+    public void Effective(double[] raw, double[] effective)
+    {
+        for (var a = 0; a < Classes; a++)
+            effective[a] = raw[a];
+
+        for (var pass = 0; pass < Classes; pass++)
+        {
+            for (var a = 0; a < Classes; a++)
+            {
+                var by = a < AmplifiedByOfClass.Length ? AmplifiedByOfClass[a] : 0L;
+                var lift = raw[a];
+
+                for (var b = 0; b < Classes && by != 0L; b++)
+                {
+                    if ((by & (1L << b)) != 0L && b != a)
+                        lift *= 1d + effective[b];
+                }
+
+                effective[a] = lift;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The factor each set of classes puts on a share they lift - the product of one plus each class's effective lift -
+    /// indexed by mask, into factors, which must hold 1 shifted by Classes entries.
+    /// </summary>
+    public void FactorsOfMasks(double[] effective, double[] factors)
+    {
+        var masks = 1 << Classes;
+
+        for (var m = 0; m < masks; m++)
+        {
+            var f = 1d;
+
+            for (var a = 0; a < Classes; a++)
+            {
+                if ((m & (1 << a)) != 0)
+                    f *= 1d + effective[a];
+            }
+
+            factors[m] = f;
+        }
+    }
+}
 
 internal sealed record PlanEnvironment(
     Vector2 Origin,
@@ -651,6 +1185,13 @@ internal sealed record PlanEnvironment(
     bool Relink = false,
 
     /// <summary>
+    /// The index in Targets of the marker the player wants taken last, or -1: the chain's final explosive must be the
+    /// one whose blast catches it. It is a must take, and Settle counts it held only when the final link catches it.
+    /// See Insisted.IsTakenLast.
+    /// </summary>
+    int TakenLast = -1,
+
+    /// <summary>
     /// The enumerated openings a worker may start from, best first, or null when none were worked out.
     ///
     /// **The same word as the class that builds them, deliberately.** Grep Openings and both the enumerator
@@ -658,6 +1199,18 @@ internal sealed record PlanEnvironment(
     /// Repair.Opening, which is where a worker takes one.
     /// </summary>
     IReadOnlyList<List<Vector2>> Openings = null,
+
+    /// <summary>
+    /// Whole chains built from orders of the capturable remnants, best first, for the workers whose role opens on one,
+    /// or null when none were built. See RemnantOrder and ThreadRoles.Opens.RemnantOrder.
+    /// </summary>
+    IReadOnlyList<List<Vector2>> RemnantOrderChains = null,
+
+    /// <summary>
+    /// Whether the workers opening on remnant orders search their own order's chain exhaustively before their usual
+    /// moves. See DestroyAndRepairSettings.RemnantOrdersFirst.
+    /// </summary>
+    bool RemnantOrdersFirst = false,
 
     /// <summary>
     /// What each worker is for, parsed once per solve. Null leaves every worker at the defaults.
@@ -699,8 +1252,91 @@ internal sealed record PlanEnvironment(
     /// How long a worker's current chain may go without improving before it restarts, or nought for never. See
     /// DestroyAndRepairSettings.StallRestartMs.
     /// </summary>
-    int StallRestartMs = 0)
+    int StallRestartMs = 0,
+
+    /// <summary>
+    /// Gaining Traction: the fraction more magic packs in a remnant's waves for each remnant already completed in the
+    /// area, or nought without it. From the table's Gaining Traction row while DebugSettings.GainingTraction is on.
+    /// See Weighing.GainingTractionRates and Planner.TractionScales.
+    /// </summary>
+    float MagicPacksPerRemnantCompleted = 0f,
+
+    /// <summary>The same for rare packs, which also sets how far rare modifier chance rises. See MagicPacksPerRemnantCompleted.</summary>
+    float RarePacksPerRemnantCompleted = 0f,
+
+    /// <summary>
+    /// The map's increased number of rare packs as a fraction - map and atlas, as the remnant wave row is scaled by -
+    /// which Gaining Traction's increase adds to rather than multiplying. Nought without it, or from a layout saved
+    /// before it was kept. See Planner.TractionScales and AtlasStats.MapMonsterIncreases.
+    /// </summary>
+    float RareIncreaseOfMap = 0f,
+
+    /// <summary>The same for magic packs. See RareIncreaseOfMap.</summary>
+    float MagicIncreaseOfMap = 0f,
+
+    /// <summary>
+    /// What one extra modifier adds to a rare's worth, as a fraction of it, for the modifier half of Gaining Traction.
+    /// See Weighing.RareModifierShareOfRare and Planner.TractionScales.
+    /// </summary>
+    float RareModifierShareOfRare = 0f,
+
+    /// <summary>
+    /// Remnants completed anywhere in the map before this chain goes off, counted towards Gaining Traction before
+    /// the chain's own. Only remnants the scan watched finish: one already spent when first seen is never taken on.
+    /// </summary>
+    int RemnantsCompletedInArea = 0,
+
+    /// <summary>
+    /// Spots every worker's shortlist takes whatever they score, from a debug setting. Null for none. See
+    /// DebugSettings.ForcedShortlistSpots.
+    /// </summary>
+    IReadOnlyList<Vector2> ForcedShortlistSpots = null,
+
+
+    /// <summary>
+    /// For each marker an explosive already down has caught, by cell, the number of the first placed
+    /// explosive that catches it, counted from one in the order the game holds them. Lets the readout credit a
+    /// caught remnant only with the banked runes of links at or before its own. Null when nothing is down, or
+    /// on an environment read back from a file. See BankedRunes and Planner.IsBankedRuneReaching.
+    /// </summary>
+    IReadOnlyDictionary<(int X, int Y), int> LinkOfCaught = null,
+
+    /// <summary>
+    /// How the amplifier runes in this site lift other runes' shares: per effect its lifts and the classes lifting it,
+    /// per group its twins. Null when nothing in the site lifts anything, or on an environment read back from a file -
+    /// then a lift booked into the Empowering group reaches every share, as it did before twins. See Amplification and
+    /// Planner.Multiplied.
+    /// </summary>
+    Amplification Amplified = null,
+
+    /// <summary>
+    /// For each group, the increase the map already gives its stat, as a fraction, which the group's shares add to:
+    /// a group's factor is (1 + base + shares) / (1 + base). Set for the increased number of rare and magic monsters
+    /// from AtlasStats.MapMonsterIncreases when DebugSettings.MapMonsterIncreases is on; null otherwise, and on an
+    /// environment read back from a file, when every group starts from nothing. See Planner.Multiplied.
+    /// </summary>
+    float[] IncreaseBaseOfGroup = null,
+
+    /// <summary>
+    /// The whole site to score in, when explosives are down: every marker, and the detonator as the start, so a chain
+    /// is scored as the explosives down plus the links after them, the figure the score on screen shows. Null when
+    /// nothing is down, and on itself. See Head and Planning.Build.
+    ///
+    /// **This environment answers where the next link may go; Whole answers what a chain is worth.** The content the
+    /// explosives down already catch is taken out of this one, and what they pay was banked in its place - and the
+    /// banking undercounted what those links do to the ones after them: on a Frigid Bluffs site (2026-10-04), twelve
+    /// explosives down, the banked scoring ranked a tail worth 73,060 as a whole chain above one worth 74,487, the
+    /// last link carrying 2,814 where the whole chain carries it 20,664. Every score taken on this environment is
+    /// taken on Whole, over the explosives down and the chain. See Planner.Evaluate and Planner.Begin.
+    /// </summary>
+    PlanEnvironment Whole = null,
+
+    /// <summary>The explosives down, first first, which a chain scored on Whole follows. See Whole.</summary>
+    IReadOnlyList<Vector2> Head = null)
 {
+    /// <summary>What EmpowerableTwinOfGroup holds for a group that is itself a twin.</summary>
+    public const int EmpowerableTwin = -2;
+
     /// <summary>
     /// The distinct tags some effect in this dig site is scoped to, and nothing else.
     ///
@@ -961,908 +1597,6 @@ internal sealed record Verdict(double Content, double Propagation, double Walked
 internal static class Planner
 {
 
-    /// <param name="found">
-    /// Called with a copy of the best chain every time a better one turns up, for a readout that
-    /// wants to show the number climbing.
-    ///
-    /// A copy, because the search goes on to mutate its working chain in place - publishing the
-    /// live one would hand a reader something that changes under it from another thread. Whoever is
-    /// called here is on the search's thread, so they must do nothing but store it.
-    /// </param>
-    /// <param name="settle">
-    /// How long to keep going after the last improvement, or zero to use the whole budget.
-    ///
-    /// The better stopping rule for a search made of restarts: how long it needs depends on how
-    /// much there is to try, so "stop when nothing has improved for a while" spends time in
-    /// proportion to whether time is doing any good. The budget stays on as a ceiling either way,
-    /// because a rule about improvements is a rule that cannot promise to terminate.
-    /// </param>
-    /// <param name="margin">
-    /// How much the score has to have gained since the settle clock last restarted before it
-    /// restarts again. Zero means any improvement counts.
-    ///
-    /// Measured from the last restart rather than from the last improvement on purpose, so a run of
-    /// small gains that add up keeps the search alive. A search grinding out a point at a time
-    /// towards something real should not be cut off for taking small steps.
-    /// </param>
-    /// <param name="seed">
-    /// A chain from an earlier solve of the same site, or null. Taken as the starting incumbent when
-    /// it is still legal, so pressing the key again never begins below where it left off.
-    /// </param>
-    public static Plan Search(PlanEnvironment env, TimeSpan budget, TimeSpan settle, double margin,
-        CancellationToken token, Action<List<Vector2>> found = null, List<Vector2> seed = null)
-    {
-        if (env.Explosives <= 0 || env.Targets.Count == 0)
-            return Plan.Empty;
-
-        // The whole search, so the phases inside it can be read against a total rather than against
-        // each other. What the named phases do not account for is the figure that matters, which is
-        // the same reason the frame table times its own entry points. See Phases.
-        using var wholeSearch = new Phase(PhaseWhole);
-
-        var candidates = Candidates(env, out var offered, out _);
-
-        Positions = candidates.Count;
-
-        // Narrowed to the places worth catching something at, when asked.
-        //
-        // **The wager is that a chain worth having passes through one of the best few spots for
-        // some remnant or some rare.** Those are the pieces of content heavy enough to build a link
-        // around, they are going to be caught by something, and where a blast catches one it may as
-        // well be a blast that catches the most beside it.
-        //
-        // If that holds, it is worth a great deal: the site offers something like fourteen hundred
-        // positions and the union of the best few per piece of content is a few dozen, so the same
-        // budget searches a space twenty times smaller and does it properly rather than sampling.
-        //
-        // If it does not hold, the search will say so by scoring worse - which is why this is a
-        // switch and not a decision. The likely failure is the bridging link: a spot that catches
-        // almost nothing but joins two rich areas, which by construction is in no top few.
-        if (candidates.Count == 0)
-        {
-            return Plan.Empty with
-            {
-                Note = offered == 0
-                    ? "no content to place on"
-                    : $"the terrain check refused all {offered} candidate spots",
-            };
-        }
-
-        // The bands, once per solve. See Narrowed.
-        List<(string Name, List<Vector2> Cells, List<Vector2> All)> bands = null;
-
-        if (env.Seeding != null)
-        {
-            var seeding = env.Seeding;
-
-            bands = Regions(env, candidates, seeding.Pairs, seeding.Rares, seeding.Slack,
-                seeding.Heavy);
-
-            Searched = bands;
-        }
-
-        _sweeps = 0;
-        _sweepGain = 0d;
-        _deferred = 0;
-        _deferGain = 0d;
-        _orders = 0;
-        _orderGain = 0d;
-        _reversals = 0;
-        _reverseGain = 0d;
-        _shifts = 0;
-        _shiftGain = 0d;
-        _fetches = 0;
-        _fetchGain = 0d;
-        _asPlaced = 0;
-        _asPlacedBest = 0d;
-        _asPlacedChain = null;
-        _asPlacedSlipped = 0;
-        _endgameBest = 0d;
-        _endgameSlipped = 0;
-
-        // **A fixed seed made every re-solve retry the same paths.** The restart operator draws its
-        // openings from this stream, so a second press on an unchanged site walked the identical
-        // sequence of random chains and could only find something new by accident - the router
-        // having warmed up, or a round or two more fitting inside the window. Pressing again read
-        // as "search harder" and mostly was not.
-        //
-        // Counted rather than clocked, so a solve is still reproducible: run number three of a site
-        // is the same run number three every time, and the number is printed in the dump.
-        Stream = Interlocked.Increment(ref _streams);
-
-        var random = new Random(20260912 + Stream);
-
-        // How much of the window the restart loop actually got through, for the dump: rounds beside
-        // improvements is what says whether a re-solve explored or idled.
-        Rounds = 0;
-
-        // The clock starts before the first pass, not after it.
-        //
-        // These used to be set up below, which meant the opening greedy and its polish - the two
-        // longest single stretches of a cold solve - ran with no way to check the time. A window of
-        // 1,500ms was routinely blown by 4,000ms of routing inside them, and the setting looked
-        // ignored because nothing had yet reached the point of reading it.
-        var deadline = DateTime.UtcNow + budget;
-
-        // **The deterministic openings had the whole window, and on a Grand site they took it.**
-        //
-        // Five dumps in a row reported nought restart rounds - which is to say the restart loop, and
-        // with it Insisting, Chasing, the sweep and the endgame, did not execute once in a solve of
-        // twenty one seconds. Everything before it is a fixed list of openings, each one polished by
-        // Improve, and Improve on fifteen links against fourteen hundred candidates is seconds. The
-        // list simply ran until the clock did.
-        //
-        // So the openings get a share and the loop gets the rest, always. A worse opening that is
-        // then searched beats a better opening that is not: the loop is where the chain gets pulled
-        // onto content it walked past, and none of that has ever run here.
-        //
-        // Measured against the improvement window rather than the ceiling, because the window is the
-        // number the player set and the ceiling is usually unbounded.
-        var opens = DateTime.UtcNow + TimeSpan.FromMilliseconds(Math.Max(300d,
-            (settle > TimeSpan.Zero ? settle : budget).TotalMilliseconds * Sown));
-
-        var improved = DateTime.UtcNow;
-        var marked = 0d;
-
-        // Empty first, because Waiting() reads it: on a cold site a flood only counts as progress
-        // while there is no chain, and the opening pass is exactly when that matters.
-        var best = new List<Vector2>();
-        var score = 0d;
-
-        // The bands first, before anything else has spent the router's allowance.
-        //
-        // **Order matters here for a reason that has nothing to do with search quality.** The router
-        // may have spent a share of the time elapsed so far, so at the start of a solve almost
-        // nothing has accrued - and whatever runs first gets it. The opening greedy and its polish
-        // sweep a thousand candidates and take the lot, so the enumeration, running afterwards, had
-        // every one of its forty odd floods refused: it walked four thousand chains of a space
-        // measured at half a million, in seventy milliseconds of a twelve hundred millisecond
-        // allowance, and reported that as its answer.
-        //
-        // The enumeration needs one flood per band edge and nothing else, which fits inside the
-        // opening allowance with room to spare. Greedy needs no ground at all to produce something -
-        // it only needs it to produce something good - so it loses nothing by going second.
-        // A quarter of the window, not a fixed 350ms.
-        //
-        // **Measured on one site: the whole space of chains over the band edges is about half a
-        // million, and a scoring costs three microseconds - so all of it is a second and a half, and
-        // the first four links of it are a fifth of a second.** The old slice was set when a narrow
-        // pass meant twenty seven spots and it saw under one percent of that. Scaled to the window,
-        // a four second solve spends a second here and covers most of the space; a short solve still
-        // gets a proportionate look rather than none.
-        var enumerating = TimeSpan.FromMilliseconds(Math.Clamp(budget.TotalMilliseconds * 0.25d,
-            200d, 1200d));
-
-        foreach (var chain in Narrowed(env, candidates, Waiting, null, bands, enumerating))
-        {
-            if (Score(env, chain) > score + 0.0001d)
-                Keep(chain);
-
-            if (!Waiting())
-                break;
-        }
-
-
-        // Reported whether or not it wins, because "it did not fire" and "it fired and was beaten"
-        // are different facts and the readout could not tell them apart.
-        EnumeratedSolveOutcome = "not attempted - too many kinds of content";
-
-        // Tried again as the ground is learned, not once at the start.
-        //
-        // **It asks whether a chain is legal, and at the start nothing knows.** The router answers
-        // from flooded ground and floods cost time it has not accrued yet, so the first call gets
-        // refusals - which read as "no legal chain in this order" and made the whole thing give up.
-        // Seen plainly: the same site solved outright on a warm router and fell back to searching
-        // on a cold one, for a hundred and twenty points.
-        //
-        // So it is retried while the search warms the ground for it. Cheap enough to repeat - six
-        // orders over a handful of candidates - and it stops asking the moment it succeeds.
-        void Outright()
-        {
-            if (Planner.TryEnumeratedSolve(env, score) is { Count: > 0 } found)
-                Keep(found);
-        }
-
-        // The sparse case, answered before anything else is attempted.
-        //
-        // **Ahead of the seeding rather than after it**, for two reasons. A greedy seed publishes
-        // itself the moment it exists, so running this second meant the player watched a worse
-        // chain appear and be replaced a frame later - and on a site this answers outright, every
-        // second of seeding, anchoring and restarting is spent improving on an answer that is
-        // already provably the best there is.
-        var perfect = RelaxedCeiling(env);
-
-        StoppedAtRelaxedCeiling = false;
-
-        Outright();
-
-        if (perfect > 0d && score >= perfect - 0.0001d)
-        {
-            StoppedAtRelaxedCeiling = true;
-
-            return Describe(env, best);
-        }
-
-        // Drawn before it is polished, not after.
-        //
-        // A greedy chain is available in milliseconds and the polish that follows it can take
-        // seconds on a cold site - and nothing was published until the polish finished, so the
-        // plugin sat blank through most of the window with a perfectly good chain in hand. The
-        // first answer is shown as soon as it exists and improves under the player rather than
-        // appearing at the end.
-        var quick = Greedy(env, candidates, null, 1);
-
-        if (best.Count == 0)
-            found?.Invoke(Copied(quick));
-
-        quick = Improve(env, candidates, quick, Waiting);
-
-        if (Score(env, quick) > score + 0.0001d || best.Count == 0)
-            Keep(quick);
-
-        // Whatever the player insisted on, fetched before anything else is tried.
-        //
-        // **Ahead of the seeds, the anchors, the compass and the restart loop, because it is the
-        // only one of them that can satisfy a requirement.** It used to run last, inside the restart
-        // rounds, and on a Grand site those rounds never began: eight phases of openings and local
-        // search spent the window first, and the dump that prompted this recorded nought rounds
-        // completed with two of three marked remnants dropped. A rule that only applies when there
-        // is time left over is not a rule.
-        foreach (var opening in Demanded(env, candidates))
-        {
-            if (!Waiting())
-                break;
-
-            var chain = Improve(env, candidates, opening, Waiting);
-
-            if (Score(env, chain) > score + 0.0001d || best.Count == 0)
-                Keep(chain);
-        }
-
-        // The answer from last time, if there was one and it is still legal.
-        //
-        // Only the routing is remembered between presses; the search itself starts from a greedy
-        // chain every time and has to rediscover what it already knew, which is why the score climbs
-        // from a low number on every re-solve. A previous chain is a perfectly good starting
-        // incumbent - it was legal a moment ago and nothing about the site has changed - so taking
-        // it means pressing again can only improve on where it left off.
-        //
-        // Checked rather than trusted: explosives may have gone down since, which moves the origin
-        // and can strand a link that was reachable before.
-        if (seed is { Count: > 0 } && Walkable(env, seed))
-        {
-            var known = Improve(env, candidates, Copied(seed), Waiting);
-
-            if (Score(env, known) > score)
-            {
-                best = known;
-                score = Score(env, best);
-            }
-        }
-        improved = DateTime.UtcNow;
-        marked = score;
-
-        found?.Invoke(Copied(best));
-
-        if (best.Count == 0)
-        {
-            var nearest = float.MaxValue;
-
-            foreach (var candidate in candidates)
-                nearest = MathF.Min(nearest, Vector2.Distance(env.Origin, candidate));
-
-            return Plan.Empty with
-            {
-                Note = nearest > env.Reach
-                    ? $"nothing within reach: the nearest spot worth using is {nearest:0} grid from the chain origin and the reach is {env.Reach:0}"
-                    : "nothing reachable is worth placing on",
-            };
-        }
-
-        // The same move the restart rounds open with, made once before they do.
-        //
-        // Cheap - it is one relocate per missed requirement - and it is the difference between a
-        // chain that is one link away from legal and one that stays invalid because the window ran
-        // out before round one. See Insisting.
-        if (best.Count > 0 && env.Musts > 0)
-        {
-            var fetched = Insisting(env, candidates, best);
-
-            if (fetched != null && Score(env, fetched) > score + 0.0001d)
-                Keep(Improve(env, candidates, fetched, Waiting));
-        }
-
-        // Running out of ideas ends it before the ceiling does.
-        //
-        // Learning the ground counts as an idea. Reachability is worked out lazily, so on a site
-        // nobody has solved before the first minutes of a search are spent discovering which links
-        // are legal at all - and a chain that uses newly opened ground cannot be found before the
-        // **The improvement window measures improvement, so it does not start until there is
-        // something to improve.**
-        //
-        // The opening is allowed half the window by design - see Sown - and it publishes nothing until
-        // it has a complete chain, so on a site where it uses that half the clock was already half
-        // gone the first time a score existed. Measured on a Grand site with an eight second window:
-        // four seconds of opening, one chain at the end of it, and the score appearing with two
-        // seconds left.
-        //
-        // This was hidden rather than handled before. The router reset the clock on every flood while
-        // no chain existed, which had the same effect for a different reason - and removing the router
-        // removed the disguise along with it. Saying it directly is better: the setting is called time
-        // to improve, and time spent before the first chain is not that.
-        //
-        // The overall deadline still bounds the solve, so this cannot run away.
-        bool Waiting()
-        {
-            if (best.Count == 0)
-                improved = DateTime.UtcNow;
-
-            return DateTime.UtcNow < deadline && !token.IsCancellationRequested &&
-                   (settle <= TimeSpan.Zero || DateTime.UtcNow - improved < settle);
-        }
-
-        // The openings' own clock: the search's rule, plus a ceiling of its own. See Sown.
-        bool Early() => DateTime.UtcNow < opens && Waiting();
-
-        // A better chain is always kept. Whether it restarts the clock is a separate question, and
-        // the answer is "once the gains since the last restart are worth having".
-        void Keep(List<Vector2> chain)
-        {
-            best = chain;
-            score = Score(env, best);
-
-            if (score - marked >= margin)
-            {
-                marked = score;
-                improved = DateTime.UtcNow;
-            }
-
-            found?.Invoke(Copied(best));
-        }
-
-        // Chains built to the shape that keeps winning, before anything is left to chance.
-        //
-        // **Every strong chain measured on a real dig site has the same structure: the remnants in
-        // the opening links, and the last links spent digging up monsters for them.** A rune pays
-        // over everything unearthed after its remnant, so a remnant taken first is worth several
-        // times one taken last - and the best and worst chains in a table of six differed by ten per
-        // cent on coverage and by ordering on everything else.
-        //
-        // Greedy cannot find that shape on purpose. It picks by what a spot adds right now, and what
-        // a remnant adds depends on what comes after it, which has not been decided yet. So it
-        // arrives at these chains by luck, and on a site with three remnants it found the good
-        // arrangement about one solve in three.
-        //
-        // These are built the other way round: pick an order for the remnants, commit to reaching
-        // them in that order, and let greedy fill what is left with the monsters that pay for them.
-        // A handful of chains, deterministic, and each one is the answer to "what if the rune came
-        // first" for a different rune.
-        foreach (var opening in Remnants(env, candidates))
-        {
-            if (!Early())
-                break;
-
-            var chain = Improve(env, candidates, opening, Early);
-
-            if (Score(env, chain) > score + 0.0001d)
-                Keep(chain);
-        }
-
-        // The whole search again over a couple of dozen spots, then polished on the real set.
-        //
-        // **The narrow set is not a shortlist of good places, it is a shortlist of good LINKS.** Each
-        // spot in it is the best few ways of catching one remnant together with one neighbour, or of
-        // catching one rare - so a chain built out of them is a chain of links that each do a job the
-        // site actually requires, which is the property the strongest recorded chains share and the
-        // one greedy has no way to aim at.
-        //
-        // Measured against six chains recorded on one site, twenty seven such spots held eighteen of
-        // the thirty links exactly and twenty three within ten grid, out of one thousand and eighty
-        // two candidates. The best chain of the six had four of its five links on the set.
-        //
-        // Seeds rather than a restriction, and the same measurement says why: three of the thirty
-        // links sat more than twenty grid from anything in the set. Searching only these would put
-        // those chains permanently out of reach and give no sign it had happened. So the narrow
-        // search runs first because it is nearly free - a greedy pass over twenty seven candidates
-        // against one over a thousand - and whatever it finds is handed to the full search as a
-        // starting point rather than as an answer.
-        // And the same set used the way a player uses it: one link, then look again.
-        var rolled = Rolling(env, candidates, Early);
-
-        if (rolled.Count > 0)
-        {
-            var polished = Improve(env, candidates, rolled, Early);
-
-            RolledBest = Score(env, polished);
-
-            if (RolledBest > score + 0.0001d)
-                Keep(polished);
-        }
-
-        // The richest spots on the site, each tried as the thing the chain is built around.
-        //
-        // A different question from the one the remnant seeds ask. Those commit to an ORDER for the
-        // content that carries runes; these commit to a PLACE - the handful of positions worth the
-        // most on their own - and ask what the best chain through each of them looks like. On a site
-        // where one blast is worth two hundred and forty and the next best is half that, a chain
-        // that misses it is almost certainly wrong, and greedy only finds it if its own first step
-        // happens to lead there.
-        //
-        // Compass already forces an opening, but it picks the best in each of eight directions,
-        // which is a question about spread rather than about value: the two richest spots on a site
-        // are often in the same sector and only one of them is ever tried.
-        foreach (var anchor in Anchors(env, candidates))
-        {
-            if (!Early())
-                break;
-
-            var chain = Improve(env, candidates, Greedy(env, candidates, null, 1, anchor), Early, 1);
-
-            if (Score(env, chain) > score + 0.0001d)
-                Keep(chain);
-        }
-
-        // Every direction out of the detonator, tried deliberately rather than hoped for.
-        //
-        // The best first link in each compass sector, each one then finished greedily and given the
-        // same local search. Eight restarts, deterministic, and between them they commit the chain
-        // to every way it could set off - which is the one thing a local search cannot discover for
-        // itself and the thing a hand-laid chain beat it by seventy eight points on.
-        foreach (var opening in Compass(env, candidates))
-        {
-            if (!Early())
-                break;
-
-            var chain = Improve(env, candidates, Greedy(env, candidates, null, 1, opening), Early, 1);
-
-            if (Score(env, chain) > score + 0.0001d)
-                Keep(chain);
-        }
-
-        // The openings the restarts draw from, worked out once.
-        //
-        // **Uniformly over every candidate is the same as not choosing at all.** A four second run
-        // gets through a few hundred restarts and there are a thousand candidates, so each opening
-        // is tried about once - and one greedy pass from an opening says almost nothing about what
-        // that opening is worth, because the four links after it were themselves chosen greedily.
-        // Measured against the player doing it by hand: placing the first explosive and solving the
-        // remaining four reaches 1,316 where the free search settles at 1,295, and the difference is
-        // not that the problem is smaller - the search reaches the same opening - it is that all
-        // four seconds went on that one opening instead of a thousandth of them.
-        //
-        // So the restarts draw from the family spots, which are the couple of dozen places a link
-        // does two jobs at once, plus the spread of rich openings the anchors already found. Each
-        // one then gets tried dozens of times over a run rather than once, with different greedy
-        // choices behind it each time.
-        //
-        // Everything is kept as the fallback, so a site with no families - or one where the pool
-        // turns out to be a trap - still gets the search it had before.
-        var openings = new List<Vector2>();
-
-        if (env.Seeding != null)
-        {
-            var (pairs, rares, remnants, spread, slack, heavy, _, _, _, _) = env.Seeding;
-
-            foreach (var (at, _, _) in Families(env, candidates, pairs, rares, remnants, spread,
-                         slack, heavy))
-                if (Reaches(env, env.Origin, at))
-                    openings.Add(at);
-        }
-
-        foreach (var anchor in Anchors(env, candidates))
-            if (!openings.Contains(anchor))
-                openings.Add(anchor);
-
-        if (openings.Count == 0)
-            openings = candidates;
-
-        // Everything, or only the edges.
-        //
-        // **A small space can be searched properly and a large one cannot.** The full candidate set
-        // is a thousand places and four seconds buys a few hundred chains through it; the bands'
-        // edges are a few dozen places chosen precisely because they are where a link both catches
-        // what it should and leans as far as it can towards the next one. Restricted to those, the
-        // same window covers most of the space rather than sampling it.
-        //
-        Openings = openings.Count;
-
-        // What the openings cost against what they were allowed, because "nought restart rounds"
-        // took five dumps to notice and this is the number that would have said it at a glance.
-        var spare = (opens - DateTime.UtcNow).TotalMilliseconds;
-
-        Sowing = spare <= 0d
-            ? "spent their whole share and were cut off"
-            : $"finished with {spare:N0}ms of their share left";
-
-        // The best any opening has been shown to be worth, and how many have been tried at all.
-        //
-        // **Sixteen openings sharing four seconds is sixteen shallow answers.** Solving the
-        // remainder of an opening properly is the expensive part, and spreading it evenly means
-        // none of them gets solved properly - which is exactly the gap against a player who places
-        // the first explosive and gives the remaining four links the whole window. Measured: the
-        // free search settles at 1,298 however it poses the problem, and the same site with one
-        // explosive down reaches 1,319 in seconds.
-        //
-        // So the budget is spent in two phases. Every opening is tried once, which is cheap and
-        // says roughly what each is worth; after that the restarts only draw from the best few, and
-        // those get the rest of the window between them. A shallow answer is enough to tell a
-        // hopeless opening from a promising one - it is not enough to tell the best chain from the
-        // second best, which is why the concentration comes afterwards rather than instead.
-        var worthOf = new double[openings.Count];
-        var tried = 0;
-
-        for (var i = 0; i < worthOf.Length; i++)
-            worthOf[i] = double.NegativeInfinity;
-
-        int Which()
-        {
-            if (tried < openings.Count)
-                return tried++;
-
-            // Among the best few, at random, so each gets repeated attempts with different greedy
-            // choices behind it rather than the same chain over and over.
-            var order = new List<int>();
-
-            for (var i = 0; i < worthOf.Length; i++)
-                order.Add(i);
-
-            order.Sort((a, b) => worthOf[b].CompareTo(worthOf[a]));
-
-            return order[random.Next(Math.Min(Deeply, order.Count))];
-        }
-
-        // How much of the chain the endgame has committed, and which window it last did it in.
-        var pins = 0;
-        var stage = DateTime.MinValue;
-
-        Committed = 0;
-
-        // Start again from somewhere else, repeatedly, and keep the best answer.
-        //
-        // This replaces a loop that nudged the single best chain it had - which cannot work, and
-        // the reason is worth stating because it is the whole shape of the problem. The chain is a
-        // PATH out of the detonator, so the first link decides which way the whole thing goes. Any
-        // search that only ever changes one link at a time is trapped in whichever direction its
-        // first answer happened to take: reversing a chain means every link moving at once, and
-        // every partial step of that is illegal or far worse than where it started.
-        //
-        // Measured against a chain laid by hand, that trap was worth seventy eight points - the
-        // hand-laid chain simply set off the other way round the dig site. No amount of local
-        // polishing finds that. Starting over from a different first link does.
-        //
-        // The restarts are greedy with a bit of randomness in the choice - the best few candidates
-        // at each step rather than always the single best - so each one commits to a different
-        // direction, and then gets the same local search the first answer got.
-        // What this site could pay at the very most, so a search that has it can stop.
-        //
-        // See RelaxedCeiling. Nought means there is nothing worth bounding, which is every ordinary site.
-        var round = 0;
-
-        // The sparse case, answered rather than searched. See Exact.
-
-
-        while (Waiting())
-        {
-            // Nothing left to find, provably.
-            //
-            // **A sparse site is solved in the first second and searched for eight more.** Nine
-            // things to catch and twenty explosives has one right answer and the search reaches it
-            // almost at once - then spends the rest of the window re-rolling openings that cannot
-            // beat a total nothing can beat. Stopping needs no cleverness, only a number that
-            // cannot be exceeded and a comparison against it.
-            if (perfect > 0d && score >= perfect - 0.0001d)
-            {
-                StoppedAtRelaxedCeiling = true;
-
-                break;
-            }
-
-            round++;
-            Rounds = round;
-
-            // Asked again only while the answer was "not yet" - a site that is genuinely too
-            // complicated, or genuinely has no legal order, is not going to change its mind.
-            if (RouterNotReady)
-                Outright();
-
-            // The generic restart, occasionally rather than every time.
-            //
-            // **It is the weakest thing in this loop and it was taking the largest share of it.** A
-            // five link chain built greedily and polished is what the search already did before the
-            // window opened; measured against it, treating one link as placed and enumerating the
-            // remaining four reaches 1,311 from cold in under half a second, where the whole five
-            // link problem reaches 1,261 in four seconds. Spending most of the window re-rolling
-            // the harder problem is spending it on the version of the question nothing has ever
-            // answered well.
-            //
-            // Go and get whatever the chain has been TOLD to take and has not.
-            //
-            // First in the round, because everything else in it is a local move and this is not a
-            // local problem - see Insisting.
-            var insisted = Insisting(env, candidates, best);
-            var gained = insisted == null ? 0d : Score(env, insisted);
-
-            if (insisted != null && gained > score + 0.0001d)
-            {
-                _fetches++;
-                _fetchGain += gained - score;
-
-                Keep(Improve(env, candidates, insisted, Waiting));
-            }
-
-            // The same move the must-take key makes, made on the plugin's own account. Every
-            // fourth round, offset from the generic restart so the two do not share a tick.
-            if (round % 4 == 3)
-            {
-                var chased = Chasing(env, candidates, best);
-                var worth = chased == null ? 0d : Score(env, chased);
-
-                if (chased != null && worth > score + 0.0001d)
-                {
-                    _fetches++;
-                    _fetchGain += worth - score;
-
-                    Keep(Improve(env, candidates, chased, Waiting));
-                }
-            }
-
-            // Kept at one in four rather than dropped, because it is the only operator here that
-            // owes nothing to the family spots - if that set is missing the site's real answer,
-            // this is what finds it anyway.
-            if (round % 4 == 1)
-            {
-                var chain = Improve(env, candidates, Greedy(env, candidates, random, Among), Waiting);
-
-                if (Score(env, chain) > score + 0.0001d)
-                    Keep(chain);
-            }
-
-            // And the cheap version of the same idea: the chain it already has, walked the other
-            // way. Legal only when the far end is within reach of the detonator, which is often
-            // enough to be worth the one test it costs.
-            var back = Reverse(env, best);
-
-            if (back != null && Score(env, back) > score + 0.0001d)
-                Keep(back);
-
-            // Pin an opening nobody chose, and solve the rest around it.
-            //
-            // **Measured in game: place the first explosive by hand and re-solve, and the chain comes
-            // out worth 1,227 where solving the whole thing from scratch found 1,157.** Fixing the
-            // first link and searching four is a smaller problem than searching five, and the search
-            // does markedly better at it - which says the full problem is under-explored rather than
-            // that the shorter one is easier.
-            //
-            // Compass already forces a first link, but only the best one in each of eight sectors,
-            // so a good opening that is not the pick of its sector is never tried. This tries any
-            // candidate at all, which is the same move the player made by hand.
-            if (openings.Count > 0)
-            {
-                var pick = Which();
-                var opening = openings[pick];
-
-                if (Reaches(env, env.Origin, opening))
-                {
-                    // EnumeratedSolveOutcome as though the first explosive were already down.
-                    //
-                    // **Measured, repeatedly: the same site with one explosive placed reaches 1,311
-                    // from cold in under half a second, where the whole five link problem reaches
-                    // 1,261 in four seconds.** Committing a link and solving the remainder properly
-                    // is not a shortcut, it is a smaller problem - a dozen times fewer arrangements,
-                    // a fifth of the routing - and it is what the player does by hand.
-                    //
-                    // Enumerated against the real environment with the opening held, so the chain is
-                    // scored by the objective it will finally be judged by. An earlier version built
-                    // a reduced environment for this and got the propagation wrong; see Narrowed.
-                    var whole = new List<Vector2>();
-                    var most = double.NegativeInfinity;
-
-                    foreach (var solved in Narrowed(env, candidates, Waiting,
-                                 new List<Vector2> { opening }, bands))
-                    {
-                        var worthHere = Score(env, solved);
-
-                        if (worthHere > most)
-                        {
-                            most = worthHere;
-                            whole = solved;
-                        }
-                    }
-
-                    // Without bands there is nothing to enumerate, so this falls back to what it
-                    // did before they existed: greedy from the committed opening, pinned so the
-                    // polish cannot move it. Restarts has to keep the operator when it is run as the
-                    // baseline - dropping it silently would make the comparison a different search
-                    // rather than an unaided one.
-                    if (whole.Count == 0)
-                    {
-                        whole = Improve(env, candidates,
-                            Greedy(env, candidates, random, Among, opening), Waiting, 1);
-                    }
-
-
-                    var worth = Walkable(env, whole) ? Score(env, whole) : double.NegativeInfinity;
-
-                    _asPlaced++;
-
-                    if (worth > _asPlacedBest)
-                    {
-                        _asPlacedBest = worth;
-                        _asPlacedChain = Copied(whole);
-                    }
-
-                    if (whole.Count > 0 && whole[0] != opening)
-                        _asPlacedSlipped++;
-
-                    if (worth > worthOf[pick])
-                        worthOf[pick] = worth;
-
-                    if (worth > score + 0.0001d)
-                        Keep(whole);
-                }
-            }
-
-            // The best restart, filled out to its full length - once, not once each.
-            //
-            // **A short chain is not an answer, and on a Grand site every restart is short.** The
-            // enumeration walks bands and stops when it runs out of legal band moves: on five links
-            // that is usually the whole chain, on fifteen it is a third of one. Measured: 182
-            // restarts, best 483.0, where fifteen explosives were available. Those stubs then lost
-            // to every full length answer, so the restart path - the operator that reproduces what
-            // a player does by hand, and the strongest one here - contributed nothing at all on
-            // exactly the sites that need it most.
-            //
-            // **Filling all of them was worse than filling none.** Tried: 179 restarts each
-            // completed and improved, which did make them whole - best 483.0 became best 1,493.9 -
-            // and the site scored LOWER, 2,099 against 2,280. Completion is greedy over every
-            // candidate for every remaining link, so it costs thousands of scorings and thousands of
-            // reach questions each time; the routing starved harder (79.5% refused against 77%) and
-            // the sweep, which earns an order of magnitude more, lost a fifth of its moves to pay
-            // for it.
-            //
-            // So they are compared as they come. Restarts are all short in the same way, so ranking
-            // them against each other is fair, and only the winner is made whole - one completion a
-            // round instead of a hundred and seventy nine.
-            if (_asPlacedChain is { Count: > 0 } && _asPlacedChain.Count < env.Explosives)
-            {
-                var filled = Improve(env, candidates,
-                    Complete(env, Copied(_asPlacedChain), candidates), Waiting, 1);
-
-                if (Walkable(env, filled) && Score(env, filled) is var made && made > score + 0.0001d)
-                    Keep(filled);
-            }
-
-            // Keep the opening, rebuild the rest. Every fourth pass, for the same reason as above:
-            // it rebuilds greedily, which the as-placed enumeration above does properly.
-            //
-            // **This is the move a player makes by hand and the search could not.** Sweep replaces
-            // one link at a time and every replacement has to reach both its neighbours, so a
-            // better chain that needs three links to move TOGETHER is unreachable from here: drop
-            // the third link where it belongs and it no longer reaches the fourth, which makes
-            // every step of the journey illegal even though the destination is legal and better.
-            //
-            // Measured, on a Sinkhole dig site: the search settled on 1,156 and a chain sharing its
-            // first two links scored 1,174. Placing those two by hand and solving again found it
-            // immediately - because solving again IS this operator, with the prefix fixed by the
-            // explosives already down. Doing it in the search costs one greedy pass.
-            //
-            // The restarts above cannot substitute. They commit to a different FIRST link, so they
-            // explore other directions out of the detonator; this explores other endings to the
-            // direction already chosen, which is a different half of the same problem.
-            if (best.Count > 1 && round % 4 == 2)
-            {
-                var keep = best.GetRange(0, 1 + random.Next(best.Count - 1));
-
-                // The kept prefix is the point of this, so it is pinned for the same reason - and
-                // pinning the whole prefix, not just the opening, because what is being asked is
-                // what a different ENDING to this beginning is worth.
-                var tail = Improve(env, candidates,
-                    Greedy(env, candidates, random, Among, null, keep), Waiting, keep.Count);
-
-                if (Score(env, tail) > score + 0.0001d)
-                    Keep(tail);
-            }
-
-            // The endgame: commit the chain a link at a time as the window runs out.
-            //
-            // **Committing early was measured and did nothing three times over; this commits late,
-            // which is a different bet.** Early on a pinned link is a guess, and the search has
-            // better uses for the time than exploring the consequences of a guess. In the last
-            // tenth of the window the chain is as good as this run is going to make it, and the
-            // only question left is whether its opening is worth keeping - which is answered by
-            // fixing that opening and rebuilding everything after it, the same move as placing an
-            // explosive by hand and pressing again.
-            //
-            // One link per window, not one per iteration. The stage only advances after something
-            // has improved since the last one, so a commitment that leads nowhere ends the solve
-            // exactly as it would have ended anyway, and a commitment that pays buys a fresh window
-            // in which to commit the next link. That makes the whole endgame free: it can extend a
-            // run only by finding something better, which is the same rule every other operator
-            // here plays by.
-            //
-            // The last link is never pinned. Pinning every link is not a search, it is the chain it
-            // already had.
-            if (settle > TimeSpan.Zero && best.Count > 2 && pins < best.Count - 1 &&
-                stage != improved && DateTime.UtcNow - improved >= settle * Endgame)
-            {
-                stage = improved;
-                pins++;
-
-                var head = best.GetRange(0, pins);
-                var rest = Improve(env, candidates,
-                    Greedy(env, candidates, random, Among, null, head), Waiting, pins);
-
-                _endgameBest = Math.Max(_endgameBest, Score(env, rest));
-
-                // Whether the pin actually held. If a committed link is not where it was committed,
-                // something downstream is moving it and the whole idea is being tested in name only.
-                for (var i = 0; i < pins && i < rest.Count; i++)
-                    if (rest[i] != head[i])
-                        _endgameSlipped++;
-
-                if (Score(env, rest) > score + 0.0001d)
-                    Keep(rest);
-
-                Committed = pins;
-            }
-        }
-
-        return Describe(env, best);
-    }
-
-    /// <summary>
-    /// The most promising first link in each direction out of the chain's origin.
-    ///
-    /// Sectors rather than a sample, so the openings are spread by construction: whatever the dig
-    /// site looks like, there is one candidate offered per eighth of the compass, and the chain gets
-    /// a chance to set off each way. Sectors with nothing reachable in them are simply absent.
-    /// </summary>
-    private static List<Vector2> Compass(PlanEnvironment env, List<Vector2> candidates)
-    {
-        const int sectors = 8;
-
-        var bestAt = new Vector2[sectors];
-        var bestGain = new double[sectors];
-        var taken = new HashSet<int>();
-
-        for (var i = 0; i < sectors; i++)
-            bestGain[i] = double.NegativeInfinity;
-
-        foreach (var candidate in candidates)
-        {
-            var away = candidate - env.Origin;
-            var far = away.Length();
-
-            // Reaches, not distance. An opening is a FORCED first link - whatever comes back from
-            // here is committed to without the greedy pass getting a say - so a sector whose best
-            // candidate has a wall in front of it must offer its next best instead of offering a
-            // link the game will refuse. This was the bug: three dig sites in a row planned an
-            // opening through a rock, because the only test it ever faced was how far away it was.
-            if (far < 0.01f || !Reaches(env, env.Origin, candidate))
-                continue;
-
-            var angle = MathF.Atan2(away.Y, away.X) + MathF.Tau;
-            var sector = (int)(angle / MathF.Tau * sectors) % sectors;
-            var gain = NewWeight(env, candidate, taken, env.Explosives - 1);
-
-            if (gain > bestGain[sector])
-            {
-                bestGain[sector] = gain;
-                bestAt[sector] = candidate;
-            }
-        }
-
-        var found = new List<Vector2>();
-
-        for (var i = 0; i < sectors; i++)
-        {
-            if (bestGain[i] > 0d)
-                found.Add(bestAt[i]);
-        }
-
-        return found;
-    }
-
     /// <summary>
     /// How many of the best candidates a construction chooses between at each step.
     ///
@@ -1895,68 +1629,25 @@ internal static class Planner
     public static int Positions { get; set; }
 
     /// <summary>
-    /// The richest spots on the site as of the last search, for drawing.
-    ///
-    /// The same figures the anchor seeds are built from, published rather than recomputed: working
-    /// them out costs a pass over every candidate against every marker, which is fine once a solve
-    /// and absurd once a frame. So the overlay shows what the search actually reasoned about, and
-    /// shows it only after a solve - which is the honest scope anyway, since the numbers describe
-    /// the site as the search understood it.
-    /// </summary>
-    /// <summary>
-    /// How many of the best spots to draw, set by the debug button. Nought draws nothing.
+    /// How many edge points are drawn, set when they are worked out. Nought draws nothing.
     /// </summary>
     public static int Drawn { get; set; }
 
     /// <summary>
-    /// A count the button has asked for and nobody has worked out yet, or -1 for nothing pending.
+    /// Whether the edge points button has asked for the edge points and the next tick has not yet worked them out.
     ///
-    /// The ranking needs an environment - the markers, the reach, the ground - and the settings
-    /// window has none of that in scope. So the button leaves the question here and the next tick
-    /// answers it, which is the same arrangement the cache button uses.
+    /// Working them out needs an environment - the markers, the reach, the ground - and the settings window has
+    /// none of that in scope. So the button leaves the request here and the next tick answers it, which is the same
+    /// arrangement the cache button uses. See ComputeEdgePointsForDrawing.
     /// </summary>
-    public static int Wanted { get; set; } = -1;
+    public static bool EdgePointsPending { get; set; }
 
     /// <summary>
-    /// Which content the pending request wants the best spots around, or None for the site overall.
-    /// </summary>
-    public static TargetKind? PerKind { get; set; }
-
-    /// <summary>
-    /// Whether the pending request is for the paired view rather than a ranking. See Pairs.
-    /// </summary>
-    public static bool Paired { get; set; }
-
-    /// <summary>
-    /// Whether the pending request is for every family at once. See Families.
-    /// </summary>
-    public static bool Family { get; set; }
-
-    /// <summary>Whether the pending request is for the bands themselves, drawn as shapes.</summary>
-    public static bool Shaped { get; set; }
-
-    /// <summary>
-    /// The bands the last SEARCH used, as opposed to any the drawing works out for itself.
+    /// The edge points as last worked out for drawing, one entry per point: its label, the point as the only cell
+    /// of the second list, and an empty third list. See EdgePointsTowardNeighbours and Overlay.Shapes.
     ///
-    /// **The drawing and the search were computing their own, and that made every disagreement
-    /// unanswerable.** They build from separate environments - the search's knows what has already
-    /// been caught and what the obstacles are at that moment - so a cell on screen might or might
-    /// not have been one the search could see, and there was no way to tell which. Published here,
-    /// the picture is the evidence: what is drawn is what was walked, and a chain the eye can build
-    /// out of the rings is a chain the search had the parts for.
-    /// </summary>
-    public static IReadOnlyList<(string Name, List<Vector2> Cells, List<Vector2> All)> Searched
-    {
-        get;
-        set;
-    } = new List<(string, List<Vector2>, List<Vector2>)>();
-
-    /// <summary>
-    /// The bands as last worked out for drawing: every cell, and the corners the search uses.
-    ///
-    /// Kept apart from the search's own call so that watching the shapes cannot change what the
-    /// search does, and so a solve running in the background cannot rewrite what is on screen
-    /// halfway through a frame.
+    /// Kept apart from the search so that drawing the points cannot change what the search does, and so a solve
+    /// running in the background cannot rewrite what is on screen halfway through a frame.
     /// </summary>
     public static IReadOnlyList<(string Name, List<Vector2> Cells, List<Vector2> All)> Shapes
     {
@@ -1964,1742 +1655,398 @@ internal static class Planner
         private set;
     } = new List<(string, List<Vector2>, List<Vector2>)>();
 
-    /// <summary>How many spots per family the pending request wants, as pair / rare / remnant.</summary>
-    public static (int Pairs, int Rares, int Remnants) Counts { get; set; } = (3, 3, 0);
-
-    /// <summary>The richest spread-out spots for an environment, worked out on demand.</summary>
-    public static void Rank(PlanEnvironment env, int most, float spread = 0f, TargetKind? each = null,
-        bool paired = false, float slack = 0f, bool heavy = true)
+    /// <summary>
+    /// Works out the edge points toward neighbours for the overlay and the dump, from the environment the planner
+    /// would solve now, with how many points each edge point step from nought to ten would give on this site. See
+    /// EdgePointsTowardNeighbours.
+    /// </summary>
+    public static void ComputeEdgePointsForDrawing(PlanEnvironment env)
     {
-        if (env == null || most <= 0)
+        if (env == null)
         {
-            Spots = new List<(Vector2, double, string)>();
+            Shapes = new List<(string, List<Vector2>, List<Vector2>)>();
             Drawn = 0;
 
             return;
         }
 
-        var candidates = Candidates(env, out _, out _);
+        Shapes = EdgePointsTowardNeighbours(env, out var said, out var seeds, out var brightness, out var labels);
+        EdgePointMarkerNames = labels;
 
-        Positions = candidates.Count;
-        Drawn = most;
+        // How many points each step from nought to ten would give on this site, for choosing one. See
+        // CandidateSpotSettings.EdgePointStepGrid.
+        var perStep = new List<string>();
 
-        if (Shaped)
+        if (env.Seeding is { } seeding)
         {
-            var (pairs, rares, _) = Counts;
+            for (var step = 0; step <= 10; step++)
+            {
+                var stepped = env with { Seeding = seeding with { EdgePointStepGrid = step } };
 
-            // What the search used, when it has run. Recomputing here would answer a different
-            // question than the one being asked.
-            Shapes = Searched.Count > 0
-                ? Searched
-                : Regions(env, candidates, pairs, rares, slack, heavy);
-
-            Spots = new List<(Vector2, double, string)>();
-            Drawn = Shapes.Count;
-            Fanned = Fanout(env, Shapes);
-
-            return;
+                perStep.Add($"{step}: {EdgePointsTowardNeighbours(stepped, out _, out _, out _, out _).Count}");
+            }
         }
 
-        if (Family)
-        {
-            var (pairs, rares, remnants) = Counts;
-
-            Spots = Families(env, candidates, pairs, rares, remnants, spread, slack, heavy);
-            Drawn = Spots.Count;
-            Linked = Adjacency(env, Spots);
-
-            return;
-        }
-
-        if (paired)
-        {
-            Spots = Pairs(env, candidates, most, spread, slack, heavy);
-
-            return;
-        }
-
-        if (each == null)
-        {
-            var flat = new List<(Vector2, double, string)>();
-            var rank = 0;
-
-            foreach (var (at, worth) in Ranked(env, candidates, most, spread, false, slack, heavy))
-                flat.Add((at, worth, $"{++rank}x{Heavy(env, at)}"));
-
-            Spots = flat;
-
-            return;
-        }
-
-        Spots = PerEach(env, candidates, most, spread, each.Value, slack, heavy);
+        EdgePointsSaid = said + (perStep.Count > 0
+            ? $"{Environment.NewLine}  points at each step (grid): {string.Join(", ", perStep)}"
+            : "");
+        EdgePointColourSeeds = seeds;
+        EdgePointBrightness = brightness;
+        Drawn = Shapes.Count;
     }
 
     /// <summary>
-    /// The best few places to catch each thing of one kind, one at a time.
+    /// The cells of the edge points toward neighbours for one environment, worked out once and shared by every
+    /// worker's shortlist. Empty when neither edge point switch is on. See Repair.Shortlist.
     ///
-    /// A different question from the best spots overall, and a more useful one for arguing with the
-    /// planner: a remnant is going to be caught by SOMETHING, so what is worth knowing is which of
-    /// the positions that catch it also sweep up the most beside it. The overall ranking answers
-    /// "where is the value on this site" and buries the third remnant behind five spots around the
-    /// first.
+    /// Keyed on the environment by reference, which is exact: it is rebuilt per solve, never mutated during one,
+    /// and carries the edge point settings.
     ///
-    /// By kind, because the same question is worth asking of rare monsters: they are the other
-    /// content heavy enough to build a link around, and where a blast catching one also catches its
-    /// neighbours is not something the eye judges well.
-    ///
-    /// Lettered by the thing and numbered within it, so a ring says what it belongs to and how it
-    /// placed among that thing's options.
+    /// **Built by one thread while the others wait**, through a Lazy. ConditionalWeakTable.GetValue runs its factory
+    /// on every thread that asks before the first stores, and every worker asks at once: measured on one Grand site
+    /// (2026-09-30), 48 builds over 6 solves at about 305ms and 58MB each, the same points eight times a press.
     /// </summary>
-    private static List<(Vector2 At, double Worth, string Note)> PerEach(PlanEnvironment env,
-        List<Vector2> candidates, int most, float spread, TargetKind kind, float slack = 0f,
-        bool heavy = true)
-    {
-        var found = new List<(Vector2 At, double Worth, string Note)>();
-        var none = new HashSet<int>();
+    internal static List<Vector2> EdgePointCellsOfEnvironment(PlanEnvironment env) =>
+        _edgePointCells.GetValue(env, static e => new Lazy<List<Vector2>>(() =>
+            e.Seeding is { HeavyEdgePoints: true } or { RareEdgePoints: true }
+                ? EdgePointsTowardNeighbours(e, out _, out _, out _, out _).ConvertAll(x => x.Cells[0])
+                : new List<Vector2>(), LazyThreadSafetyMode.ExecutionAndPublication)).Value;
 
-        // Two markers sharing one best spot drew two rings on the same cell, one hidden under the
-        // other, and the pair read as a single ring belonging to whichever was drawn last. Folded
-        // instead, carrying both names - a spot that answers for two rares is a fact worth seeing,
-        // not a collision to hide.
-        var where = new Dictionary<(int, int), int>();
-        var letter = 'A';
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PlanEnvironment,
+        Lazy<List<Vector2>>> _edgePointCells = new();
+
+    /// <summary>Which markers a blast here catches, as their indices in the target list, for comparing two spots.</summary>
+    private static string ContentsCaughtAt(PlanEnvironment env, Vector2 at)
+    {
+        var text = new StringBuilder();
 
         for (var i = 0; i < env.Targets.Count; i++)
         {
-            var target = env.Targets[i];
-
-            if (target.Kind != kind)
-                continue;
-
-            // **A seed is a spot chosen FOR a marker, so there is no such thing as a good one for a
-            // marker nothing may catch.** The objective already prices these below anything a legal
-            // chain can score, which settles which plan wins - it does not stop the search opening
-            // every pass from spots built around them, testing chains that were worthless before the
-            // first link was placed. See PlanTarget.Shunned.
-            if (target.Shunned)
-                continue;
-
-            var worth = new List<(Vector2 At, double Solo)>();
-
-            foreach (var candidate in candidates)
-            {
-                if (Catches(env, candidate, target))
-                    worth.Add((candidate, NewWeight(env, candidate, none, env.Explosives - 1)));
-            }
-
-            if (worth.Count == 0)
-                continue;
-
-            worth.Sort(Better(Pull(env, heavy), Best(worth), slack));
-
-            var apart = spread > 0f ? spread : MathF.Max(1f, env.Apart);
-            var kept = new List<Vector2>();
-
-            foreach (var (at, solo) in worth)
-            {
-                if (kept.Count >= most)
-                    break;
-
-                var clear = true;
-
-                foreach (var already in kept)
-                    clear &= Vector2.Distance(already, at) > apart;
-
-                if (!clear)
-                    continue;
-
-                kept.Add(at);
-
-                var cell = ((int)MathF.Round(at.X), (int)MathF.Round(at.Y));
-                var note = $"{letter}{kept.Count}";
-
-                if (where.TryGetValue(cell, out var shared))
-                {
-                    var was = found[shared];
-
-                    found[shared] = (was.At, was.Worth, $"{was.Note} {note}");
-
-                    continue;
-                }
-
-                where[cell] = found.Count;
-                found.Add((at, solo, $"{note}x{Heavy(env, at)}"));
-            }
-
-            letter++;
+            if (Catches(env, at, env.Targets[i]))
+                text.Append(i).Append(',');
         }
 
-        return found;
+        return text.ToString();
     }
 
     /// <summary>
-    /// One link at a time, with the bands worked out again after each.
+    /// For each heavy marker, and each other heavy marker or rare a next bomb could catch from its edge, the points on
+    /// the first marker's catch ring that lead towards the second: one per distinct set of markers caught, the one
+    /// nearest the second marker, only those no other point beats on both - catching at least as much weight and
+    /// ending at least as near - and of those, going from the richest, only a point at least the edge point step
+    /// nearer than the last one kept. Then across directions, a point is folded into another catching exactly the
+    /// same markers that ends within the step of it towards every neighbour it leads to, and that one takes its
+    /// neighbours.
+    /// Rares are starting points as well as heavy markers when the settings ask for it. See
+    /// CandidateSpotSettings.HeavyEdgePoints, RareEdgePoints and EdgePointStepGrid. See Openings.RingSpotsOfAnchor, which supplies the ring, and
+    /// Openings.BestTowardEachNextArea, which makes the same trade between content and direction for a link of a
+    /// chain.
     ///
-    /// **Bands go stale the moment a link is chosen.** They are drawn against the content still to
-    /// be caught, so as soon as the first blast takes its markers every remaining family's best
-    /// ground moves - the pair that was worth standing east of is now half collected, and the area
-    /// that catches what is left is somewhere else. Enumerating orderings against one frozen picture
-    /// asks where to stand for a site that stops existing after the first link.
+    /// One ring per cell, however many pairs keep it, labelled with the heavy markers it catches and the
+    /// neighbours it leads towards, as "R1+R3 > E2 L4". Coloured by the heavy markers it catches, from their
+    /// positions, so a combination keeps its colour when the names renumber, and dimmed by how much of its origin's
+    /// richest spot it catches. See EdgePointColourSeeds and EdgePointBrightness.
     ///
-    /// Measured by hand: reading the bands off the screen, placing one explosive, and recomputing
-    /// reaches the best chain on this site easily - at one percent slack, where the frozen
-    /// enumeration needs a wider band and still falls twenty points short.
-    ///
-    /// So this is that method. Each step looks ahead over the current bands, commits only the next
-    /// link, and recomputes - a receding horizon, which is the standard answer when the world
-    /// changes underneath a plan and re-planning is cheap. Here it costs one scan of a disc per
-    /// family per link, which on the sites measured is tens of milliseconds.
-    ///
-    /// Scored throughout against the real environment, never a reduced one: the bands are only a way
-    /// of proposing places, so narrowing what they are drawn from cannot mis-price a rune.
+    /// A neighbour is within reach when the gap between the two catch distances is no more than a bomb's reach.
+    /// Heavy is Openings.HeavyTargetsOfSite's measure. Near means the distance left before a bomb could catch the
+    /// neighbour, nought for a point that already catches it.
     /// </summary>
-    private static List<Vector2> Rolling(PlanEnvironment env, List<Vector2> candidates,
-        Func<bool> waiting)
-    {
-        if (env.Seeding == null)
-            return new List<Vector2>();
-
-        var (pairs, rares, _, _, slack, heavy, _, _, _, _) = env.Seeding;
-        var chain = new List<Vector2>();
-
-        for (var step = 0; step < env.Explosives; step++)
-        {
-            if (waiting?.Invoke() == false)
-                break;
-
-            // What the bands are drawn against: the content this chain has not already taken. Given
-            // as a set of indices rather than a trimmed environment, so the coverage index survives
-            // - see Regions.
-            var gone = new HashSet<int>();
-
-            for (var t = 0; t < env.Targets.Count; t++)
-            {
-                var taken = false;
-
-                foreach (var link in chain)
-                    taken |= Catches(env, link, env.Targets[t]);
-
-                if (taken)
-                    gone.Add(t);
-            }
-
-            if (gone.Count >= env.Targets.Count)
-                break;
-
-            var bands = Regions(env, candidates, pairs, rares, slack, heavy, gone);
-
-            if (bands.Count == 0)
-                break;
-
-            var best = new List<Vector2>();
-            var most = double.NegativeInfinity;
-
-            // A share of one slice between all the steps, not a slice each. Five links at three
-            // hundred and fifty milliseconds apiece is most of a four second window spent looking
-            // ahead down chains that are thrown away after their first link.
-            foreach (var found in Narrowed(env, candidates, waiting, Copied(chain), bands,
-                         Slice / Math.Max(1, env.Explosives)))
-            {
-                var worth = Score(env, found);
-
-                if (worth > most)
-                {
-                    most = worth;
-                    best = found;
-                }
-            }
-
-            // Only the next link is kept. The rest of that chain was worked out against bands that
-            // are about to be redrawn, so it is a look ahead rather than a decision.
-            if (best.Count <= chain.Count)
-                break;
-
-            chain.Add(best[chain.Count]);
-        }
-
-        return chain;
-    }
-
-    /// <summary>
-    /// Chains built from the family spots alone, each then polished against the full candidate set.
-    ///
-    /// One greedy pass and one per compass direction, which on a set this small is close to trying
-    /// everything - and every chain that comes out is finished on the real candidates, so a link
-    /// that wants to sit two grid off a family spot still can. Nothing here is kept unless it beats
-    /// what the search already has.
-    ///
-    /// Empty when the site has no families - no remnant sharing a blast with anything, no rares -
-    /// and then this costs one pass over the targets and contributes nothing, which is correct.
-    ///
-    /// **Only the best few are polished, and that is the difference between this helping and this
-    /// costing.** The narrow passes are nearly free - a greedy over twenty seven candidates - but
-    /// the polish that follows each one is a full local search over a thousand, and nine of those
-    /// run before the main loop has started. On a four second budget that is felt: the search looks
-    /// slow off the mark for chains that were mostly going to be thrown away. So every direction is
-    /// tried narrowly, scored narrowly, and only the best two are handed the expensive pass.
-    /// </summary>
-    /// <param name="head">
-    /// Links already committed, which the enumeration builds on rather than replaces.
-    ///
-    /// **Scored as one chain with them, which is the entire point and was got wrong once already.**
-    /// The first attempt at this built a smaller environment - origin at the committed link, one
-    /// fewer explosive, and the content that link catches removed from the targets - and solved
-    /// that. It is wrong in a way that is invisible from outside: on this site the committed link
-    /// catches a remnant, and a remnant's rune multiplies every monster unearthed after it. Delete
-    /// the remnant from the target list and the remainder is chosen by a search that cannot see the
-    /// twenty percent riding on everything it picks up, so it picks up the wrong things - the same
-    /// wrong things every time, which is why that path returned 1,294.3 however much of the window
-    /// it was given.
-    ///
-    /// Keeping the real environment and scoring the head and the tail together has none of that: the
-    /// objective is the one the plan is finally judged by, so nothing has to be added back.
-    /// </param>
-    /// <summary>
-    /// Narrowed, with what it allocates attributed.
-    ///
-    /// **An iterator cannot be measured by wrapping the call.** Calling it only builds the state
-    /// machine; every byte it spends is spent inside MoveNext, between one yield and the next, and
-    /// a using block round the call would have reported it as free. So the stepping is measured
-    /// instead. See Phases.
-    /// </summary>
-    private static IEnumerable<List<Vector2>> Narrowed(PlanEnvironment env, List<Vector2> candidates,
-        Func<bool> waiting, List<Vector2> head = null,
-        List<(string Name, List<Vector2> Cells, List<Vector2> All)> bands = null,
-        TimeSpan? slice = null)
-    {
-        using var steps = NarrowedInner(env, candidates, waiting, head, bands, slice).GetEnumerator();
-
-        while (true)
-        {
-            bool more;
-
-            using (new Phase(PhaseNarrowed))
-                more = steps.MoveNext();
-
-            if (!more)
-                yield break;
-
-            yield return steps.Current;
-        }
-    }
-
-    private static IEnumerable<List<Vector2>> NarrowedInner(PlanEnvironment env,
-        List<Vector2> candidates, Func<bool> waiting, List<Vector2> head = null,
-        List<(string Name, List<Vector2> Cells, List<Vector2> All)> bands = null,
-        TimeSpan? slice = null)
-    {
-        if (env.Seeding == null)
-            yield break;
-
-        var clock = Stopwatch.StartNew();
-        var (pairs, rares, remnants, spread, slack, heavy, _, _, _, _) = env.Seeding;
-        var narrow = new List<Vector2>();
-
-        foreach (var (at, _, _) in Families(env, candidates, pairs, rares, remnants, spread, slack,
-                     heavy))
-            narrow.Add(at);
-
-        if (head == null || head.Count == 0)
-        {
-            Seeded = narrow.Count;
-            SeededMs = clock.Elapsed.TotalMilliseconds;
-        }
-
-        if (narrow.Count == 0)
-            yield break;
-
-        // The bands rather than their representatives, and the cell chosen when the chain arrives.
-        //
-        // See Regions for why. The branching is over families now - a dozen or so - rather than over
-        // three near-copies of each, and the cell is whichever member of the band the previous link
-        // can actually reach. That is the difference between offering the chain a place it cannot
-        // get to and offering it the same place from a step to the side.
-        // Handed in wherever there is a caller to hand them in, because working them out means
-        // walking a disc of ground per family and the restarts ask for them dozens of times a solve.
-        var regions = bands ?? Regions(env, candidates, pairs, rares, slack, heavy);
-
-        Banded = regions.Count;
-
-        if (regions.Count == 0)
-            yield break;
-
-        // The ground between the edges, learned before the walk rather than during it.
-        //
-        // **The enumeration was not running out of time, it was running out of legal moves.** On a
-        // cold site the router refuses anything it has not flooded yet, so most edge to edge links
-        // read as impossible and the tree collapses - four thousand chains walked in seventy
-        // milliseconds of a twelve hundred millisecond allowance, out of a space measured at half a
-        // million. The search then chose the best of a fraction of a percent of the site and looked
-        // for all the world as though it had finished.
-        //
-        // Asking for every edge pair first is at most one flood per edge, because a flood answers
-        // every question from that point at once: forty odd floods, something under two hundred
-        // milliseconds, and then all nineteen hundred pairs are cached and the walk is free to see
-        // the whole tree. That fits inside the router's opening allowance, so it costs the solve
-        // nothing it was not already going to spend.
-        var edges = 0;
-
-        foreach (var (_, corners, _) in regions)
-            foreach (var corner in corners)
-            {
-                if (waiting?.Invoke() == false)
-                    break;
-
-                edges++;
-                Reaches(env, env.Origin, corner);
-
-                foreach (var (_, others, _) in regions)
-                    foreach (var other in others)
-                        Reaches(env, corner, other);
-            }
-
-
-        // States already explored, so a second route into one is not walked again.
-        //
-        // **The same position, the same bands spent, the same score - the same future.** Chains reach
-        // a place by many routes: two openings that both lead to the third band arrive at the same
-        // cell with the same two bands used, and everything they could do next is identical. Walking
-        // it twice explores nothing new and, on a five link chain over a dozen bands, most of the
-        // tree is that.
-        //
-        // The score is part of the key and has to be. Coverage does not care what order a chain was
-        // laid in, but propagation cares about nothing else: a rune carried by the first link pays
-        // over four blasts and by the third over two, so the same bands in a different order are a
-        // different position to be in. Keying on place and bands alone would prune arrangements that
-        // are genuinely worth more. Keying on the score as well means only true repeats are cut.
-        var walked = new HashSet<(long Cell, ulong Spent, long Worth)>();
-        var mask = 0UL;
-        var spared = 0;
-
-        var deep = new int[env.Explosives + 1];
-        var tried = 0;
-        var passed = 0;
-        var bailed = "ran out of moves";
-        var rough = new List<(List<Vector2> Chain, double Worth)>();
-        var fixedHead = head ?? new List<Vector2>();
-        var chain = Copied(fixedHead);
-        var used = new bool[regions.Count];
-        var seen = 0;
-        var until = Stopwatch.StartNew();
-        var spare = slice ?? Slice;
-
-        // How far into the walk the current opening may run. Raised by each opening's share as it
-        // is reached, so an opening that finishes early leaves its remainder to the ones after it.
-        var stopAt = TimeSpan.Zero;
-
-        // The opening the best chain of this walk began at. See where it is set.
-        var bestFrom = (Band: "", At: Vector2.Zero, Worth: double.NegativeInfinity);
-
-        void Walk()
-        {
-            if (chain.Count == env.Explosives)
-            {
-                rough.Add((Copied(chain), Score(env, chain)));
-
-                return;
-            }
-
-            var from = chain.Count == 0 ? env.Origin : chain[^1];
-
-            for (var r = 0; r < regions.Count; r++)
-            {
-                if (used[r] || seen >= Most || until.Elapsed > stopAt)
-                    continue;
-
-                // Every corner of the band, not the first that connects.
-                //
-                // **Which cell of a band to stand in cannot be decided on the way in.** The corners
-                // are its extremes towards each of the other bands, so the right one is the one
-                // facing wherever the chain goes next - and at the moment of arrival that is not
-                // known yet. Taking the first cell that connects decides it backwards, on where the
-                // chain came from, and the edge that mattered is never tried.
-                //
-                // Measured the hard way: reading these bands off the screen and picking, for each,
-                // the edge facing the next one reproduces the best chain on this site easily, where
-                // the search settled twenty points short. Branching over the corners is that method
-                // - the choice is left open until the next band is chosen, and the enumeration is
-                // what tries the combinations.
-                used[r] = true;
-
-                foreach (var cell in regions[r].Cells)
-                {
-                    if (seen >= Most || until.Elapsed > stopAt)
-                    {
-                        bailed = seen >= Most ? "hit the chain cap" : "ran out of time";
-
-                        break;
-                    }
-
-                    var top = chain.Count == fixedHead.Count;
-
-                    if (top)
-                        tried++;
-
-                    if (!Reaches(env, from, cell) || !Spaced(env, chain, cell, chain.Count))
-                        continue;
-
-                    if (top)
-                        passed++;
-
-                    seen++;
-                    chain.Add(cell);
-                    deep[Math.Min(chain.Count, deep.Length - 1)]++;
-
-                    var worth = Score(env, chain);
-
-                    if (chain.Count < env.Explosives)
-                        rough.Add((Copied(chain), worth));
-
-                    mask |= 1UL << (r & 63);
-
-                    // Everything reachable from here has been reached from here already, and it is
-                    // all still in rough from that first visit.
-                    if (walked.Add((Key(cell), mask, (long)Math.Round(worth * 10d))))
-                        Walk();
-                    else
-                        spared++;
-
-                    mask &= ~(1UL << (r & 63));
-
-                    chain.RemoveAt(chain.Count - 1);
-
-                    if (waiting?.Invoke() == false)
-                    {
-                        bailed = "the search said stop";
-                        used[r] = false;
-
-                        return;
-                    }
-                }
-
-                used[r] = false;
-            }
-        }
-
-        // Every opening gets a share of the time, rather than the first one getting all of it.
-        //
-        // **Depth first spends the whole allowance on whichever opening it happens to try first.**
-        // Measured: twenty three legal openings on this site, the walk tried one, enumerated its
-        // four and a half thousand descendants to the end, and ran out - so the enumeration was
-        // choosing the best chain that begins in one particular place and calling it the best chain.
-        // Widening the slice only enumerated that same subtree more finely, which is why every
-        // change to the budget did nothing.
-        //
-        // The fix is not breadth first, which would have to rank partial chains and cannot - see
-        // Narrowed's note on why prefixes cannot be judged. It is to divide the time between the
-        // openings and let each have a proper depth first look inside its own share.
-        var starts = new List<(int Band, Vector2 At, double Worth)>();
-
-        for (var r = 0; r < regions.Count; r++)
-            foreach (var cell in regions[r].Cells)
-                if (Reaches(env, chain.Count == 0 ? env.Origin : chain[^1], cell) &&
-                    Spaced(env, chain, cell, chain.Count))
-                {
-                    chain.Add(cell);
-                    starts.Add((r, cell, Score(env, chain)));
-                    chain.RemoveAt(chain.Count - 1);
-                }
-
-        // **The richest openings first, and with more of the clock.**
-        //
-        // Measured once the bridges let the walk cross the site: a hundred and twenty five openings
-        // sharing seventy milliseconds is half a millisecond of depth-first each, so every subtree
-        // gets a glance and none gets a look - and the order they were tried in was the order the
-        // bands happened to come out of Regions. The site then scored 2,718 on the first press and
-        // 2,766 on the second, which is a search finding the good opening by luck rather than by
-        // looking.
-        //
-        // Sorted by what the first link is worth on its own, which is the only thing that can be
-        // known about an opening before its subtree is walked.
-        starts.Sort((a, b) => b.Worth.CompareTo(a.Worth));
-
-        // Divided only when the opening is what is being chosen.
-        //
-        // A call with a head is not choosing an opening - the chain is already going where it is
-        // going, and the branches here are its next link. Splitting a seventy millisecond lookahead
-        // between twenty of those leaves each a few milliseconds and the rolling pass collapsed from
-        // 1,266 to 783 when it was.
-        var each = fixedHead.Count == 0 && starts.Count > 0 ? spare / starts.Count : spare;
-
-        // Half the window split evenly, half split by worth.
-        //
-        // **A bridge opening is worth almost nothing by itself and is the reason this site is
-        // solvable at all**, so an allocation purely by worth would starve exactly the openings
-        // that were added to make the far side of the map reachable - a place whose whole value is
-        // what can be reached FROM it scores as empty ground when asked what it catches. The even
-        // half is the floor that protects them; the weighted half is what stops a rich opening
-        // getting the same glance as a barren one.
-        var total = 0d;
-
-        foreach (var (_, _, worth) in starts)
-            total += Math.Max(0d, worth);
-
-        var weighted = fixedHead.Count == 0 && starts.Count > 0 && total > 0d;
-
-        foreach (var (band, at, worth) in starts)
-        {
-            stopAt += weighted
-                ? each / 2d + spare * (Math.Max(0d, worth) / total) / 2d
-                : each;
-            tried++;
-            passed++;
-            seen++;
-            used[band] = true;
-            chain.Add(at);
-            deep[Math.Min(chain.Count, deep.Length - 1)]++;
-
-            var opened = Score(env, chain);
-
-            if (chain.Count < env.Explosives)
-                rough.Add((Copied(chain), opened));
-
-            mask |= 1UL << (band & 63);
-
-            // Which opening the best chain came out of, for the dump.
-            //
-            // The one question the enumeration could not answer about itself: it reports how many
-            // openings it tried and how deep it got, and said nothing about WHICH of them produced
-            // the answer - so whether the bridges are earning their branches, or whether the rich
-            // openings were winning all along, was a matter of opinion. The chains an opening
-            // produces are the ones it appends to rough, so the winner is read off the tail.
-            var was = rough.Count;
-
-            if (walked.Add((Key(at), mask, (long)Math.Round(opened * 10d))))
-                Walk();
-            else
-                spared++;
-
-            for (var i = was; i < rough.Count; i++)
-            {
-                if (rough[i].Worth <= bestFrom.Worth)
-                    continue;
-
-                bestFrom = (regions[band].Name, at, rough[i].Worth);
-            }
-
-            mask &= ~(1UL << (band & 63));
-
-            chain.RemoveAt(chain.Count - 1);
-            used[band] = false;
-
-            if (waiting?.Invoke() == false)
-            {
-                bailed = "the search said stop";
-
-                break;
-            }
-        }
-
-        // Only the main pass is reported.
-        //
-        // The rolling pass and the as-placed restarts call this too - dozens of times a solve, each
-        // with a head and a fraction of the time - so whichever ran last was overwriting the figures
-        // and the dump described a small late lookahead while appearing to describe the enumeration
-        // the solve is built on.
-        if (fixedHead.Count == 0)
-        {
-            Enumerated = seen;
-            EnumeratedMs = until.Elapsed.TotalMilliseconds;
-            var opens = new List<string>();
-
-            foreach (var (name, corners, _) in regions)
-            {
-                var can = 0;
-                var nearest = float.MaxValue;
-
-                foreach (var corner in corners)
-                {
-                    nearest = MathF.Min(nearest, Vector2.Distance(env.Origin, corner));
-
-                    if (Reaches(env, env.Origin, corner) && Spaced(env, new List<Vector2>(), corner))
-                        can++;
-                }
-
-                opens.Add($"{name}:{can}/{corners.Count}@{nearest:0}");
-            }
-
-            Walked = $"stopped because it {bailed}; openings {passed} of {tried} tried; " +
-                     $"{spared} repeats skipped, {walked.Count} states; " +
-                     $"{edges} edges, " +
-                     $"by depth {string.Join("/", deep[1..])}" + Environment.NewLine +
-                     $"      reach {env.Reach:0}, apart {env.Apart:0}, placed {env.Placed?.Count ?? 0}, " +
-                     $"origin ({env.Origin.X:0},{env.Origin.Y:0})" + Environment.NewLine +
-                     "      openable per band (reachable/corners@nearest): " + string.Join(" ", opens) +
-                     Environment.NewLine +
-                     (bestFrom.Band.Length > 0
-                         ? $"      best chain opened from {bestFrom.Band} at " +
-                           $"({bestFrom.At.X:0},{bestFrom.At.Y:0}) worth {bestFrom.Worth:N1}"
-                         : "      no opening produced a chain");
-        }
-
-        rough.Sort((a, b) => b.Worth.CompareTo(a.Worth));
-
-        SeededBest = rough.Count > 0 ? rough[0].Worth : 0d;
-        SeededMs = clock.Elapsed.TotalMilliseconds;
-
-        // Polished with the head held, so a committed link stays committed through the local search
-        // that follows - and at least the opening in the ordinary case, which is what every other
-        // seed here does.
-        for (var i = 0; i < rough.Count && i < Polished; i++)
-            yield return Improve(env, candidates, rough[i].Chain, waiting,
-                Math.Max(1, fixedHead.Count));
-    }
-
-    /// <summary>
-    /// How many of the narrow chains get the full local search. See Narrowed.
-    /// </summary>
-    private const int Polished = 2;
-
-    /// <summary>
-    /// How many partial chains the narrow sweep carries forward at each depth.
-    ///
-    /// Wide enough that a link which is worth less now but keeps the site open survives to be
-    /// judged on the chain it leads to - which is the entire point of sweeping rather than picking.
-    /// A few hundred over a few dozen spots is most of the space anyway.
-    /// </summary>
-    /// **Measured, and cut back hard.** At four hundred this was thirty three thousand full chain
-    /// scorings - every marker weighed and every remnant's combination re-chosen for each - and the
-    /// plugin showed nothing at all for the first three seconds of a four second window. A hundred
-    /// and twenty is a quarter of the work and still carries every partial that a greedy pick would
-    /// have thrown away, which is the whole reason for sweeping.
-    /// <summary>
-    /// How many chains the narrow enumeration may examine before it settles for what it has.
-    ///
-    /// Reach and spacing keep the real count far below this on the sites measured so far. It exists
-    /// so that a site with a great many family spots close together degrades into a partial search
-    /// rather than into a hang.
-    /// </summary>
-    private const int Most = 600000;
-
-    /// <summary>
-    /// How long the narrow enumeration may take before the rest of the search gets the window back.
-    /// </summary>
-    private static readonly TimeSpan Slice = TimeSpan.FromMilliseconds(350);
-
-    /// <summary>
-    /// Which drawn spots can follow which, as the search sees it.
-    ///
-    /// A chain is a path through these, so a spot the others cannot reach is a spot no chain can
-    /// use however much it is worth - and a hop inside the straight line reach can still be refused
-    /// when the walk round the terrain is longer than the chain is. That is invisible from the
-    /// drawing, where two rings a comfortable distance apart look like a link.
-    /// </summary>
-    public static string Linked { get; private set; } = "not worked out";
-
-    private static string Adjacency(PlanEnvironment env,
-        IReadOnlyList<(Vector2 At, double Worth, string Note)> spots)
-    {
-        var lines = new List<string>();
-
-        for (var i = 0; i < spots.Count; i++)
-        {
-            var to = new List<string>();
-
-            for (var j = 0; j < spots.Count; j++)
-            {
-                if (i == j)
-                    continue;
-
-                if (Reaches(env, spots[i].At, spots[j].At) && Spaced(env, new List<Vector2>(), spots[j].At))
-                    to.Add(Name(spots[j].Note));
-            }
-
-            var from = Reaches(env, env.Origin, spots[i].At) ? "opens" : "     ";
-
-            lines.Add($"    {Name(spots[i].Note),-10} {from}  reaches {to.Count,2}: {string.Join(" ", to)}");
-        }
-
-        return string.Join(Environment.NewLine, lines);
-    }
-
-    /// <summary>The first label on a spot, which is enough to recognise it by.</summary>
-    private static string Name(string note)
-    {
-        var space = note.IndexOf(' ');
-
-        return space < 0 ? note : note[..space];
-    }
-
-    /// <summary>How many narrow chains the last search examined, for the dump.</summary>
-    public static int Enumerated { get; private set; }
-
-    public static double EnumeratedMs { get; private set; }
-
-    /// <summary>What the main enumeration actually walked, for the dump.</summary>
-    public static string Walked { get; private set; } = "has not run";
-
-    /// <summary>
-    /// How the edges-only tree grows: legal chains of each length, and how many places each one
-    /// could go next on average.
-    ///
-    /// The size of the space the search is actually working in, which is a different number from
-    /// the count of places in it. Every link must be within reach of the last, must keep its
-    /// distance from all of them, and must come from a band nothing else in the chain has used - so
-    /// the tree is far narrower than the places suggest, and how much narrower is the thing worth
-    /// knowing before deciding whether it can be searched outright.
-    /// </summary>
-    public static string Fanned { get; private set; } = "not worked out";
-
-    private static string Fanout(PlanEnvironment env,
-        IReadOnlyList<(string Name, List<Vector2> Cells, List<Vector2> All)> bands)
-    {
-        var edges = new List<(int Band, Vector2 At)>();
-
-        for (var i = 0; i < bands.Count; i++)
-            foreach (var corner in bands[i].Cells)
-                edges.Add((i, corner));
-
-        var live = new List<(List<Vector2> Chain, bool[] Used)>
-        {
-            (new List<Vector2>(), new bool[bands.Count]),
-        };
-
-        var lines = new List<string>
-        {
-            $"    {edges.Count} edges over {bands.Count} bands, {env.Explosives} explosives",
-        };
-
-        for (var depth = 1; depth <= env.Explosives; depth++)
-        {
-            var next = new List<(List<Vector2> Chain, bool[] Used)>();
-            var dead = 0;
-
-            foreach (var (chain, used) in live)
-            {
-                var from = chain.Count == 0 ? env.Origin : chain[^1];
-                var grew = false;
-
-                foreach (var (band, at) in edges)
-                {
-                    if (used[band] || !Reaches(env, from, at) || !Spaced(env, chain, at, chain.Count))
-                        continue;
-
-                    grew = true;
-
-                    if (next.Count >= Most)
-                        continue;
-
-                    var made = Copied(chain);
-
-                    made.Add(at);
-                    var mark = (bool[])used.Clone();
-
-                    mark[band] = true;
-                    next.Add((made, mark));
-                }
-
-                if (!grew)
-                    dead++;
-            }
-
-            var fan = live.Count > 0 ? (double)next.Count / live.Count : 0d;
-
-            lines.Add($"    {depth} placed: {next.Count,8:N0} chains, " +
-                      $"{fan,6:N1} ways on from each, {dead} dead end{(dead == 1 ? "" : "s")}");
-
-            if (next.Count == 0)
-                break;
-
-            live = next;
-        }
-
-        return string.Join(Environment.NewLine, lines);
-    }
-
-    /// <summary>How many bands the last narrow enumeration branched over, for the dump.</summary>
-    public static int Banded { get; private set; }
-
-    /// <summary>What the rolling, recomputing pass reached, for the dump.</summary>
-    public static double RolledBest { get; private set; }
-
-    /// <summary>How many family spots the last search seeded from, for the dump.</summary>
-    public static int Seeded { get; private set; }
-
-    /// <summary>How many openings the restarts drew from, for the dump.</summary>
-    public static int Openings { get; private set; }
-
-    /// <summary>Which random stream the last search drew from. See the seed in Search.</summary>
-    public static int Stream { get; private set; }
-
-    /// <summary>How many restart rounds the last search completed, for the dump.</summary>
-    public static int Rounds { get; private set; }
-
-    private static int _streams;
-
-    /// <summary>
-    /// How many of the openings get the rest of the window once every one has been tried once.
-    ///
-    /// Three rather than one, because a single shallow pass is a noisy way to rank them and
-    /// committing everything to the leader of one attempt would throw away the site's real answer
-    /// whenever that attempt was unlucky.
-    /// </summary>
-    private const int Deeply = 3;
-
-    /// <summary>
-    /// What share of the improvement window the deterministic openings may spend before the restart
-    /// loop begins whatever they have got through. See Search.
-    /// </summary>
-    private const double Sown = 0.5d;
-
-    /// <summary>How long the openings actually took, and how long they were allowed. For the dump.</summary>
-    public static string Sowing { get; private set; } = "not run";
-
-    /// <summary>
-    /// How far into the improvement window the endgame starts, as a fraction of it.
-    ///
-    /// Nine tenths: late enough that the free search has had the window it was given, early enough
-    /// that a commitment has a tenth of it to prove itself in - four hundred milliseconds at the
-    /// usual four second setting.
-    /// </summary>
-    private const double Endgame = 0.9;
-
-    /// <summary>How many links the endgame committed before the search ended, for the dump.</summary>
-    public static int Committed { get; private set; }
-
-    /// <summary>What the narrow pass scored before any polishing, and how long it took.</summary>
-    public static double SeededBest { get; private set; }
-
-    public static double SeededMs { get; private set; }
-
-    /// <summary>
-    /// A family as the band of places that satisfy it, rather than as one place.
-    ///
-    /// **A spot is a point and a family is an area, and collapsing the second into the first threw
-    /// away the only thing that decided the chain.** Measured on one site: the winning chain's third
-    /// link is at (1015,482), the family set held (1014,483) instead - one and a half grid away,
-    /// worth the same to a tenth of a point - and the difference is that the walk from the previous
-    /// link routes under the reach to one and over it to the other. No amount of searching over the
-    /// wrong representative finds the right chain, because the two are the same score and only one
-    /// is connectable.
-    ///
-    /// The blast has a radius, so catching a remnant and a rare together is satisfied by a band of
-    /// cells, not a cell. Which cell in the band costs nothing and decides what the next link can
-    /// reach. So the band is carried whole and the choice is deferred to the moment a chain actually
-    /// arrives, when the previous link is known and reachability can be tested rather than guessed.
-    /// </summary>
-    /// <param name="slack">
-    /// How much worth may separate a cell from the best in its band and still count as the same
-    /// answer. The default tenth of a point is there because these are sums over dozens of markers
-    /// and two cells catching the identical set differ in the last bits.
-    /// </param>
-    /// <param name="caught">
-    /// Markers already taken, by their index in the real environment's target list.
-    ///
-    /// **Passed rather than removed, because the coverage index is keyed on the environment.** The
-    /// caller used to hand in a copy of the environment with the caught markers stripped out, which
-    /// meant a new object every redraw - so the index rebuilt every time, and the indices in it
-    /// meant something different on each call. Here the environment is always the real one and what
-    /// is gone is a set of numbers against it.
-    /// </param>
-    public static List<(string Name, List<Vector2> Cells, List<Vector2> All)> Regions(
-        PlanEnvironment env, List<Vector2> candidates, int pairs, int rares, float slack, bool heavy,
-        HashSet<int> caught = null)
-    {
-        using var phase = new Phase(PhaseRegions);
-
-        return RegionsInner(env, candidates, pairs, rares, slack, heavy, caught);
-    }
-
-    /// <summary>The body of Regions, wrapped so its allocation is attributed. See Phases.</summary>
-    private static List<(string Name, List<Vector2> Cells, List<Vector2> All)> RegionsInner(
-        PlanEnvironment env, List<Vector2> candidates, int pairs, int rares, float slack, bool heavy,
-        HashSet<int> caught = null)
+    internal static List<(string Name, List<Vector2> Cells, List<Vector2> All)> EdgePointsTowardNeighbours(
+        PlanEnvironment env, out string said, out List<int> seeds, out List<float> brightness,
+        out List<(Vector2 Grid, string Name)> labels)
     {
         var found = new List<(string Name, List<Vector2> Cells, List<Vector2> All)>();
-        var gone = caught ?? new HashSet<int>();
-        var none = gone;
-        var pull = Pull(env, heavy);
-        var covers = CoverageOfEnvironment(env);
+        var text = new StringBuilder();
+        var placed = env.Placed ?? (IReadOnlyList<Vector2>)Array.Empty<Vector2>();
+        // Nought links laid on top of the environment: its explosive count is already what is left in hand, so passing
+        // the placed count took them off twice and valued a relic's effect over no links at all.
+        var heavy = global::AutoExpedition.Openings.HeavyTargetsOfSite(env, 0)
+            .Where(t => !t.Shunned).ToList();
+        var neighbours = heavy.Concat(env.Targets.Where(t => t.Kind == TargetKind.Elite && !t.Shunned))
+            .Distinct(ReferenceEqualityComparer.Instance).Cast<PlanTarget>().ToList();
 
-        // The ground itself, a grid unit at a time - not the candidate list.
+        // Where edge points start from: heavy content and rares, each when its switch is on. Both are destinations
+        // either way. A rare that passes the heavy test is a heavy starting point. See
+        // CandidateSpotSettings.HeavyEdgePoints and RareEdgePoints.
+        var anchors = (env.Seeding?.HeavyEdgePoints ?? true ? heavy : new List<PlanTarget>())
+            .Concat(env.Seeding?.RareEdgePoints ?? true
+                ? env.Targets.Where(t => t.Kind == TargetKind.Elite && !t.Shunned)
+                : [])
+            .Distinct(ReferenceEqualityComparer.Instance).Cast<PlanTarget>().ToList();
+
+        // Short names, by kind and numbered in the target list's order, with the positions in the dump.
         //
-        // **A band cannot be found among the candidates, because the candidates are not a sampling
-        // of the ground.** They are marker centres and the points where two markers' blast circles
-        // cross: a sparse set of geometrically interesting places, chosen so that greedy has
-        // something worth trying. Asking which of them tie with the best returns the two or three
-        // intersections that happen to lie nearby, which is why every band came back one to three
-        // cells across nought to four grid, and why drawing them as shapes looked wrong. It was
-        // wrong. There is no region in a list of isolated points.
-        //
-        // So a band is measured where it lives: every placeable cell within reach of the family's
-        // best, stepped one grid at a time, kept when it catches the same content for near enough
-        // the same score. That is a real area with a real shape, and its extremes are real places
-        // the chain can stand - including the ones that are not candidates at all, which is where
-        // the best chain on this site puts its third link.
-        void Add(string name, List<int> required, Vector2 around)
+        // **Numbered per letter, not per kind.** Kinds share letters - a chest and a caged encounter are both C - and
+        // numbering each kind from one named two markers C1 on a Grand site (2026-09-30), which threw on the lookup
+        // by name below and took down every worker's shortlist.
+        // By the object, not its fields: a record hashes by every field, cached ones included, and a worker filling a
+        // target's cache while this runs would move it out from under its key. See PlanTarget.MagicAndRareWaves.
+        var names = new Dictionary<PlanTarget, string>(ReferenceEqualityComparer.Instance);
+        var perLetter = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var target in env.Targets)
         {
-            var cells = new List<(Vector2 At, double Solo)>();
-            var reach = (int)MathF.Ceiling(Spill);
-
-            for (var dy = -reach; dy <= reach; dy++)
-            {
-                for (var dx = -reach; dx <= reach; dx++)
-                {
-                    var at = new Vector2(MathF.Round(around.X) + dx, MathF.Round(around.Y) + dy);
-
-                    if (dx * dx + dy * dy > reach * reach || !env.CanPlace(at))
-                        continue;
-
-                    var all = true;
-
-                    foreach (var which in required)
-                        all &= Catches(env, at, env.Targets[which]);
-
-                    if (all)
-                        cells.Add((at, Adds(env, covers, at, none, env.Explosives - 1)));
-                }
-            }
-
-            if (cells.Count == 0)
-                return;
-
-            var best = Best(cells);
-            var band = Math.Max(0.1d, Math.Abs(best) * slack);
-
-            // Strictly by worth, and emphatically not by Better.
-            //
-            // **Better is not a valid ordering once the band is wide.** It calls two cells equal
-            // when they are within the band of each other, so with a five percent band A ties B, B
-            // ties C, and A beats C - which is not an order at all, and List.Sort given an
-            // inconsistent comparison returns an arbitrary one. The gathering loop then met an
-            // out-of-band cell early, stopped, and whole families came back missing or truncated.
-            // Here the band is a filter, so the sort only has to be a sort.
-            cells.Sort((a, b) => b.Solo.CompareTo(a.Solo));
-
-            var kept = new List<Vector2>();
-
-            foreach (var (at, solo) in cells)
-            {
-                if (kept.Count >= Band)
-                    break;
-
-                if (best - solo <= band)
-                    kept.Add(at);
-            }
-
-            if (kept.Count == 0)
-                return;
-
-            // One place, one band, whatever number of families want it.
-            //
-            // A rare's own band and the pair band that contains that rare are frequently the same
-            // ground - and three rares close together give three identical bands. Branching over
-            // each of them separately is the same chain explored twice over, and it crowds out the
-            // breadth that would have gone somewhere new. Merged on the best cell, which is what
-            // makes them the same answer, and the names are joined so the drawing still says which
-            // families a place serves.
-            for (var i = 0; i < found.Count; i++)
-            {
-                if (found[i].All.Count > 0 && found[i].All[0] == kept[0])
-                {
-                    found[i] = ($"{found[i].Name} {name}", found[i].Cells, found[i].All);
-
-                    return;
-                }
-            }
-
-            found.Add((name, kept, kept));
-        }
-
-        /// <summary>
-        /// Where a family's band sits: the candidate that catches its content best, or failing that
-        /// the middle of the content itself.
-        ///
-        /// **A family with no candidate to sit on was dropped silently, and it cost four remnants
-        /// out of five.** Measured on a site whose remnants sit in its four corners: the band list
-        /// came back holding R1+E8 and R1+E9 and nothing else remnant-shaped, because a candidate is
-        /// a marker centre or the crossing of two blast circles, and a remnant with no rare close
-        /// enough for one point to catch both has no such crossing. The ground between them was
-        /// perfectly placeable and caught both; nothing ever looked at it.
-        ///
-        /// Add already sweeps real ground around this point and keeps only cells that catch every
-        /// required target, so a fallback that is merely in the right area costs one sweep when it
-        /// is wrong and finds the family when it is right. The middle of the required content is in
-        /// the right area by construction: a cell catching all of them is within a blast of each,
-        /// so it cannot be far from their centre.
-        /// </summary>
-        Vector2 Around(List<int> required)
-        {
-            var at = Vector2.Zero;
-            var most = double.NegativeInfinity;
-
-            foreach (var candidate in candidates)
-            {
-                var all = true;
-
-                foreach (var which in required)
-                    all &= Catches(env, candidate, env.Targets[which]);
-
-                if (!all)
-                    continue;
-
-                var worth = Adds(env, covers, candidate, none, env.Explosives - 1);
-
-                if (worth > most)
-                {
-                    most = worth;
-                    at = candidate;
-                }
-            }
-
-            if (at != Vector2.Zero)
-                return at;
-
-            var middle = Vector2.Zero;
-
-            foreach (var which in required)
-                middle += env.Targets[which].Grid;
-
-            return required.Count > 0 ? middle / required.Count : Vector2.Zero;
-        }
-
-        // A band of cells that can throw to both of two places, and whether there was any ground
-        // that could do it. See where it is called.
-        bool Bridge(string name, Vector2 one, Vector2 two)
-        {
-            var middle = (one + two) / 2f;
-            var far = env.Reach;
-
-            // The lens of cells in range of both ends sits about the midpoint, and its half height
-            // is what is left of the reach once half the gap is spent. Stepped two grid at a time:
-            // this is a region rather than a lattice of distinct answers, and Corners reduces it to
-            // a handful of cells afterwards regardless.
-            var span = (int)MathF.Ceiling(MathF.Sqrt(MathF.Max(1f,
-                far * far - Vector2.DistanceSquared(one, two) / 4f)));
-            var cells = new List<(Vector2 At, double Solo)>();
-
-            for (var dy = -span; dy <= span; dy += 2)
-            {
-                for (var dx = -span; dx <= span; dx += 2)
-                {
-                    var at = new Vector2(MathF.Round(middle.X) + dx, MathF.Round(middle.Y) + dy);
-
-                    if (Vector2.DistanceSquared(at, one) > far * far ||
-                        Vector2.DistanceSquared(at, two) > far * far ||
-                        !env.CanPlace(at))
-                        continue;
-
-                    cells.Add((at, Adds(env, covers, at, none, env.Explosives - 1)));
-                }
-            }
-
-            if (cells.Count == 0)
-                return false;
-
-            // By worth, and every cell kept up to the usual ceiling rather than filtered to a band
-            // of near-equal ones. A bridge is chosen for WHERE it is, so narrowing it to the cells
-            // that score alike would throw away exactly the geometry it exists to provide. Corners
-            // then keeps the ones nearest each other band, which is the right summary of a place
-            // whose job is to be reachable from two directions.
-            cells.Sort((a, b) => b.Solo.CompareTo(a.Solo));
-
-            // Two far bands lying the same way from here want the same ground in between, and a
-            // second copy of a place is a second branch at every level of the walk that leads
-            // somewhere already reachable. Add merges content families on exactly this test; a
-            // bridge is added directly, so it has to make the test itself.
-            foreach (var (_, _, all) in found)
-            {
-                if (all.Count > 0 && Vector2.DistanceSquared(all[0], cells[0].At) <= Same * Same)
-                    return false;
-            }
-
-            var kept = new List<Vector2>();
-
-            foreach (var (at, _) in cells)
-            {
-                if (kept.Count >= Band)
-                    break;
-
-                kept.Add(at);
-            }
-
-            found.Add((name, kept, kept));
-
-            return true;
-        }
-
-        var heavies = new List<(int Which, string Name)>();
-
-        for (var i = 0; i < env.Targets.Count; i++)
-        {
-            var kind = env.Targets[i].Kind;
-
-            // Never a band's anchor. See PlanTarget.Shunned.
-            if (kind is TargetKind.Remnant or TargetKind.Elite && !gone.Contains(i) &&
-                !env.Targets[i].Shunned)
-                heavies.Add((i, $"{(kind == TargetKind.Remnant ? "R" : "E")}{heavies.Count + 1}"));
-        }
-
-        if (pairs > 0)
-        {
-            foreach (var (which, name) in heavies)
-            {
-                if (env.Targets[which].Kind != TargetKind.Remnant)
-                    continue;
-
-                foreach (var (other, label) in heavies)
-                {
-                    if (other == which ||
-                        (env.Targets[other].Kind == TargetKind.Remnant && other < which))
-                        continue;
-
-                    var pair = new List<int> { which, other };
-                    var near = Around(pair);
-
-                    if (near != Vector2.Zero)
-                        Add($"{name}+{label}", pair, near);
-                }
-            }
-        }
-
-        if (rares > 0)
-        {
-            foreach (var (which, name) in heavies)
-            {
-                if (env.Targets[which].Kind != TargetKind.Elite)
-                    continue;
-
-                var one = new List<int> { which };
-                var near = Around(one);
-
-                if (near != Vector2.Zero)
-                    Add(name, one, near);
-            }
-        }
-
-        // **And one band for each remnant on its own, unconditionally.**
-        //
-        // The pairs above only reach a remnant that has a heavy neighbour close enough to share a
-        // blast with. On the site this was found on, four remnants of five had no band at all -
-        // which means the search could not commit to taking them, could not open from them, and
-        // could not be told about the places a player picks in a second by eye. A remnant is the
-        // heaviest thing on the site and it is going to be caught by SOMETHING; where from is the
-        // first question anyone asks of a layout, and it was the one question the band set could
-        // not answer.
-        //
-        // Not behind a count the way pairs and rares are. Those two gates exist so the families can
-        // be turned off and compared; this one would be off for every player who already has a
-        // config, because a saved setting beats a changed default and "Spots per remnant" ships at
-        // nought. A band per remnant is not an experiment, it is the floor.
-        foreach (var (which, name) in heavies)
-        {
-            if (env.Targets[which].Kind != TargetKind.Remnant)
+            if (!neighbours.Any(n => ReferenceEquals(n, target)) || names.ContainsKey(target))
                 continue;
 
-            var alone = new List<int> { which };
-            var sits = Around(alone);
-
-            if (sits != Vector2.Zero)
-                Add(name, alone, sits);
-        }
-
-        // **Places whose worth is that the chain can get from here to there.**
-        //
-        // Measured, and it is the whole reason a site of four cornered remnants scored 1,701 where
-        // a player scored 2,756 by eye: reach 91, and six of nine bands with their nearest corner
-        // at 96 to 124. The enumeration walks band corner to band corner, so it explored 18 states
-        // at depth one, 144 at depth two, and NOTHING at depth three - 162 chains, in no measurable
-        // time, because from any two link state there was no third band in reach. A player looks at
-        // that layout and says the chain has to path through the middle; the middle catches little,
-        // belongs to no family, and was therefore not a place the search could put a link at all.
-        //
-        // So a bridge is a family whose requirement is geometric rather than content: cells within
-        // reach of both bands, ranked by whatever they do happen to catch. It does not decide that
-        // the chain should go that way - it only makes going that way expressible, which it was not.
-        //
-        // Only between bands further apart than one throw and closer than two, since nearer needs no
-        // bridge and further cannot be bridged by a single link. Capped, because every band is
-        // another branch at every level of the walk, and the point is to make the walk reach the far
-        // side of the site rather than to make it wider.
-        // **The detonator is the first endpoint, and the most important one.** Every chain starts
-        // there, and on the site this was measured on only three of nine bands were within a throw
-        // of it - so the first link could reach no remnant at all, whatever the rest of the walk
-        // might have managed afterwards. A bridge from the start is the answer to "where do I put
-        // the first explosive so that the second can reach the thing I actually want", which is
-        // precisely the question a player answers by eye before placing anything.
-        //
-        // It comes first in the list so that, with the cap reached, the bridges that exist are the
-        // ones leaving the origin rather than an arbitrary pair in the middle of the site.
-        var ends = new List<(string Name, Vector2 At)> { ("start", env.Origin) };
-
-        foreach (var (name, _, all) in new List<(string, List<Vector2>, List<Vector2>)>(found))
-        {
-            if (all.Count > 0)
-                ends.Add((name, all[0]));
-        }
-
-        var bridged = 0;
-
-        for (var i = 0; i < ends.Count && bridged < Bridges; i++)
-        {
-            for (var j = i + 1; j < ends.Count && bridged < Bridges; j++)
+            var letter = target.Kind switch
             {
-                var apart = Vector2.Distance(ends[i].At, ends[j].At);
+                TargetKind.Remnant => "R",
+                TargetKind.Elite => "E",
+                TargetKind.Relic => "L",
+                TargetKind.Chest => "C",
+                _ => target.Kind.ToString()[..1],
+            };
 
-                if (apart <= env.Reach || apart > env.Reach * 2f)
+            perLetter[letter] = perLetter.GetValueOrDefault(letter) + 1;
+            names[target] = letter + perLetter[letter];
+        }
+
+        var byCell = new Dictionary<Vector2, (double Caught, List<string> Toward)>();
+        var step = env.Seeding?.EdgePointStepGrid ?? 0f;
+
+        // Each cell's best share of the richest spot on the edge of a marker it was kept for. See
+        // EdgePointBrightness.
+        var shareOf = new Dictionary<Vector2, (double Share, string Of)>();
+        var pairs = 0;
+
+        foreach (var anchor in anchors)
+        {
+            var ring = new List<(Vector2 At, double Caught, double Toward)>();
+
+            global::AutoExpedition.Openings.RingSpotsOfAnchor(env, anchor, env.Origin, placed, heavy, ring,
+                askGround: false, anywhere: true);
+
+            if (ring.Count == 0)
+                continue;
+
+            var caughtBy = ring.ToDictionary(x => x.At, x => ContentsCaughtAt(env, x.At));
+            var heavyCaughtBy = ring.ToDictionary(x => x.At,
+                x => string.Join(",", heavy.Where(t => Catches(env, x.At, t)).Select(t => names[t])));
+            var anchorCatch = env.Blast + anchor.Radius;
+            var richest = ring.Max(x => x.Caught);
+
+            foreach (var neighbour in neighbours)
+            {
+                if (ReferenceEquals(neighbour, anchor))
                     continue;
 
-                if (Bridge(ends[i].Name + "~" + ends[j].Name, ends[i].At, ends[j].At))
-                    bridged++;
+                var neighbourCatch = env.Blast + neighbour.Radius;
+
+                if (Vector2.Distance(anchor.Grid, neighbour.Grid) - anchorCatch - neighbourCatch > env.Reach)
+                    continue;
+
+                double Left(Vector2 at) => Math.Max(0d, Vector2.Distance(at, neighbour.Grid) - neighbourCatch);
+
+                // The nearest point of each distinct set of markers caught.
+                var nearest = new Dictionary<string, (Vector2 At, double Caught, double Left)>();
+
+                foreach (var (at, weight, _) in ring)
+                {
+                    var left = Left(at);
+
+                    if (!nearest.TryGetValue(caughtBy[at], out var had) || left < had.Left)
+                        nearest[caughtBy[at]] = (at, weight, left);
+                }
+
+                // Only those no other catching the same heavy markers beats on both terms.
+                //
+                // **The same heavy markers, not any.** A point that catches a second remnant beside the anchor
+                // catches more, and was allowed to cull the point that leaves it - but leaving it is a move: take one
+                // remnant now and the other with a later link, after a relic whose effect it then carries. Measured on
+                // one Grand site (2026-09-30): the chain that took one of two close remnants from (724,796), reaching a
+                // relic from there, scored 59,429 against 55,757 for the same route taking both; the spot was culled
+                // here, and with it on the shortlist by hand two presses of ten found the 59k chains.
+                var points = nearest.Values.ToList();
+                var front = points.Where(p => !points.Any(q =>
+                        heavyCaughtBy[q.At] == heavyCaughtBy[p.At] &&
+                        q.Caught >= p.Caught && q.Left <= p.Left && (q.Caught > p.Caught || q.Left < p.Left)))
+                    .OrderByDescending(p => p.Caught)
+                    .ToList();
+
+                // And only a real step nearer each time. Round a ring the content falls and the distance shrinks a
+                // little at almost every cell, so the front alone kept ten or more points a pair on one site.
+                //
+                // Within each set of heavy markers caught, for the reason the front is. See above.
+                var kept = new List<(Vector2 At, double Caught, double Left)>();
+                var lastOfSet = new Dictionary<string, double>();
+
+                foreach (var point in front)
+                {
+                    var set = heavyCaughtBy[point.At];
+
+                    if (lastOfSet.TryGetValue(set, out var last) && point.Left > last - step)
+                        continue;
+
+                    kept.Add(point);
+                    lastOfSet[set] = point.Left;
+                }
+
+                if (kept.Count == 0)
+                    continue;
+
+                pairs++;
+
+                foreach (var point in kept)
+                {
+                    if (!byCell.TryGetValue(point.At, out var entry))
+                        byCell[point.At] = entry = (point.Caught, new List<string>());
+
+                    if (!entry.Toward.Contains(names[neighbour]))
+                        entry.Toward.Add(names[neighbour]);
+
+                    var share = richest > 0d ? Math.Clamp(point.Caught / richest, 0d, 1d) : 1d;
+
+                    if (!shareOf.TryGetValue(point.At, out var had) || share > had.Share)
+                        shareOf[point.At] = (share, names[anchor]);
+                }
             }
         }
 
-        // Corners last, once every band is known.
-        //
-        // **A corner is only worth keeping if something might be reached from it**, and what might
-        // be reached is the other bands - so the directions that matter are the directions they lie
-        // in, not the eight points of the compass. A band at the eastern edge of the site has every
-        // other band to its west; its eastern extremes lean towards nothing and can never be the
-        // right cell to stand in. Fixed compass directions kept them anyway, which is why a band out
-        // there came back as an eight sided shape when half of it could not matter.
-        var whole = new List<(string Name, List<Vector2> Cells, List<Vector2> All)>(found);
-        var spread2 = env.Seeding?.PerBand ?? 6;
+        // **Folded across directions.** Each direction keeps the cell nearest its own neighbour, so two directions
+        // wanting the same content kept two cells a grid or two apart: on one site (2026-09-30) (2186,1665) towards R2
+        // and E5 and (2188,1665) towards L4, both catching 221, neither more than 1.3 grid nearer any of its
+        // neighbours. A cell is folded into one catching exactly the same markers that ends within the step of it
+        // towards every neighbour it leads to, richest first, and that one takes its neighbours. **The same markers,
+        // not as much weight:** folding into any richer cell culled cells whose own marker the richer one does not
+        // catch, and at a step of nought still folded every cell already catching its neighbour into any richer cell
+        // catching it too.
+        var markerNamed = names.ToDictionary(n => n.Value, n => n.Key);
 
-        for (var i = 0; i < found.Count; i++)
+        double LeftTo(Vector2 at, string neighbour) =>
+            Math.Max(0d, Vector2.Distance(at, markerNamed[neighbour].Grid) - (env.Blast + markerNamed[neighbour].Radius));
+
+        var folded = new Dictionary<Vector2, (double Caught, List<string> Toward)>();
+        var contentsOf = new Dictionary<Vector2, string>();
+
+        foreach (var (at, (caught, toward)) in byCell.OrderByDescending(x => x.Value.Caught))
         {
-            var ways = new List<Vector2>();
+            var contents = contentsOf[at] = ContentsCaughtAt(env, at);
+            var into = folded.FirstOrDefault(kept => contentsOf[kept.Key] == contents &&
+                                                      toward.All(n => LeftTo(kept.Key, n) <= LeftTo(at, n) + step));
 
-            // The detonator counts as a direction.
-            //
-            // **It is where every chain starts, and it is not a band.** Corners lean towards the
-            // other bands, so the cell of a band nearest the chain's origin was never kept - and a
-            // band whose reachable side faces the detonator then had no corner the first link could
-            // use. Measured: the enumeration found one legal opening where the site has twenty
-            // three, explored that single subtree to the end in seventy milliseconds, and reported
-            // it as the answer.
-            ways.Add(env.Origin);
-
-            for (var j = 0; j < whole.Count; j++)
+            if (into.Value.Toward == null)
             {
-                if (i == j || whole[j].All.Count == 0)
-                    continue;
+                folded[at] = (caught, new List<string>(toward));
 
-                ways.Add(Middle(whole[j].All));
+                continue;
             }
 
-            found[i] = (found[i].Name, Corners(found[i].All, ways, spread2), found[i].All);
+            foreach (var n in toward)
+            {
+                if (!into.Value.Toward.Contains(n))
+                    into.Value.Toward.Add(n);
+            }
+
+            if (shareOf.TryGetValue(at, out var gone) &&
+                (!shareOf.TryGetValue(into.Key, out var stays) || gone.Share > stays.Share))
+                shareOf[into.Key] = gone;
         }
+
+        byCell = folded;
+
+        // One ring per cell, coloured by the heavy markers it catches.
+        seeds = new List<int>();
+        brightness = new List<float>();
+
+        foreach (var (at, (caught, toward)) in byCell.OrderByDescending(x => x.Value.Caught))
+        {
+            var taken = anchors.Where(t => Catches(env, at, t)).ToList();
+            var label = $"{string.Join("+", taken.Select(t => names[t]).OrderBy(n => n))} > " +
+                        string.Join(" ", toward);
+
+            // From the markers' positions, so the colour follows the combination rather than the numbering.
+            var seed = 0;
+
+            foreach (var target in taken)
+                seed += (int)MathF.Round(target.Grid.X) * 31 + (int)MathF.Round(target.Grid.Y) * 17;
+
+            found.Add((label, new List<Vector2> { at }, new List<Vector2>()));
+            seeds.Add(((seed % 997) + 997) % 997);
+
+            var (best, of) = shareOf[at];
+
+            brightness.Add((float)(EdgePointDimmest + (1d - EdgePointDimmest) * best));
+            text.AppendLine($"    ({at.X:0},{at.Y:0})  {label}  catches {caught:N0}, {best:P0} of {of}'s richest");
+        }
+
+
+        var legend = string.Join("  ", names.Select(n => $"{n.Value} ({n.Key.Grid.X:0},{n.Key.Grid.Y:0})"));
+
+        labels = names.Select(n => (n.Key.Grid, n.Value)).ToList();
+        var combinations = found.Select(f => f.Name.Split(" > ")[0]).Distinct().Count();
+
+        // Why each relic is or is not a starting point: its worth as the heavy test counts it, and whether it is a
+        // must-avoid, which the edge points leave out.
+        var downstream = Math.Max(0, env.Explosives - 1);
+
+        double SwitchWorth(PlanTarget t) => global::AutoExpedition.Openings.SwitchWorthOfTarget(env, t);
+
+        var relics = string.Join("; ", env.Targets.Where(t => t.Kind == TargetKind.Relic).Select(t =>
+            $"({t.Grid.X:0},{t.Grid.Y:0}) worth {WorthOfTarget(t) + Math.Max(0f, t.Rough(downstream)) + SwitchWorth(t):N1}" +
+            $"{(t.Shunned ? " MUST-AVOID" : "")}{(heavy.Contains(t) ? " heavy" : "")}"));
+
+        said = (found.Count == 0
+                   ? "  no heavy marker has a neighbour in reach"
+                   : $"  {pairs} pair(s), {found.Count} point(s) in {combinations} colour(s); markers: {legend}" +
+                     $"{Environment.NewLine}{text.ToString().TrimEnd()}") +
+               $"{Environment.NewLine}  relics: {relics}";
 
         return found;
     }
+
+
+    /// <summary>
+    /// A number per drawn edge point that picks its colour, the same for points catching the same heavy markers. See
+    /// EdgePointsTowardNeighbours and Overlay.Shapes.
+    /// </summary>
+    public static IReadOnlyList<int> EdgePointColourSeeds { get; private set; } = new List<int>();
+
+    /// <summary>
+    /// How bright each drawn edge point's colour is, from EdgePointDimmest to one: its weight caught as a share of the
+    /// richest spot on the edge of the heavy marker it was kept for, the best share where it was kept for several.
+    /// The points nearest a neighbour catch less by construction, so dim means content given up, not a worse route.
+    /// </summary>
+    public static IReadOnlyList<float> EdgePointBrightness { get; private set; } = new List<float>();
+
+    /// <summary>The brightness of an edge point catching nothing, so it still shows against the ground.</summary>
+    private const double EdgePointDimmest = 0.3d;
+
+    /// <summary>
+    /// The short names the edge point labels use - R3, E1, L2 - and the marker each belongs to, drawn on the markers
+    /// while the edge points are. See EdgePointsTowardNeighbours.
+    /// </summary>
+    public static IReadOnlyList<(Vector2 Grid, string Name)> EdgePointMarkerNames { get; private set; } =
+        new List<(Vector2, string)>();
+
+    /// <summary>What EdgePointsTowardNeighbours last drew, for the dump; empty until the button is pressed.</summary>
+    public static string EdgePointsSaid { get; private set; } = "";
+
+    /// <summary>
+    /// Whether the edge points towards each heavy marker's neighbours have been asked for and are to be drawn. See
+    /// EdgePointsTowardNeighbours.
+    /// </summary>
+    public static bool TowardNeighbours { get; set; }
 
     /// <summary>A cell as one number, for keying a state on where the chain stands.</summary>
     internal static long Key(Vector2 at) =>
         ((long)MathF.Round(at.X) << 20) | (long)(MathF.Round(at.Y) + 1000f);
 
-    /// <summary>The middle of a band, which is what a direction between two of them is measured from.</summary>
-    private static Vector2 Middle(List<Vector2> cells)
+    /// <summary>
+    /// Stops drawing the edge points and forgets the request behind them. The delete plan buttons call it. See
+    /// Caches.
+    /// </summary>
+    public static void ClearDrawnSpots()
     {
-        var sum = Vector2.Zero;
-
-        foreach (var cell in cells)
-            sum += cell;
-
-        return cells.Count > 0 ? sum / cells.Count : Vector2.Zero;
+        EdgePointsPending = false;
+        Drawn = 0;
+        TowardNeighbours = false;
+        Shapes = new List<(string, List<Vector2>, List<Vector2>)>();
+        EdgePointsSaid = "";
+        EdgePointColourSeeds = new List<int>();
+        EdgePointBrightness = new List<float>();
+        EdgePointMarkerNames = new List<(Vector2, string)>();
     }
-
-    /// <summary>How many cells of a band are gathered before they are reduced to its corners.</summary>
-    private const int Band = 400;
-
-    /// <summary>
-    /// How many bridging bands one site may have. See where Bridge is called.
-    ///
-    /// Six. Every band is another branch at every level of the enumeration, and the walk already
-    /// explores 144 states at depth two on a nine band site - so this is deliberately enough to
-    /// connect the far corners of a layout and not enough to turn the walk into a search over empty
-    /// ground.
-    /// </summary>
-    private const int Bridges = 6;
-
-    /// <summary>How close two bands' best cells have to be to count as the same place, in grid.</summary>
-    private const float Same = 6f;
-
-    /// <summary>
-    /// A band reduced to the cells that can actually gain something: its best, and its furthest in
-    /// each direction.
-    ///
-    /// **Every other cell in a band is dominated.** They all score the same - that is what makes it
-    /// a band - so the only thing one cell has over another is how far it stands in some direction,
-    /// and a cell that is furthest in no direction is strictly worse than the one that is, whichever
-    /// way the chain goes next. Sixty cells collapse to nine or fewer without losing a single option
-    /// the chain could have used.
-    ///
-    /// **Nearest to each other band, not furthest along the direction of it.** Those are the same
-    /// thing for a round band and different for a real one, and the difference is the whole game: a
-    /// link is legal when the walk to the next place fits inside the reach, so the cell that matters
-    /// is the one that shortens that walk most. Measured on one site, the band holding the best
-    /// chain's third link spans four grid, and the cell the chain needs is one and a half grid
-    /// nearer the previous link than the cell the direction rule kept - which is the difference
-    /// between a link the router allows and one it refuses. An exhaustive walk of every chain
-    /// through the direction-picked edges topped out at 1,287.8 against 1,319 by hand, because the
-    /// cell was in the band and not in the edges.
-    ///
-    /// One per other band, plus the detonator, because those are the only places a chain leaves here
-    /// for. A band on the edge of the site therefore keeps the cells on its inward side and none on
-    /// the outward one, where leaning gains nothing that anything can use.
-    ///
-    /// Extremes of the MEMBERS, not corners of the area, so a band shaped like a crescent yields
-    /// real cells rather than a point in the hollow that nothing can be placed on.
-    /// </summary>
-    /// <param name="most">
-    /// How many cells to end up with, filled out by spreading over the band when the reasoned picks
-    /// do not reach it.
-    ///
-    /// **One cell per neighbouring band is far too coarse a summary of an area.** Measured: a band
-    /// of three hundred and thirty three cells spanning thirty grid was reduced to five, and the
-    /// cell the best known chain uses was not among them - it was on the screen as a dot the player
-    /// could see and pick, and the search never had it. Whichever rule chooses the representatives,
-    /// a rule that keeps five of three hundred will keep the wrong five sometimes; covering the band
-    /// evenly as well is what stops a whole region of it being invisible.
-    /// </param>
-    private static List<Vector2> Corners(List<Vector2> cells, List<Vector2> ways, int most)
-    {
-        if (cells.Count <= 3 || ways.Count == 0)
-            return cells;
-
-        // Sorted by worth already, so the first is the band's best and stays its first answer: when
-        // reach is not binding, the chain should stand where the score is highest.
-        var keep = new List<Vector2> { cells[0] };
-        var middle = Middle(cells);
-
-        foreach (var way in ways)
-        {
-            var closest = Vector2.Zero;
-            var least = float.MaxValue;
-
-            foreach (var cell in cells)
-            {
-                var gap = Vector2.DistanceSquared(cell, way);
-
-                if (gap < least)
-                {
-                    least = gap;
-                    closest = cell;
-                }
-            }
-
-            if (!keep.Contains(closest))
-                keep.Add(closest);
-
-            // And the far side of the band along the same bearing.
-            //
-            // **Both rules are right about different things and neither is right about both.**
-            // Nearest to the next band shortens the link that has to reach it; furthest along the
-            // bearing keeps distance from the link just laid, which is what leaves the chain room
-            // to arrive here at all. They coincide on a round band and diverge on a real one -
-            // and swapping one for the other silently dropped the cells a player had been picking
-            // off the screen to build the best chain on this site by hand.
-            var bearing = way - middle;
-
-            if (bearing.LengthSquared() > 0.01f)
-            {
-                bearing = Vector2.Normalize(bearing);
-
-                var furthest = Vector2.Zero;
-                var most2 = float.NegativeInfinity;
-
-                foreach (var cell in cells)
-                {
-                    var along = Vector2.Dot(cell - middle, bearing);
-
-                    if (along > most2)
-                    {
-                        most2 = along;
-                        furthest = cell;
-                    }
-                }
-
-                if (!keep.Contains(furthest))
-                    keep.Add(furthest);
-            }
-        }
-
-        // Then spread over whatever the band still has, furthest first.
-        //
-        // Each addition is the cell furthest from everything kept so far, so the covering gets
-        // coarser as it goes and every part of the band is within some distance of a kept cell -
-        // which is the property the reasoned picks cannot promise on their own.
-        while (keep.Count < most)
-        {
-            var furthest = Vector2.Zero;
-            var best = -1f;
-
-            foreach (var cell in cells)
-            {
-                var nearest = float.MaxValue;
-
-                foreach (var already in keep)
-                    nearest = MathF.Min(nearest, Vector2.DistanceSquared(cell, already));
-
-                if (nearest > best)
-                {
-                    best = nearest;
-                    furthest = cell;
-                }
-            }
-
-            if (best <= 0f || keep.Contains(furthest))
-                break;
-
-            keep.Add(furthest);
-        }
-
-        return keep;
-    }
-
-    /// <summary>
-    /// How far from a family's best the ground is searched for the rest of its band.
-    ///
-    /// **A band has to stay one place.** At thirty a band came back three hundred and thirty cells
-    /// across thirty three grid by thirty, which is not a way of catching one thing from various
-    /// angles - it is a quarter of the dig site whose totals happen to land within the slack. The
-    /// blast is under thirty across, so eighteen still lets a band run most of the way round its
-    /// markers while keeping the far side of them out of it.
-    /// </summary>
-    private const float Spill = 18f;
-
-    /// <summary>
-    /// The families together: the pair spots, the per-rare spots and the per-remnant spots, folded
-    /// into one set with nothing counted twice.
-    ///
-    /// **One builder, because the rings drawn and the spots searched have to be the same thing.**
-    /// The whole value of the drawn views is that a dump can be held against a chain that actually
-    /// scored; compute the search's candidates by a second route and the dumps stop being evidence
-    /// about the search and become evidence about the drawing.
-    ///
-    /// Measured against six recorded chains on one site, at three per pair and three per rare, this
-    /// set held 18 of the 30 links exactly and 27 within 20 grid, out of 1,082 candidates. The best
-    /// chain of the six had four of its five links exactly on it.
-    ///
-    /// The families are complements rather than alternatives, which is why this is one set with
-    /// counts rather than a choice between three modes. Pair spots cover the early links, where the
-    /// remnants are, and are blind by construction to a link that catches no remnant - which is what
-    /// the last two links of every recorded chain are. Rare spots cover exactly those. Neither
-    /// reaches four of five on its own.
-    /// </summary>
-    /// <summary>
-    /// The family spots, worked out once per solve and handed to everyone who asks for them again.
-    ///
-    /// **It was computed twice, identically, and it is the most expensive thing in the search.**
-    /// The band enumeration builds it at the top of Narrowed and the restart openings build it again
-    /// afterwards, with the same environment, the same candidates and the same five settings - and
-    /// on a Grand site each pass is five and a half seconds of scanning every candidate against
-    /// every one of three hundred and seventy six markers. Measured: 5,463ms reported for the first,
-    /// against a sixteen second window, before a single chain had been examined.
-    ///
-    /// Reference equality on the environment and the candidate list, which is the same test CoverageOfEnvironment
-    /// uses and is exact for the thing being asked: both are rebuilt per solve and neither is
-    /// mutated during one. The settings are carried on the environment, so two calls that agree on
-    /// those two references agree on everything.
-    ///
-    /// Per thread, because a solve runs off the main one and the debug spots button asks from the
-    /// render thread.
-    /// </summary>
-    public static List<(Vector2 At, double Worth, string Note)> Families(PlanEnvironment env,
-        List<Vector2> candidates, int pairs, int rares, int remnants, float spread, float slack,
-        bool heavy)
-    {
-        if (ReferenceEquals(_kinEnv, env) && ReferenceEquals(_kinFrom, candidates) && _kin != null)
-            return _kin;
-
-        var made = FamiliesOfCandidates(env, candidates, pairs, rares, remnants, spread, slack, heavy);
-
-        _kinEnv = env;
-        _kinFrom = candidates;
-        _kin = made;
-
-        return made;
-    }
-
-    [ThreadStatic] private static PlanEnvironment _kinEnv;
-    [ThreadStatic] private static List<Vector2> _kinFrom;
-    [ThreadStatic] private static List<(Vector2 At, double Worth, string Note)> _kin;
-
-    /// <summary>The work itself. See Families, which is what everything calls.</summary>
-    private static List<(Vector2 At, double Worth, string Note)> FamiliesOfCandidates(PlanEnvironment env,
-        List<Vector2> candidates, int pairs, int rares, int remnants, float spread, float slack,
-        bool heavy)
-    {
-        var found = new List<(Vector2 At, double Worth, string Note)>();
-        var where = new Dictionary<(int, int), int>();
-
-        void Fold(List<(Vector2 At, double Worth, string Note)> from)
-        {
-            foreach (var (at, worth, note) in from)
-            {
-                var cell = ((int)MathF.Round(at.X), (int)MathF.Round(at.Y));
-
-                if (where.TryGetValue(cell, out var shared))
-                {
-                    var was = found[shared];
-
-                    found[shared] = (was.At, was.Worth, $"{was.Note} {note}");
-
-                    continue;
-                }
-
-                where[cell] = found.Count;
-                found.Add((at, worth, note));
-            }
-        }
-
-        if (pairs > 0)
-            Fold(Pairs(env, candidates, pairs, spread, slack, heavy));
-
-        if (rares > 0)
-            Fold(PerEach(env, candidates, rares, spread, TargetKind.Elite, slack, heavy));
-
-        if (remnants > 0)
-            Fold(PerEach(env, candidates, remnants, spread, TargetKind.Remnant, slack, heavy));
-
-        return found;
-    }
-
-    /// <summary>
-    /// One spot per remnant and neighbour that a single blast can take together.
-    ///
-    /// The ranked views answer "where is the value", and they are right about that and unhelpful
-    /// about what follows it. A chain is a sequence, so the question at each step is not only which
-    /// spot is richest but which of the near-equal spots leaves the next link possible - and the
-    /// strongest recorded chains are built out of links that do two jobs, catching a remnant and a
-    /// rare at once rather than spending a link on each.
-    ///
-    /// So this asks one question per remnant per thing it can share a blast with. A neighbour counts
-    /// only if some candidate actually catches **both** - not if it is merely nearby, which is the
-    /// difference between a handful of rings and one per pair of markers on the site. A remnant with
-    /// nothing it can double up with contributes nothing, which is the intended answer rather than a
-    /// gap: the per-kind views already cover where its own best spots are.
-    ///
-    /// Other remnants count as neighbours too, not only rares. Two remnants inside one blast is the
-    /// best link on the site when it exists, and it is not a thing the eye picks out.
-    ///
-    /// The obvious failure is drawing the same point several times over - one spot catching a
-    /// remnant and two rares answers two pairs - so positions are folded together and carry every
-    /// pair they answer in one label.
-    /// </summary>
-    private static List<(Vector2 At, double Worth, string Note)> Pairs(PlanEnvironment env,
-        List<Vector2> candidates, int most, float spread, float slack = 0f, bool heavy = true)
-    {
-        var markers = new List<(int Which, string Name)>();
-
-        for (var i = 0; i < env.Targets.Count; i++)
-        {
-            var kind = env.Targets[i].Kind;
-
-            // Half a pair that must not be caught is not half a pair. See PlanTarget.Shunned.
-            if (kind is TargetKind.Remnant or TargetKind.Elite && !env.Targets[i].Shunned)
-                markers.Add((i, $"{(kind == TargetKind.Remnant ? "R" : "E")}{markers.Count + 1}"));
-        }
-
-        var none = new HashSet<int>();
-        var found = new List<(Vector2 At, double Worth, string Note)>();
-        var where = new Dictionary<(int, int), int>();
-
-        foreach (var (which, name) in markers)
-        {
-            // Remnants anchor, everything heavy neighbours. Anchoring on rares as well drew the
-            // same pair twice from both ends and turned a readable handful of rings into forty.
-            if (env.Targets[which].Kind != TargetKind.Remnant)
-                continue;
-
-            var anchor = env.Targets[which];
-
-            foreach (var (other, label) in markers)
-            {
-                if (other == which)
-                    continue;
-
-                // Each unordered pair once. Two remnants would otherwise be asked about from both
-                // ends and answered identically.
-                if (env.Targets[other].Kind == TargetKind.Remnant && other < which)
-                    continue;
-
-                var both = new List<(Vector2 At, double Solo)>();
-
-                foreach (var candidate in candidates)
-                {
-                    if (Catches(env, candidate, anchor) && Catches(env, candidate, env.Targets[other]))
-                        both.Add((candidate, NewWeight(env, candidate, none, env.Explosives - 1)));
-                }
-
-                // Nothing can take the two together, so there is no such spot to draw. This is the
-                // "no rares in range" case and drawing the anchor's own best spot instead would be
-                // answering a question nobody asked.
-                if (both.Count == 0)
-                    continue;
-
-                // Among the spots that catch both, the same lean as everywhere else: the one nearest
-                // the weight of the site, within the slack allowed.
-                both.Sort(Better(Pull(env, heavy), Best(both), slack));
-
-                // **The whole family, not its best member.** Measured against six recorded chains,
-                // the best chain's decisive link was an R2+E4 spot sitting 18 grid from the R2+E4
-                // spot this drew - same pair, lower standalone worth, chosen by the chain for the
-                // reach it left the next link. Keeping one per pair threw the winner away and kept
-                // the runner-up, and the spots that survived predicted the WORST chain of the six
-                // better than the best one.
-                //
-                // So a pair is a family of options spread out across the band that catches both,
-                // and how many of them to show is the same count and spacing the other views use.
-                var apart = spread > 0f ? spread : MathF.Max(1f, env.Apart);
-                var kept = new List<Vector2>();
-
-                foreach (var (at, solo) in both)
-                {
-                    if (kept.Count >= most)
-                        break;
-
-                    var clear = true;
-
-                    foreach (var already in kept)
-                        clear &= Vector2.Distance(already, at) > apart;
-
-                    if (!clear)
-                        continue;
-
-                    kept.Add(at);
-
-                    var cell = ((int)MathF.Round(at.X), (int)MathF.Round(at.Y));
-                    var note = kept.Count > 1 ? $"{name}+{label}#{kept.Count}" : $"{name}+{label}";
-
-                    if (where.TryGetValue(cell, out var shared))
-                    {
-                        var was = found[shared];
-
-                        found[shared] = (was.At, was.Worth, $"{was.Note} {note}");
-
-                        continue;
-                    }
-
-                    where[cell] = found.Count;
-                    found.Add((at, solo, $"{note}x{Heavy(env, at)}"));
-                }
-            }
-        }
-
-        return found;
-    }
-
-    /// <summary>
-    /// Puts a set of places on screen from outside the ranking machinery.
-    ///
-    /// The edge-only mode works out its own options and wants them drawn; this is how, without it
-    /// having to pretend to be one of the debug buttons.
-    /// </summary>
-    public static void Show(List<(string Name, List<Vector2> Cells, List<Vector2> All)> these)
-    {
-        Family = false;
-        Paired = false;
-        PerKind = null;
-        Spots = new List<(Vector2, double, string)>();
-        Shapes = these;
-        Shaped = true;
-        Drawn = these.Count;
-    }
-
-    public static IReadOnlyList<(Vector2 At, double Worth, string Note)> Spots { get; private set; } =
-        new List<(Vector2, double, string)>();
 
     private static int _sweeps;
     private static double _sweepGain;
@@ -3710,34 +2057,6 @@ internal static class Planner
 
     private static int _orders;
     private static double _orderGain;
-
-    /// <summary>
-    /// The same chain in the other order, or null when the game could not place it.
-    ///
-    /// Every link is re-tested rather than only measured, for the same reason the openings are: a
-    /// chain walked backwards is a different set of segments over the same points, so a reversal
-    /// can be perfectly well spaced and still put its first link through a wall.
-    /// </summary>
-    private static List<Vector2> Reverse(PlanEnvironment env, List<Vector2> chain)
-    {
-        if (chain.Count < 2)
-            return null;
-
-        var back = Copied(chain);
-        back.Reverse();
-
-        var from = env.Origin;
-
-        foreach (var point in back)
-        {
-            if (!Reaches(env, from, point))
-                return null;
-
-            from = point;
-        }
-
-        return back;
-    }
 
     /// <summary>
     /// Every position worth considering.
@@ -3793,7 +2112,11 @@ internal static class Planner
                 no++;
         }
 
-        var wanted = env.Targets.Where(t => t.Weight > 0f).ToList();
+        // **Anything worth catching, not only what has a weight of its own.** A relic's worth is mostly its effect -
+        // more rares, pack size, duplicated runic monsters - which the score counts through Spread and NonStacking,
+        // so one whose row carries no plain weight had no candidate on or around it and could only be caught by a
+        // spot chosen for something else. Must-avoids still get none: Shunned is a negative weight.
+        var wanted = env.Targets.Where(OffersCandidates).ToList();
 
         foreach (var target in wanted)
             Offer(target.Grid);
@@ -3884,8 +2207,7 @@ internal static class Planner
     ///
     /// A SPOT is different. No legal chain may ever place an explosive here, so the spot is dead
     /// weight in every pass that touches it - and the passes touch it a great deal: Improve sweeps
-    /// every candidate for every link, the beam expands every candidate at every step, and PerEach
-    /// tests every candidate against every marker. Nine thousand candidates on a Grand site, so a
+    /// every candidate for every link and the beam expands every candidate at every step. Nine thousand candidates on a Grand site, so a
     /// spot removed once is removed from hundreds of thousands of tests.
     ///
     /// **Kept when it would leave nothing.** A ban that covered every placeable spot would otherwise
@@ -4314,9 +2636,30 @@ internal static class Planner
             new Lazy<List<(List<Vector2> Tour, int Held, double Worth)>>(() =>
             {
                 var tours = new List<(List<Vector2> Tour, int Held, double Worth)>();
+                var began = Stopwatch.GetTimestamp();
+                var (fetchBefore, completeBefore) = (_demandedFetchTicks, _demandedCompleteTicks);
 
                 foreach (var tour in Demanded(env, candidates))
                     tours.Add((tour, Rate(env, tour).Held, Score(env, tour)));
+
+                var detonatorTicks = Stopwatch.GetTimestamp() - began;
+                var fetchTicks = _demandedFetchTicks - fetchBefore;
+                var completeTicks = _demandedCompleteTicks - completeBefore;
+
+                double Ms(long ticks) => ticks * 1000d / Stopwatch.Frequency;
+
+                lock (_sharedTourBuilds)
+                {
+                    _sharedTourBuilds.Add($"{DateTime.Now:HH:mm:ss.fff} site copy " +
+                                          $"{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(env):X8}, " +
+                                          $"{candidates.Count} spots: detonator tours {Ms(detonatorTicks):N0}ms " +
+                                          $"(fetching {Ms(fetchTicks):N0}ms, completing {Ms(completeTicks):N0}ms, " +
+                                          $"scoring the rest), " +
+                                          $"{Ms(Stopwatch.GetTimestamp() - began):N0}ms in all");
+
+                    if (_sharedTourBuilds.Count > 12)
+                        _sharedTourBuilds.RemoveAt(0);
+                }
 
                 return tours;
             }, LazyThreadSafetyMode.ExecutionAndPublication));
@@ -4458,9 +2801,9 @@ internal static class Planner
     /// better one to be had.
     ///
     /// **The destroy-and-repair search cannot reach a distant must-take on its own, and this is
-    /// what it calls to get there.** Demanded and Insisting both live inside Search, which is
-    /// reached only from the score card - so the live path had the 43,255 charge for dropping a
-    /// requirement and no operator able to satisfy one. A Craggy Peninsula site sat 335 grid west
+    /// what it calls to get there.** Demanded was written for a restart search that only the score
+    /// card ever ran, and has since been removed - so the live path had the 43,255 charge for
+    /// dropping a requirement and no operator able to satisfy one. A Craggy Peninsula site sat 335 grid west
     /// of a marked marker with 463 of budget spare and never went for it.
     ///
     /// **The charge alone cannot fix that, and the size of it is why.** Tear, Rebuild and the rest
@@ -4551,6 +2894,29 @@ internal static class Planner
         return equal[worker <= 0 ? 0 : worker % equal.Count].Tour;
     }
 
+    /// <summary>Ticks this thread has spent in Demanded's fetching and completing, for timing its callers.</summary>
+    [ThreadStatic] private static long _demandedFetchTicks;
+
+    [ThreadStatic] private static long _demandedCompleteTicks;
+
+    /// <summary>
+    /// Every build of the shared detonator tours, newest last, with which copy of the site it was for and what it
+    /// spent - so a dump can say whether one solve built them more than once. See FromDetonator.
+    /// </summary>
+    private static readonly List<string> _sharedTourBuilds = new();
+
+    /// <summary>The shared detonator tour builds, for the dump. See _sharedTourBuilds.</summary>
+    internal static string SharedTourBuildsSaid
+    {
+        get
+        {
+            lock (_sharedTourBuilds)
+                return _sharedTourBuilds.Count == 0
+                    ? "    none yet"
+                    : string.Join(Environment.NewLine, _sharedTourBuilds.Select(x => "    " + x));
+        }
+    }
+
     /// <summary>
     /// Chains that go and fetch every marker the player insisted on, one per order to fetch them in.
     ///
@@ -4558,9 +2924,9 @@ internal static class Planner
     /// without it the marks were decoration on a Grand site.** Nothing else can: greedy picks the
     /// next link by what it adds now, and a marker six hundred grid away adds nothing to any link
     /// within reach of the detonator, so it produces no pull at all until a chain happens to end up
-    /// near it. Remnants commits to an ORDER but demands each stop be one hop from the last, so it
-    /// silently skips anything that needs bridging. And Insisting moves a single link onto a missed
-    /// marker, which cannot be legal when the marker is two or three links past the end of the chain.
+    /// near it. Committing to an ORDER of remnants with each stop one hop from the last silently
+    /// skips anything that needs bridging, and moving a single link onto a missed marker cannot be
+    /// legal when the marker is two or three links past the end of the chain.
     ///
     /// Measured on the Grand site that prompted this: three marked remnants, the chain took one, and
     /// the other two sat 179 and 214 grid beyond its last link against a reach of 108.
@@ -4609,6 +2975,15 @@ internal static class Planner
             orders = new List<List<int>> { found };
         }
 
+        // The marker taken last is fetched last, since a tour that takes it earlier does not hold it. See
+        // PlanEnvironment.TakenLast.
+        var endsOnTakenLast = env.TakenLast >= 0 && found.Contains(env.TakenLast);
+
+        if (endsOnTakenLast)
+            orders = orders.Where(order => order[^1] == env.TakenLast)
+                .DefaultIfEmpty(found.Where(i => i != env.TakenLast).Append(env.TakenLast).ToList())
+                .ToList();
+
         foreach (var order in orders)
         {
             var chain = prefix == null ? new List<Vector2>() : new List<Vector2>(prefix);
@@ -4621,6 +2996,8 @@ internal static class Planner
                 from = at;
             }
 
+            var fetching = Stopwatch.GetTimestamp();
+
             foreach (var want in order)
             {
                 // Already caught by a link laid on the way to an earlier one, which is common when
@@ -4631,11 +3008,21 @@ internal static class Planner
                 Fetch(env, candidates, chain, taken, ref from, want, asker: Touring);
             }
 
+            _demandedFetchTicks += Stopwatch.GetTimestamp() - fetching;
+
             if (chain.Count == 0)
                 continue;
 
-            // The rest greedily, which is now only being asked where the monsters are.
-            yield return Greedy(env, candidates, null, 1, null, chain);
+            // The rest greedily, which is now only being asked where the monsters are - unless the tour ends on the marker
+            // taken last, after which nothing may be placed: the explosives left over are for the search to lay earlier.
+            var completing = Stopwatch.GetTimestamp();
+            var completed = endsOnTakenLast && taken.Contains(env.TakenLast)
+                ? chain
+                : Greedy(env, candidates, null, 1, null, chain);
+
+            _demandedCompleteTicks += Stopwatch.GetTimestamp() - completing;
+
+            yield return completed;
         }
     }
 
@@ -4748,15 +3135,13 @@ internal static class Planner
     /// <summary>The callers of Fetch, as the counters index them. See Fetch's asker.</summary>
     internal const int Touring = 0;
 
-    internal const int Stepping = 1;
+    internal const int Bridging = 1;
 
-    internal const int Bridging = 2;
-
-    private static readonly int[] _fetchWon = new int[3];
-    private static readonly int[] _fetchStuck = new int[3];
-    private static readonly int[] _fetchSpent = new int[3];
-    private static readonly int[] _fetchStuckHops = new int[3];
-    private static readonly int[] _fetchSpentHops = new int[3];
+    private static readonly int[] _fetchWon = new int[2];
+    private static readonly int[] _fetchStuck = new int[2];
+    private static readonly int[] _fetchSpent = new int[2];
+    private static readonly int[] _fetchStuckHops = new int[2];
+    private static readonly int[] _fetchSpentHops = new int[2];
 
     /// <summary>
     /// Why the bridges the reach operator builds do not arrive, for the dump.
@@ -4775,10 +3160,10 @@ internal static class Planner
     {
         get
         {
-            var names = new[] { "tour", "step", "reach" };
+            var names = new[] { "tour", "reach" };
             var said = new List<string>();
 
-            for (var i = 0; i < 3; i++)
+            for (var i = 0; i < names.Length; i++)
             {
                 // **A row that never fired still prints, saying so.** Skipping it made "this
                 // builder was never called" and "this builder is not reported" look identical, and
@@ -4804,7 +3189,7 @@ internal static class Planner
     /// <summary>Forgets it, so a solve is judged on its own. See Fetches.</summary>
     public static void Unfetch()
     {
-        for (var i = 0; i < 3; i++)
+        for (var i = 0; i < _fetchWon.Length; i++)
         {
             _fetchWon[i] = 0;
             _fetchStuck[i] = 0;
@@ -4850,185 +3235,6 @@ internal static class Planner
     /// still gets to change its mind about the opening, it simply no longer does so before it has
     /// found out what the opening was worth.
     /// </param>
-    /// <summary>
-    /// The best the chain can do once one marker has changed, without searching the whole site.
-    ///
-    /// **Improve answers "any spot, any order" and that is what makes the reroll advice unusable on a
-    /// Grand site.** It is six rounds of Sweep, and Sweep is every link against every candidate -
-    /// fifteen against several hundred, six times, per sampled outcome, per candidate remnant: ten to
-    /// twenty seconds for one remnant's advice with the player standing still.
-    ///
-    /// Almost all of what a roll is worth needs neither of those freedoms. Propagation dominates the
-    /// objective - content 1,690 against propagation 12,630 on one site - and propagation flows
-    /// forward from the link that carries it, so a rune that has just become valuable is realised by
-    /// moving its remnant EARLIER. That is Order, at O(links squared) with a folded prefix tally.
-    ///
-    /// What Order cannot do is bring in a marker the chain does not catch, which is the case a roll
-    /// most often creates. So the one marker that changed is offered a place: the spots that catch it
-    /// are tried against each position, the illegal ones are dropped, and the survivor is re-ordered.
-    ///
-    /// Roughly two orders of magnitude under Improve. What it gives up is a DIFFERENT spot becoming
-    /// worth taking for reasons unrelated to this marker, which the next full solve finds anyway.
-    /// </summary>
-    /// <param name="marker">
-    /// Which target changed. Its own spots are the only ones offered a place, which is the whole of
-    /// the saving: the question is not "what is the best chain now" but "what does this marker
-    /// change".
-    /// </param>
-    /// <param name="links">
-    /// How many links a substitution may disturb. One replaces a single link, which usually fails
-    /// because a marker off the route is off it precisely because the reach cannot get there; two
-    /// lets the following link move as well, which is what recovers most of those. See
-    /// SolverSettings.RollSubstitutionLinks.
-    /// </param>
-    internal static List<Vector2> Restitched(PlanEnvironment env, List<Vector2> chain, int marker,
-        List<Vector2> candidates, int links)
-    {
-        if (env == null || chain is not { Count: > 0 })
-            return chain;
-
-        var best = Order(env, Copied(chain));
-        var score = Score(env, best);
-
-        if (marker < 0 || marker >= env.Targets.Count || candidates == null)
-            return best;
-
-        var covers = CoverageOfEnvironment(env);
-
-        // Already caught, so there is nothing to bring in and the ordering above is the whole answer.
-        foreach (var at in chain)
-        {
-            foreach (var index in covers.Of(at))
-            {
-                if (index == marker)
-                    return best;
-            }
-        }
-
-        // The spots that would catch it, richest first. A handful, because they differ from each
-        // other only in what ELSE they take and the best few cover that.
-        var offers = new List<(Vector2 At, double Worth)>();
-
-        foreach (var candidate in candidates)
-        {
-            var takes = false;
-            var worth = 0d;
-
-            foreach (var index in covers.Of(candidate))
-            {
-                takes |= index == marker;
-                worth += WorthOfTarget(env.Targets[index]);
-            }
-
-            if (takes)
-                offers.Add((candidate, worth));
-        }
-
-        if (offers.Count == 0)
-            return best;
-
-        offers.Sort(static (a, b) => b.Worth.CompareTo(a.Worth));
-
-        var tried = Math.Min(offers.Count, Offers);
-        var work = new List<Vector2>(chain.Count);
-
-        for (var o = 0; o < tried; o++)
-        {
-            var offer = offers[o].At;
-
-            for (var k = 0; k < chain.Count; k++)
-            {
-                work.Clear();
-                work.AddRange(chain);
-                work[k] = offer;
-
-                // One link. Cheap, and enough whenever the marker sits within reach of the link
-                // before the one it replaces.
-                if (Legal(env, work) && Keep(env, work, ref best, ref score))
-                    continue;
-
-                if (links < 2)
-                    continue;
-
-                // Two. The link AFTER the substitution is what the new spot most often cannot reach,
-                // so that is the one allowed to move - to the best few spots that restore the chain
-                // rather than to every candidate in the site, which is the loop this exists to avoid.
-                var next = k + 1;
-
-                if (next >= chain.Count)
-                    continue;
-
-                var reached = 0;
-
-                foreach (var candidate in candidates)
-                {
-                    if (reached >= Offers)
-                        break;
-
-                    if (!Reaches(env, offer, candidate))
-                        continue;
-
-                    work.Clear();
-                    work.AddRange(chain);
-                    work[k] = offer;
-                    work[next] = candidate;
-
-                    if (!Legal(env, work))
-                        continue;
-
-                    reached++;
-                    Keep(env, work, ref best, ref score);
-                }
-            }
-        }
-
-        return best;
-    }
-
-    /// <summary>How many spots and how many repairs a substitution tries. See Restitched.</summary>
-    private const int Offers = 3;
-
-    /// <summary>
-    /// Whether every link of a chain is reachable from the one before it and spaced from the rest.
-    ///
-    /// The same two questions Repair.Sound asks, here because Restitched asks them per trial and a
-    /// substitution that breaks either is not a chain. See Planner.Reaches and Planner.Spaced.
-    /// </summary>
-    private static bool Legal(PlanEnvironment env, List<Vector2> chain)
-    {
-        for (var i = 0; i < chain.Count; i++)
-        {
-            if (!Reaches(env, i == 0 ? env.Origin : chain[i - 1], chain[i]))
-                return false;
-
-            if (!Spaced(env, chain, chain[i], i))
-                return false;
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Orders a trial and keeps it if it beats what is held. Says whether it did, so a caller can
-    /// stop trying to repair something that already worked. See Restitched.
-    /// </summary>
-    private static bool Keep(PlanEnvironment env, List<Vector2> trial, ref List<Vector2> best,
-        ref double score)
-    {
-        // Ordered before it is judged, because the substitution is what changed which runes
-        // propagate from where - an unordered trial is the same chain scored in the wrong order.
-        var ordered = Order(env, Copied(trial));
-        var worth = Score(env, ordered);
-
-        if (worth <= score)
-            return false;
-
-        best = ordered;
-        score = worth;
-
-        return true;
-    }
-
     internal static List<Vector2> Improve(PlanEnvironment env, List<Vector2> candidates,
         List<Vector2> chain, Func<bool> waiting = null, int pinned = 0)
     {
@@ -5162,22 +3368,6 @@ internal static class Planner
 
     private static int _shifts;
     private static double _shiftGain;
-    private static int _asPlaced;
-    private static double _asPlacedBest;
-    private static List<Vector2> _asPlacedChain;
-    private static int _asPlacedSlipped;
-    private static double _endgameBest;
-    private static int _endgameSlipped;
-
-    /// <summary>What the two "as if placed" paths actually managed, for the dump.</summary>
-    public static string Committing =>
-        $"as-placed restarts {_asPlaced} best {_asPlacedBest:N1}" +
-        (_asPlacedSlipped > 0 ? $" ({_asPlacedSlipped} LOST THE OPENING)" : "") +
-        (_asPlacedChain == null
-            ? " (no chain)"
-            : " [" + string.Join(" ", _asPlacedChain.ConvertAll(p => $"({p.X:0},{p.Y:0})")) + "]") +
-        $"; endgame best {_endgameBest:N1}" +
-        (_endgameSlipped > 0 ? $" ({_endgameSlipped} PINS SLIPPED)" : "");
 
     /// <summary>
     /// Tries the same spots in a different order, keeping the best.
@@ -5321,68 +3511,6 @@ internal static class Planner
     }
 
     /// <summary>
-    /// Moves one link of a chain onto a marker the player insisted on and the chain is missing.
-    ///
-    /// **A must-take is a cliff in the objective and hill climbing does not climb cliffs.** The
-    /// weight put on an insisted marker is larger than the whole site, so a chain that reaches it
-    /// beats one that does not by more than everything else combined - but getting there usually
-    /// means moving a link a long way, and every intermediate position is worse than where it
-    /// started. Sweep, Order, Reverse and Shift all move one link and keep the result only if it
-    /// improves, so none of them can cross the valley. The chain sits one adjustment away from a
-    /// twelve thousand point gain, which a person looking at it can see and the search cannot.
-    ///
-    /// Observed exactly that: run four missed a marked henge and scored 75,122, run five found it
-    /// and scored 87,425 with a chain no harder to walk. The difference was which random restart
-    /// happened to open near it - which is to say, luck.
-    ///
-    /// So it is asked directly rather than waited for. For each insisted marker the chain misses,
-    /// every spot that would catch it is tried in place of every existing link, and the best legal
-    /// swap is kept. That is one pass over the candidates per missing marker, which is nothing next
-    /// to a restart, and it only runs at all on a site where something has been insisted on.
-    ///
-    /// Null when there is nothing insisted, nothing missing, or no legal swap - and the caller
-    /// scores what comes back rather than trusting it, because a swap that takes the marker and
-    /// strands the rest of the chain is not an improvement.
-    /// </summary>
-    private static List<Vector2> Insisting(PlanEnvironment env, List<Vector2> candidates,
-        List<Vector2> chain) =>
-        Onto(env, candidates, chain, Missing(env, chain, insisted: true, keep: int.MaxValue),
-            int.MaxValue);
-
-    /// <summary>
-    /// The same move, made on the plugin's own initiative rather than on being told.
-    ///
-    /// **The must-take key is a person doing an operator the search does not have, and it works.**
-    /// Marked by hand, the score went from about fourteen and a half thousand to fifteen and a half
-    /// - and that is the PLAIN score, with the insisted bonus taken out, so the chain really is
-    /// seven per cent better by the plugin's own objective. The weights were never the problem. The
-    /// search was losing it, and a person could see the move at a glance.
-    ///
-    /// What they were doing is not mysterious: pick something valuable the chain walks past, and
-    /// make one link go and get it. That is a relocate-to-cover, and it is the one move none of the
-    /// local operators can make - see Insisting - because the link has to cross ground where every
-    /// intermediate position scores worse.
-    ///
-    /// So it is done without being asked, for the richest few things the chain is missing. The score
-    /// still decides: a swap that grabs a chest and strands the chain behind it is refused like any
-    /// other. All this changes is which moves get TRIED, which is exactly what the key was
-    /// supplying by hand.
-    ///
-    /// Bounded, because it is not free: a few targets, a few spots each, and not every round. The
-    /// restarts are still what finds a different shape of chain; this is what stops a good shape
-    /// being abandoned one link short of a better one.
-    /// </summary>
-    private static List<Vector2> Chasing(PlanEnvironment env, List<Vector2> candidates,
-        List<Vector2> chain) =>
-        Onto(env, candidates, chain, Missing(env, chain, insisted: false, keep: Chased), Reaching);
-
-    /// <summary>How many of the richest missed targets to go after at once. See Chasing.</summary>
-    private const int Chased = 3;
-
-    /// <summary>How many spots per missed target to try. See Chasing.</summary>
-    private const int Reaching = 10;
-
-    /// <summary>
     /// The targets a chain does not cover, richest first.
     /// </summary>
     /// <param name="insisted">
@@ -5436,89 +3564,6 @@ internal static class Planner
         }
 
         return found;
-    }
-
-    /// <summary>
-    /// Moves one link of the chain onto each of a set of targets it is missing, keeping the best.
-    /// </summary>
-    /// <param name="cap">How many covering spots to try per target, or everything.</param>
-    private static List<Vector2> Onto(PlanEnvironment env, List<Vector2> candidates,
-        List<Vector2> chain, List<int> wanted, int cap)
-    {
-        if (chain.Count == 0 || wanted.Count == 0)
-            return null;
-
-        var covers = CoverageOfEnvironment(env);
-
-        List<Vector2> best = null;
-        var most = Score(env, chain);
-
-        // The links before the one being moved are untouched by moving it, and the loop below walks
-        // those positions in order - so the prefix is wound forward rather than rebuilt for each.
-        // Reset per spot, because each spot starts again from the top of the chain. See Wind.
-        var tally = Begin(env, chain.Count);
-        var work = new List<Vector2>(chain.Count);
-
-        foreach (var t in wanted)
-        {
-            var tried = 0;
-
-            foreach (var spot in candidates)
-            {
-                if (tried >= cap)
-                    break;
-
-                var catches = false;
-
-                foreach (var index in covers.Of(spot))
-                {
-                    if (index != t)
-                        continue;
-
-                    catches = true;
-
-                    break;
-                }
-
-                if (!catches)
-                    continue;
-
-                tried++;
-
-                work.Clear();
-                Unfold(env, tally);
-
-                for (var i = 0; i < chain.Count; i++)
-                {
-                    if (chain[i] == spot)
-                        continue;
-
-                    var was = chain[i];
-
-                    chain[i] = spot;
-
-                    // The head up to this link is the same whichever spot is being tried into it.
-                    Wind(env, tally, work, chain, i);
-
-                    // Legal all the way through: the link before it has to reach it, it has to
-                    // reach the link after, and it must not sit on top of another.
-                    if (Walkable(env, chain))
-                    {
-                        var worth = WorthOfChainWithTail(env, tally, work, chain, i);
-
-                        if (worth > most)
-                        {
-                            most = worth;
-                            best = Copied(chain);
-                        }
-                    }
-
-                    chain[i] = was;
-                }
-            }
-        }
-
-        return best;
     }
 
     /// <summary>Whether every link of a chain can be thrown from the one before it, and is spaced.</summary>
@@ -5714,7 +3759,9 @@ internal static class Planner
             // worth testing are the intersection of two discs - a small part of a site. Walking the
             // whole list to reject most of it on those two distance tests is the loop's bulk, and the
             // buckets answer it by arithmetic instead. Identical set, far fewer visits.
-            foreach (var candidate in Near(candidates, before, env.Reach))
+            // A cell wider than the reach, because Span measures from the near edges of two cells and
+            // so allows a straight line up to about seven tenths of a cell longer. See Span.
+            foreach (var candidate in Near(candidates, before, env.Reach + 1f))
             {
                 if (candidate == here)
                     continue;
@@ -5722,11 +3769,16 @@ internal static class Planner
                 // The cheap tests first, so a candidate on the far side of the site costs two
                 // distance checks rather than a walk of every marker in the dig site - and the
                 // ground between is only walked for one that survives them.
-                if (Vector2.DistanceSquared(before, candidate) > env.Reach * env.Reach)
+                //
+                // **Span, the reach rule's own distance, not the straight line.** The straight line
+                // refused links the rule and the game both allow: (700,819) to (726,714) is 108.17
+                // straight and 107.6 by Span against a reach of 108, and a sweep that could not see
+                // it left a chain on a Frigid Bluffs site 5 points short for three minutes of
+                // solving, until some other move happened on it.
+                if (Span(before, candidate) > env.Reach)
                     continue;
 
-                if (after != null &&
-                    Vector2.DistanceSquared(candidate, after.Value) > env.Reach * env.Reach)
+                if (after != null && Span(candidate, after.Value) > env.Reach)
                     continue;
 
                 // **Separation before routing, because one is arithmetic and the other is a search.**
@@ -6064,6 +4116,11 @@ internal static class Planner
 
     internal static Verdict Evaluate(PlanEnvironment env, List<Vector2> chain, bool detail = false)
     {
+        // On the whole site, over the explosives down and the chain, when explosives are down. A chain that already
+        // starts with them - the whole route a caller holds - is scored as it is. See PlanEnvironment.Whole.
+        if (env.Whole is { } whole && env.Head is { Count: > 0 } head && chain != null)
+            return Evaluate(whole, StartsWithHead(chain, head) ? chain : Headed(head, chain, ref _headedForEvaluate), detail);
+
         _verdicts++;
 
         using var phase = new Phase(PhaseEvaluate);
@@ -6227,7 +4284,7 @@ internal static class Planner
                 // Counted where the coverage is already being walked, so refusing a chain costs
                 // nothing per score. See Verdict.Missed.
                 if (target.Must)
-                    musts++;
+                    musts += target.MustWeight;
 
                 // Listed only if it can still pay something later.
                 //
@@ -6375,6 +4432,37 @@ internal static class Planner
         public int Covered;
         public int Musts;
         public double Travel;
+
+        /// <summary>
+        /// The whole site this tally scores in, when explosives are down, with them folded in first at the lowest
+        /// steps; null otherwise. Every link folded after them sits Offset steps along. See PlanEnvironment.Whole.
+        /// </summary>
+        public PlanEnvironment Over;
+
+        /// <summary>The explosives down, folded in first. See Over.</summary>
+        public IReadOnlyList<Vector2> Head;
+
+        /// <summary>How many steps the explosives down take, which a chain's own links come after. See Over.</summary>
+        public int Offset;
+    }
+
+    /// <summary>
+    /// Points a tally at the whole site and folds the explosives down into it, when this environment has them;
+    /// nothing otherwise. Called after every reset, since a reset forgets them with the rest. See Running.Over.
+    /// </summary>
+    private static void Headed(PlanEnvironment env, Running tally)
+    {
+        if (env.Whole is not { } whole || env.Head is not { Count: > 0 } head)
+        {
+            (tally.Over, tally.Head, tally.Offset) = (null, null, 0);
+
+            return;
+        }
+
+        (tally.Over, tally.Head, tally.Offset) = (whole, head, head.Count);
+
+        for (var i = 0; i < head.Count; i++)
+            FoldAt(whole, tally, i, i == 0 ? whole.Origin : head[i - 1], head[i]);
     }
 
     /// <summary>A running tally for one environment, ready for its first link.</summary>
@@ -6397,9 +4485,10 @@ internal static class Planner
     /// </summary>
     internal static Running BeginScratch(PlanEnvironment env, int links)
     {
-        var count = env.Targets.Count;
-        var wide = Math.Max(links, 1);
-        var shape = (count, wide, env.Relevant?.Length ?? -1, env.Scoped?.Length ?? -1);
+        var scored = env.Whole is { } whole && env.Head is { Count: > 0 } ? whole : env;
+        var count = scored.Targets.Count;
+        var wide = Math.Max(links, 1) + (ReferenceEquals(scored, env) ? 0 : env.Head.Count);
+        var shape = (count, wide, scored.Relevant?.Length ?? -1, scored.Scoped?.Length ?? -1);
 
         _scratches ??= new Dictionary<(int, int, int, int), Running>();
 
@@ -6450,6 +4539,8 @@ internal static class Planner
         had.Musts = 0;
         had.Travel = 0d;
 
+        Headed(env, had);
+
         return had;
     }
 
@@ -6476,34 +4567,27 @@ internal static class Planner
 
     internal static Running Begin(PlanEnvironment env, int links)
     {
-        var count = env.Targets.Count;
+        // Over the whole site and room for the explosives down too, when there are any. See PlanEnvironment.Whole.
+        var scored = env.Whole is { } whole && env.Head is { Count: > 0 } ? whole : env;
+        var wide = links + (ReferenceEquals(scored, env) ? 0 : env.Head.Count);
+        var count = scored.Targets.Count;
 
-        return new Running
+        var tally = new Running
         {
             Step = new int[count],
             Seen = new int[count],
             Touched = new int[count],
-            Added = new int[Math.Max(links, 1) + 1],
-            Monsters = new float[Math.Max(links, 1)],
-            Tagged = Fresh(env, links),
-            Classed = Owning(env, links),
-            Counted = Owning(env, links),
+            Added = new int[Math.Max(wide, 1) + 1],
+            Monsters = new float[Math.Max(wide, 1)],
+            Tagged = Fresh(scored, wide),
+            Classed = Owning(scored, wide),
+            Counted = Owning(scored, wide),
             Visit = 1,
         };
-    }
 
-    /// <summary>
-    /// Adds one link, and returns what the chain is worth with it.
-    ///
-    /// The coverage is folded in; the settling is redone, because it depends on the whole chain.
-    /// </summary>
-    internal static double Push(PlanEnvironment env, Running tally, List<Vector2> chain, Vector2 at)
-    {
-        Fold(env, tally, chain, at);
+        Headed(env, tally);
 
-        var running = Price(env, tally, chain);
-
-        return running;
+        return tally;
     }
 
     /// <summary>
@@ -6515,9 +4599,7 @@ internal static class Planner
     /// and settling five times does the same work five times for four answers nobody reads.
     ///
     /// Split so a caller that wants the worth of a chain it is about to build can fold the run and
-    /// ask once. Push is that pair, kept for the callers that add one link and want its answer, and
-    /// it is the audited path - see Audit, which is why the pair rather than the halves carries the
-    /// check.
+    /// ask Price once.
     ///
     /// The step a link is folded at is its position in the chain, so a run must be folded in
     /// increasing order: the coverage index records which link was FIRST to catch each marker, and
@@ -6525,8 +4607,16 @@ internal static class Planner
     /// </summary>
     internal static void Fold(PlanEnvironment env, Running tally, List<Vector2> chain, Vector2 at)
     {
+        // After the explosives down, when the tally holds them. See Running.Over.
+        var previous = chain.Count >= 2 ? chain[^2] : tally.Offset > 0 ? tally.Head[tally.Offset - 1] : env.Origin;
+
+        FoldAt(tally.Over ?? env, tally, tally.Offset + chain.Count - 1, previous, at);
+    }
+
+    /// <summary>Folds one link in at a given step, after a given point. See Fold.</summary>
+    private static void FoldAt(PlanEnvironment env, Running tally, int s, Vector2 previous, Vector2 at)
+    {
         var covers = CoverageOfEnvironment(env);
-        var s = chain.Count - 1;
 
         tally.Added[s] = tally.Found;
         tally.Monsters[s] = 0f;
@@ -6543,11 +4633,32 @@ internal static class Planner
             tally.Counted[c][s] = 0f;
         }
 
-        foreach (var i in covers.Of(at))
+        // **And what a barrel caught here sets off, as Evaluate counts it.** This took only what the
+        // blast itself covers, and Evaluate adds everything a directly caught barrel's own blast
+        // reaches at the same step: on a Frigid Bluffs chain (2026-10-04) the two came out 373 apart,
+        // the same at every link, so Sweep and Polish compared a spliced price 373 short against the
+        // whole score and refused a 5 point nudge the game's own best chain then took. Only the
+        // object the explosive reached is expanded, and only when it is new here, as in Evaluate; a
+        // barrel inside a barrel's blast is content. See PlanTarget.Sets.
+        foreach (var caught in covers.Of(at))
         {
-            if (tally.Seen[i] == tally.Visit)
+            if (tally.Seen[caught] == tally.Visit)
                 continue;
 
+            Take(caught);
+
+            if (env.Targets[caught].Sets is { Length: > 0 } sets)
+            {
+                foreach (var also in sets)
+                {
+                    if (tally.Seen[also] != tally.Visit)
+                        Take(also);
+                }
+            }
+        }
+
+        void Take(int i)
+        {
             var target = env.Targets[i];
 
             tally.Seen[i] = tally.Visit;
@@ -6556,7 +4667,7 @@ internal static class Planner
             tally.Covered++;
 
             if (target.Must)
-                tally.Musts++;
+                tally.Musts += target.MustWeight;
 
             if (target.Choices is { Length: > 0 } || target.Carries > 0f ||
                 target.NonStacking is { Length: > 0 } || target.Spread is { Length: > 0 })
@@ -6620,7 +4731,7 @@ internal static class Planner
             }
         }
 
-        tally.Travel += Vector2.Distance(s == 0 ? env.Origin : chain[s - 1], at);
+        tally.Travel += Vector2.Distance(previous, at);
     }
 
     /// <summary>
@@ -6758,13 +4869,27 @@ internal static class Planner
         tally.Covered = 0;
         tally.Musts = 0;
         tally.Travel = 0d;
+
+        Headed(env, tally);
     }
 
     /// <summary>What the chain in the tally is worth, without changing it. See Fold.</summary>
-    internal static double Price(PlanEnvironment env, Running tally, List<Vector2> chain) =>
-        Settle(env, chain, tally.Step, tally.Seen, tally.Visit, tally.Monsters, tally.Tagged,
+    internal static double Price(PlanEnvironment env, Running tally, List<Vector2> chain)
+    {
+        // Its own phase, so a trial's cost splits into the folding its caller does and the settling here.
+        using var phase = new Phase(PhaseSettle);
+
+        // Over the whole site, the explosives down in front, when the tally holds them. See Running.Over.
+        if (tally.Over is { } over)
+        {
+            env = over;
+            chain = Headed(tally.Head, chain, ref _headedForPrice);
+        }
+
+        return Settle(env, chain, tally.Step, tally.Seen, tally.Visit, tally.Monsters, tally.Tagged,
             tally.Classed, tally.Counted, tally.Touched, tally.Found, tally.Content, tally.Covered,
             tally.Musts, tally.Travel, false).Total;
+    }
 
     /// <summary>
     /// Where a combination ranking is written down, or null while nobody is reading.
@@ -6943,13 +5068,37 @@ internal static class Planner
     /// </summary>
     internal static void Pop(PlanEnvironment env, Running tally, List<Vector2> chain, Vector2 at)
     {
-        var covers = CoverageOfEnvironment(env);
-        var s = chain.Count;
+        // After the explosives down, when the tally holds them. See Running.Over.
+        var previous = chain.Count >= 1 ? chain[^1] : tally.Offset > 0 ? tally.Head[tally.Offset - 1] : env.Origin;
 
-        foreach (var i in covers.Of(at))
+        PopAt(tally.Over ?? env, tally, tally.Offset + chain.Count, previous, at);
+    }
+
+    /// <summary>Takes back the link folded at a given step, after a given point. See Pop.</summary>
+    private static void PopAt(PlanEnvironment env, Running tally, int s, Vector2 previous, Vector2 at)
+    {
+        var covers = CoverageOfEnvironment(env);
+
+        // What Fold took at this step: the coverage, and what each barrel it caught new here set off.
+        // The barrel's sets first, while its own step still says it was new here. See Fold.
+        foreach (var caught in covers.Of(at))
+        {
+            if (tally.Seen[caught] != tally.Visit || tally.Step[caught] != s)
+                continue;
+
+            if (env.Targets[caught].Sets is { Length: > 0 } sets)
+            {
+                foreach (var also in sets)
+                    Give(also);
+            }
+
+            Give(caught);
+        }
+
+        void Give(int i)
         {
             if (tally.Seen[i] != tally.Visit || tally.Step[i] != s)
-                continue;
+                return;
 
             var target = env.Targets[i];
 
@@ -6958,11 +5107,11 @@ internal static class Planner
             tally.Covered--;
 
             if (target.Must)
-                tally.Musts--;
+                tally.Musts -= target.MustWeight;
         }
 
         tally.Found = tally.Added[s];
-        tally.Travel -= Vector2.Distance(s == 0 ? env.Origin : chain[s - 1], at);
+        tally.Travel -= Vector2.Distance(previous, at);
     }
 
     /// <summary>
@@ -7008,6 +5157,178 @@ internal static class Planner
         // up also unearths what it covers, and that is affected too.
         var taggedAfter = Suffix(tagged, chain.Count);
 
+        // **Content and propagation per link, booked where the scoring books them**, for the blast labels and the
+        // score card. Content goes to the link that first caught the object it belongs to. See ScoreOfEachBlast and
+        // Lines.
+        var perLink = detail || _recordingLinks;
+
+        if (perLink)
+        {
+            _credited = Grow(_credited, chain.Count);
+            _contentAtLink = Grow(_contentAtLink, chain.Count);
+
+            for (var k = 0; k < chain.Count; k++)
+            {
+                _credited[k] = 0d;
+                _contentAtLink[k] = 0d;
+            }
+
+            // The base weight of everything caught, which the coverage walk added to content before this was called.
+            for (var i = 0; i < env.Targets.Count; i++)
+            {
+                if (seen[i] == visit)
+                    _contentAtLink[step[i]] += env.Targets[i].Weight;
+            }
+
+            _chosenByTarget = Grow(_chosenByTarget, env.Targets.Count);
+
+            for (var i = 0; i < env.Targets.Count; i++)
+                _chosenByTarget[i] = -1;
+
+            _linksRecorded = chain.Count;
+        }
+
+        void ContentToLink(int at, double amount)
+        {
+            if (perLink && at >= 0 && at < chain.Count)
+                _contentAtLink[at] += amount;
+        }
+
+        // **Gaining Traction: a remnant's magic and rare packs, and its rares' modifiers, grow with every remnant
+        // completed before it.** The scales are TractionScales'.
+        //
+        // The chain does not go on until a detonation is cleared, so a remnant first caught at link s comes after
+        // every remnant caught at an earlier link, and after those completed elsewhere in the map. Its magic and rare
+        // wave share is scaled by one plus the rate times that count: in its own worth, in the monster pools the runes
+        // upstream of it pay on (every step up to its own, since those pools are inclusive suffix sums), and in the
+        // payout on its own waves below. Taken from the game's text, "50% increased Monster Rarity per Remnant
+        // Completed in Area", whose stat names magic and rare packs. Watched on one Grand site (2026-09-30) the
+        // rise per remnant was near the text's; across seven sites it read lower, with the two confounded by rune
+        // counts. "Completed before" is detonated before: every remnant an earlier link catches.
+        var tractive = env.MagicPacksPerRemnantCompleted > 0f || env.RarePacksPerRemnantCompleted > 0f;
+        var tractionOf = _tractionOf = Grow(_tractionOf, Math.Max(found, 1));
+        var rareTractionOf = _rareTractionOf = Grow(_rareTractionOf, Math.Max(found, 1));
+        var normalTractionOf = _normalTractionOf = Grow(_normalTractionOf, Math.Max(found, 1));
+        var monstersExtra = _monstersExtra = Grow(_monstersExtra, Math.Max(chain.Count, 1));
+
+        for (var t = 0; t < found; t++)
+        {
+            tractionOf[t] = 1f;
+            rareTractionOf[t] = 1f;
+            normalTractionOf[t] = 1f;
+        }
+
+        for (var s = 0; s < chain.Count; s++)
+            monstersExtra[s] = 0f;
+
+        if (tractive)
+        {
+            // Every remnant the chain catches, whatever was read of it: one whose combinations were never read went
+            // off all the same. Counted by the link that first caught it; the ones one explosive catches go off
+            // together, so none of them counts for another.
+            var remnants = RemnantIndicesOf(env);
+            var caughtAt = _remnantsCaughtAt = Grow(_remnantsCaughtAt, chain.Count + 1);
+
+            for (var s = 0; s <= chain.Count; s++)
+                caughtAt[s] = 0;
+
+            foreach (var i in remnants)
+            {
+                if (seen[i] == visit)
+                    caughtAt[step[i]]++;
+            }
+
+            int DetonatedBefore(int link)
+            {
+                var before = env.RemnantsCompletedInArea;
+
+                // Only remnants caught at a link still sending, when the sources are cut off. See ScoreOfEachBlast.
+                for (var s = 0; s < link && SendsFrom(s); s++)
+                    before += caughtAt[s];
+
+                return before;
+            }
+
+            // Its worth and the monster pools upstream runes pay on, for every caught remnant.
+            foreach (var i in remnants)
+            {
+                if (seen[i] != visit)
+                    continue;
+
+                var before = DetonatedBefore(step[i]);
+
+                if (before <= 0)
+                    continue;
+
+                var (normalScale, magicScale, rareScale) = TractionScalesOfTarget(env, env.Targets[i], before);
+                var waves = env.Targets[i].MagicAndRareWaves;
+                var normals = env.Targets[i].NormalWaves;
+                var extraMonsters = (magicScale - 1f) * waves.MagicMonsters + (rareScale - 1f) * waves.RareMonsters +
+                                    (normalScale - 1f) * normals.NormalMonsters;
+
+                var tractionWorth = (magicScale - 1f) * waves.Magic + (rareScale - 1f) * waves.Rare +
+                                    (normalScale - 1f) * normals.Normal;
+
+                content += tractionWorth;
+                ContentToLink(step[i], tractionWorth);
+                monstersExtra[step[i]] += extraMonsters;
+
+                for (var s = 0; s <= step[i]; s++)
+                    after[s] += extraMonsters;
+            }
+
+            // The payout on its own waves and the scoped pools, which only remnants settled per marker have - those
+            // are the touched ones with combinations.
+            for (var t = 0; t < found; t++)
+            {
+                var i = touched[t];
+                var target = env.Targets[i];
+
+                if (target.Kind != TargetKind.Remnant)
+                    continue;
+
+                var before = DetonatedBefore(step[i]);
+
+                if (before <= 0)
+                    continue;
+
+                var (normalScale, magicScale, rareScale) = TractionScalesOfTarget(env, target, before);
+
+                tractionOf[t] = magicScale;
+                rareTractionOf[t] = rareScale;
+                normalTractionOf[t] = normalScale;
+
+                if (taggedAfter != null && target.PartsSettledPerMarker && target.Parts is { } waves)
+                {
+                    var scoped = env.Scoped;
+
+                    foreach (var (mask, part, _) in waves)
+                    {
+                        if (part <= 0f)
+                            continue;
+
+                        var tierScale = (mask & (1L << Tags.Rares)) != 0L ? rareScale
+                            : (mask & (1L << Tags.Magics)) != 0L ? magicScale
+                            : normalScale;
+
+                        if (tierScale == 1f)
+                            continue;
+
+                        var extra = part * (tierScale - 1f);
+
+                        for (var k = 0; k < scoped.Length; k++)
+                        {
+                            if ((mask & (1L << scoped[k])) == 0L || taggedAfter[k] == null)
+                                continue;
+
+                            for (var s = 0; s <= step[i]; s++)
+                                taggedAfter[k][s] += extra;
+                        }
+                    }
+                }
+            }
+        }
+
         var distinct = 0;
 
         // One credit per effect, against the most monsters it could ever reach - which is the
@@ -7021,7 +5342,7 @@ internal static class Planner
         // an effect that pays once however many are taken wants exactly the same treatment whatever
         // that switch says. See PlanTarget.Once.
         void Book(string id, float weight, float reach, int tag = -1, int at = 0,
-            (int X, int Y) owner = default, bool rune = false, bool flat = false)
+            (int X, int Y) owner = default, bool rune = false, bool flat = false, float[] heldLifts = null)
         {
             if (weight <= 0f || string.IsNullOrEmpty(id))
                 return;
@@ -7032,6 +5353,46 @@ internal static class Planner
                 tag = Tags.Monsters;
 
             var band = GroupIndexOfEffect(env, id);
+            var liftScale = 1f;
+
+            // **Lifted at its source**, by the amplifiers its remnant holds: worth each lift more, and filed in the twin
+            // for the classes left, so a chain-wide amplifier of a class already applied does not lift it a second time -
+            // empowered is on or off. A lift this effect carries is scaled the same way. See PlanTarget.HeldLiftsOfChoice.
+            if (heldLifts != null && env.Amplified is { } amplified && NumberOfEffect(env, id) is var number &&
+                number >= 0 && number < amplified.MaskOfEffect.Length)
+            {
+                var ofShare = band >= 0 && band < amplified.MaskOfGroup.Length ? amplified.MaskOfGroup[band] : 0L;
+                var ofLift = amplified.MaskOfEffect[number];
+                var shareFactor = 1f;
+                var held = 0L;
+
+                for (var a = 0; a < amplified.Classes && a < heldLifts.Length; a++)
+                {
+                    if (heldLifts[a] <= 0f)
+                        continue;
+
+                    if ((ofShare & (1L << a)) != 0L)
+                    {
+                        shareFactor *= 1f + heldLifts[a];
+                        held |= 1L << a;
+                    }
+
+                    if ((ofLift & (1L << a)) != 0L)
+                        liftScale *= 1f + heldLifts[a];
+                }
+
+                if (held != 0L)
+                {
+                    // Only the part of the lift that reaches this rune's group - all of it, unless its row writes the
+                    // share plain and empowered. See Amplification.LiftedFactorOfGroup.
+                    var liftReach = amplified.ReachOfGroup is { } reaches && band >= 0 && band < reaches.Length
+                        ? reaches[band]
+                        : 1d;
+
+                    weight *= (float)(1d + (shareFactor - 1d) * liftReach);
+                    band = amplified.TwinOf(amplified.PlainOfGroup[band], ofShare & ~held);
+                }
+            }
 
             // **Numbered once per site, compared as integers ever after.** This was a linear scan of
             // case-insensitive string comparisons, run once per effect per covered marker per scored
@@ -7080,6 +5441,10 @@ internal static class Planner
                     _carriedTag[r] = tag;
                     _carriedGroup[r] = band;
 
+                    // The winning source's weight too, since one source may send it empowered and another not.
+                    _carriedWeights[r] = weight;
+                    _carriedLiftScale[r] = liftScale;
+
                     if (Tags.Monsterly(tag))
                         _carriedRich[r] = reach;
                 }
@@ -7102,6 +5467,13 @@ internal static class Planner
             _carriedGroup = Grow(_carriedGroup, distinct + 1);
             _carriedTag[distinct] = tag;
             _carriedGroup[distinct] = band;
+
+            // **Which effect, and how much its source lifts its lift**, so the drain can add a lift the effect carries
+            // per class. See Rate and Amplification.
+            _carriedEffect = Grow(_carriedEffect, distinct + 1);
+            _carriedLiftScale = Grow(_carriedLiftScale, distinct + 1);
+            _carriedEffect[distinct] = NumberOfEffect(env, id);
+            _carriedLiftScale[distinct] = liftScale;
 
             // Which link this was booked at, so the number drawn in that blast circle can be the
             // share the objective actually credited there. See CreditToLink.
@@ -7152,14 +5524,10 @@ internal static class Planner
         // the search runs this half a million times and must not be writing to it.
         if (detail)
         {
-            if (_credited == null || _credited.Length < chain.Count)
-                _credited = new double[Math.Max(chain.Count, 16)];
-
-            for (var k = 0; k < chain.Count; k++)
-                _credited[k] = 0d;
-
             RuneTallyByRemnant.Clear();
+            WavesPredictedByRemnant.Clear();
             Chosen.Clear();
+            OwnEffectsUnderPassedPower.Clear();
             Rankings.Clear();
             _ratedAside?.Clear();
             PropagationTrailByRemnant.Clear();
@@ -7172,7 +5540,7 @@ internal static class Planner
         var switches = 0;
         var repeated = 0d;
 
-        void Credit(string id, float weight)
+        void Credit(string id, float weight, int at)
         {
             if (weight <= 0f || string.IsNullOrEmpty(id))
                 return;
@@ -7190,6 +5558,7 @@ internal static class Planner
                 // Seen before: this object's copy of the weight was counted with its coverage and
                 // is now taken back.
                 repeated += weight;
+                ContentToLink(at, -weight);
 
                 return;
             }
@@ -7241,8 +5610,16 @@ internal static class Planner
 
         _rates = rates;
 
+        // The same shares less every rune's, for what no rune reaches. See Tags.UnaffectedByRunes.
+        var ratesWithoutRunes = Grow(_ratesWithoutRunes, groups * width * Math.Max(links, 1));
+
+        _ratesWithoutRunes = ratesWithoutRunes;
+
         for (var i = 0; i < groups * width * links; i++)
+        {
             rates[i] = 0f;
+            ratesWithoutRunes[i] = 0f;
+        }
 
         // What flat effects add to each thing of a class, per link they are in force from.
         //
@@ -7259,11 +5636,14 @@ internal static class Planner
 
         // How much the chain's empowering effects scale everything else, per link. Untagged on
         // purpose: an effect that scales other effects scales them whatever they are pointed at.
-        var lifts = Grow(_lifts, Math.Max(links, 1));
+        // One run of links per amplifier class; one class where the site has no amplification table, which is the
+        // shape this had before classes. See Amplification.
+        var amplifiers = env.Amplified?.Classes ?? 1;
+        var lifts = Grow(_lifts, Math.Max(links * amplifiers, 1));
 
         _lifts = lifts;
 
-        for (var i = 0; i < links; i++)
+        for (var i = 0; i < links * amplifiers; i++)
             lifts[i] = 0f;
 
         // An amount added to every thing of this tag the chain unearths from this link onwards.
@@ -7287,20 +5667,40 @@ internal static class Planner
         /// not the same as nothing being there, and is why the trail says NOTHING NAMED rather than
         /// leaving the share out.
         /// </param>
-        void Rate(int band, int tag, int at, float percent, string what = null)
+        void Rate(int band, int tag, int at, float percent, string what = null, int effect = -1, float liftScale = 1f,
+            bool fromRune = false)
         {
-            if (percent <= 0f || at < 0 || at >= links)
+            if (at < 0 || at >= links)
                 return;
 
-            // **An empowering rate never enters a group.** It is not a share of anything landing on
-            // a monster - it is a multiplier on the whole of what does - so it is held aside and
-            // applied once, after the groups have compounded. See PlanEnvironment.Empowering.
-            if (band == env.Empowering)
+            // **A lift never enters a group.** It is not a share of anything landing on a monster - it is a
+            // multiplier on the shares its class lifts - so it is held aside per class and applied once, after the
+            // groups have compounded. Read off the effect, so a rune that adds as well pays its share below. See
+            // Amplification.
+            if (env.Amplified is { } amplified && effect >= 0 && effect < amplified.LiftsOfEffect.Length &&
+                amplified.LiftsOfEffect[effect] is { } own)
             {
-                lifts[at] += percent / 100f;
+                for (var a = 0; a < amplified.Classes && a < own.Length; a++)
+                {
+                    if (own[a] > 0f)
+                        lifts[a * links + at] += own[a] * liftScale;
+                }
+
+                if (band == env.Empowering)
+                    return;
+            }
+            else if (band == env.Empowering)
+            {
+                // With no table to read it from - an environment from a file, or a banked carry with no name - the
+                // rate is the lift, on the one class there was before classes. See PlanEnvironment.Empowering.
+                if (percent > 0f)
+                    lifts[at] += percent / 100f;
 
                 return;
             }
+
+            if (percent <= 0f)
+                return;
 
             var k = Indexed(env, tag < 0 ? Tags.Monsters : tag);
 
@@ -7308,6 +5708,9 @@ internal static class Planner
                 return;
 
             rates[(band * width + k) * links + at] += percent / 100f;
+
+            if (!fromRune)
+                ratesWithoutRunes[(band * width + k) * links + at] += percent / 100f;
 
             // **Kept aside because a rate is not a booking and the trail could only read bookings.**
             //
@@ -7366,7 +5769,8 @@ internal static class Planner
             {
                 if (string.IsNullOrEmpty(id))
                 {
-                    Rate(band, Tags.Monsters, 0, percent, $"banked from ({from.X},{from.Y})");
+                    // An unnamed banked carry is a caught remnant's runes. See the comment above the loop.
+                    Rate(band, Tags.Monsters, 0, percent, $"banked from ({from.X},{from.Y})", fromRune: true);
 
                     // **Counted for the readout, because the Book cannot hold it.**
                     //
@@ -7414,13 +5818,44 @@ internal static class Planner
             }
         }
 
+        // **The rune class's lift in force at a link from the links before it**, out of what is booked so far: the
+        // strongest booked effect lifting that class - Power's - first reaching monsters before the link. The walk below
+        // is in link order and books as it goes, so this is complete for every earlier link when a later one chooses.
+        // The lifts themselves are written to `lifts` only after the walk, so they are read off the bookings. See
+        // PlanTarget.Best's passedLift.
+        double PowerPassedTo(int link)
+        {
+            if (env.Amplified is not { RuneClass: >= 0 } amplified)
+                return 0d;
+
+            var most = 0d;
+
+            for (var r = 0; r < distinct; r++)
+            {
+                var effect = _carriedEffect[r];
+
+                if (effect < 0 || effect >= amplified.LiftsOfEffect.Length ||
+                    amplified.LiftsOfEffect[effect] is not { } liftsOfIt || amplified.RuneClass >= liftsOfIt.Length ||
+                    liftsOfIt[amplified.RuneClass] <= 0f || _carriedFrom[r] >= link)
+                    continue;
+
+                most = Math.Max(most, liftsOfIt[amplified.RuneClass] * _carriedLiftScale[r]);
+            }
+
+            return most;
+        }
+
         // **Cleared, because this is per-thread scratch reused on every score.** A marker with no
         // ordinary runes reads whatever the last chain left at its index otherwise, and attaches
         // somebody else's runes to its waves.
         _localsOf = Grow(_localsOf, found);
+        _chosenOf = Grow(_chosenOf, found);
 
         for (var t = 0; t < found; t++)
+        {
             _localsOf[t] = null;
+            _chosenOf[t] = -1;
+        }
 
         // **Walked in LINK order, which is what lets a choice see what is already on its way.**
         //
@@ -7478,8 +5913,33 @@ internal static class Planner
                 ? new List<string>(env.Targets[i].Choices.Length)
                 : null;
 
-            var choice = env.Targets[i].Best(after[step[i]], monsters[step[i]],
-                env, taggedAfter, step[i], distinct, out var chose);
+            var choice = env.Targets[i].Best(after[step[i]], monsters[step[i]] + monstersExtra[step[i]],
+                env, taggedAfter, step[i], distinct, out var chose, tractionOf[t], rareTractionOf[t],
+                PowerPassedTo(step[i]));
+
+            // The combination the full chain took, when ScoreOfEachBlast has pinned it, so that passes with fewer
+            // sources differ in the sources alone.
+            if (_pinnedChoices != null && i < _pinnedChoices.Length && _pinnedChoices[i] >= 0 &&
+                env.Targets[i].Choices is { } offered && _pinnedChoices[i] < offered.Length)
+            {
+                chose = _pinnedChoices[i];
+                choice = offered[chose];
+            }
+
+            // Gaining Traction on the waves this combination has over the remnant's own recipe, which its reward
+            // counts at face value. See PlanTarget.TractionOfChoice.
+            var tractionOfChoice = env.Targets[i].TractionOfChoice(chose, tractionOf[t], rareTractionOf[t]);
+
+            // What its runes' "own" effects do to its own waves, and the combination kept for the payout below,
+            // which scales the same parts. See PlanTarget.OwnOfChoice.
+            var ownOfChoice = env.Targets[i].OwnOfChoice(chose, tractionOf[t], rareTractionOf[t]);
+
+            content += tractionOfChoice + ownOfChoice + choice.Reward;
+            ContentToLink(step[i], tractionOfChoice + ownOfChoice + choice.Reward);
+            _chosenOf[t] = chose;
+
+            if (perLink)
+                _chosenByTarget[i] = chose;
 
             // The decision, kept where the readouts can see it. Detail only: the search runs this
             // millions of times and only the last pass describes the chain anybody is looking at.
@@ -7500,7 +5960,7 @@ internal static class Planner
                     target.Named is { Length: > 0 } named && chose >= 0 && chose < named.Length
                         ? named[chose]
                         : "(unnamed)",
-                    (choice.Locals?.Length ?? 0) + (choice.Runes?.Length ?? 0),
+                    RunesInLocals(choice.Locals) + (choice.Runes?.Length ?? 0),
                     choice.Carries,
                     DiscountedForDuplicates(env, target, choice.Runes, choice.Carries, step[i], distinct),
                     choice.Local,
@@ -7509,10 +5969,10 @@ internal static class Planner
                     target.Recipes is { Length: > 0 } ids && chose >= 0 && chose < ids.Length
                         ? ids[chose] ?? ""
                         : "",
-                    choice.Reward);
+                    choice.Reward,
+                    target.OwnOfChoice(chose, tractionOf[t], rareTractionOf[t]),
+                    (float)after[step[i]]);
             }
-
-            content += choice.Reward;
 
             // The runes that stay put, worth their percentage of THIS blast. Outside the stacking
             // question entirely: a local rune reaches one explosive's worth of monsters, so two
@@ -7567,6 +6027,8 @@ internal static class Planner
                 _localCarry = Grow(_localCarry, locals + 1);
                 _localRunes[locals] = choice.Locals;
                 _localCarry[locals] = choice.Runes;
+                _localSlots = Grow(_localSlots, locals + 1);
+                _localSlots[locals] = env.Targets[i].SlotRunesOfChoice(chose);
 
                 // **The two lists between the combination's runes and what gets booked**, because a
                 // rune can be lost at either hop and the dump could not say which.
@@ -7593,11 +6055,21 @@ internal static class Planner
                 // come out of the inherited count or they are counted as arriving from
                 // somewhere else.
                 _localOwn[locals] = choice.Runes?.Length ?? 0;
-                _localCount[locals] = choice.Locals?.Length ?? 0;
+                _localCount[locals] = RunesInLocals(choice.Locals);
                 _localReach[locals] = after[step[i]];
                 _localAt = Grow(_localAt, locals + 1);
                 _localAt[locals] = step[i];
                 locals++;
+            }
+
+            // **Nothing sent from a link past the cutoff**, when ScoreOfEachBlast is scoring with fewer sources. What it
+            // catches is still content; a switch it repeats is still taken back.
+            if (!SendsFrom(step[i]))
+            {
+                foreach (var (id, _, _, weight) in env.Targets[i].NonStacking ?? [])
+                    Credit(id, weight, step[i]);
+
+                continue;
             }
 
             // What this object passes on to particular kinds of thing. Nothing reaches here unless
@@ -7622,7 +6094,15 @@ internal static class Planner
                 // remnants both propagating the same scoped rune are one credit between them.
                 // Booked per rune AND tag, so one rune reaching two things is two credits and
                 // rightly.
-                Book(rune, percent, got, tag, step[i], CellKeyOf(env.Targets[i].Grid), true, flat);
+                // Its own remnant's waves only from its slot onward. See PlanTarget.WaveShareOfCarried.
+                var share = env.Targets[i].WaveShareOfCarried(chose, rune);
+
+                if (share < 1f)
+                    got = MathF.Max(0f, got - (1f - share) *
+                        env.Targets[i].OwnWavesOfTag(tag, tractionOf[t], rareTractionOf[t]));
+
+                Book(rune, percent, got, tag, step[i], CellKeyOf(env.Targets[i].Grid), true, flat,
+                    env.Targets[i].HeldLiftsOfChoice(chose));
             }
 
             var spread = env.Targets[i].Spread;
@@ -7662,9 +6142,18 @@ internal static class Planner
             {
                 foreach (var (id, weight) in runes)
                 {
-                    if (weight > 0f && id != null)
-                        Book(id, weight, after[step[i]], -1, step[i],
-                            CellKeyOf(env.Targets[i].Grid), true);
+                    if (weight <= 0f || id == null)
+                        continue;
+
+                    // Its own remnant's waves only from its slot onward. See PlanTarget.WaveShareOfCarried.
+                    var share = env.Targets[i].WaveShareOfCarried(chose, id);
+                    var reach = share < 1f
+                        ? MathF.Max(0f, after[step[i]] - (1f - share) *
+                            env.Targets[i].OwnWavesOfTag(-1, tractionOf[t], rareTractionOf[t]))
+                        : after[step[i]];
+
+                    Book(id, weight, reach, -1, step[i],
+                        CellKeyOf(env.Targets[i].Grid), true, heldLifts: env.Targets[i].HeldLiftsOfChoice(chose));
                 }
             }
             else if (choice.Carries > 0f)
@@ -7679,7 +6168,8 @@ internal static class Planner
                 // flat where it does not. See PlanTarget.Once.
                 if (env.Targets[i].Once.Length == 0)
                     Rate(env.Targets[i].Group, Tags.Monsters, step[i], choice.Carries,
-                        $"({env.Targets[i].Grid.X:0},{env.Targets[i].Grid.Y:0}) carries");
+                        // Formatted only for the dump, which is the only reader. See Rate.
+                        detail ? $"({env.Targets[i].Grid.X:0},{env.Targets[i].Grid.Y:0}) carries" : null);
                 else
                     Book(env.Targets[i].Once, choice.Carries, after[step[i]], -1, step[i]);
             }
@@ -7706,7 +6196,7 @@ internal static class Planner
                         Book(id, percent, reach, tag, step[i]);
                 }
 
-                Credit(id, weight);
+                Credit(id, weight, step[i]);
             }
         }
 
@@ -7728,12 +6218,34 @@ internal static class Planner
 
         // Each booking is one modifier, credited once, at the earliest link that offered it.
         // (the held ordinary runes are cleared before the collection loop - see _localsOf)
+        // A lift is one per effect however many tags its rune is booked under, so the second booking of the same effect
+        // pays its share and not its lift again. See Rate.
+        var liftedCount = 0;
+
+        _liftedEffects = Grow(_liftedEffects, Math.Max(distinct, 1));
+
         for (var r = 0; r < distinct; r++)
         {
+            var effect = _carriedEffect[r];
+
+            if (effect >= 0)
+            {
+                var already = false;
+
+                for (var e = 0; e < liftedCount && !already; e++)
+                    already = _liftedEffects[e] == effect;
+
+                if (already)
+                    effect = -1;
+                else
+                    _liftedEffects[liftedCount++] = effect;
+            }
+
             if (_carriedFlat != null && r < _carriedFlat.Length && _carriedFlat[r])
                 Flat(_carriedTag[r], _carriedAt[r], _carriedWeights[r]);
             else
-                Rate(_carriedGroup[r], _carriedTag[r], _carriedAt[r], _carriedWeights[r]);
+                Rate(_carriedGroup[r], _carriedTag[r], _carriedAt[r], _carriedWeights[r], null, effect,
+                    _carriedLiftScale[r], _carriedRune[r] || IsRuneName(_carriedNames[r]));
         }
 
         // **One walk down the chain, paying each class of thing what it is actually worth.**
@@ -7752,8 +6264,16 @@ internal static class Planner
 
         _prefix = prefix;
 
+        // The running sum of the shares no rune contributed. See ratesWithoutRunes.
+        var prefixWithoutRunes = Grow(_prefixWithoutRunes, groups * width);
+
+        _prefixWithoutRunes = prefixWithoutRunes;
+
         for (var i = 0; i < groups * width; i++)
+        {
             prefix[i] = 0f;
+            prefixWithoutRunes[i] = 0f;
+        }
 
         // The same running sum for the flat amounts. One per class rather than per group and class,
         // for the reason flats gives.
@@ -7770,20 +6290,52 @@ internal static class Planner
         // The empowering effects in force by this link, accumulated exactly as the prefix is - an
         // effect reaches the links after it and not the ones before, and that is the whole of why
         // both of these are running sums over s rather than totals.
+        // Each amplifier class's lift accumulated down the chain, what it comes to with the classes lifting it applied,
+        // and the factor each set of classes puts on the shares it lifts. lifted is all of them together, for the
+        // readouts and for an environment with no amplification table. See Amplification.
         var lifted = 0d;
+        var amplified = env.Amplified;
+        var liftedOf = _liftedOf = Grow(_liftedOf, amplifiers);
+        var effective = _effective = Grow(_effective, amplifiers);
+        var factors = _factors = Grow(_factors, 1 << Math.Max(1, amplifiers));
+        var markerLifts = _markerLifts = Grow(_markerLifts, amplifiers);
+        var markerEffective = _markerEffective = Grow(_markerEffective, amplifiers);
+        var markerFactors = _markerFactors = Grow(_markerFactors, 1 << Math.Max(1, amplifiers));
+        var mineLifts = _mineLifts = Grow(_mineLifts, amplifiers);
+        var chainLifts = _chainLifts = Grow(_chainLifts, amplifiers);
+
+        for (var a = 0; a < amplifiers; a++)
+            liftedOf[a] = 0d;
 
         if (detail)
             _liftedFrom = -1;
 
+        var paying = new Phase(PhaseSettlePayout);
+
         for (var s = 0; s < links; s++)
         {
             for (var i = 0; i < groups * width; i++)
+            {
                 prefix[i] += rates[i * links + s];
+                prefixWithoutRunes[i] += ratesWithoutRunes[i * links + s];
+            }
 
             for (var k = 0; k < width; k++)
                 flatly[k] += flats[k * links + s];
 
-            lifted += lifts[s];
+            for (var a = 0; a < amplifiers; a++)
+                liftedOf[a] += lifts[a * links + s];
+
+            if (amplified != null)
+            {
+                amplified.Effective(liftedOf, effective);
+                amplified.FactorsOfMasks(effective, factors);
+                lifted = factors[(1 << amplifiers) - 1] - 1d;
+            }
+            else
+            {
+                lifted = liftedOf[0];
+            }
 
             // **Which links it actually reaches, because "every payout" is not true.**
             //
@@ -7801,7 +6353,7 @@ internal static class Planner
                     : $"{1d + lifted:0.###}x from link {_liftedFrom + 1} onwards - " +
                       $"{links - _liftedFrom} of {links} links scaled, the earlier ones untouched";
 
-                RecordFactorsAtLink(env, s, prefix, groups, width, lifted, distinct);
+                RecordFactorsAtLink(env, s, prefix, groups, width, lifted, factors, distinct);
             }
 
             for (var c = 1; c < classes; c++)
@@ -7816,7 +6368,8 @@ internal static class Planner
                 // the class is WORTH, so it is paid on the weight; a flat effect adds a fixed amount
                 // to each thing of the class, so the only thing that can pay it is the count. See
                 // Planner.Counts, which exists for this term alone.
-                var paid = weight * (Multiplied(prefix, null, groups, width, c, lifted) - 1d) +
+                var paid = weight * (Multiplied(prefix, null, groups, width, c, lifted, amplified, factors,
+                               env.IncreaseBaseOfGroup) - 1d) +
                            many * Flatly(flatly, width, c);
 
                 propagation += paid;
@@ -7837,7 +6390,92 @@ internal static class Planner
                     env.Targets[i].Parts is not { Length: > 0 } waving)
                     continue;
 
-                var own = LocalSharesOfMarker(env, _localsOf, t, groups, s, distinct, out var mineLift);
+                var own = LocalSharesOfMarker(env, _localsOf, t, groups, s, distinct, mineLifts);
+                var mineLift = 0d;
+
+                // **A lift passed in from an earlier link misses this remnant's first wave.** What was booked at this
+                // link is the remnant's own carried rune, already on its slot's share of the waves; what arrived from
+                // before reaches all but wave 1. See PlanTarget.ShareOfWavesPassedLift.
+                var passedShare = env.Targets[i].ShareOfWavesPassedLift;
+                var passedCut = false;
+
+                for (var a = 0; a < amplifiers; a++)
+                {
+                    var here = lifts[a * links + s];
+                    var arrived = liftedOf[a] - here;
+
+                    chainLifts[a] = arrived * passedShare + here;
+                    passedCut |= passedShare < 1f && arrived > 0d;
+                }
+
+                var markerLifted = lifted;
+
+                // **Per class, the stronger of the chain's lift and this remnant's own**, then the classes lifting each
+                // applied, as the chain's are. With one class this is the maximum it always was. See Amplification.
+                if (amplified != null)
+                {
+                    var any = false;
+
+                    for (var a = 0; a < amplifiers; a++)
+                    {
+                        markerLifts[a] = Math.Max(chainLifts[a], mineLifts[a]);
+                        any |= mineLifts[a] > 0d;
+                    }
+
+                    if (passedCut && !any)
+                    {
+                        amplified.Effective(markerLifts, markerEffective);
+                        amplified.FactorsOfMasks(markerEffective, markerFactors);
+                        markerLifted = markerFactors[(1 << amplifiers) - 1] - 1d;
+                    }
+                    else if (any)
+                    {
+                        amplified.Effective(markerLifts, markerEffective);
+                        amplified.FactorsOfMasks(markerEffective, markerFactors);
+
+                        var mineProduct = 1d;
+
+                        for (var a = 0; a < amplifiers; a++)
+                            mineProduct *= 1d + mineLifts[a];
+
+                        mineLift = mineProduct - 1d;
+                    }
+                    else
+                    {
+                        for (var m = 0; m < 1 << amplifiers; m++)
+                            markerFactors[m] = factors[m];
+                    }
+                }
+                else
+                {
+                    mineLift = mineLifts[0];
+                    markerLifted = chainLifts[0];
+                }
+
+                // **The rate a Power passed in from earlier links brings to these waves**, the rune class's, wave 1 cut.
+                // Its own effects' bonuses are lifted by it, in the content here and in the payout below. Not where the
+                // remnant holds a Power itself: Weighing.OwnEffectsOfRunes has lifted them by that already, and two
+                // Powers on one remnant's waves do not stack. See PlanTarget.OwnFactorsOfPart.
+                var runeClass = amplified?.RuneClass ?? 0;
+                var holdsPower = env.Targets[i].HeldLiftsOfChoice(_chosenOf[t]) is { } heldLiftsHere &&
+                                 runeClass >= 0 && runeClass < heldLiftsHere.Length && heldLiftsHere[runeClass] > 0f;
+                // Uncut: each own effect takes the share of its waves the lift reaches. See PlanTarget.OwnFactorsOfPart.
+                var ownLift = !holdsPower && runeClass >= 0 && runeClass < amplifiers
+                    ? liftedOf[runeClass] - lifts[runeClass * links + s]
+                    : 0d;
+
+                if (ownLift > 0d)
+                {
+                    var ownLifted = env.Targets[i].OwnOfChoice(_chosenOf[t], tractionOf[t], rareTractionOf[t], ownLift);
+
+                    var ownGained = ownLifted - env.Targets[i].OwnOfChoice(_chosenOf[t], tractionOf[t], rareTractionOf[t]);
+
+                    content += ownGained;
+                    ContentToLink(s, ownGained);
+
+                    if (detail)
+                        OwnEffectsUnderPassedPower[CellKeyOf(env.Targets[i].Grid)] = (ownLift, ownLifted);
+                }
 
                 // **Both figures, because a tie has no single owner.**
                 //
@@ -7853,8 +6491,18 @@ internal static class Planner
                 if (detail && (mineLift > 0d || lifted > 0d))
                     _lifting[CellKeyOf(env.Targets[i].Grid)] = (mineLift, lifted);
 
-                foreach (var (mask, part, many) in waving)
+                foreach (var (mask, listedPart, listedMany) in waving)
                 {
+                    // Its magic and rare waves as Gaining Traction grows them. See the bonus above.
+                    var scale = (mask & (1L << Tags.Rares)) != 0L ? rareTractionOf[t]
+                        : (mask & (1L << Tags.Magics)) != 0L ? tractionOf[t]
+                        : normalTractionOf[t];
+                    // And the "own" effects of the combination taken, their bonuses lifted by the Power reaching
+                    // these waves. See PlanTarget.OwnFactorsOfPart.
+                    var (ownWorth, ownMany) = env.Targets[i].OwnFactorsOfPart(_chosenOf[t], mask, ownLift);
+                    var part = listedPart * scale * ownWorth;
+                    var many = listedMany * scale * ownMany;
+
                     if (part <= 0f && many <= 0f)
                         continue;
 
@@ -7897,13 +6545,12 @@ internal static class Planner
                     // whichever side the lift sits on. Nobody is paid for a Power rune with nothing to
                     // empower. See Weighing.GroupKeyOfEffect.
                     //
-                    // **The lift still reaches relic shares as well as rune ones**, which it always
-                    // did and which is not obviously right - "Runes gain" names runes. Confining it
-                    // would need per-share provenance beside rates, since a relic and a rune can be
-                    // typed into the same stat group, so it is left as it was rather than changed
-                    // twice in one pass.
+                    // **The lift reaches only the shares of runes the empowering effect names**, held in
+                    // twin groups - see PlanEnvironment.EmpowerableTwinOfGroup. Relic shares and the
+                    // runes it does not name are not lifted. On an environment without twins, one read
+                    // back from a file, it reaches every share, as it did before.
                     var paid = part * (Multiplied(prefix, own, groups, width, cls,
-                                  Math.Max(lifted, mineLift)) - 1d) +
+                                  Math.Max(markerLifted, mineLift), amplified, markerFactors, env.IncreaseBaseOfGroup) - 1d) +
                                many * Flatly(flatly, width, cls);
 
                     propagation += paid;
@@ -7912,8 +6559,37 @@ internal static class Planner
                     if (detail)
                         pooled += part * Added(prefix, own, groups, width, cls);
                 }
+
+                // **What the remnant's "per" effects add, lifted by the shares reaching their row.** A row tagged
+                // unaffected_by_runes takes the shares no rune contributed - relics, and the map's increases through
+                // the base - and no lift; any other row takes the chain's as a part does. Their face value is in
+                // content already. See PlanTarget.CreatedOfEntry and Tags.UnaffectedByRunes.
+                if (env.Targets[i].CreatedOfChoices is { } createdAll && _chosenOf[t] >= 0 &&
+                    _chosenOf[t] < createdAll.Length && createdAll[_chosenOf[t]] is { } created)
+                {
+                    foreach (var entry in created)
+                    {
+                        var worth = env.Targets[i].CreatedOfEntry(_chosenOf[t], entry, tractionOf[t],
+                            rareTractionOf[t], ownLift);
+
+                        if (worth <= 0f)
+                            continue;
+
+                        var cls = ClassOfMask(env, entry.Mask);
+                        var paid = entry.UnaffectedByRunes
+                            ? worth * (Multiplied(prefixWithoutRunes, null, groups, width, cls, 0d, null, null,
+                                env.IncreaseBaseOfGroup) - 1d)
+                            : worth * (Multiplied(prefix, own, groups, width, cls, Math.Max(markerLifted, mineLift),
+                                amplified, markerFactors, env.IncreaseBaseOfGroup) - 1d);
+
+                        propagation += paid;
+                        CreditToLink(detail, s, paid);
+                    }
+                }
             }
         }
+
+        paying.Dispose();
 
         // **The stacking bonus is gone, because the payout now stacks.**
         //
@@ -7970,7 +6646,7 @@ internal static class Planner
                 if (hit < 0)
                     continue;
 
-                var mine = already.Best(after[hit], monsters[hit], env, taggedAfter, hit, 0, out _);
+                var mine = already.Best(after[hit], monsters[hit], env, taggedAfter, hit, 0, out var mineChose);
 
                 _localCount = Grow(_localCount, locals + 1);
                 _localReach = Grow(_localReach, locals + 1);
@@ -7980,11 +6656,13 @@ internal static class Planner
 
                 _localCarry = Grow(_localCarry, locals + 1);
                 _localCarry[locals] = mine.Runes;
+                _localSlots = Grow(_localSlots, locals + 1);
+                _localSlots[locals] = already.SlotRunesOfChoice(mineChose);
                 _localRunes[locals] = mine.Locals;
                 _localGrid[locals] = ((int)MathF.Round(already.Grid.X),
                     (int)MathF.Round(already.Grid.Y));
                 _localOwn[locals] = mine.Runes?.Length ?? 0;
-                _localCount[locals] = mine.Locals?.Length ?? 0;
+                _localCount[locals] = RunesInLocals(mine.Locals);
                 _localReach[locals] = after[hit];
                 _localAt = Grow(_localAt, locals + 1);
                 _localAt[locals] = hit;
@@ -7992,7 +6670,8 @@ internal static class Planner
             }
         }
 
-        Locally(env, distinct, locals, detail);
+        using (new Phase(PhaseSettleLocally))
+            Locally(env, distinct, locals, detail);
 
         // **What each link was credited with, published for the audit.**
         //
@@ -8009,12 +6688,12 @@ internal static class Planner
 
             Credits = credits;
 
-            var factors = new string[chain.Count];
+            var factorsSaid = new string[chain.Count];
 
             for (var k = 0; k < chain.Count && _factored != null && k < _factored.Length; k++)
-                factors[k] = _factored[k] ?? "";
+                factorsSaid[k] = _factored[k] ?? "";
 
-            Factors = factors;
+            Factors = factorsSaid;
         }
 
         // Every grant of a switch after the first. Taken off content rather than never added,
@@ -8042,8 +6721,46 @@ internal static class Planner
             Pooled = pooled;
         }
 
+        // **The marker taken last is held only when the chain's final link catches it.** It is a must take, so a chain
+        // that catches it earlier loses one must take's credit and ranks as a chain that missed one: every chain
+        // ending on it comes before every chain that does not, and the ranking is otherwise unchanged. Here, where the
+        // whole scorer and the incremental one meet, so both agree. See PlanEnvironment.TakenLast.
+        // **What the model expects each remnant's waves to bring, once everything has been paid**, so it uses what the
+        // payout used: the combination chosen, the Gaining Traction scales, and the lift a passed-in Power gave its own
+        // effects, as OwnEffectsUnderPassedPower recorded it (none where it was not lifted). See WavesPredictedByRemnant.
+        if (detail)
+        {
+            for (var t = 0; t < found; t++)
+            {
+                var target = env.Targets[touched[t]];
+
+                if (target.Kind != TargetKind.Remnant || _chosenOf[t] < 0)
+                    continue;
+
+                var cell = CellKeyOf(target.Grid);
+                var paidLift = OwnEffectsUnderPassedPower.TryGetValue(cell, out var under) ? under.Lift : 0d;
+
+                WavesPredictedByRemnant[cell] = PredictedWavesOf(target, _chosenOf[t], normalTractionOf[t], tractionOf[t],
+                    rareTractionOf[t], paidLift);
+            }
+        }
+
+        if (env.TakenLast >= 0 && musts > 0 && TakenBeforeTheFinalLink(env, chain, step, seen, visit))
+            musts -= env.Targets[env.TakenLast].MustWeight;
+
         return new Verdict(content, propagation, travel, covered, steps, each,
             Math.Max(0, env.Musts - musts), env.Refused, musts);
+    }
+
+    /// <summary>
+    /// Whether the chain catches the marker taken last at a link before its final one, so an explosive is placed after
+    /// it. Everything the final blast catches, set-off barrels included, shares its step. See PlanEnvironment.TakenLast.
+    /// </summary>
+    private static bool TakenBeforeTheFinalLink(PlanEnvironment env, List<Vector2> chain, int[] step, int[] seen, int visit)
+    {
+        var last = env.TakenLast;
+
+        return last < seen.Length && seen[last] == visit && step[last] != chain.Count - 1;
     }
 
     /// <summary>
@@ -8076,6 +6793,35 @@ internal static class Planner
         if (table == null)
             return null;
 
+        // **Worked out once per recipe and handed back after that.** Settle asks this twice for every remnant a chain
+        // touches on every trial, and building the array each time was 1,152 of the 1,232 bytes a settle allocated,
+        // measured offline on one Grand site (2026-09-30). The answer depends only on the recipe's rune list and the
+        // weight table, both fixed objects, so it is kept against the list and reused while the table is the same
+        // one. Callers only read it, as they already did the target.Runes returned above.
+        if (RuneWeightsOfRecipe.TryGetValue(chosen, out var kept) && ReferenceEquals(kept.Table, table))
+            return kept.Weights;
+
+        var weights = WeightsOfChosenRunesUncached(table, chosen);
+
+        RuneWeightsOfRecipe.AddOrUpdate(chosen, new RuneWeightsOfChosenRecipe(table, weights));
+
+        return weights;
+    }
+
+    /// <summary>What WeightsOfChosenRunes worked out for a recipe's rune list, and the table it was read from.</summary>
+    private sealed record RuneWeightsOfChosenRecipe((string Id, float Weight)[] Table, (string Id, float Weight)[] Weights);
+
+    /// <summary>
+    /// WeightsOfChosenRunes' answers, kept against each recipe's rune list and dropped with it. See
+    /// WeightsOfChosenRunes.
+    /// </summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<string[], RuneWeightsOfChosenRecipe>
+        RuneWeightsOfRecipe = new();
+
+    /// <summary>The body of WeightsOfChosenRunes, without its cache.</summary>
+    private static (string Id, float Weight)[] WeightsOfChosenRunesUncached((string Id, float Weight)[] table,
+        string[] chosen)
+    {
         var found = new (string, float)[chosen.Length];
         var count = 0;
 
@@ -8243,12 +6989,38 @@ internal static class Planner
 
         foreach (var (name, from) in banked)
         {
-            if (from != cell && string.Equals(name, id, StringComparison.OrdinalIgnoreCase))
+            if (IsBankedRuneReaching(env, from, cell) && string.Equals(name, id, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
 
         return false;
     }
+
+    /// <summary>
+    /// Whether a rune banked from one caught remnant reaches the waves of another remnant.
+    ///
+    /// Never its own. Otherwise only forward along the chain: a remnant the chain has yet to take is after every
+    /// explosive already down and receives everything banked, while a caught remnant receives only what was
+    /// banked at or before its own link - the same blast included, as for live links. Every banked rune used to
+    /// reach every caught remnant, so after a re-solve with twelve explosives down the second remnant of the
+    /// chain was credited with runes from the thirteenth. The game passes runes forward only: on a Grand site recorded
+    /// 2026-09-30 the third remnant's monsters carried the runes of the second and none from later links.
+    /// Readout only; the payout books banked carries at the first link, which every link still to plan follows.
+    /// </summary>
+    private static bool IsBankedRuneReaching(PlanEnvironment env, (int X, int Y) from, (int X, int Y) cell)
+    {
+        if (from == cell)
+            return false;
+
+        if (env.LinkOfCaught == null || !env.LinkOfCaught.TryGetValue(cell, out var mine))
+            return true;
+
+        return !env.LinkOfCaught.TryGetValue(from, out var theirs) || theirs <= mine;
+    }
+
+    /// <summary>Whether anything upstream is already sending this rune to the given remnant.</summary>
+    internal static bool IsRuneAlreadySentTo(PlanEnvironment env, PlanTarget target, string id, int at, int distinct) =>
+        IsRuneAlreadySent(env, id, CellKeyOf(target.Grid), at, distinct);
 
     /// <summary>Whether anything upstream is already sending this rune to that remnant.</summary>
     private static bool IsRuneAlreadySent(PlanEnvironment env, string id, (int X, int Y) cell, int at,
@@ -8296,7 +7068,7 @@ internal static class Planner
     /// <summary>Adds to a link's share, when a detailed pass is keeping them. See _credited.</summary>
     private static void CreditToLink(bool detail, int at, double paid)
     {
-        if (detail && _credited != null && at >= 0 && at < _credited.Length)
+        if ((detail || _recordingLinks) && _credited != null && at >= 0 && at < _credited.Length)
             _credited[at] += paid;
     }
 
@@ -8322,7 +7094,7 @@ internal static class Planner
     /// building strings in it.
     /// </summary>
     private static void RecordFactorsAtLink(PlanEnvironment env, int at, float[] prefix, int groups, int width,
-        double lifted, int distinct)
+        double lifted, double[] factors, int distinct)
     {
         _factored = Grow(_factored, Math.Max(at + 1, 1));
 
@@ -8370,7 +7142,13 @@ internal static class Planner
                 if (add == 0f)
                     continue;
 
-            var factor = 1d + add * (1d + lifted);
+            // The lift on this group's shares: its classes' factor where there is a table, and every class together
+            // where there is not. A plain group's mask is nought, so its factor is one. See Amplification.
+            var amplified = env.Amplified;
+            var groupLift = amplified != null && g < amplified.MaskOfGroup.Length
+                ? amplified.LiftedFactorOfGroup(g, factors) - 1d
+                : lifted;
+            var factor = 1d + add * (1d + groupLift);
 
             product.Add(factor.ToString("0.####", CultureInfo.InvariantCulture));
 
@@ -8424,12 +7202,12 @@ internal static class Planner
                 .Append((add * 100d).ToString("0.##", CultureInfo.InvariantCulture))
                 .Append('%');
 
-            if (lifted > 0d)
+            if (groupLift > 0d)
             {
-                said.Append(" empowered x")
-                    .Append((1d + lifted).ToString("0.###", CultureInfo.InvariantCulture))
+                said.Append(" lifted x")
+                    .Append((1d + groupLift).ToString("0.###", CultureInfo.InvariantCulture))
                     .Append(" -> +")
-                    .Append((add * (1d + lifted) * 100d).ToString("0.##", CultureInfo.InvariantCulture))
+                    .Append((add * (1d + groupLift) * 100d).ToString("0.##", CultureInfo.InvariantCulture))
                     .Append('%');
             }
 
@@ -8438,7 +7216,8 @@ internal static class Planner
                     .AppendLine();
             }
 
-            var mult = Multiplied(prefix, null, groups, width, cls, lifted);
+            var mult = Multiplied(prefix, null, groups, width, cls, lifted, env.Amplified, factors,
+                env.IncreaseBaseOfGroup);
 
             said.Append("      ")
                 .Append(Tags.Known[relevant[k]])
@@ -8531,15 +7310,9 @@ internal static class Planner
             // Taken off here rather than never added, because the loop credits the local term before
             // there is a chain to compare against: what reaches a link is not known until every
             // booking is in. Same reason Locally is a post pass at all.
-            var wasted = 0;
-
-            foreach (var (id, worth) in _localRunes[n] ?? [])
-            {
-                if (id == null || !IsRuneBookedUpstream(env, id, mineAt, distinct))
-                    continue;
-
-                wasted++;
-            }
+            // Counted by rune, a lift key as its rune: Power held for its lift is filed as a lift key, and compared
+            // by that name it never matched the Power arriving from upstream. See RunesInLocalsArriving.
+            var wasted = RunesInLocalsArriving(_localRunes[n], id => IsRuneBookedUpstream(env, id, mineAt, distinct));
 
             // **Counted, not charged for.** The duplicate is never paid in the first place now -
             // see Owned, which skips a local rune the chain is already sending to these waves - so
@@ -8609,7 +7382,7 @@ internal static class Planner
                 // one Elsewhere exists to fix, in the half that names them.
                 foreach (var (name, from) in env.BankedRunes ?? [])
                 {
-                    if (from != _localGrid[n] &&
+                    if (IsBankedRuneReaching(env, from, _localGrid[n]) &&
                         !arriving.Contains(name, StringComparer.OrdinalIgnoreCase))
                         arriving.Add(name);
                 }
@@ -8618,6 +7391,49 @@ internal static class Planner
                 // remnant under a placed explosive sends its runes forward as plain rates - see
                 // PlanEnvironment.BankedRunes - so without this it read as the source of nothing while
                 // every later remnant inherited from it.
+                // **Propagated runes the scoring does not price, by name.** A rune worth nothing to the score - one whose
+                // row is an own effect only, as Oath's is - is never booked, so the booked set above cannot name it,
+                // though the game passes it on all the same. A remnant sending Oath read "13 (5+11-3)" with nothing
+                // named, against "14 (5+11-2) Oath" in the combinations window, which counts by name. Taken from each
+                // remnant's chosen propagating sockets: one at or before this link arrives here, and this remnant's own
+                // is one it first sources unless it is already arriving.
+                var unpriced = 0;
+                var unpricedOwn = 0;
+
+                for (var m = 0; m < locals; m++)
+                {
+                    if (m == n || _localCarry == null || m >= _localCarry.Length ||
+                        (_localAt != null && m < _localAt.Length && _localAt[m] > mineAt))
+                        continue;
+
+                    foreach (var id in _localCarry[m] ?? [])
+                    {
+                        if (id == null || adds.Contains(id, StringComparer.OrdinalIgnoreCase) ||
+                            arriving.Contains(id, StringComparer.OrdinalIgnoreCase))
+                            continue;
+
+                        arriving.Add(id);
+                        unpriced++;
+                    }
+                }
+
+                if (_localCarry != null && n < _localCarry.Length && _localCarry[n] is { Length: > 0 } ownCarry)
+                {
+                    var withUnpriced = new List<string>(adds);
+
+                    foreach (var id in ownCarry)
+                    {
+                        if (id != null && !withUnpriced.Contains(id, StringComparer.OrdinalIgnoreCase) &&
+                            !arriving.Contains(id, StringComparer.OrdinalIgnoreCase))
+                        {
+                            withUnpriced.Add(id);
+                            unpricedOwn++;
+                        }
+                    }
+
+                    adds = withUnpriced.ToArray();
+                }
+
                 if (env.BankedRunes is { Length: > 0 } sent)
                 {
                     var mineSent = new List<string>(adds);
@@ -8691,7 +7507,7 @@ internal static class Planner
                 RuneTallyByRemnant[_localGrid[n]] = new RuneTally(
                     // Counts every socket, empowering ones included - they were invisible here too,
                     // which is what made a six socket remnant read five. See LocalSharesOfMarker's lift.
-                    Sockets: (_localRunes[n]?.Length ?? 0) + _localOwn[n],
+                    Sockets: RunesInLocals(_localRunes[n]) + _localOwn[n],
 
                     // Less what it FIRST sources, not less what it holds. Subtracting everything it
                     // holds took the duplicated Time out of the inherited count as well, where it
@@ -8707,13 +7523,20 @@ internal static class Planner
                     // they carried three or seven. A remnant alone in its chain reported 7 (5+3-1) with
                     // nothing else propagating to it. The same mistake _carriedRune exists to prevent
                     // on the booked path, made again on the banked one. See PlanEnvironment.BankedRunes.
-                    Inherited: Math.Max(0, runes - adds.Length) + BankedRunesReaching(env, _localGrid[n]),
+                    // The unpriced runes this remnant first sources were never among the booked ones counted in runes.
+                    Inherited: Math.Max(0, runes - (adds.Length - unpricedOwn)) + unpriced +
+                               BankedRunesReaching(env, _localGrid[n]),
 
                     // Plus a local rune the banked set is already sending here, which the booked
                     // check above cannot see. See PlanEnvironment.BankedRunes.
                     Wasted: wasted + spare + IsAlreadyArriving(env, _localRunes[n], _localGrid[n]),
                     FirstSourced: adds,
-                    Arriving: arriving.ToArray());
+                    Arriving: arriving.ToArray(),
+                    Propagating: _localCarry != null && n < _localCarry.Length ? _localCarry[n] ?? [] : [],
+                    Downstream: DownstreamCarriesOf(n, mineAt, locals),
+                    Empowered: EmpoweredCarriesOf(n),
+                    PerWave: Propagation.RunesPerWave(_localSlots != null && n < _localSlots.Length ? _localSlots[n] : null,
+                        arriving));
             }
         }
     }
@@ -8734,7 +7557,7 @@ internal static class Planner
 
         foreach (var (_, from) in banked)
         {
-            if (from != cell)
+            if (IsBankedRuneReaching(env, from, cell))
                 many++;
         }
 
@@ -8765,7 +7588,7 @@ internal static class Planner
             {
                 // Its own banked runes are its sockets, counted as sockets. Only another remnant's
                 // banking wastes a local slot here.
-                if (from != cell && string.Equals(name, id, StringComparison.OrdinalIgnoreCase))
+                if (IsBankedRuneReaching(env, from, cell) && string.Equals(name, id, StringComparison.OrdinalIgnoreCase))
                 {
                     many++;
 
@@ -8787,6 +7610,26 @@ internal static class Planner
 
     /// <summary>Per link, how much the empowering effects in force there scale everything.</summary>
     [ThreadStatic] private static float[] _lifts;
+
+    /// <summary>Per class: the chain's lift so far, with its lifters applied, and the factors per set of classes. See Settle.</summary>
+    [ThreadStatic] private static double[] _liftedOf;
+
+    [ThreadStatic] private static double[] _effective;
+
+    [ThreadStatic] private static double[] _factors;
+
+    /// <summary>The same for one marker, the stronger of the chain's and its own runes' per class. See Settle.</summary>
+    [ThreadStatic] private static double[] _markerLifts;
+
+    [ThreadStatic] private static double[] _markerEffective;
+
+    [ThreadStatic] private static double[] _markerFactors;
+
+    /// <summary>One marker's own runes' lift per class. See LocalSharesOfMarker.</summary>
+    [ThreadStatic] private static double[] _mineLifts;
+
+    /// <summary>The chain's lift per class as it reaches one remnant's waves, wave 1 cut. See PlanTarget.ShareOfWavesPassedLift.</summary>
+    [ThreadStatic] private static double[] _chainLifts;
 
     /// <summary>
     /// What the empowering effects came to on the last scored chain, for the dump.
@@ -8831,6 +7674,9 @@ internal static class Planner
     /// Carrying.
     /// </summary>
     [ThreadStatic] private static string[][] _localCarry;
+
+    /// <summary>The rune in each slot of each local's chosen recipe, for its count per wave. See RuneTally.PerWave.</summary>
+    [ThreadStatic] private static string[][] _localSlots;
 
     /// <summary>
     /// Every rune the remnant could carry, with the weight Runes.Weight gave it. From
@@ -8892,9 +7738,24 @@ internal static class Planner
     /// does, because only the first one is credited.
     /// </param>
     /// <param name="Arriving">Every rune reaching this remnant from anywhere else, by name.</param>
+    /// <param name="Propagating">The runes this remnant's chosen combination propagates, in socket order.</param>
+    /// <param name="Downstream">The runes a later remnant in the chain propagates with the combination it is taking.</param>
+    /// <param name="Empowered">
+    /// The runes in Propagating the game sends down the chain empowered, because the same combination holds Power. Every
+    /// one of them, not only those the scoring lifts. See EmpoweredCarriesOf.
+    /// </param>
+    /// <param name="PerWave">
+    /// How many distinct runes each wave's monsters carry, wave 1 first, from the chosen recipe's slots and Arriving;
+    /// null when the slots are not known. The last wave has every slot in force, so it should equal Total. See
+    /// Propagation.RunesPerWave.
+    /// </param>
     internal readonly record struct RuneTally(int Sockets, int Inherited, int Wasted,
         string[] FirstSourced,
-        string[] Arriving = null)
+        string[] Arriving = null,
+        string[] Propagating = null,
+        string[] Downstream = null,
+        string[] Empowered = null,
+        int[] PerWave = null)
     {
         /// <summary>Distinct runes actually reaching these waves. The number drawn under a remnant.</summary>
         public int Total => Math.Max(0, Sockets + Inherited - Wasted);
@@ -8923,18 +7784,73 @@ internal static class Planner
     /// depend on which combination it ends up taking - every earlier link has already chosen. That is
     /// what makes this answerable for a row nobody has picked.
     /// </summary>
+    /// <summary>
+    /// The runes later remnants in the chain propagate with the combinations they are taking, by name: those at a later
+    /// link than this one. For the line under a remnant, which marks a rune it sends that a later remnant sends too.
+    /// </summary>
+    private static string[] DownstreamCarriesOf(int n, int mineAt, int locals)
+    {
+        var found = new List<string>();
+
+        for (var m = 0; m < locals; m++)
+        {
+            if (m == n || _localCarry == null || m >= _localCarry.Length || _localAt == null || m >= _localAt.Length ||
+                _localAt[m] <= mineAt)
+                continue;
+
+            foreach (var id in _localCarry[m] ?? [])
+            {
+                if (id != null && !found.Contains(id, StringComparer.OrdinalIgnoreCase))
+                    found.Add(id);
+            }
+        }
+
+        return found.ToArray();
+    }
+
+    /// <summary>
+    /// The runes local n propagates that the game sends empowered: all of them when its combination holds Power in any
+    /// socket, less a rune that only lifts others and so has nothing to empower, Power itself among them.
+    ///
+    /// **Every propagated rune, not the ones the scoring lifts.** Measured across the recordings (2026-10-01): a remnant
+    /// holding Power sent Death, Soul, Vision, Celestial, Adaptive, Moon, Toxic and Stone down the chain empowered. The
+    /// scoring lifts only the runes whose table row carries the tag Power lifts - HeldFactorOfEffect - because doubling
+    /// the others pays nothing, so this line can mark a rune the plan scores the same either way. Only Power was
+    /// measured; another rune holding a lift is not taken to do the same. See RuneTally.Empowered.
+    /// </summary>
+    private static string[] EmpoweredCarriesOf(int n) =>
+        EmpoweredCarriesOfCombination(_localCarry != null && n < _localCarry.Length ? _localCarry[n] : null,
+            _localRunes != null && n < _localRunes.Length ? _localRunes[n] : null);
+
+    /// <summary>
+    /// The runes a combination propagates that the game sends empowered, from what it propagates and what its ordinary
+    /// sockets hold. The rule for the line under a remnant and for each row of the Runeshape Combinations window. See
+    /// EmpoweredCarriesOf.
+    /// </summary>
+    internal static string[] EmpoweredCarriesOfCombination(string[] carried, (string Id, float Worth)[] locals)
+    {
+        if (carried is not { Length: > 0 })
+            return [];
+
+        var holdsPower = carried.Any(IsPower) || (locals ?? []).Any(x => IsPower(Weighing.BaseOfLiftKey(x.Id)));
+
+        if (!holdsPower)
+            return [];
+
+        return carried.Where(id => id != null && (Weighing.LiftsOfRune(id) == null || Weighing.HasShareEffect(id)))
+            .ToArray();
+
+        static bool IsPower(string id) => string.Equals(id, "power", StringComparison.OrdinalIgnoreCase);
+    }
+
     internal static RuneTally RuneTallyOfOption(RuneTally remnant,
-        (string Id, float Worth)[] optionLocals, string[] optionPropagates)
+        (string Id, float Worth)[] optionLocals, string[] optionPropagates, string[] optionSlots = null)
     {
         var arriving = remnant.Arriving ?? [];
         var wasted = 0;
         var adds = new List<string>();
 
-        foreach (var (id, _) in optionLocals ?? [])
-        {
-            if (id != null && arriving.Contains(id, StringComparer.OrdinalIgnoreCase))
-                wasted++;
-        }
+        wasted += RunesInLocalsArriving(optionLocals, id => arriving.Contains(id, StringComparer.OrdinalIgnoreCase));
 
         foreach (var id in optionPropagates ?? [])
         {
@@ -8947,8 +7863,86 @@ internal static class Planner
                 adds.Add(id);
         }
 
-        return new RuneTally((optionLocals?.Length ?? 0) + (optionPropagates?.Length ?? 0), remnant.Inherited,
-            wasted, adds.ToArray(), arriving);
+        return new RuneTally(RunesInLocals(optionLocals) + (optionPropagates?.Length ?? 0), remnant.Inherited,
+            wasted, adds.ToArray(), arriving,
+            Empowered: EmpoweredCarriesOfCombination(optionPropagates, optionLocals),
+            PerWave: Propagation.RunesPerWave(optionSlots, arriving));
+    }
+
+    /// <summary>
+    /// How many runes a combination's local entries are: a rune that adds and lifts has two entries, its share and its
+    /// lift key, and is one rune. See Weighing.LiftKeyOf.
+    /// </summary>
+    /// <summary>
+    /// How many of the runes in a combination's local slots already arrive, counted as RunesInLocals counts them: a lift
+    /// key as its rune, and once only where its rune's share is listed too. On a Grazed Prairie site (2026-10-06) a
+    /// remnant holding Power, filed as its lift key, with Power arriving from upstream read "16 (7+10-1)" against 15
+    /// runes on its last wave. See Weighing.LiftKeyOf.
+    /// </summary>
+    internal static int RunesInLocalsArriving((string Id, float Worth)[] locals, Func<string, bool> arrives)
+    {
+        if (locals is not { Length: > 0 })
+            return 0;
+
+        var count = 0;
+
+        for (var i = 0; i < locals.Length; i++)
+        {
+            var id = locals[i].Id;
+
+            if (id == null)
+                continue;
+
+            var rune = Weighing.BaseOfLiftKey(id);
+
+            if (Weighing.IsLiftKey(id))
+            {
+                var listed = false;
+
+                for (var j = 0; j < locals.Length && !listed; j++)
+                    listed = string.Equals(locals[j].Id, rune, StringComparison.OrdinalIgnoreCase);
+
+                if (listed)
+                    continue;
+            }
+
+            if (arrives(rune))
+                count++;
+        }
+
+        return count;
+    }
+
+    internal static int RunesInLocals((string Id, float Worth)[] locals)
+    {
+        if (locals is not { Length: > 0 })
+            return 0;
+
+        var count = 0;
+
+        for (var i = 0; i < locals.Length; i++)
+        {
+            var id = locals[i].Id;
+
+            if (!Weighing.IsLiftKey(id))
+            {
+                count++;
+
+                continue;
+            }
+
+            // A lift key counts unless its rune's share is listed too.
+            var rune = Weighing.BaseOfLiftKey(id);
+            var listed = false;
+
+            for (var j = 0; j < locals.Length && !listed; j++)
+                listed = string.Equals(locals[j].Id, rune, StringComparison.OrdinalIgnoreCase);
+
+            if (!listed)
+                count++;
+        }
+
+        return count;
     }
 
     /// <summary>A grid position as the cell everything else keys on.</summary>
@@ -8967,6 +7961,206 @@ internal static class Planner
 
     /// <summary>What each remnant's waves are wearing, from the last detailed pass.</summary>
     public static readonly Dictionary<(int X, int Y), RuneTally> RuneTallyByRemnant = new();
+
+    /// <summary>
+    /// How many monsters of each tier the model expects a remnant's waves to bring: with Gaining Traction and the chosen
+    /// combination's own count effects (Bond's x0.33 on rares, say), and with traction but without them. Expected
+    /// counts, not worth.
+    /// </summary>
+    /// <param name="EachWave">
+    /// The same with its own effects, wave by wave from wave 1, each as normal/magic/rare and separated by spaces, from
+    /// Weighing.PacksOfEachWave. Empty when the wave count is not known.
+    /// </param>
+    internal readonly record struct WavesPredicted(float Normal, float Magic, float Rare, float NormalWithoutOwn,
+        float MagicWithoutOwn, float RareWithoutOwn, string EachWave);
+
+    /// <summary>
+    /// Each remnant's WavesPredicted from the last detailed pass, by cell, written beside RuneTallyByRemnant. The census
+    /// records it with the counts it saw, so the model's estimates can be compared with what came over many runs. See
+    /// Spawns.
+    /// </summary>
+    public static readonly Dictionary<(int X, int Y), WavesPredicted> WavesPredictedByRemnant = new();
+
+    /// <summary>
+    /// What the scoring holds a remnant's waves to bring, as monsters by tier, for the census to audit against what came.
+    /// Each term is one the payout pays, counted rather than priced:
+    ///
+    /// - its wave parts, each part's monsters times its tier's Gaining Traction scale and the count factor combination
+    ///   c's own effects put on it under the lift paid (OwnFactorsOfPart);
+    /// - the magic and rare waves combination c has over the remnant's recipe (MagicAndRareWavesOfChoices), as monsters
+    ///   at the parts' worth apiece, on the same scales and factors, as TractionOfChoice and OwnOfChoice pay them;
+    /// - the monsters its "per" effects add, in the tier of the row they add (CreatedCountOfEntry, which CreatedOfEntry
+    ///   prices).
+    ///
+    /// Without its own effects is the first two with no own factor and nothing added. Wave by wave, the first two
+    /// follow Weighing.PacksOfEachWave's share of each tier and the added monsters the waves from their slot's on - the
+    /// scoring itself is not wave by wave, so that split is the wave model's shape and not a figure the solver pays.
+    /// </summary>
+    private static WavesPredicted PredictedWavesOf(PlanTarget target, int c, float normalScale, float magicScale,
+        float rareScale, double lift)
+    {
+        float normal = 0f, magic = 0f, rare = 0f, normalWithout = 0f, magicWithout = 0f, rareWithout = 0f;
+        float rareWorth = 0f, rareMany = 0f, magicWorth = 0f, magicMany = 0f;
+        long rareMask = 0L, magicMask = 0L;
+
+        foreach (var (mask, worth, many) in target.Parts ?? [])
+        {
+            var isRare = (mask & (1L << Tags.Rares)) != 0L;
+            var isMagic = !isRare && (mask & (1L << Tags.Magics)) != 0L;
+
+            // The worth apiece the choice's extra waves are counted at, over every part of the tier, as
+            // CreatedCountOfEntry counts them.
+            if (isRare)
+            {
+                rareWorth += worth;
+                rareMany += many;
+                rareMask = rareMask == 0L ? mask : rareMask;
+            }
+            else if (isMagic)
+            {
+                magicWorth += worth;
+                magicMany += many;
+                magicMask = magicMask == 0L ? mask : magicMask;
+            }
+
+            if (many <= 0f || (mask & (1L << Tags.Monsters)) == 0L)
+                continue;
+
+            var own = target.OwnFactorsOfPart(c, mask, lift).Many;
+
+            if (isRare)
+            {
+                rareWithout += many * rareScale;
+                rare += many * rareScale * own;
+            }
+            else if (isMagic)
+            {
+                magicWithout += many * magicScale;
+                magic += many * magicScale * own;
+            }
+            else
+            {
+                // As the scorer pays a normal part: Gaining Traction on it (Settle), and its own effects' change on it
+                // unscaled (OwnOfChoice scales rare and magic parts only), so not the product of the two.
+                normalWithout += many * normalScale;
+                normal += many * normalScale + many * (own - 1f);
+            }
+        }
+
+        if (target.MagicAndRareWavesOfChoices is { } changes && c >= 0 && c < changes.Length)
+        {
+            if (rareMask != 0L && rareWorth > 0f && rareMany > 0f)
+            {
+                var extra = changes[c].Rare / (rareWorth / rareMany) * rareScale;
+
+                rareWithout += extra;
+                rare += extra * target.OwnFactorsOfPart(c, rareMask, lift).Many;
+            }
+
+            if (magicMask != 0L && magicWorth > 0f && magicMany > 0f)
+            {
+                var extra = changes[c].Magic / (magicWorth / magicMany) * magicScale;
+
+                magicWithout += extra;
+                magic += extra * target.OwnFactorsOfPart(c, magicMask, lift).Many;
+            }
+        }
+
+        // The wave model's share of each tier, wave by wave, for the split below.
+        var waves = Weighing.PartsOfEachWave(target.WaveCount);
+        var shape = new (float Normal, float Magic, float Rare)[waves.Length];
+        var (allNormal, allMagic, allRare) = (0f, 0f, 0f);
+
+        for (var w = 0; w < waves.Length; w++)
+        {
+            foreach (var (mask, _, many) in waves[w])
+            {
+                if (many <= 0f || (mask & (1L << Tags.Monsters)) == 0L)
+                    continue;
+
+                if ((mask & (1L << Tags.Rares)) != 0L)
+                    shape[w].Rare += many;
+                else if ((mask & (1L << Tags.Magics)) != 0L)
+                    shape[w].Magic += many;
+                else
+                    shape[w].Normal += many;
+            }
+
+            allNormal += shape[w].Normal;
+            allMagic += shape[w].Magic;
+            allRare += shape[w].Rare;
+        }
+
+        var perWave = new (float Normal, float Magic, float Rare)[waves.Length];
+
+        for (var w = 0; w < waves.Length; w++)
+        {
+            perWave[w] = (allNormal > 0f ? normal * shape[w].Normal / allNormal : 0f,
+                allMagic > 0f ? magic * shape[w].Magic / allMagic : 0f,
+                allRare > 0f ? rare * shape[w].Rare / allRare : 0f);
+        }
+
+        // The monsters its "per" effects add, to the totals and to the waves from their slot's on: the last waves holding
+        // the entry's share of the monsters it counts.
+        if (target.CreatedOfChoices is { } createdOfChoices && c >= 0 && c < createdOfChoices.Length &&
+            createdOfChoices[c] is { } entries)
+        {
+            foreach (var entry in entries)
+            {
+                var count = target.CreatedCountOfEntry(c, entry, magicScale, rareScale, lift);
+
+                if (count <= 0f)
+                    continue;
+
+                var tier = (entry.Mask & (1L << Tags.Rares)) != 0L ? 2 : (entry.Mask & (1L << Tags.Magics)) != 0L ? 1 : 0;
+
+                if (tier == 2)
+                    rare += count;
+                else if (tier == 1)
+                    magic += count;
+                else
+                    normal += count;
+
+                float Counted(int w) => entry.Source == Tags.Rares ? shape[w].Rare
+                    : entry.Source == Tags.Magics ? shape[w].Magic
+                    : entry.Source == Tags.Normals ? shape[w].Normal
+                    : shape[w].Normal + shape[w].Magic + shape[w].Rare;
+
+                var whole = 0f;
+
+                for (var w = 0; w < waves.Length; w++)
+                    whole += Counted(w);
+
+                if (whole <= 0f)
+                    continue;
+
+                var first = waves.Length - 1;
+                var reached = Counted(first);
+
+                while (first > 0 && reached / whole < Math.Min(1f, entry.WaveShare) - 0.001f)
+                    reached += Counted(--first);
+
+                for (var w = first; w < waves.Length; w++)
+                {
+                    var added = reached > 0f ? count * Counted(w) / reached : 0f;
+
+                    perWave[w] = tier == 2 ? (perWave[w].Normal, perWave[w].Magic, perWave[w].Rare + added)
+                        : tier == 1 ? (perWave[w].Normal, perWave[w].Magic + added, perWave[w].Rare)
+                        : (perWave[w].Normal + added, perWave[w].Magic, perWave[w].Rare);
+                }
+            }
+        }
+
+        var eachWave = new System.Text.StringBuilder();
+
+        foreach (var (waveNormal, waveMagic, waveRare) in perWave)
+        {
+            eachWave.Append(eachWave.Length > 0 ? " " : "")
+                .Append(System.FormattableString.Invariant($"{waveNormal:0.#}/{waveMagic:0.#}/{waveRare:0.#}"));
+        }
+
+        return new WavesPredicted(normal, magic, rare, normalWithout, magicWithout, rareWithout, eachWave.ToString());
+    }
 
     /// <summary>
     /// Whether RuneTallyByRemnant describes a chain that has since changed under it.
@@ -9003,6 +8197,13 @@ internal static class Planner
     public static readonly Dictionary<(int X, int Y), Picked> Chosen = new();
 
     /// <summary>
+    /// Per remnant a Power reaches from earlier links, on the last detailed pass: the lift on its own waves (wave 1
+    /// cut) and what its combination's own effects then change in those waves, as the payout scored them. For the
+    /// dump, beside the unlifted figure. See Settle's ownLift.
+    /// </summary>
+    public static readonly Dictionary<(int X, int Y), (double Lift, float Own)> OwnEffectsUnderPassedPower = new();
+
+    /// <summary>
     /// How each remnant's combinations ranked, for the cell they stand on. See ChoiceRankingTrail.
     /// </summary>
     public static readonly Dictionary<(int X, int Y), List<string>> Rankings = new();
@@ -9027,8 +8228,11 @@ internal static class Planner
     /// the per-blast figures came to 1,048.5 against a plan whose content was 2,911.6, with the
     /// difference being four remnants' rewards and nothing saying so.
     /// </param>
+    /// <param name="Own">What the combination's own effects add to the remnant's own waves, with Gaining Traction, in points. See PlanTarget.OwnOfChoice.</param>
+    /// <param name="Downstream">The monster pool a rune it carries pays on from this link, in points. See PlanTarget.Best.</param>
     internal readonly record struct Picked(string Reward, int Sockets, float Carries, float Kept,
-        float Local, float Held, string[] Carrying, string Recipe = "", float Worth = 0f);
+        float Local, float Held, string[] Carrying, string Recipe = "", float Worth = 0f, float Own = 0f,
+        float Downstream = 0f);
 
     /// <summary>
     /// Why each remnant's inherited count came out as it did, for the dump. See Locally.
@@ -9225,6 +8429,14 @@ internal static class Planner
 
     [ThreadStatic] private static int[] _carriedGroup;
 
+    /// <summary>Each booking's effect number, and the lift its source's held amplifiers put on its lift. See Book.</summary>
+    [ThreadStatic] private static int[] _carriedEffect;
+
+    [ThreadStatic] private static float[] _carriedLiftScale;
+
+    /// <summary>The effect numbers whose lift the drain has already added this pass, one each. See Settle's drain.</summary>
+    [ThreadStatic] private static int[] _liftedEffects;
+
     /// <summary>
     /// Shares that were rated straight into the product instead of being booked, with what each
     /// one is. Detailed passes only. See Rate and RecordFactorsAtLink.
@@ -9234,6 +8446,9 @@ internal static class Planner
 
     /// <summary>The ordinary runes of each covered marker, kept until its waves are paid.</summary>
     [ThreadStatic] private static (string Id, float Worth)[][] _localsOf;
+
+    /// <summary>The combination each touched marker took, by its position in touched; minus one for none. See Settle.</summary>
+    [ThreadStatic] private static int[] _chosenOf;
     [ThreadStatic] private static bool[] _carriedRune;
 
     /// <summary>
@@ -9250,6 +8465,125 @@ internal static class Planner
     /// the only arrangement in which the two cannot drift again.
     /// </summary>
     [ThreadStatic] private static double[] _credited;
+
+    /// <summary>
+    /// Content per link, booked by Settle at the link that first caught what it belongs to: weight, Gaining Traction,
+    /// own effects, reward, less a repeated switch. Filled on a detailed pass or while _recordingLinks is set.
+    /// </summary>
+    [ThreadStatic] private static double[] _contentAtLink;
+
+    /// <summary>Whether Settle keeps _credited, _contentAtLink and _chosenByTarget on a pass that is not detailed.</summary>
+    [ThreadStatic] private static bool _recordingLinks;
+
+    /// <summary>How many links the last recorded pass scored, the head of laid explosives included.</summary>
+    [ThreadStatic] private static int _linksRecorded;
+
+    /// <summary>The combination each target took on the last recorded pass, by target index, or -1.</summary>
+    [ThreadStatic] private static int[] _chosenByTarget;
+
+    /// <summary>Combinations Settle takes instead of choosing, by target index, -1 for none. See ScoreOfEachBlast.</summary>
+    [ThreadStatic] private static int[] _pinnedChoices;
+
+    /// <summary>Whether only objects caught up to _sourcesThrough send anything. See SendsFrom.</summary>
+    [ThreadStatic] private static bool _sourcesLimited;
+
+    [ThreadStatic] private static int _sourcesThrough;
+
+    /// <summary>Whether what is caught at this link sends anything on the current pass. See ScoreOfEachBlast.</summary>
+    private static bool SendsFrom(int link) => !_sourcesLimited || link <= _sourcesThrough;
+
+    /// <summary>
+    /// What each blast adds, as the blast labels draw it. Content and Propagation are what is paid at the blast;
+    /// ToLaterBlasts is what the objects it catches add at the blasts after it. The first two add up across the chain to
+    /// ChainContent and ChainPropagation, the chain's own figures; PinnedContent and PinnedPropagation are the chain
+    /// scored with every combination pinned, which must match them. See ScoreOfEachBlast.
+    /// </summary>
+    internal sealed record BlastScores(List<(double Content, double Propagation, double ToLaterBlasts)> Each,
+        double ChainContent, double ChainPropagation, double PinnedContent, double PinnedPropagation);
+
+    /// <summary>
+    /// What each blast in the chain adds to the score when it goes off, and what the objects it catches add to the
+    /// blasts after it.
+    ///
+    /// What a blast adds is what Settle books at its link: the content of everything it is first to catch - weight,
+    /// Gaining Traction from the remnants before, own effects, reward - and the propagation paid on what it unearths,
+    /// from its own runes and every earlier blast's. With the combinations fixed, nothing after a link changes what is
+    /// booked at it, so these add up to the chain's score and the sum over the first k blasts is the score of the chain
+    /// stopped there.
+    ///
+    /// What it adds to later blasts is what its objects send: their runes and relic effects, the lifts they hold, and
+    /// the Traction their completion gives the remnants after. The chain is scored once per link with only the objects
+    /// caught up to that link sending anything; what the blasts after a link gain when its objects start sending is
+    /// its figure. These overlap with the later blasts' own figures, being part of them, so they do not add up to
+    /// anything. Where two senders compound - a Power at link 9 lifting a rune first sent at link 12 - the
+    /// compounding goes to the later sender. Every combination is pinned to the one the full chain takes, so the passes
+    /// differ in their senders alone.
+    /// </summary>
+    internal static BlastScores ScoreOfEachBlast(PlanEnvironment env, List<Vector2> chain)
+    {
+        if (env == null || chain is not { Count: > 0 })
+            return null;
+
+        try
+        {
+            _recordingLinks = true;
+            _pinnedChoices = null;
+            _sourcesLimited = false;
+
+            var full = Evaluate(env, chain);
+
+            if (double.IsNegativeInfinity(full.Content))
+                return null;
+
+            var links = _linksRecorded;
+            var contentAt = new double[links];
+            var propagationAt = new double[links];
+
+            Array.Copy(_contentAtLink, contentAt, links);
+            Array.Copy(_credited, propagationAt, links);
+
+            _pinnedChoices = (int[])_chosenByTarget.Clone();
+            _sourcesLimited = true;
+
+            // What is booked at each link with only the objects caught up to link k sending, k from -1.
+            var bookedWithSenders = new double[links + 1][];
+            var pinned = (Content: 0d, Propagation: 0d);
+
+            for (var k = -1; k < links; k++)
+            {
+                _sourcesThrough = k;
+
+                var scored = Evaluate(env, chain);
+                var booked = new double[links];
+
+                for (var j = 0; j < links; j++)
+                    booked[j] = _contentAtLink[j] + _credited[j];
+
+                bookedWithSenders[k + 1] = booked;
+                pinned = (scored.Content, scored.Propagation);
+            }
+
+            var each = new List<(double Content, double Propagation, double ToLaterBlasts)>(links);
+
+            for (var s = 0; s < links; s++)
+            {
+                var toLater = 0d;
+
+                for (var j = s + 1; j < links; j++)
+                    toLater += bookedWithSenders[s + 1][j] - bookedWithSenders[s][j];
+
+                each.Add((contentAt[s], propagationAt[s], toLater));
+            }
+
+            return new BlastScores(each, full.Content, full.Propagation, pinned.Content, pinned.Propagation);
+        }
+        finally
+        {
+            _recordingLinks = false;
+            _pinnedChoices = null;
+            _sourcesLimited = false;
+        }
+    }
 
     [ThreadStatic] private static int[] _carriedIds;
 
@@ -9294,6 +8628,167 @@ internal static class Planner
     ///
     /// Doubled rather than fitted, so a chain that needs thirty does not reallocate fourteen times.
     /// </summary>
+    /// <summary>Settle's Gaining Traction scratch: each touched target's factor, each link's extra monsters, and how
+    /// many remnants each link first catches. See Settle.</summary>
+    [ThreadStatic] private static float[] _tractionOf;
+
+    [ThreadStatic] private static float[] _monstersExtra;
+
+    [ThreadStatic] private static float[] _rareTractionOf;
+
+    /// <summary>Settle's Gaining Traction scratch: each touched remnant's factor on its normal waves. See Settle.</summary>
+    [ThreadStatic] private static float[] _normalTractionOf;
+
+    /// <summary>
+    /// What Gaining Traction multiplies this remnant's normal, magic and rare waves by after so many remnants: its own
+    /// table, worked out from its wave count when the environment was built, or the environment's rule with normals
+    /// untouched where it has none - a layout saved before the pack model. See Weighing.TractionByBeforeOfTarget.
+    /// </summary>
+    internal static (float Normal, float Magic, float Rare) TractionScalesOfTarget(PlanEnvironment env, PlanTarget target, int before)
+    {
+        if (before <= 0)
+            return (1f, 1f, 1f);
+
+        if (target?.TractionByBefore is { Length: > 0 } byBefore)
+            return byBefore[Math.Min(before, byBefore.Length - 1)];
+
+        var (magic, rare) = TractionScales(env, before);
+
+        return (1f, magic, rare);
+    }
+
+    /// <summary>
+    /// What Gaining Traction multiplies a remnant's magic and rare waves by after the given number of remnants: magic
+    /// by its packs, rare by its packs and by the modifiers its modifier chance buys. The rates are the table's Gaining
+    /// Traction row.
+    ///
+    /// **Added to the map's increase, not multiplied on it.** The stat is an increased number of magic and rare packs
+    /// (MapExpedition2RemnantNumberOfMagicAndRarePacksPct...PerRemnantCompleted, 50), and increases add: a pack count
+    /// already at +217% from the map and atlas goes to +267% after one remnant, x1.16, where multiplying made it x1.5.
+    /// Fitted on 406 wave rares in 34 runs (2026-10-05), multiplying at +25% predicted 575 and adding at +50% 406; the
+    /// patch notes give +50% (0.5.4 Hotfix 3). So the count scales by (1 + increase + rate x before) / (1 + increase),
+    /// the wave row having been scaled by the map's (1 + increase) already. See NOTES, "Gaining Traction".
+    ///
+    /// **The modifiers, from the chance, by a rule read off the game's text.** The stat raises rare monster modifier
+    /// chance by the same percent as the rare packs. "Monster Modifier Chance increases the potential number of Rare
+    /// Monster Modifiers with each modifier above 4 requiring twice as much Modifier Chance" - so a fifth at 100%, a
+    /// sixth at 300%, a seventh at 700% - which is log2(1 + chance) extra modifiers at those points, and between them
+    /// the same curve, standing in for the chance of reaching the next. Each extra modifier adds the table's rare
+    /// modifier row's share of a rare's worth (5 of 20 as shipped). The interpolation is this plugin's reading; the page
+    /// gives no formula. Recorded rares with six or more remnants before carried about 1.4 more modifiers than the first
+    /// remnant's (2026-09-30, one bucket of 40).
+    /// </summary>
+    internal static (float Magic, float Rare) TractionScales(PlanEnvironment env, int before)
+    {
+        if (before <= 0 || (env.MagicPacksPerRemnantCompleted <= 0f && env.RarePacksPerRemnantCompleted <= 0f))
+            return (1f, 1f);
+
+        var raised = env.RarePacksPerRemnantCompleted * before;
+        var extraModifiers = MathF.Log2(1f + raised);
+        var rareCount = (1f + env.RareIncreaseOfMap + raised) / (1f + env.RareIncreaseOfMap);
+        var magicCount = (1f + env.MagicIncreaseOfMap + env.MagicPacksPerRemnantCompleted * before) /
+                         (1f + env.MagicIncreaseOfMap);
+
+        return (magicCount, rareCount * (1f + env.RareModifierShareOfRare * extraModifiers));
+    }
+
+    [ThreadStatic] private static int[] _remnantsCaughtAt;
+
+    /// <summary>
+    /// The indices of the remnants among an environment's targets, per thread, worked out again when the target list
+    /// changes. Keyed on the list rather than the environment, since a copy made with other targets keeps the
+    /// original's initialisers. See Settle's Gaining Traction.
+    /// </summary>
+    private static int[] RemnantIndicesOf(PlanEnvironment env)
+    {
+        if (ReferenceEquals(_remnantIndicesFor, env.Targets))
+            return _remnantIndices;
+
+        var found = new List<int>();
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            if (env.Targets[i].Kind == TargetKind.Remnant)
+                found.Add(i);
+        }
+
+        _remnantIndicesFor = env.Targets;
+        _remnantIndices = found.ToArray();
+
+        return _remnantIndices;
+    }
+
+    [ThreadStatic] private static IReadOnlyList<PlanTarget> _remnantIndicesFor;
+
+    [ThreadStatic] private static int[] _remnantIndices;
+
+    /// <summary>
+    /// The most Gaining Traction can add to a remnant's magic and rare waves on this site, as a fraction: the rare scale
+    /// less one, which is the larger, at every other remnant here and every one completed in the map before it. For the
+    /// ceilings, which must stay above any chain. See TractionScales.
+    /// </summary>
+    internal static float MostTractionOf(PlanEnvironment env)
+    {
+        if (env.MagicPacksPerRemnantCompleted <= 0f && env.RarePacksPerRemnantCompleted <= 0f)
+            return 0f;
+
+        var remnants = 0;
+
+        foreach (var target in env.Targets)
+        {
+            if (target.Kind == TargetKind.Remnant)
+                remnants++;
+        }
+
+        var most = Math.Max(0, remnants - 1 + env.RemnantsCompletedInArea);
+        var (magic, rare) = TractionScales(env, most);
+
+        // The larger of the two, since the rates are set apart and either may be the bigger. See TractionScales.
+        var largest = MathF.Max(magic, rare) - 1f;
+
+        // And each remnant's own table, normals included, which the scoring reads. See TractionScalesOfTarget.
+        foreach (var target in env.Targets)
+        {
+            if (target.Kind != TargetKind.Remnant || target.TractionByBefore is not { Length: > 0 })
+                continue;
+
+            var (n, m, r) = TractionScalesOfTarget(env, target, most);
+
+            largest = MathF.Max(largest, MathF.Max(n, MathF.Max(m, r)) - 1f);
+        }
+
+        return largest;
+    }
+
+    /// <summary>
+    /// The most Gaining Traction can add to a target on this site, for the ceilings: its magic and rare waves and the
+    /// best of its combinations' extra waves, at the largest scale. See MostTractionOf.
+    ///
+    /// Plus the most any combination's "own" effects add to its waves, where one raises them, at the largest scale for
+    /// both tiers - an upper bound on the magic one. Those waves are monsters, so the same amount bounds the monster
+    /// pool. Nought where every own effect lowers them, which leaves the ceilings above every chain as they were.
+    /// </summary>
+    private static (float Content, float Monsters) MostTractionOfTarget(PlanTarget target, float traction)
+    {
+        var own = 0f;
+
+        for (var c = 0; c < (target.OwnEffectsOfChoices?.Length ?? 0); c++)
+            own = MathF.Max(own, target.OwnOfChoice(c, 1f + MathF.Max(0f, traction), 1f + MathF.Max(0f, traction)));
+
+        if (traction <= 0f)
+            return (own, own);
+
+        var waves = target.MagicAndRareWaves;
+        var normals = target.NormalWaves;
+        var choices = 0f;
+
+        foreach (var (rare, magic) in target.MagicAndRareWavesOfChoices ?? [])
+            choices = MathF.Max(choices, rare + magic);
+
+        return (traction * (waves.Rare + waves.Magic + normals.Normal + choices) + own,
+            traction * (waves.RareMonsters + waves.MagicMonsters + normals.NormalMonsters) + own);
+    }
+
     private static T[] Grow<T>(T[] held, int size)
     {
         if (held != null && held.Length >= size)
@@ -9347,7 +8842,8 @@ internal static class Planner
         for (var s = 0; s < chain.Count; s++)
         {
             var point = chain[s];
-            var weight = 0d;
+            // What the scoring loop booked at this link. See Settle's ContentToLink.
+            var weight = _contentAtLink != null && s < _contentAtLink.Length ? _contentAtLink[s] : 0d;
             var kinds = new SortedDictionary<string, int>();
 
             for (var i = 0; i < env.Targets.Count; i++)
@@ -9359,15 +8855,6 @@ internal static class Planner
                     continue;
 
                 var target = env.Targets[i];
-                var choice = target.Best(after[s], monsters[s], env, sums, s, 0, out _);
-
-                // Worth, not Weight: the number written in the middle of a blast circle is read by
-                // a person, and a link that happens to catch the required marker would otherwise
-                // claim the whole must-have bonus. See Verdict's Bonus.
-                weight += WorthOfTarget(target) + choice.Reward;
-                // Content only. What this link passes on is taken from _credited below, which the
-            // scoring loop filled as it went - the same arithmetic rather than a second copy of it.
-
                 var name = target.Kind.ToString().ToLowerInvariant();
                 kinds[name] = kinds.TryGetValue(name, out var had) ? had + 1 : 1;
             }
@@ -9470,8 +8957,12 @@ internal static class Planner
             {
                 Interlocked.Add(ref AllPhaseBytes[i], _phaseBytes[i]);
                 Interlocked.Add(ref AllPhaseCalls[i], _phaseCalls[i]);
+                Interlocked.Add(ref AllPhaseTicks[i], _phaseTicks?[i] ?? 0L);
                 _phaseBytes[i] = 0;
                 _phaseCalls[i] = 0;
+
+                if (_phaseTicks != null)
+                    _phaseTicks[i] = 0;
             }
         _copies = 0;
         _copied = 0;
@@ -9491,6 +8982,7 @@ internal static class Planner
         {
             Interlocked.Exchange(ref AllPhaseBytes[i], 0);
             Interlocked.Exchange(ref AllPhaseCalls[i], 0);
+            Interlocked.Exchange(ref AllPhaseTicks[i], 0);
         }
     }
 
@@ -9509,50 +9001,87 @@ internal static class Planner
     /// </summary>
     private static readonly string[] Phases =
         {
-            "candidates", "regions", "greedy", "improve", "narrowed", "evaluate", "reaches",
-            "whole (planner)", "whole (repair)", "whole (grasp)", "whole (beam)",
+            "candidates", "greedy", "improve", "evaluate", "reaches",
+            "whole (repair)", "whole (grasp)", "whole (beam)",
             "repair/tear", "repair/rebuild",
             "improve/sweep", "improve/order", "improve/reverse", "improve/shift",
-            "improve/polish",
+            "improve/polish", "reaches/clamp", "reaches/route", "price/settle",
+            "settle/payout", "settle/locally", "rebuild/rank", "rebuild/reach row",
+            "shortlist", "shortlist/edge points",
         };
 
     internal const int PhaseCandidates = 0;
-    internal const int PhaseRegions = 1;
-    internal const int PhaseGreedy = 2;
-    internal const int PhaseImprove = 3;
-    internal const int PhaseNarrowed = 4;
-    internal const int PhaseEvaluate = 5;
-    internal const int PhaseReaches = 6;
+    internal const int PhaseGreedy = 1;
+    internal const int PhaseImprove = 2;
+    internal const int PhaseEvaluate = 3;
+    internal const int PhaseReaches = 4;
 
-    internal const int PhaseWhole = 7;
+    internal const int PhaseRepair = 5;
 
-    internal const int PhaseRepair = 8;
+    internal const int PhaseGrasp = 6;
 
-    internal const int PhaseGrasp = 9;
+    internal const int PhaseBeam = 7;
 
-    internal const int PhaseBeam = 10;
+    internal const int PhaseTear = 8;
 
-    internal const int PhaseTear = 11;
+    internal const int PhaseRebuild = 9;
 
-    internal const int PhaseRebuild = 12;
+    internal const int PhaseSweep = 10;
 
-    internal const int PhaseSweep = 13;
+    internal const int PhaseOrder = 11;
 
-    internal const int PhaseOrder = 14;
+    internal const int PhaseReverse = 12;
 
-    internal const int PhaseReverse = 15;
+    internal const int PhaseShift = 13;
 
-    internal const int PhaseShift = 16;
+    internal const int PhasePolish = 14;
 
-    internal const int PhasePolish = 17;
+    /// <summary>A search for an aim that lands on a spot the direct aim cannot. See Terrain.Aiming and SnapModel.Aim.</summary>
+    internal const int PhaseClamp = 15;
+
+    /// <summary>A route searched for because the router had none on record. See Wire.Bend.</summary>
+    internal const int PhaseRoute = 16;
+
+    /// <summary>Settling a folded tally into a score, for the incremental pricing. See Price.</summary>
+    internal const int PhaseSettle = 17;
+
+    /// <summary>Settle's loop over links that pays out the rates in force. See Settle.</summary>
+    internal const int PhaseSettlePayout = 18;
+
+    /// <summary>Settle's check of each remnant's own runes against those arriving. See Locally.</summary>
+    internal const int PhaseSettleLocally = 19;
+
+    /// <summary>Rebuild ranking the shortlist by what each spot adds, for one hole. See Repair.RebuildInner.</summary>
+    internal const int PhaseRebuildRank = 20;
+
+    /// <summary>A row of the repair's reach table: one link position asked about every shortlist spot. See Repair.Near.</summary>
+    internal const int PhaseReachRow = 21;
+
+    /// <summary>A worker building its shortlist before its first round. See Repair.Shortlist.</summary>
+    internal const int PhaseShortlist = 22;
+
+    /// <summary>The edge points a shortlist takes, worked out or fetched. See Planner.EdgePointCellsOfEnvironment.</summary>
+    internal const int PhaseShortlistEdgePoints = 23;
 
     [ThreadStatic] private static long[] _phaseBytes;
 
     [ThreadStatic] private static long[] _phaseCalls;
 
-    private static readonly long[] AllPhaseBytes = new long[18];
+    private static readonly long[] AllPhaseBytes = new long[Phases.Length];
 
-    private static readonly long[] AllPhaseCalls = new long[18];
+    private static readonly long[] AllPhaseCalls = new long[Phases.Length];
+
+    /// <summary>
+    /// Stopwatch ticks each phase spent itself, its nested phases taken out, per thread and then across all
+    /// workers - the same accounting as the bytes. Summed over every worker, so a phase's total can be many times
+    /// a press. See Phase.
+    /// </summary>
+    [ThreadStatic] private static long[] _phaseTicks;
+
+    private static readonly long[] AllPhaseTicks = new long[Phases.Length];
+
+    /// <summary>The ticks the open phase's nested phases have taken. See Phase and _phaseChildBytes.</summary>
+    [ThreadStatic] private static long _phaseChildTicks;
 
     /// <summary>
     /// Measures what one phase of a search allocates on the thread running it.
@@ -9589,6 +9118,8 @@ internal static class Planner
         private readonly int _id;
         private readonly long _had;
         private readonly long _enclosing;
+        private readonly long _began;
+        private readonly long _enclosingTicks;
 
         public Phase(int id)
         {
@@ -9598,33 +9129,76 @@ internal static class Planner
             // and can measure its own children.
             _enclosing = _phaseChildBytes;
             _phaseChildBytes = 0L;
+            _enclosingTicks = _phaseChildTicks;
+            _phaseChildTicks = 0L;
 
             _had = GC.GetAllocatedBytesForCurrentThread();
+            _began = Stopwatch.GetTimestamp();
         }
 
         public void Dispose()
         {
+            var took = Stopwatch.GetTimestamp() - _began;
             var spent = GC.GetAllocatedBytesForCurrentThread() - _had;
 
             // Everything under this phase was banked into _phaseChildBytes as each child closed, so
-            // what is left is what this phase allocated itself.
+            // what is left is what this phase allocated itself. Time the same way.
             (_phaseBytes ??= new long[Phases.Length])[_id] += spent - _phaseChildBytes;
             (_phaseCalls ??= new long[Phases.Length])[_id]++;
+            (_phaseTicks ??= new long[Phases.Length])[_id] += took - _phaseChildTicks;
 
             // And this phase, in full, is a child of whatever encloses it.
             _phaseChildBytes = _enclosing + spent;
+            _phaseChildTicks = _enclosingTicks + took;
         }
     }
 
     /// <summary>What each phase of the search has allocated, and how often it ran. See Phases.</summary>
-    public static IEnumerable<(string Name, long Bytes, long Calls)> PhaseTotals()
+    public static IEnumerable<(string Name, long Bytes, long Calls, double Ms)> PhaseTotals()
     {
         for (var i = 0; i < Phases.Length; i++)
             yield return (Phases[i], Volatile.Read(ref AllPhaseBytes[i]),
-                Volatile.Read(ref AllPhaseCalls[i]));
+                Volatile.Read(ref AllPhaseCalls[i]),
+                Volatile.Read(ref AllPhaseTicks[i]) * 1000d / Stopwatch.Frequency);
     }
 
     internal static double Score(PlanEnvironment env, List<Vector2> chain) => Evaluate(env, chain).Total;
+
+    /// <summary>Whether a chain starts with these explosives, as a route that includes the ones down does. See Evaluate.</summary>
+    private static bool StartsWithHead(List<Vector2> chain, IReadOnlyList<Vector2> head)
+    {
+        if (chain.Count < head.Count)
+            return false;
+
+        for (var i = 0; i < head.Count; i++)
+        {
+            if (Vector2.DistanceSquared(chain[i], head[i]) >= 1f)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The explosives down followed by the chain, in a list this thread reuses: Evaluate is called millions of times
+    /// a solve and is allocation free. The caller must not keep it. See PlanEnvironment.Whole.
+    /// </summary>
+    private static List<Vector2> Headed(IReadOnlyList<Vector2> head, List<Vector2> chain, ref List<Vector2> buffer)
+    {
+        buffer ??= new List<Vector2>(head.Count + chain.Count);
+        buffer.Clear();
+
+        for (var i = 0; i < head.Count; i++)
+            buffer.Add(head[i]);
+
+        buffer.AddRange(chain);
+
+        return buffer;
+    }
+
+    [ThreadStatic] private static List<Vector2> _headedForEvaluate;
+
+    [ThreadStatic] private static List<Vector2> _headedForPrice;
 
     /// <summary>
     /// What a chain is worth to a READER - content and propagation, without the insistence bonus.
@@ -9636,312 +9210,6 @@ internal static class Planner
     /// </summary>
     internal static double Plainly(PlanEnvironment env, List<Vector2> chain) =>
         Evaluate(env, chain).Plain;
-
-    /// <summary>
-    /// What a blast here would add, counting nothing already covered by an earlier one.
-    ///
-    /// The greedy pass cannot know how many remnants come after this link, because it has not
-    /// chosen them yet - so propagation is valued at the explosives still in hand, which is the
-    /// most remnants that could possibly follow. Deliberately optimistic: it makes greedy reach for
-    /// a propagating remnant early, which is the right instinct, and the exact objective in
-    /// <see cref="Evaluate"/> is what decides whether the chain it built is actually better.
-    /// </summary>
-    /// <summary>
-    /// Chains that visit the remnants first, one for each order they could be visited in.
-    ///
-    /// The spot chosen for a remnant is the best one that catches it and can be reached from the
-    /// link before - "best" by what it adds overall, so a spot that catches the remnant AND a chest
-    /// beside it wins over one that catches the remnant alone. What is left of the chain is filled
-    /// greedily, which is the right way round: by then the remnants are placed and greedy is only
-    /// being asked to find monsters, which is a question it can answer.
-    ///
-    /// Four remnants at most, so the orderings stay at twenty four. A site with more of them is a
-    /// site where the richest four are what the chain will be built around anyway.
-    /// </summary>
-    private static IEnumerable<List<Vector2>> Remnants(PlanEnvironment env, List<Vector2> candidates)
-    {
-        var found = new List<int>();
-
-        // **Every one of them, and the cut comes after the ranking.** This used to stop scanning at
-        // the first eight that qualified and only then sort by weight, so which remnants a site's
-        // seeds were built around was decided by the order the scan happened to file them in. On a
-        // site with eleven, three were never candidates for the sort at all - and on this one the
-        // three that mattered were the far cluster.
-        for (var i = 0; i < env.Targets.Count; i++)
-        {
-            var target = env.Targets[i];
-
-            // A seed is a route built to reach something, so there is no sense in building one
-            // towards a marker no chain may catch. See PlanTarget.Shunned.
-            if (target.Shunned)
-                continue;
-
-            // The same four tests the other two carrier scans apply. This one asked about
-            // combinations and a flat carry only, so a relic whose magnitude lives in its scoped
-            // effects - which is now every relic - was not counted as something worth ordering for.
-            if (target.Choices is { Length: > 0 } || target.Carries > 0f ||
-                target.NonStacking is { Length: > 0 } || target.Spread is { Length: > 0 })
-                found.Add(i);
-        }
-
-        if (found.Count == 0)
-            yield break;
-
-        // **Ranked by what the remnant is actually worth, which is not its Weight.** A remnant's
-        // reward lives in its combinations, because which one wins depends on where the chain puts
-        // it - so Weight is only what the marker is worth for BEING a remnant, and sorting on it
-        // made a six socket monster of a stone rank level with an empty one. Rough(0) adds back the
-        // best combination's reward and its local rune, which is the same measure Pull leans on.
-        //
-        // Then cut to four: the orderings are factorial and the tail of a long remnant list is not
-        // what a chain gets built around.
-        found.Sort((a, b) => (WorthOfTarget(env.Targets[b]) + env.Targets[b].Rough(0f))
-            .CompareTo(WorthOfTarget(env.Targets[a]) + env.Targets[a].Rough(0f)));
-
-        if (found.Count > 4)
-            found.RemoveRange(4, found.Count - 4);
-
-        foreach (var order in Orders(found))
-        {
-            var chain = new List<Vector2>();
-            var taken = new HashSet<int>();
-            var from = env.Origin;
-
-            foreach (var want in order)
-            {
-                if (chain.Count >= env.Explosives)
-                    break;
-
-                // Already caught on the way to an earlier stop, which is common in a cluster.
-                if (taken.Contains(want))
-                    continue;
-
-                // **Bridged rather than skipped.** This used to demand a covering spot within one
-                // link of the last stop and drop the remnant when there was none - which is every
-                // remnant more than one explosive away, so the tour could only ever string together
-                // stones that were already neighbours. See Fetch.
-                Fetch(env, candidates, chain, taken, ref from, want, asker: Stepping);
-            }
-
-            if (chain.Count == 0)
-                continue;
-
-            // The rest greedily, which is now only being asked where the monsters are.
-            yield return Greedy(env, candidates, null, 1, null, chain);
-        }
-    }
-
-    /// <summary>
-    /// Where the weight of the site lies, for breaking ties between equally good spots.
-    ///
-    /// **Two spots that catch the same things are not equal, and the code used to treat them as
-    /// such** - it kept whichever came first out of the candidate list, which is an accident of
-    /// generation order. A blast has a radius, so a piece of content can usually be caught from
-    /// anywhere in a band several grid units wide, and every unit of that band spent in the wrong
-    /// direction is a unit of reach the next link does not have.
-    ///
-    /// The right direction is where the rest of the content is. Weighted, so a remnant pulls harder
-    /// than a chest, and over everything rather than what is left - the chain has to get to all of
-    /// it eventually.
-    ///
-    /// **A remnant's reward is not in its Weight** - it is one of the choices the search makes,
-    /// because which combination wins depends on where the chain puts it. Pulling on Weight alone
-    /// therefore valued a remnant at its bare kind weight and made a rich one pull no harder than a
-    /// poor one, which is the wrong direction on exactly the sites where the direction matters.
-    /// Rough(0) adds back what the remnant is worth where it stands - the best combination's reward
-    /// and its local rune, without the propagation, which depends on a chain that does not exist
-    /// yet.
-    ///
-    /// A required remnant carries a weight larger than the rest of the site put together, so it
-    /// takes the pull nearly to itself. That is intended: when one marker has to be caught, leaning
-    /// every tie towards it is the right lean.
-    ///
-    /// **Which content pulls is a real choice, and the two answers are far apart** - measured on one
-    /// site, 22 grid, which is the same order as the distance this lean is trying to make up. Over
-    /// everything, 58 monster markers outnumber the 13 remnants and rares four to one and drag the
-    /// centre towards where the filler is, even at low weight each. Over heavy content only, it
-    /// points at the skeleton the chain is obliged to reach.
-    ///
-    /// Heavy by default, because that is the question being asked. Monsters are what propagation
-    /// multiplies and that is worth real points - but those points are already counted in each
-    /// spot's worth. The pull exists to answer "which way does the chain still owe a visit", and
-    /// monsters are what it sweeps up on the way rather than what it is going for.
-    /// </summary>
-    private static Vector2 Pull(PlanEnvironment env, bool heavy = true)
-    {
-        var sum = Vector2.Zero;
-        var weight = 0f;
-
-        foreach (var target in env.Targets)
-        {
-            if (heavy && target.Kind is not (TargetKind.Remnant or TargetKind.Elite))
-                continue;
-
-            var of = MathF.Max(0f, target.Weight + target.Rough(0f));
-
-            sum += target.Grid * of;
-            weight += of;
-        }
-
-        // A site with no heavy content at all would otherwise pull towards the origin of the grid,
-        // which is not a direction so much as a corner of the map.
-        return weight > 0f ? sum / weight : heavy ? Pull(env, false) : Vector2.Zero;
-    }
-
-    /// <summary>
-    /// Best first, and among near-equals the one nearest the weight of the site.
-    ///
-    /// **How near counts as equal is the whole question.** Exact equality answers it badly: measured
-    /// on a real site, comparing at a tenth of a point moved six of nine rings and moved them 1 to 5
-    /// grid, because neighbouring cells differ by fractions as a chest or a monster slips in and out
-    /// of the blast. Nothing ties, so nothing leans, and the reach the lean was meant to save is
-    /// still spent. The chains that actually score best put their links 13 to 27 grid from these
-    /// spots, so a lean of 5 is not a small version of the right answer.
-    ///
-    /// So the tie is a band rather than a point, and the band is a share of the best worth on offer
-    /// rather than a fixed number of points - a tenth of a point means something quite different
-    /// against 368 than against 77. Inside the band the nearest to the pull wins outright: the loss
-    /// is bounded by the share, and what is bought with it is reach for the link that follows.
-    /// </summary>
-    /// <param name="best">The best worth in the set being sorted, which sets the size of the band.</param>
-    /// <param name="slack">How much of that worth may be given up to lean, as a fraction.</param>
-    private static Comparison<(Vector2 At, double Solo)> Better(Vector2 pull, double best = 0d,
-        float slack = 0f)
-    {
-        // A tenth of a point is the floor even with no slack asked for: these are sums over dozens
-        // of markers, and two spots catching the identical set can differ in the last bits.
-        var band = Math.Max(0.1d, Math.Abs(best) * slack);
-
-        return (a, b) =>
-        {
-            var by = Math.Abs(a.Solo - b.Solo) <= band ? 0 : b.Solo.CompareTo(a.Solo);
-
-            return by != 0
-                ? by
-                : Vector2.DistanceSquared(a.At, pull).CompareTo(Vector2.DistanceSquared(b.At, pull));
-        };
-    }
-
-    /// <summary>
-    /// The best worth in a list, for sizing the tie band. Empty lists give nought, which floors it.
-    /// </summary>
-    private static double Best(List<(Vector2 At, double Solo)> worth)
-    {
-        var most = 0d;
-
-        foreach (var (_, solo) in worth)
-            most = Math.Max(most, solo);
-
-        return most;
-    }
-
-    /// <summary>
-    /// How many pieces of heavy content one blast would catch: remnants and rares.
-    ///
-    /// A different measure from what a spot is worth, and the evidence says a more telling one. On
-    /// one site the position (1035,552) was the best catch for TWO rares at once, scored a middling
-    /// 163.8 against a best of 368.6 - and was used by the three highest scoring chains ever
-    /// recorded there. A spot that serves two pieces of heavy content lets a chain spend one link
-    /// where it would otherwise need two, and total weight does not say that.
-    /// </summary>
-    public static int Heavy(PlanEnvironment env, Vector2 at)
-    {
-        var count = 0;
-
-        foreach (var target in env.Targets)
-        {
-            if (target.Kind is TargetKind.Remnant or TargetKind.Elite && Catches(env, at, target))
-                count++;
-        }
-
-        return count;
-    }
-
-    /// <summary>The richest spread-out spots, with what each is worth on its own.</summary>
-    /// <param name="opening">
-    /// Whether the spot has to be reachable in one throw from where the chain starts.
-    ///
-    /// True for anchors, which are forced as the FIRST link and are worthless if they cannot be
-    /// thrown to. False for the drawing, and that distinction was a real bug: with the detonator as
-    /// the origin, requiring one throw ranked only the ground within ninety grid of it, so every
-    /// ring clustered around the start and the remnants a hundred grid out - perfectly reachable as
-    /// a second or third link - were not considered at all.
-    /// </param>
-    private static List<(Vector2 At, double Worth)> Ranked(PlanEnvironment env,
-        List<Vector2> candidates, int most, float spread = 0f, bool opening = true, float slack = 0f, bool heavy = true)
-    {
-        var worth = new List<(Vector2 At, double Solo)>();
-        var none = new HashSet<int>();
-
-        // What the whole chain could span, as a sanity bound on the ones that need no single throw.
-        var span = env.Reach * MathF.Max(1, env.Explosives);
-
-        foreach (var candidate in candidates)
-        {
-            var near = opening
-                ? Reaches(env, env.Origin, candidate)
-                : Vector2.Distance(env.Origin, candidate) <= span;
-
-            if (near)
-                worth.Add((candidate, NewWeight(env, candidate, none, env.Explosives - 1)));
-        }
-
-        worth.Sort(Better(Pull(env, heavy), Best(worth), slack));
-
-        var kept = new List<(Vector2, double)>();
-
-        if (worth.Count == 0)
-            return kept;
-
-        // Spread by the game's own minimum spacing, not by a blast radius.
-        //
-        // Two explosives closer than this cannot both exist, so it is the real reason to treat two
-        // positions as alternatives rather than as separate options. A blast radius was the first
-        // guess and it is far too wide: it thinned the list to "the best spot in each AREA", so once
-        // the good areas were used the remaining entries were the best of whatever was left, which
-        // on a worked site is almost nothing.
-        var apart = spread > 0f ? spread : MathF.Max(1f, env.Apart);
-
-        // And a floor, so the count is a maximum rather than a quota.
-        //
-        // Asking for eight on a site with three spots worth having produced eight rings, five of
-        // them on ground worth sixteen against a best of three hundred and eighty. A list padded to
-        // length reads as though the padding is also an answer.
-        var floor = worth[0].Solo * 0.1d;
-
-        foreach (var (at, solo) in worth)
-        {
-            if (kept.Count >= most || solo < floor)
-                break;
-
-            var clear = true;
-
-            foreach (var (already, _) in kept)
-                clear &= Vector2.Distance(already, at) > apart;
-
-            if (clear)
-                kept.Add((at, solo));
-        }
-
-        return kept;
-    }
-
-    /// <summary>
-    /// The spots worth the most on their own, as openings to build a chain around.
-    ///
-    /// Standalone value, not marginal: what this blast catches with nothing else placed. That is the
-    /// right measure for an anchor, because the question being asked is "if the chain must include
-    /// this, what does it look like" rather than "what should come next".
-    ///
-    /// Spread out on purpose. The richest dozen positions on a site are usually the same blast
-    /// nudged a grid unit at a time, and twelve seeds that are one seed tell you nothing - so an
-    /// anchor has to sit a blast away from every anchor already taken.
-    /// </summary>
-    private static IEnumerable<Vector2> Anchors(PlanEnvironment env, List<Vector2> candidates)
-    {
-        foreach (var (at, _) in Ranked(env, candidates, 8))
-            yield return at;
-    }
 
     /// <summary>Every order a handful of things could be taken in.</summary>
     private static IEnumerable<List<int>> Orders(List<int> of)
@@ -9973,12 +9241,11 @@ internal static class Planner
     /// <summary>
     /// Which markers a blast at each cell would catch, worked out once for a whole site.
     ///
-    /// **A cell's coverage never changes; only which of the markers are still standing does.** The
-    /// band scan asks, for every cell of every family's disc, what a blast there would be worth -
-    /// and answering that from scratch means testing the cell against all eighty odd markers, about
-    /// one and a half million distance tests per redraw. Measured on one site: three hundred and
-    /// seventy nine redraws at twenty six milliseconds apiece, ten of the twelve seconds a complete
-    /// search took.
+    /// **A cell's coverage never changes; only which of the markers are still standing does.**
+    /// Answering what a blast at a cell would be worth from scratch means testing the cell against all
+    /// eighty odd markers. Measured on one site, when a since-removed band scan asked it of every cell
+    /// of a disc: three hundred and seventy nine redraws at twenty six milliseconds apiece, ten of the
+    /// twelve seconds a complete search took.
     ///
     /// Indexed instead. Coverage is geometry and the geometry is fixed, so each cell keeps the list
     /// of markers it catches and a redraw becomes a sum over five indices rather than a sweep of
@@ -10011,6 +9278,41 @@ internal static class Planner
             var made = found.ToArray();
 
             _at[key] = made;
+
+            return made;
+        }
+
+        private readonly Dictionary<int, int[]> _remnantsNear = new();
+
+        /// <summary>
+        /// The remnants close enough to a marker that a link after one of them could still catch it, in index order:
+        /// within a reach, two blasts and both markers' extents. The distance half of Planner.Waiting, which is
+        /// geometry and does not change within an environment.
+        /// </summary>
+        public int[] RemnantsWithinDeferral(int target)
+        {
+            if (_remnantsNear.TryGetValue(target, out var already))
+                return already;
+
+            var found = new List<int>();
+            var marker = _env.Targets[target];
+
+            for (var i = 0; i < _env.Targets.Count; i++)
+            {
+                var other = _env.Targets[i];
+
+                if (other.Kind != TargetKind.Remnant)
+                    continue;
+
+                var span = _env.Reach + 2f * _env.Blast + marker.Radius + other.Radius;
+
+                if (Vector2.DistanceSquared(marker.Grid, other.Grid) <= span * span)
+                    found.Add(i);
+            }
+
+            var made = found.ToArray();
+
+            _remnantsNear[target] = made;
 
             return made;
         }
@@ -10082,7 +9384,7 @@ internal static class Planner
     /// **Per solve, from the frame, because the guard against redoing it is the text itself.**
     /// Outright stops once EnumeratedSolveOutcome starts with "took", which is what keeps it from re-running every
     /// round of a warm search - and that same text would then survive into the next solve and the
-    /// next site. It used to be reset inside Planner.Search, which Destroy and Repair never enters.
+    /// next site. It used to be reset inside the restart search, which Destroy and Repair never entered.
     /// </summary>
     internal static void ForgetEnumeratedSolve() => EnumeratedSolveOutcome = "has not run";
 
@@ -10102,6 +9404,7 @@ internal static class Planner
         var covers = CoverageOfEnvironment(env);
         var worth = new List<double>(candidates.Count);
         var brings = new List<double>(candidates.Count);
+        var traction = MostTractionOf(env);
 
         // What each candidate spot could contribute to each group, one list per group. The blast
         // is the unit because the chain is chosen in blasts: whatever a spot covers arrives
@@ -10123,8 +9426,10 @@ internal static class Planner
             {
                 var target = env.Targets[index];
 
-                content += MathF.Max(0f, target.Weight);
-                monsters += target.MonstersUnearthed;
+                var (tractionContent, tractionMonsters) = MostTractionOfTarget(target, traction);
+
+                content += MathF.Max(0f, target.Weight) + tractionContent;
+                monsters += target.MonstersUnearthed + tractionMonsters;
 
                 if (carried != null && index < carried.Length && carried[index] != null)
                 {
@@ -10229,16 +9534,24 @@ internal static class Planner
 
     internal static double RelaxedCeiling(PlanEnvironment env)
     {
+        // A bound on what Evaluate returns, so over the same whole site when explosives are down. See
+        // PlanEnvironment.Whole.
+        if (env?.Whole is { } whole && env.Head is { Count: > 0 })
+            return RelaxedCeiling(whole);
+
         if (env == null || env.Targets.Count == 0)
             return 0d;
 
         var content = 0d;
         var monsters = 0d;
+        var traction = MostTractionOf(env);
 
         foreach (var target in env.Targets)
         {
-            content += MathF.Max(0f, target.Weight);
-            monsters += target.MonstersUnearthed;
+            var (tractionContent, tractionMonsters) = MostTractionOfTarget(target, traction);
+
+            content += MathF.Max(0f, target.Weight) + tractionContent;
+            monsters += target.MonstersUnearthed + tractionMonsters;
 
             // **A remnant's reward is content and it was not in the ceiling.** Settle adds the
             // chosen combination's price to content - that is what makes one combination worth more
@@ -10338,15 +9651,40 @@ internal static class Planner
             // what any single one of them brings.
             if (target.Choices != null)
             {
-                foreach (var choice in target.Choices)
+                for (var c = 0; c < target.Choices.Length; c++)
                 {
+                    var choice = target.Choices[c];
+
+                    // The lifts the combination holds lift what it carries, and nothing below counts them: a local
+                    // total leaves amplifiers out. Every carried share at every held class's lift, which over-counts and
+                    // so stays a ceiling. See PlanTarget.HeldLiftsOfChoice.
+                    var empowered = 1d;
+
+                    foreach (var heldLift in target.HeldLiftsOfChoice(c) ?? [])
+                        empowered *= 1d + heldLift;
+
                     one.Clear();
 
-                    Into(one, env, null, choice.Carries);
+                    Into(one, env, null, choice.Carries * empowered);
                     Into(one, env, null, choice.Local);
 
                     foreach (var (id, _, percent, _) in choice.Spread ?? [])
-                        Into(one, env, id, percent);
+                        Into(one, env, id, percent * empowered);
+
+                    // **And what a rune that adds as well lifts**, each class as a factor of its own on everything. A
+                    // pure amplifier is already here as its carry, as Power always was. Over-counts, so stays a ceiling.
+                    foreach (var id in choice.Runes ?? [])
+                    {
+                        if (!Weighing.HasShareEffect(id) || Weighing.LiftsOfRune(id) is not { } lifts)
+                            continue;
+
+                        for (var a = 0; a < lifts.Length; a++)
+                        {
+                            if (lifts[a] > 0f)
+                                one[LiftBandOfClass(a)] = Math.Max(one.GetValueOrDefault(LiftBandOfClass(a)),
+                                    lifts[a] * empowered);
+                        }
+                    }
 
                     KeepLargestPerGroup(mine, one);
                 }
@@ -10551,7 +9889,7 @@ internal static class Planner
     /// <summary>
     /// The exact answer for a simple site, for any strategy that wants it, or null.
     ///
-    /// **Lifted out of Planner.Search, where it was reachable only by the fallback strategy.** The
+    /// **Lifted out of the restart search, since removed, where it was reachable only by the fallback strategy.** The
     /// sparse solve was written for a map holding about ten things of two kinds, and it lived inside
     /// the restart search - so with Destroy and Repair selected, which is the default and the one
     /// that wins the bake-offs, it never ran at all. Every dump taken on that strategy says "working
@@ -11315,27 +10653,66 @@ internal static class Planner
     /// nothing else - so they join the product here rather than in the chain-wide accumulator, and
     /// only for the monster part of a class.
     /// </summary>
+    /// <param name="lift">
+    /// Every class's lift together, applied to every share - only where there is no amplification table, an
+    /// environment read back from a file. See PlanEnvironment.Amplified.
+    /// </param>
+    /// <param name="factors">
+    /// The factor each set of amplifier classes puts on the shares it lifts, indexed by mask. See
+    /// Amplification.FactorsOfMasks.
+    /// </param>
     private static double Multiplied(float[] prefix, float[] extra, int groups, int width, int cls,
-        double lift = 0d)
+        double lift = 0d, Amplification amplified = null, double[] factors = null, float[] bases = null)
     {
         var mult = 1d;
 
         for (var g = 0; g < groups; g++)
         {
-            var add = extra != null && (cls & 1) != 0 ? extra[g] : 0f;
-            var at = g * width;
+            // **Shares add to what the map already gives the stat**, so they are worth that much less: the factor is
+            // (1 + base + shares) / (1 + base). See PlanEnvironment.IncreaseBaseOfGroup.
+            var start = bases != null && g < bases.Length ? 1d + bases[g] : 1d;
 
-            for (var k = 0; k < width; k++)
+            // **With twins, each lift reaches only the shares its classes lift.** A twin is summed with its plain group
+            // below, at the factor of the classes lifting it, and skipped as a group of its own. See Amplification.
+            if (amplified == null || factors == null)
             {
-                if ((cls & (1 << k)) != 0)
-                    add += prefix[at + k];
+                var add = ShareOfGroup(prefix, extra, g, width, cls);
+
+                if (add != 0f)
+                    mult *= 1d + add * (1d + lift) / start;
+
+                continue;
             }
 
-            if (add != 0f)
-                mult *= 1d + add * (1d + lift);
+            if (g < amplified.PlainOfGroup.Length && amplified.PlainOfGroup[g] >= 0)
+                continue;
+
+            var twins = g < amplified.TwinsOfGroup.Length ? amplified.TwinsOfGroup[g] : null;
+            var total = (double)ShareOfGroup(prefix, extra, g, width, cls);
+
+            foreach (var twin in twins ?? [])
+                total += ShareOfGroup(prefix, extra, twin, width, cls) * amplified.LiftedFactorOfGroup(twin, factors);
+
+            if (total != 0d)
+                mult *= 1d + total / start;
         }
 
         return mult;
+    }
+
+    /// <summary>One group's shares reaching this class of thing, the marker's own ordinary runes included. See Multiplied.</summary>
+    private static float ShareOfGroup(float[] prefix, float[] extra, int g, int width, int cls)
+    {
+        var add = extra != null && (cls & 1) != 0 ? extra[g] : 0f;
+        var at = g * width;
+
+        for (var k = 0; k < width; k++)
+        {
+            if ((cls & (1 << k)) != 0)
+                add += prefix[at + k];
+        }
+
+        return add;
     }
 
     /// <summary>
@@ -11459,6 +10836,29 @@ internal static class Planner
 
     /// <summary>The share each group picks up at each link, per relevant tag. See Multiplied.</summary>
     [ThreadStatic] private static float[] _rates;
+
+    /// <summary>The shares no rune contributed, per group, tag and link. See Tags.UnaffectedByRunes.</summary>
+    [ThreadStatic] private static float[] _ratesWithoutRunes;
+
+    /// <summary>Their running sum down the chain. See _ratesWithoutRunes.</summary>
+    [ThreadStatic] private static float[] _prefixWithoutRunes;
+
+    /// <summary>Whether a booked name is a rune's, by the table holding a rune row of it. Cached per thread. A banked
+    /// rune is booked as no rune for the line under remnants, so the flag alone cannot say. See Settle's payout.</summary>
+    [ThreadStatic] private static Dictionary<string, bool> _runeNames;
+
+    private static bool IsRuneName(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+            return false;
+
+        _runeNames ??= new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        if (!_runeNames.TryGetValue(name, out var rune))
+            _runeNames[name] = rune = Wrt.Of(Wrt.Id.Rune(Weighing.BaseOfLiftKey(name))) != null;
+
+        return rune;
+    }
 
     /// <summary>What flat effects add per thing, by class and link. See Settle's flats.</summary>
     [ThreadStatic] private static float[] _flats;
@@ -11635,6 +11035,87 @@ internal static class Planner
     /// which is what makes an unclassified site score exactly as it did before groups existed. See
     /// TableGrammar.Effect's "as" clause.
     /// </summary>
+    /// <summary>
+    /// The factor the lifts a remnant holds put on one effect it propagates: the product of one plus each held class's
+    /// lift, over the classes lifting the effect. One where none applies. See PlanTarget.HeldLiftsOfChoice.
+    /// </summary>
+    internal static double HeldFactorOfEffect(PlanEnvironment env, string id, float[] heldLifts)
+    {
+        if (heldLifts == null || env.Amplified is not { } amplified)
+            return 1d;
+
+        var number = NumberOfEffect(env, id);
+
+        if (number < 0 || number >= amplified.MaskOfEffect.Length)
+            return 1d;
+
+        var mask = amplified.MaskOfEffect[number];
+        var factor = 1d;
+
+        for (var a = 0; a < amplified.Classes && a < heldLifts.Length; a++)
+        {
+            if ((mask & (1L << a)) != 0L && heldLifts[a] > 0f)
+                factor *= 1d + heldLifts[a];
+        }
+
+        return factor;
+    }
+
+    /// <summary>
+    /// What a propagated rune that adds and lifts is worth for its lift at link at, in the units Best's reach adds
+    /// (percent times weight): each class it lifts, times the shares already booked that the class lifts, times what they
+    /// reach from this link on. Only bookings made before this point of the walk are seen, so a rune lifting shares booked
+    /// further down the chain is under-ranked here; the payout counts them. Nought for a rune that only lifts - Best
+    /// weighs that as a carry, as it always weighed Power. See Amplification.
+    /// </summary>
+    internal static double AmplifierWorthAt(PlanEnvironment env, string id, float[] heldLifts, int at, float[][] sums,
+        float downstream, int distinct)
+    {
+        if (env.Amplified is not { } amplified || string.IsNullOrEmpty(id) || !Weighing.HasShareEffect(id))
+            return 0d;
+
+        var number = NumberOfEffect(env, id);
+
+        if (number < 0 || number >= amplified.LiftsOfEffect.Length || amplified.LiftsOfEffect[number] is not { } lifts)
+            return 0d;
+
+        var scale = HeldFactorOfEffect(env, id, heldLifts);
+        var worth = 0d;
+
+        for (var r = 0; r < distinct && _carriedEffect != null && r < _carriedEffect.Length; r++)
+        {
+            var effect = _carriedEffect[r];
+
+            if (effect < 0 || effect >= amplified.MaskOfEffect.Length || _carriedWeights[r] <= 0f)
+                continue;
+
+            var mask = amplified.MaskOfEffect[effect];
+            var lift = 0d;
+
+            for (var a = 0; a < amplified.Classes && a < lifts.Length; a++)
+            {
+                if ((mask & (1L << a)) != 0L)
+                    lift += lifts[a];
+            }
+
+            if (lift > 0d)
+                worth += lift * scale * _carriedWeights[r] * Reach(env, _carriedTag[r], sums, null, at, downstream);
+        }
+
+        return worth;
+    }
+
+    /// <summary>
+    /// The key the relaxed ceiling files one amplifier class's lift under, apart from every real group, so it multiplies
+    /// as a factor of its own. See RelaxedCeiling.
+    /// </summary>
+    private static int LiftBandOfClass(int a) => -1000 - a;
+
+    /// <summary>Whether any amplifier lifts this effect. See Weighing.AmplifiedClassesOfRune.</summary>
+    internal static bool IsEmpowerableEffect(PlanEnvironment env, string id) =>
+        env.Amplified is { } amplified && NumberOfEffect(env, id) is var number && number >= 0 &&
+        number < amplified.MaskOfEffect.Length && amplified.MaskOfEffect[number] != 0L;
+
     private static int GroupIndexOfEffect(PlanEnvironment env, string id)
     {
         var key = NumberOfEffect(env, id);
@@ -11665,9 +11146,10 @@ internal static class Planner
     /// Which link's waves are being paid, so a duplicate is judged on order. See Booked.
     /// </param>
     private static float[] LocalSharesOfMarker(PlanEnvironment env, (string Id, float Worth)[][] locals, int t,
-        int groups, int mineAt, int distinct, out double lift)
+        int groups, int mineAt, int distinct, double[] lift)
     {
-        lift = 0d;
+        for (var a = 0; a < lift.Length; a++)
+            lift[a] = 0d;
 
         var mine = locals != null && t < locals.Length ? locals[t] : null;
 
@@ -11716,7 +11198,20 @@ internal static class Planner
                 // plain key while a scoped booking is stored under a negative one, so a tagged Power
                 // was never found at all. The payout composes the two halves instead, where the
                 // accumulated figure is already correct by position. See the call site.
-                lift = Math.Max(lift, worth / 100d);
+                // Per class, the slot's share of the waves times what the rune lifts that class by; with no table to
+                // read it from, the worth is the lift on the one class there was before classes.
+                var number = NumberOfEffect(env, id);
+
+                if (env.Amplified is { } amplified && number >= 0 && number < amplified.LiftsOfEffect.Length &&
+                    amplified.LiftsOfEffect[number] is { } lifts)
+                {
+                    for (var a = 0; a < lift.Length && a < lifts.Length; a++)
+                        lift[a] = Math.Max(lift[a], lifts[a] * (worth / 100d));
+                }
+                else
+                {
+                    lift[0] = Math.Max(lift[0], worth / 100d);
+                }
 
                 continue;
             }
@@ -11842,37 +11337,18 @@ internal static class Planner
 
     private static Coverage CoverageOfEnvironment(PlanEnvironment env)
     {
-        if (!ReferenceEquals(_covered, env))
+        // Kept across a copy of the environment that changes nothing the index reads - the markers, the blast and
+        // the reach. The openings' rollouts each pass a copy with fewer explosives, and rebuilding on reference alone
+        // threw the worker's index away on every one of them.
+        if (!ReferenceEquals(_covered, env) &&
+            !(_covered != null && ReferenceEquals(_covered.Targets, env.Targets) &&
+              _covered.Blast == env.Blast && _covered.Reach == env.Reach))
         {
             _covered = env;
             _covers = new Coverage(env);
         }
 
         return _covers;
-    }
-
-    /// <summary>
-    /// What a blast at one cell adds, over the markers not already taken.
-    ///
-    /// The indexed form of NewWeight: same answer, read from the cell's own coverage list rather
-    /// than by testing every marker on the site.
-    /// </summary>
-    private static double Adds(PlanEnvironment env, Coverage covers, Vector2 at, HashSet<int> taken,
-        int downstream)
-    {
-        var weight = 0d;
-
-        foreach (var i in covers.Of(at))
-        {
-            if (taken.Contains(i))
-                continue;
-
-            var target = env.Targets[i];
-
-            weight += target.Weight + target.Rough(downstream);
-        }
-
-        return weight;
     }
 
     /// <param name="defer">
@@ -11896,6 +11372,21 @@ internal static class Planner
         int downstream, bool defer = false)
     {
         var weight = 0d;
+        var covers = CoverageOfEnvironment(env);
+
+        // **The cell's coverage list, when the spot is a whole cell.** Coverage.Of applies the same Wanted and
+        // Catches filter as the loop below, in the same index order, so the sum is the same to the last bit. It is
+        // keyed on the rounded cell, so a spot off the lattice is priced by the loop instead. Measured on one Grand
+        // site of 408 markers (2026-09-30): the greedy build spent 118ms a chain on its own, most of it here, walking
+        // every marker for every spot in reach at every step.
+        if (at.X == MathF.Round(at.X) && at.Y == MathF.Round(at.Y))
+        {
+            foreach (var i in covers.Of(at))
+                if (!taken.Contains(i))
+                    weight += WorthOfCaughtTarget(env, covers, i, taken, downstream, defer);
+
+            return weight;
+        }
 
         for (var i = 0; i < env.Targets.Count; i++)
         {
@@ -11910,34 +11401,62 @@ internal static class Planner
             if (!Catches(env, at, target))
                 continue;
 
-            var worth = target.Weight + target.Rough(downstream);
-
-            if (defer && downstream > 0 && target.Weight > 0f)
-            {
-                var rate = Waiting(env, target, taken);
-
-                if (rate > 0f)
-                {
-                    // What waiting would be worth, discounted for the chance it does not happen.
-                    //
-                    // Taken now the marker is worth w; taken after the rune it is worth w(1+c), so
-                    // the price of taking it now is w.c/(1+c) - that is the arithmetic that makes
-                    // the two moments comparable. Halved, because the two outcomes are not
-                    // symmetrical: a deferral that works gains the uplift, and a deferral that fails
-                    // loses the whole marker. Where the bet is that lopsided the tie belongs to
-                    // taking it.
-                    var price = worth * (rate / (1f + rate)) * Chance;
-
-                    worth -= price;
-                    _deferred++;
-                    _deferGain += price;
-                }
-            }
-
-            weight += worth;
+            weight += WorthOfCaughtTarget(env, covers, i, taken, downstream, defer);
         }
 
         return weight;
+    }
+
+    /// <summary>What one marker a blast catches adds to NewWeight, deferral included. See NewWeight's defer.</summary>
+    private static double WorthOfCaughtTarget(PlanEnvironment env, Coverage covers, int index,
+        HashSet<int> taken, int downstream, bool defer)
+    {
+        var target = env.Targets[index];
+        var worth = target.Weight + target.Rough(downstream);
+
+        // Gaining Traction, counted off the remnants this chain has taken already - the estimate's own view of which
+        // went off before this one. Its combinations' extra waves are left to the exact objective. See Settle.
+        if (target.Kind == TargetKind.Remnant &&
+            (env.MagicPacksPerRemnantCompleted > 0f || env.RarePacksPerRemnantCompleted > 0f))
+        {
+            var before = env.RemnantsCompletedInArea;
+
+            foreach (var r in RemnantIndicesOf(env))
+            {
+                if (taken.Contains(r))
+                    before++;
+            }
+
+            var (normalScale, magicScale, rareScale) = TractionScalesOfTarget(env, target, before);
+            var waves = target.MagicAndRareWaves;
+
+            worth += (magicScale - 1f) * waves.Magic + (rareScale - 1f) * waves.Rare +
+                     (normalScale - 1f) * target.NormalWaves.Normal;
+        }
+
+        if (defer && downstream > 0 && target.Weight > 0f)
+        {
+            var rate = Waiting(env, covers, index, taken);
+
+            if (rate > 0f)
+            {
+                // What waiting would be worth, discounted for the chance it does not happen.
+                //
+                // Taken now the marker is worth w; taken after the rune it is worth w(1+c), so
+                // the price of taking it now is w.c/(1+c) - that is the arithmetic that makes
+                // the two moments comparable. Halved, because the two outcomes are not
+                // symmetrical: a deferral that works gains the uplift, and a deferral that fails
+                // loses the whole marker. Where the bet is that lopsided the tie belongs to
+                // taking it.
+                var price = worth * (rate / (1f + rate)) * Chance;
+
+                worth -= price;
+                _deferred++;
+                _deferGain += price;
+            }
+        }
+
+        return worth;
     }
 
     /// <summary>
@@ -11950,34 +11469,27 @@ internal static class Planner
     /// all only if they are closer together than those three legs put end to end. Further apart than
     /// that and deferring is not a rearrangement, it is a loss.
     /// </summary>
-    private static float Waiting(PlanEnvironment env, PlanTarget target, HashSet<int> taken)
+    private static float Waiting(PlanEnvironment env, Coverage covers, int index, HashSet<int> taken)
     {
-        if (target.Kind is not (TargetKind.Monster or TargetKind.Elite))
+        if (env.Targets[index].Kind is not (TargetKind.Monster or TargetKind.Elite))
             return 0f;
 
         var best = 0f;
 
-        for (var i = 0; i < env.Targets.Count; i++)
+        // Only the remnants close enough, which is geometry and so worked out once per environment. See
+        // Coverage.RemnantsWithinDeferral.
+        foreach (var i in covers.RemnantsWithinDeferral(index))
         {
             if (taken.Contains(i))
                 continue;
 
             var other = env.Targets[i];
-
-            if (other.Kind != TargetKind.Remnant)
-                continue;
-
             var carries = other.Carries;
 
             foreach (var choice in other.Choices ?? [])
                 carries = MathF.Max(carries, choice.Carries);
 
-            if (carries <= best)
-                continue;
-
-            var span = env.Reach + 2f * env.Blast + target.Radius + other.Radius;
-
-            if (Vector2.DistanceSquared(target.Grid, other.Grid) <= span * span)
+            if (carries > best)
                 best = carries;
         }
 
@@ -12008,6 +11520,10 @@ internal static class Planner
     }
 
     /// <summary>The blast touching a marker is enough; it need not reach its middle.</summary>
+    /// <summary>Whether candidate spots are offered on and around a target. See Candidates.</summary>
+    internal static bool OffersCandidates(PlanTarget target) =>
+        !target.Shunned && (target.Weight > 0f || target.Wanted || target.NonStacking is { Length: > 0 });
+
     internal static bool Catches(PlanEnvironment env, Vector2 at, PlanTarget target) =>
         Vector2.DistanceSquared(at, target.Grid) <=
         (env.Blast + target.Radius) * (env.Blast + target.Radius) &&
@@ -12026,20 +11542,7 @@ internal static class Planner
                     $"sweep took {_sweeps} moves worth {_sweepGain:N1}, " +
                     $"reorder took {_orders} swaps worth {_orderGain:N1}, " +
                     $"reverse took {_reversals} stretches worth {_reverseGain:N1}, " +
-                    $"relocate took {_shifts} moves worth {_shiftGain:N1}, " +
-                    $"fetch took {_fetches} moves worth {_fetchGain:N1}";
-
-    /// <summary>
-    /// How often the fetch operator paid, and by how much. See Chasing.
-    ///
-    /// Worth its own pair of numbers rather than folding into relocate: it is the one operator here
-    /// that came from watching a person work, and whether it earns its place is a question somebody
-    /// will ask. A zero on a site with content left over says it is not finding anything and can be
-    /// run less often; a large gain says the search was leaving that much on the table.
-    /// </summary>
-    private static int _fetches;
-
-    private static double _fetchGain;
+                    $"relocate took {_shifts} moves worth {_shiftGain:N1}";
 
     /// <summary>
     /// Fills a chain out to the explosives available, greedily, from the site's own spots.
@@ -12204,9 +11707,20 @@ internal static class Planner
         // **A plan that drops a requirement says so.** It is still the plan - the best chain there
         // is, is worth seeing even when nothing can take everything - but it must not look like a
         // considered answer, which is exactly what it looked like on the site that prompted this.
+        // A marker taken last that the chain catches before its final link counts as missed (see Settle), and is said
+        // apart: it was reached, just not at the end.
+        var notLast = env.TakenLast >= 0 && verdict.Missed > 0 && taken.Contains(env.TakenLast) &&
+                      verdict.Missed > Enumerable.Range(0, env.Targets.Count).Count(i => env.Targets[i].Must && !taken.Contains(i));
+        var unreached = verdict.Missed - (notLast ? 1 : 0);
+
         var note = verdict.Missed > 0
-            ? $"INVALID: {verdict.Missed} of {env.Musts} must-take marker" +
-              $"{(env.Musts == 1 ? "" : "s")} cannot be reached by any chain found"
+            ? "INVALID: " + string.Join("; ", new[]
+            {
+                unreached > 0
+                    ? $"{unreached} of {env.Musts} must-take marker{(env.Musts == 1 ? "" : "s")} cannot be reached by any chain found"
+                    : null,
+                notLast ? "the marker taken last cannot be caught by the final explosive of any chain found" : null,
+            }.Where(x => x != null))
             : "";
 
         return new Plan(chain, verdict.Total, verdict.Covered, note, catches, verdict.Plain,

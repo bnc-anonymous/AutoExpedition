@@ -66,6 +66,9 @@ internal sealed class Wire
     /// <summary>How many pairs have been routed, for the dump to report.</summary>
     public int Known => _known.Count;
 
+    /// <summary>Every pair whose routed length is held, as integer cells. For a layout snapshot to replay. See Layout.</summary>
+    internal IEnumerable<(int FromX, int FromY, int ToX, int ToY)> KnownPairs => _known.Keys;
+
     /// <summary>
     /// How many routed paths are held, which is the larger of the two caches and the one a cap has to count.
     ///
@@ -340,6 +343,36 @@ internal sealed class Wire
         return Length(from, to) > Vector2.Distance(a, b) + 0.01f;
     }
 
+    /// <summary>
+    /// Lands answered without routing where geometry settles it, or null where only a route can. No when the straight
+    /// line is more than a cell past the reach - the wire is never shorter than it - or when the head's coarse cell is
+    /// unroutable, which Route refuses outright. Yes when the straight line is clear and at least
+    /// <paramref name="margin"/> inside the reach: the wire can still bend round a coarse waypoint the line test fails
+    /// on, which is what the margin is for. Scored against Lands by the offline --estimate-check. See
+    /// RemnantOrder.EstimatedReachOf.
+    /// </summary>
+    internal bool? LandsByEstimate(Vector2 from, Vector2 to, float reach, float margin)
+    {
+        var ax = (int)MathF.Round(from.X);
+        var ay = (int)MathF.Round(from.Y);
+        var bx = (int)MathF.Round(to.X);
+        var by = (int)MathF.Round(to.Y);
+        var straight = MathF.Sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+
+        if (straight > reach + 1f)
+            return false;
+
+        var start = _slab.Cell(ax, ay);
+
+        if (start != _slab.Cell(bx, by) && !RoutableCell(start))
+            return false;
+
+        if (straight <= reach - margin && !LineBlocked(ax, ay, bx, by))
+            return true;
+
+        return null;
+    }
+
     /// <summary>Whether the wire reaches - the routed length against the budget.</summary>
     public bool Reaches(Vector2 from, Vector2 to, float reach) => Length(from, to) <= reach;
 
@@ -393,7 +426,14 @@ internal sealed class Wire
 
         Interlocked.Increment(ref _misses);
 
-        var made = Route(from, to);
+        List<Vector2> made;
+
+        var routing = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        using (new Planner.Phase(Planner.PhaseRoute))
+            made = Route(from, to);
+
+        Interlocked.Add(ref _routeTicks, System.Diagnostics.Stopwatch.GetTimestamp() - routing);
 
         // Kept only while there is room; past the limit the path is still returned, just not stored. See MostPaths.
         if (!Full && _bent.TryAdd(key, made))
@@ -422,9 +462,14 @@ internal sealed class Wire
     /// </summary>
     public static (long Hits, long Misses) Routing => (Volatile.Read(ref _hits), Volatile.Read(ref _misses));
 
+    /// <summary>The stopwatch ticks spent routing the misses, summed over the threads. See Routing.</summary>
+    public static long RouteTicks => Volatile.Read(ref _routeTicks);
+
     private static long _hits;
 
     private static long _misses;
+
+    private static long _routeTicks;
 
     /// <summary>Starts the counts again. See Caches.Clear.</summary>
     public static void ForgetCounts()
@@ -484,7 +529,7 @@ internal sealed class Wire
         // orders the open list differently and picks a different route between two of equal cost -
         // and the string-pull turns that into several units of wire. Searching the wrong way round
         // scored 90.2% against the game's own landings; searching this way scores 97.6%.
-        var path = Search(goal, start);
+        var path = UseCellArraySearch ? SearchCells(goal, start) : Search(goal, start);
 
         if (path == null)
             return null;
@@ -579,6 +624,122 @@ internal sealed class Wire
 
         return false;
     }
+
+    /// <summary>
+    /// Whether Route searches with SearchCells rather than Search. The two return the same path for every pair; this is
+    /// here so the offline check can time and compare them. See SearchCells.
+    /// </summary>
+    internal static bool UseCellArraySearch = true;
+
+    /// <summary>
+    /// Search, over flat per-thread arrays indexed by coarse cell instead of dictionaries keyed by cell, with a stamp per
+    /// search so nothing is cleared between routes. The open list holds the same priorities in the same order, and a
+    /// heap compares only priorities, so it dequeues the same cells as Search and returns the same path - checked over
+    /// every recorded aim of two Grand sites offline. Falls back to Search when the start is off the grid, where the
+    /// arrays have no index for it.
+    /// </summary>
+    private List<(int X, int Y)> SearchCells((int X, int Y) start, (int X, int Y) goal)
+    {
+        var wide = _slab.Wider;
+        var cells = wide * _slab.Higher;
+
+        if (start.X < 0 || start.Y < 0 || start.X >= wide || start.Y >= _slab.Higher)
+            return Search(start, goal);
+
+        if (_gOfCell == null || _gOfCell.Length < cells)
+        {
+            _gOfCell = new float[cells];
+            _cameFromCell = new int[cells];
+            _stampOfCell = new int[cells];
+            _stamp = 0;
+        }
+
+        if (++_stamp == int.MaxValue)
+        {
+            Array.Clear(_stampOfCell);
+            _stamp = 1;
+        }
+
+        var stamp = _stamp;
+        var g = _gOfCell;
+        var came = _cameFromCell;
+        var stamps = _stampOfCell;
+        var open = _openCells ??= new PriorityQueue<int, float>();
+
+        open.Clear();
+
+        var first = start.Y * wide + start.X;
+        var target = goal.Y * wide + goal.X;
+
+        g[first] = 0f;
+        came[first] = -1;
+        stamps[first] = stamp;
+        open.Enqueue(first, Apart(start, goal));
+
+        var seen = 0;
+
+        while (open.TryDequeue(out var at, out _) && seen++ < Most)
+        {
+            if (at == target)
+            {
+                var path = _path ??= new List<(int X, int Y)>();
+
+                path.Clear();
+
+                for (var cell = at; cell >= 0; cell = came[cell])
+                    path.Add((cell % wide, cell / wide));
+
+                path.Reverse();
+
+                return path;
+            }
+
+            var ax = at % wide;
+            var ay = at / wide;
+            var cost = g[at];
+            var mask = _slab.Bytes[at];
+
+            for (var i = 0; i < Steps.Length; i++)
+            {
+                if (((mask >> i) & 1) == 0)
+                    continue;
+
+                var nx = ax + Steps[i].X;
+                var ny = ay + Steps[i].Y;
+
+                if (!RoutableCell((nx, ny)))
+                    continue;
+
+                var next = ny * wide + nx;
+                var step = cost + Steps[i].Cost;
+
+                if (stamps[next] == stamp && g[next] <= step)
+                    continue;
+
+                g[next] = step;
+                came[next] = at;
+                stamps[next] = stamp;
+                open.Enqueue(next, step + Apart((nx, ny), goal));
+            }
+        }
+
+        return null;
+    }
+
+    [ThreadStatic] private static float[] _gOfCell;
+
+    [ThreadStatic] private static int[] _cameFromCell;
+
+    [ThreadStatic] private static int[] _stampOfCell;
+
+    [ThreadStatic] private static int _stamp;
+
+    [ThreadStatic] private static PriorityQueue<int, float> _openCells;
+
+    /// <summary>
+    /// The routed polyline between two points without the cache, for the offline check that compares the two searches.
+    /// </summary>
+    internal List<Vector2> RouteUncached(Vector2 from, Vector2 to) => Route(from, to);
 
     /// <summary>
     /// Whether a cell reads below the clearance the route builder asks for, which is 1.
@@ -731,9 +892,11 @@ internal sealed class Wire
     internal IReadOnlyDictionary<(int X, int Y), float> Costs => _costs;
 
     /// <summary>
-    /// Route one pair purely so the search runs and Costs fills. Diagnostic; the answer is dropped.
+    /// Route one pair purely so the search runs and Costs fills. Diagnostic; the answer is dropped. Searched every time
+    /// and with Search, which is the one that fills Costs, as Route would search it: from the requested point.
     /// </summary>
-    internal void Trace(Vector2 from, Vector2 to) => Bend(from, to);
+    internal void Trace(Vector2 from, Vector2 to) =>
+        Search(_slab.Cell((int)to.X, (int)to.Y), _slab.Cell((int)from.X, (int)from.Y));
 
     private Dictionary<(int X, int Y), float> _costs = new();
 

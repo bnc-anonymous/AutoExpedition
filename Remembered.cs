@@ -120,6 +120,15 @@ internal static class Remembered
                     target.ExplicitPacks,
                     target.ExplicitMagicPacks,
                     target.ExplicitRarePacks,
+                    // The object's own modifiers, which say what a relic grants. Read from a live entity and
+                    // latched for the map, but a site restored from here came back without them, so after a
+                    // plugin reload every relic was worth its flat weight alone until walked past again: two
+                    // "Runic Monsters are Duplicated" relics on one site read 3 and 0 to the heavy test. Tabs
+                    // separate the columns, so the commas inside are safe. See Target.Mods.
+                    target.Mods,
+                    // Whether a remnant was found to belong to no dig site, which is settled only by picking a
+                    // recipe beside it and is not something to have to do twice. See Target.Lone.
+                    target.Lone switch { true => "1", false => "0", _ => "" },
                     target.Meta));
             }
 
@@ -235,6 +244,10 @@ internal static class Remembered
                     ExplicitPacks = parts.Length > 22 ? (int)Number(parts[19]) : 0,
                     ExplicitMagicPacks = parts.Length > 22 ? (int)Number(parts[20]) : 0,
                     ExplicitRarePacks = parts.Length > 22 ? (int)Number(parts[21]) : 0,
+
+                    // One more, the modifiers, read the same way; a file written before it has none.
+                    Mods = parts.Length > 23 ? parts[22] : "",
+                    Lone = parts.Length > 24 ? parts[23] switch { "1" => true, "0" => false, _ => null } : null,
                     Meta = parts[^1],
                 };
 

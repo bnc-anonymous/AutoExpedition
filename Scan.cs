@@ -182,8 +182,15 @@ internal enum TargetKind
     /// colour, and one line in the census. What they have in common is where their weight is spent,
     /// not how much it is.
     ///
-    /// Told by "Monolith" in the metadata, backed up by its own states - pick_boss, boss_spawned,
-    /// boss_defeated - which no gate has.
+    /// Told by the table row path:*Monolith*, and only where the metadata also names Expedition; no
+    /// state is checked.
+    ///
+    /// **Not yet seen.** No saved site holds an expedition monolith. The row alone matched only the
+    /// essence encounter's Metadata/MiscellaneousObjects/Monolith and MiniMonolith (28 targets over 51
+    /// saved sites), which an explosive does nothing to, and the solver spent blasts on them. A matches
+    /// cell opens only at its ends, so "*Expedition*Monolith*" cannot say this, and the qualifier lives
+    /// in Scan as the hatch's does. The states pick_boss, boss_spawned and boss_defeated were described
+    /// here as the evidence; they were never read.
     /// </summary>
     Monolith,
 
@@ -343,6 +350,51 @@ internal sealed class Target
     public string Art { get; init; } = "";
 
     /// <summary>
+    /// Whether the table says to ignore this target, asked again only when the table changes. A target scanned or
+    /// remembered before its row was written is dropped by this rather than by being classified again, which a
+    /// known target never is. See Scan.IgnoredByTable.
+    /// </summary>
+    public bool Ignored
+    {
+        get
+        {
+            if (_ignoredAt != Wrt.Revision)
+                (_ignored, _ignoredAt) = (Scan.IgnoredByTable(Meta), Wrt.Revision);
+
+            return _ignored;
+        }
+    }
+
+    private bool _ignored;
+
+    private int _ignoredAt = -1;
+
+    /// <summary>
+    /// The model as it can be read now: Art when the scan had it, otherwise read again - at most once a second -
+    /// until the game has streamed it in, then kept. Art is read once, when the object is classified, and an
+    /// object classified before its art loaded kept an empty one. See Unknowns.Key.
+    /// </summary>
+    public string ArtNow
+    {
+        get
+        {
+            if (Art.Length > 0)
+                return Art;
+
+            if (_artLate.Length > 0 || Entity == null || DateTime.UtcNow - _artTriedAt < TimeSpan.FromSeconds(1))
+                return _artLate;
+
+            _artTriedAt = DateTime.UtcNow;
+
+            return _artLate = Scan.Art(Entity) ?? "";
+        }
+    }
+
+    private string _artLate = "";
+
+    private DateTime _artTriedAt = DateTime.MinValue;
+
+    /// <summary>
     /// The magic mods the object carries, joined.
     ///
     /// **This is how a relic says what it is, and it took three tilesets to notice.** Every relic
@@ -393,6 +445,9 @@ internal sealed class Target
     }
 
     private string _mods = "";
+
+    /// <summary>Whether the modifiers have been read, without reading them. See Scan.Keep.</summary>
+    public bool ModsKnown => _mods.Length > 0;
 
     /// <summary>
     /// Every modifier on this object with the values the game printed on it, implicit and explicit.
@@ -626,6 +681,32 @@ internal sealed class Target
     public string Icon { get; init; } = "";
 
     /// <summary>
+    /// The minimap icon as it can be read now: Icon when the scan had it, otherwise read again - at most once a
+    /// second - until the game has set it, then kept. Read once at classification, an icon not there yet stayed
+    /// empty: a relic and a sub-area entrance on a Frigid Bluffs site (2026-10-04) were filed without theirs and
+    /// missed their shipped rows. See ArtNow and Unknowns.Key.
+    /// </summary>
+    public string IconNow
+    {
+        get
+        {
+            if (Icon.Length > 0)
+                return Icon;
+
+            if (_iconLate.Length > 0 || Entity == null || DateTime.UtcNow - _iconTriedAt < TimeSpan.FromSeconds(1))
+                return _iconLate;
+
+            _iconTriedAt = DateTime.UtcNow;
+
+            return _iconLate = Scan.Icon(Entity) ?? "";
+        }
+    }
+
+    private string _iconLate = "";
+
+    private DateTime _iconTriedAt = DateTime.MinValue;
+
+    /// <summary>
     /// What to call this on screen: the best name there is for it, never blank.
     ///
     /// The art if it has one, the minimap icon if it does not, the tail of its metadata if it has
@@ -712,6 +793,14 @@ internal sealed class Target
     /// has never been edited.
     /// </summary>
     public int PricedUnder { get; set; } = -1;
+
+    /// <summary>
+    /// Whether this remnant's rewards were collapsed to its best option when they were priced: a must take with no
+    /// reward chosen on it (see Valuation.Pinned). The list has to be priced again when that changes - the mark coming
+    /// off or going on, or a reward being chosen on a must take: kept, it left a remnant un-marked with F3 holding one
+    /// option, and a combination the player then set by hand could not be found in it.
+    /// </summary>
+    public bool PricedCollapsedToMustTake { get; set; }
 
     /// <summary>
     /// Which revision the "is anything about this still unpriced" answer was worked out under.
@@ -811,6 +900,14 @@ internal sealed class Target
     public int FixedSlot { get; set; } = -1;
 
     /// <summary>
+    /// The recipe the solver last picked at this remnant while no combination was chosen on it, or empty when it has
+    /// never picked one. Frozen once a combination is chosen: with Overrule already chosen rewards off the solver is
+    /// then pinned to the choice, so its later picks are the player's and say nothing about what it wanted. The
+    /// overlay draws a chosen combination red when it differs from this. See Overlay.Remnants.
+    /// </summary>
+    public string SolverPickBeforeChoice { get; set; } = "";
+
+    /// <summary>
     /// Whether this remnant is the result of a Liquid Verisium rather than of the map.
     ///
     /// The game says so outright, which is what makes the census able to keep the two populations
@@ -883,6 +980,16 @@ internal sealed class Target
     public bool WasLive { get; set; }
 
     /// <summary>
+    /// For a remnant: true when it belongs to no dig site, false when it is confirmed to belong to the one it is filed
+    /// under, null while nobody knows. Settled by picking a recipe and reading what the game does - see
+    /// Scan.SettleLoneRemnants. Saved with the site. A lone remnant is left out of every dig site's targets.
+    /// </summary>
+    public bool? Lone { get; set; }
+
+    /// <summary>When a recipe was first seen picked on this remnant with it still at activated 1. See Scan.SettleLoneRemnants.</summary>
+    public DateTime? PickedWhileIdleSince { get; set; }
+
+    /// <summary>
     /// Throws away everything read about what this remnant offers.
     ///
     /// Called when it stops being the same remnant. A Liquid Verisium replaces it outright - new
@@ -912,17 +1019,13 @@ internal sealed class Target
     /// <summary>
     /// The second entity standing on this cell, where the thing is two entities. See Holds.
     ///
-    /// **A strongbox is a mound and a box, and only one of them lights.** The mound is the terrain
+    /// **A strongbox is a mound and a box, and either may be the one lit.** The mound is the terrain
     /// fill a blast breaks and the box is the content inside it; they share a cell, and whichever
-    /// the sweep met first became Entity. When that was the mound - which it usually is, since the
-    /// terrain streams in ahead of the chest - every state read went to an object that carries
-    /// glow_epk permanently at nought.
-    ///
-    /// The placement check asks whether the markers a blast was chosen for are highlighted, so the
-    /// box could never answer yes: a blast that had in fact lit it reported one marker unlit and
-    /// called itself the wrong blast, with nothing on the ground to point at because the box was
-    /// sitting there lit. Seen in a dump with glow_epk=1 on the chest and 0 on the mound at the
-    /// same coordinates. See Glowing.
+    /// the sweep met first became Entity, with the other held here. Reading only one half gets the
+    /// lit state wrong both ways: one dump had glow_epk=1 on the chest and 0 on the mound, and
+    /// another (2026-10-02, a box on the edge of a blast at (758,873)) had 1 on the mound and 0 on
+    /// the chest. The placement check then reported the box unlit and called the blast the wrong
+    /// one. So Glowing asks both. See Glowing and Scan.Attach.
     /// </summary>
     public Entity Held { get; set; }
 
@@ -1111,6 +1214,25 @@ internal sealed class Target
     /// walk of the state list, and with eighty odd markers that was hundreds of reads a frame for
     /// an answer that cannot change between two draws.
     /// </summary>
+    /// <summary>
+    /// Whether an explosive already placed will take this, by the client's "in_range" state.
+    ///
+    /// Read off one dump on Sloughed Gully (2026-09-30) with two explosives down: all twenty objects
+    /// reading in_range=1 were within 36.4 grid of one of them, except a Devourer boss egg at 44.1 whose
+    /// size carries it in, and none of them also read in_placing_range. So something a placed explosive
+    /// already has does not light under the placement circle, and its not lighting says nothing about
+    /// the circle. See Placement.Coverage.
+    /// </summary>
+    public bool InPlacedBlast => Live && State("in_range") == 1;
+
+    /// <summary>
+    /// Whether this live marker's highlight can be read at all: glow_epk present on it or on its pair. A marker the
+    /// client has only half loaded lists no states, and Glowing then reads false whatever the client draws - on a
+    /// Grazed Prairie site (2026-10-06) a monster marker 16 grid inside the blast, with no states, no art and no
+    /// rotation readable, was reported unlit while its three neighbours listed their states. See Placement.Coverage.
+    /// </summary>
+    public bool GlowReadable => Live && (State("glow_epk") >= 0 || Stated(Held, "glow_epk") >= 0);
+
     public bool Glowing
     {
         get
@@ -1120,7 +1242,7 @@ internal sealed class Target
 
             _glowFrame = Frame.Number;
 
-            // Either half: a strongbox is a mound plus a box and only the box lights. See Held.
+            // Either half: a strongbox is a mound plus a box, and either may be the one lit. See Held.
             _glow = Live && (State("glow_epk") == 1 || Stated(Held, "glow_epk") == 1);
 
             return _glow;
@@ -1460,11 +1582,15 @@ internal sealed class Scan
     public Scan(GameController gc) => _gc = gc;
 
     /// <summary>Everything remembered, whichever site it belongs to.</summary>
-    public List<Target> Targets => _known.Values.ToList();
+    public List<Target> Targets => _known.Values.Where(t => !t.Ignored).ToList();
 
     private Vector2 _atSite = new(float.NaN, float.NaN);
     private int _atCount = -1;
+    private int _atLone = -1;
     private List<Target> _at = new();
+
+    /// <summary>Counts the lone remnant verdicts given, so the per-site list is rebuilt when one changes.</summary>
+    private int _loneVerdicts;
 
     /// <summary>
     /// What belongs to one dig site, named by that site's detonator position.
@@ -1604,17 +1730,135 @@ internal sealed class Scan
         return joined;
     }
 
+    private int _atRevision = -1;
+
     public List<Target> At(Vector2 site)
     {
-        if (site == _atSite && _known.Count == _atCount)
+        if (site == _atSite && _known.Count == _atCount && _loneVerdicts == _atLone && Wrt.Revision == _atRevision)
             return _at;
 
         _atSite = site;
         _atCount = _known.Count;
-        _at = _known.Values.Where(t => Vector2.Distance(t.Site, site) < 1f).ToList();
+        _atLone = _loneVerdicts;
+        _atRevision = Wrt.Revision;
+
+        // A remnant confirmed to belong to no dig site is nobody's content, and nor is anything the table says to
+        // ignore. See Target.Lone and Target.Ignored.
+        _at = _known.Values.Where(t => Vector2.Distance(t.Site, site) < 1f && t.Lone != true && !t.Ignored).ToList();
 
         return _at;
     }
+
+    /// <summary>
+    /// Settles which remnants belong to no dig site, from what the game does when a recipe is picked.
+    ///
+    /// **A remnant attached to a dig site moves its "activated" state from 1 to 2 when a recipe is picked; a lone one
+    /// stays at 1 and offers its shatter button, which starts its encounter.** Measured on one map (2026-09-30): six
+    /// picks on site remnants each read 2 at the next record, and the lone remnant read 1 with "Perfect Chaos Orb"
+    /// picked at about a dozen records over seventy minutes, then 5, 6 and 7 once shattered. One lone remnant, so a
+    /// pattern rather than a rule. A pick is only judged lone after LoneAfter at 1, in case the state lags the pick.
+    /// Nothing is ever judged without a pick, so an unsettled remnant stays in the plan. See Target.Lone.
+    /// </summary>
+    /// <param name="picked">The name of the recipe picked on a loaded remnant, or empty. See Valuation.ChosenName.</param>
+    public void SettleLoneRemnants(Func<Entity, string> picked)
+    {
+        // A Grand Expedition has no lone remnants. See Detonator.Grand.
+        if (Detonator.Grand(_gc))
+            return;
+
+        foreach (var target in _known.Values)
+        {
+            if (target.Kind != TargetKind.Remnant || target.Lone != null || !target.Live)
+                continue;
+
+            var name = Safe.Read(() => picked(target.Entity), "") ?? "";
+            var activated = target.State("activated");
+
+            if (name.Length == 0)
+            {
+                target.PickedWhileIdleSince = null;
+
+                continue;
+            }
+
+            if (activated is 2 or 3)
+            {
+                target.Lone = false;
+                _loneVerdicts++;
+
+                continue;
+            }
+
+            if (activated != 1)
+                continue;
+
+            target.PickedWhileIdleSince ??= DateTime.UtcNow;
+
+            if (DateTime.UtcNow - target.PickedWhileIdleSince.Value < LoneAfter)
+                continue;
+
+            target.Lone = true;
+            _loneVerdicts++;
+        }
+    }
+
+    /// <summary>How long a picked remnant must stay at activated 1 before it is judged lone. See SettleLoneRemnants.</summary>
+    private static readonly TimeSpan LoneAfter = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Whether a remnant not yet settled has no other expedition marker near it, which is what a lone remnant looked
+    /// like on the one map it was seen on: its nearest neighbours were ordinary monsters, not markers. A suspicion
+    /// only, for pointing the player at it to pick a recipe; it changes nothing the plan does. Never on a Grand
+    /// Expedition, which has no lone remnants. See SettleLoneRemnants.
+    ///
+    /// **Only once the site's detonator panel is filled in**, which the game does when the player is at the site.
+    /// Remnants are readable from across the map and other markers are not: from 371 grid off a site the scan held
+    /// seven remnants and two other markers, so every remnant of the site read as having no marker near it (Flotsam,
+    /// 2026-10-01). A regular site is small enough that its markers have loaded by the time the panel is filled in.
+    /// </summary>
+    public bool MaybeLone(Target remnant) =>
+        remnant.Kind == TargetKind.Remnant && remnant.Lone == null && !Detonator.Grand(_gc) &&
+        Detonator.PanelReady(_gc) && NearestMarkerTo(remnant) > LoneMarkerGap;
+
+    /// <summary>
+    /// How far the nearest other expedition marker - monster, rare, chest or relic - is from a target, or infinity for
+    /// none.
+    /// </summary>
+    public float NearestMarkerTo(Target target)
+    {
+        var nearest = float.PositiveInfinity;
+
+        foreach (var other in _known.Values)
+        {
+            if (ReferenceEquals(other, target) ||
+                other.Kind is not (TargetKind.Monster or TargetKind.Elite or TargetKind.Chest or TargetKind.Relic))
+                continue;
+
+            nearest = MathF.Min(nearest, Vector2.Distance(other.Grid, target.Grid));
+        }
+
+        return nearest;
+    }
+
+    /// <summary>
+    /// How far a remnant's nearest other expedition marker must be for it to be suspected lone, in grid: two blast
+    /// radii. Chosen, not measured; the dump prints each remnant's nearest marker so it can be checked. See MaybeLone.
+    /// </summary>
+    private const float LoneMarkerGap = 60f;
+
+    /// <summary>What is known of a remnant's dig site, in words, for the dump.</summary>
+    public string MembershipSaid(Target remnant) =>
+        Detonator.Grand(_gc) && remnant.Lone == null
+            ? "Grand Expedition, which has no lone remnants"
+            : remnant.Lone switch
+        {
+            true => "LONE (a recipe picked left it at activated 1) - left out of the site",
+            false => "belongs to the site (a recipe picked moved it to activated 2)",
+            _ => $"not settled, nearest marker {NearestMarkerTo(remnant):0.#} grid" +
+                 (MaybeLone(remnant) ? " - MAY BE LONE, pick a recipe to find out"
+                     : !Detonator.PanelReady(_gc) ? " (not judged until the site's panel is filled in - its markers may not have loaded)"
+                     : ""),
+        };
 
     /// <summary>How many separate dig sites have been seen in this area.</summary>
     public int Sites => _known.Values.Select(t => (t.Site.X, t.Site.Y)).Distinct().Count();
@@ -1741,6 +1985,8 @@ internal sealed class Scan
             _refusedPaths.Clear();
             HeldForAnotherLook = 0;
             _saved = 0;
+            _savedMods = 0;
+            _savedLone = _loneVerdicts;
 
             // A new area is walked at once rather than waiting out the backstop, and its first walk
             // is not counted as a miss - nothing has been told to us about this area yet.
@@ -1761,6 +2007,7 @@ internal sealed class Scan
                 }
 
                 _saved = _known.Count;
+                _savedMods = ModsKnownCount();
             }
         }
 
@@ -1773,16 +2020,31 @@ internal sealed class Scan
     /// **Called as it goes rather than only on the way out.** A plugin reload is the case this
     /// exists for and it gives no warning - the instance holding a lap's worth of markers is simply
     /// gone - so waiting for an area change would save exactly the sessions that did not need it.
+    ///
+    /// **And if more modifiers are known than when it last wrote.** A relic's modifiers say what it grants and can only
+    /// be read while it is loaded, so on a site whose markers were all found on the first pass they were read after
+    /// the last write and never reached the file. See Remembered.Save.
     /// </summary>
     public void Keep()
     {
-        if (_real == 0 || _known.Count <= _saved)
+        if (_real == 0 || _known.Count <= _saved && ModsKnownCount() <= _savedMods && _loneVerdicts <= _savedLone)
             return;
 
         Remembered.Save(Home, _real, _name, _size, _known.Values);
         _saved = _known.Count;
+        _savedMods = ModsKnownCount();
+        _savedLone = _loneVerdicts;
         _wrote = DateTime.UtcNow;
     }
+
+    /// <summary>How many known markers have their modifiers read. See Keep.</summary>
+    private int ModsKnownCount() => _known.Values.Count(t => t.ModsKnown);
+
+    /// <summary>How many had them at the last write. See Keep.</summary>
+    private int _savedMods;
+
+    /// <summary>How many lone remnant verdicts had been given at the last write. See Keep.</summary>
+    private int _savedLone;
 
     /// <summary>
     /// Prices any remnant that is loaded and has not been priced yet.
@@ -2272,6 +2534,9 @@ internal sealed class Scan
             // live. Nothing here needs to move when it changes.
             known.Chose = Safe.Read(() => valuation.ChosenName(known.Entity), null) ?? "";
 
+            if (known.Chose.Length == 0 && Options.Solved(known) is var solved and >= 0)
+                known.SolverPickBeforeChoice = known.Rewards[solved].Recipe;
+
             // Forgetting clears the rewards, so a rolled remnant comes back through here and is
             // read afresh without needing a second flag to say so.
             //
@@ -2287,10 +2552,13 @@ internal sealed class Scan
             // under covers both without needing a flag for either. See Valuation.FixedRune.
             var namedNow = Safe.Read(() => valuation.FixedRune(known.Entity), null) ?? "";
             var slotNow = Safe.Read(() => valuation.FixedSlot(known.Entity), -1);
+            var collapsedNow = Safe.Read(() => Insisted.Here.MarkedForRewardValue(known.Entity.GridPos), false) &&
+                               Safe.Read(() => valuation.ChosenByPlayer(known.Entity), null) == null;
 
             if (known.Rewards.Count > 0 && known.Rewards[0].Value > 0d &&
                 known.PricedUnder == Wrt.Revision &&
-                known.FixedRune == namedNow && known.FixedSlot == slotNow)
+                known.FixedRune == namedNow && known.FixedSlot == slotNow &&
+                known.PricedCollapsedToMustTake == collapsedNow)
                 continue;
 
             // **Half a read is not a price, and storing one wrecked a whole site.**
@@ -2330,6 +2598,7 @@ internal sealed class Scan
             if (found.Count > 0)
             {
                 known.PricedUnder = Wrt.Revision;
+                known.PricedCollapsedToMustTake = collapsedNow;
                 known.Rewards = found;
                 known.Spread = valuation.Spread(known.Entity);
                 known.FixedRune = valuation.FixedRune(known.Entity) ?? "";
@@ -2897,7 +3166,8 @@ internal sealed class Scan
         // showing twenty milliseconds against a ten millisecond average looks like either way.
         sweeping.Dispose();
 
-        if (_known.Count > _saved && DateTime.UtcNow - _wrote > TimeSpan.FromSeconds(10))
+        if ((_known.Count > _saved || ModsKnownCount() > _savedMods || _loneVerdicts > _savedLone) &&
+            DateTime.UtcNow - _wrote > TimeSpan.FromSeconds(10))
             using (Spent.On("Scan.Tick/Keep"))
                 Keep();
     }
@@ -3064,8 +3334,15 @@ internal sealed class Scan
                 // shares its cell with the mound the blast breaks, so whichever arrived second
                 // was walked past. The second one is not a rival for the cell - it is the other
                 // half of the same thing. See Target.Holds.
-                if (existing.Kind == TargetKind.Strongbox &&
-                    standing.Contains("/StrongBoxes/", StringComparison.OrdinalIgnoreCase))
+                //
+                // **Either half can be the one on record.** A record made from the chest walked past the
+                // mound arriving second, and on 2026-10-02 every strongbox on a site read one entity: at
+                // (758,873), on the edge of a blast, the mound read glow_epk 1 and the chest 0, so the
+                // placement check called the box unlit. The mound is what the blast breaks.
+                var chest = standing.Contains("/StrongBoxes/", StringComparison.OrdinalIgnoreCase);
+                var mound = standing.Contains("ExplodingFill_StrongBox", StringComparison.OrdinalIgnoreCase);
+
+                if (existing.Kind == TargetKind.Strongbox && (chest || mound))
                 {
                     // **The handle is taken every sweep, what it says is read once.** Holds is
                     // written to the site file and comes back with it, so a site restored from
@@ -3075,7 +3352,7 @@ internal sealed class Scan
                     // streams, so an address kept from one sweep is stale by the next.
                     existing.Held = entity;
 
-                    if (existing.Holds.Length == 0)
+                    if (chest && existing.Holds.Length == 0)
                     {
                         existing.Holds = standing;
                         existing.Rarity = Rarity(entity);
@@ -3142,6 +3419,9 @@ internal sealed class Scan
             return null;
 
         var metadata = Safe.Read(entity, static e => e.Metadata, "") ?? "";
+
+        if (IgnoredByTable(metadata))
+            return null;
 
         // **Asked once.** This was five separate calls on the same string, one per kind tested, and
         // each one scans every matching rule in the weight reference table and then parses the
@@ -3317,11 +3597,9 @@ internal sealed class Scan
         if (relic.State("expedition_relic") > 0)
             return relic;
 
-        // A monolith: a boss behind a blast rather than monsters. Its states say so outright -
-        // pick_boss, boss_spawned, boss_defeated. See TargetKind.Monolith.
-        // Nested inside the expedition_relic state test above, which a matches cell cannot express
-        // either - so as with the hatch, the name lives in the row and only the qualifier lives here.
-        if (kinded == TargetKind.Monolith)
+        // A monolith: a boss behind a blast rather than monsters. The row matches any metadata naming
+        // Monolith, so the essence encounter's crystals are turned away here. See TargetKind.Monolith.
+        if (kinded == TargetKind.Monolith && metadata.Contains("Expedition", StringComparison.OrdinalIgnoreCase))
         {
             return new Target
             {
@@ -3689,7 +3967,7 @@ internal sealed class Scan
     /// - so they are left unranked and take the middling weight rather than being guessed at.
     /// </summary>
     /// <summary>The minimap icon's name, which on a Grand site says more than the art does.</summary>
-    private static string Icon(Entity entity)
+    internal static string Icon(Entity entity)
     {
         LeafCalls.ComponentReads++;
 
@@ -3707,15 +3985,27 @@ internal sealed class Scan
     /// anything about from the table: "Explodable scenery" sat there with a weight and no visible
     /// reason it ever applied.
     ///
-    /// Only the kinds whose test is purely the metadata. Hatch excludes "Spawner" and Monolith fires
-    /// only on an entity already carrying an expedition_relic state, and a matches cell can say
-    /// neither - so those two stay here and say so.
+    /// Only the kinds whose test is purely the metadata. Hatch excludes "Spawner" and Monolith needs
+    /// "Expedition" as well, and a matches cell can say neither - so those two stay here and say so.
+    /// See TargetKind.Monolith.
     ///
     /// **Branch ORDER still decides, and it has to.** ExplodingFill_StrongBox, _BoomBarrel and
     /// _BoxxesofGold are one family, and the first two are a strongbox and a barrel before they are
     /// scenery. The tests below run in the same order they always did; this only changes what each
     /// one asks.
     /// </summary>
+    /// <summary>
+    /// Whether the table says to ignore this metadata: the path: row it answers to has Ignored in its Kind cell. A
+    /// row's id may open either end with a star, so one row can cover a family - path:Metadata/Monsters/VaalMonsters/
+    /// Zealots/* covers every Vaal Zealot. See TableGrammar.Matched and IgnoredKind.
+    /// </summary>
+    internal static bool IgnoredByTable(string metadata) =>
+        string.Equals(Wrt.Of(TableGrammar.Matched(metadata ?? "", TableGrammar.Path))?.Kind, IgnoredKind,
+            StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The word in a path: row's Kind cell that makes the scan drop what the row matches. See IgnoredByTable.</summary>
+    internal const string IgnoredKind = "Ignored";
+
     private static TargetKind? Kinded(string metadata)
     {
         var id = TableGrammar.Matched(metadata ?? "", TableGrammar.Path);

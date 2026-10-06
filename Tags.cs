@@ -60,7 +60,7 @@ internal static class Tags
         var key = Unknowns.Key(target);
         var said = Wrt.Of(Wrt.Id.Found(key))?.Tags
                    ?? (Weighing.RowOfTarget(target) is { } row ? Wrt.Of(row)?.Tags : null)
-                   ?? Wrt.Of(Wrt.Id.Kind(target.Kind, target.Tier))?.Tags;
+                   ?? Wrt.Of(Weighing.RowIdOfTarget(target))?.Tags;
 
         if (said == null)
         {
@@ -432,6 +432,13 @@ internal static class Tags
 
     /// <summary>Anything a propagating modifier may scale. Named here so it is spelt once.</summary>
     public const string Modifiable = "weight_modifiable";
+
+    /// <summary>
+    /// A thing no rune share reaches, though relics and the map's increases still do: the Runemarked rares of the
+    /// Death rune's merge, which carry no rune modifier. Written on a row; read by Planner.Settle's payout, which pays
+    /// such a thing from the non-rune shares alone. See NOTES, "Death merges".
+    /// </summary>
+    public const string UnaffectedByRunes = "unaffected_by_runes";
 
     /// <summary>
     /// Whether a tag names monsters, so a rune scoped to it lands on things that fight you.

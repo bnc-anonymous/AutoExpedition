@@ -42,14 +42,14 @@ internal static class Wash
     /// second at most; the frame draws sixty times a second. Rebuilding per frame would be fourteen
     /// thousand pixels of work to produce a byte-identical image.
     /// </summary>
-    private static (int Wide, int High, int Stamp, int Colour) _built = (0, 0, -1, 0);
+    private static (int Wide, int High, int Stamp, int Colour, int Height) _built = (0, 0, -1, 0, 0);
 
     private static bool _have;
 
     /// <summary>Forgets the texture, so a new area builds its own. See Scouted.AreaChange.</summary>
     public static void Forget()
     {
-        _built = (0, 0, -1, 0);
+        _built = (0, 0, -1, 0, 0);
         _have = false;
     }
 
@@ -61,7 +61,12 @@ internal static class Wash
     /// it says - the difference is that it is now applied once per pixel instead of once per quad
     /// overlapping that pixel.
     /// </summary>
-    public static bool Ready(Graphics graphics, Scouted scouted, Colour colour)
+    /// <summary>
+    /// The layer's image, built again when anything it shows has changed. <paramref name="heightAt"/> is the grid
+    /// position whose terrain height the corners are projected at; each tile is moved by its own height against that
+    /// one, as the map draws it. See Corners and Scouted.HeightOfTile.
+    /// </summary>
+    public static bool Ready(Graphics graphics, Scouted scouted, Colour colour, Vector2 heightAt)
     {
         if (graphics == null || scouted is not { Ready: true })
             return false;
@@ -72,7 +77,12 @@ internal static class Wash
         if (wide <= 0 || high <= 0)
             return false;
 
-        var now = (wide, high, scouted.Stamp, colour.ToArgb());
+        // In steps of 25 world units, since a whole tile's move takes about 350 and a reference read off the player
+        // would otherwise rebuild the image with every step across a slope.
+        var reference = MathF.Round(scouted.HeightAt(heightAt) / 25f) * 25f;
+
+        Reference = reference;
+        var now = (wide, high, scouted.Stamp, colour.ToArgb(), (int)reference);
 
         if (_have && now == _built)
             return true;
@@ -84,12 +94,22 @@ internal static class Wash
 
             image.ProcessPixelRows(rows =>
             {
+                // Each tile moved up the map by its height above the reference, in whole tiles, both ways at once,
+                // as Radar moves its pixels: a height of h moves a cell h / GridToWorld / 2 grid units back on each axis.
                 for (var y = 0; y < high; y++)
                 {
-                    var row = rows.GetRowSpan(y);
-
                     for (var x = 0; x < wide; x++)
-                        row[x] = scouted.Unpainted(x, y) ? paint : default;
+                    {
+                        if (!scouted.Unpainted(x, y))
+                            continue;
+
+                        var shift = (int)MathF.Round((scouted.HeightOfTile(x, y) - reference) /
+                                                      Detonator.GridToWorld / 2f / Scouted.Tile);
+                        var (tx, ty) = (x - shift, y - shift);
+
+                        if (tx >= 0 && ty >= 0 && tx < wide && ty < high)
+                            rows.GetRowSpan(ty)[tx] = paint;
+                    }
                 }
             });
 
@@ -119,23 +139,81 @@ internal static class Wash
     /// the entire walkable map this way and it reads fine, which is the evidence for accepting it -
     /// and a wash saying "you have not been here" does not need to be height accurate.
     /// </summary>
+    /// <summary>
+    /// The image's corners on the map, each projected at the terrain height of <paramref name="heightAt"/> rather than
+    /// its own, since the tiles have been moved by their heights against that one. See Ready.
+    /// </summary>
     public static (Vector2 A, Vector2 B, Vector2 C, Vector2 D) Corners(Graphics graphics,
-        Scouted scouted)
+        Scouted scouted, Vector2 heightAt)
     {
         var wide = scouted.Wide * Scouted.Tile;
         var high = scouted.High * Scouted.Tile;
 
-        return (At(graphics, 0, 0), At(graphics, wide, 0),
-            At(graphics, wide, high), At(graphics, 0, high));
+        return (At(graphics, 0, 0, heightAt), At(graphics, wide, 0, heightAt),
+            At(graphics, wide, high, heightAt), At(graphics, 0, high, heightAt));
     }
+
+    /// <summary>
+    /// The image's corners on the large map projected as Radar projects its walkable map, or null when the large map is
+    /// not up or cannot be read: from the large map's own centre and scale, about the player, at the player's model
+    /// height against <paramref name="reference"/>, the height the tiles were moved against. See Ready.
+    ///
+    /// **Not GridToMap, which drew the layer a few pixels low.** Projected through GridToMap the layer agreed with
+    /// GridToMap to the pixel at the site, the player and the highest and lowest tiles painted, and still sat below the
+    /// map's own walkable outlines on an Exhumed Ruins site (2026-10-05): spilling past the edges at the bottom of each
+    /// area, a gap at the top. Radar anchors its image on the player's model height rather than a terrain height read
+    /// at a point, and lines up with the map with its offsets at nought.
+    /// </summary>
+    /// <param name="heightOffset">
+    /// How far above the ground to draw the layer, in world units. See UnscoutedDisplaySettings.UnscoutedHeightOffset.
+    /// </param>
+    public static (Vector2 A, Vector2 B, Vector2 C, Vector2 D)? CornersAboutPlayer(GameController gc, Scouted scouted,
+        float reference, float heightOffset = 0f)
+    {
+        var large = Safe.Read(gc, static g => g.IngameState.IngameUi.Map.LargeMap.AsObject<ExileCore2.PoEMemory.Elements.SubMap>(), null);
+
+        if (large == null || !Safe.Read(large, static m => m.IsVisible, false))
+            return null;
+
+        var centre = Safe.Read(large, static m => m.MapCenter, Vector2.Zero);
+        var scale = Safe.Read(large, static m => (float)m.MapScale, 0f);
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var unclamped = Safe.Read(gc, static g => g.Player.GetComponent<ExileCore2.PoEMemory.Components.Render>()?.UnclampedHeight, null);
+
+        if (centre == Vector2.Zero || scale <= 0f || player == Vector2.Zero || unclamped is not { } height)
+            return null;
+
+        var wide = scouted.Wide * Scouted.Tile;
+        var high = scouted.High * Scouted.Tile;
+
+        return (AboutPlayer(0, 0), AboutPlayer(wide, 0), AboutPlayer(wide, high), AboutPlayer(0, high));
+
+        Vector2 AboutPlayer(float x, float y)
+        {
+            var (dx, dy) = (x - player.X, y - player.Y);
+            // Height is subtracted: in this projection a larger height moves a point down the screen, which is why
+            // Radar passes the player's height negated. Added, a positive offset lowered the layer.
+            var dz = (reference - heightOffset - height) / Detonator.GridToWorld;
+
+            return centre + scale * new Vector2((dx - dy) * CameraCos, (dz - (dx + dy)) * CameraSin);
+        }
+    }
+
+    /// <summary>The camera's tilt the large map is drawn at, as Radar takes it: 38.7 degrees.</summary>
+    private static readonly float CameraCos = MathF.Cos(38.7f * MathF.PI / 180f);
+
+    private static readonly float CameraSin = MathF.Sin(38.7f * MathF.PI / 180f);
+
+    /// <summary>The height Ready last moved the tiles against, for the corners. See CornersAboutPlayer.</summary>
+    public static float Reference { get; private set; }
 
     public static nint Texture(Graphics graphics) =>
         _have ? Safe.Read(() => graphics.GetTextureId(Name), 0) : 0;
 
-    private static Vector2 At(Graphics graphics, float x, float y)
+    private static Vector2 At(Graphics graphics, float x, float y, Vector2 heightAt)
     {
         var grid = new Vector2(x, y);
 
-        return Safe.Read(() => graphics.GridToMap(grid, grid), Vector2.Zero);
+        return Safe.Read(() => graphics.GridToMap(grid, heightAt), Vector2.Zero);
     }
 }

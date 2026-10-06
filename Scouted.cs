@@ -41,6 +41,9 @@ internal sealed class Scouted
     private int _high;
     private bool[] _seen;
     private bool[] _ground;
+
+    /// <summary>The terrain's height at each tile's middle, in world units, or null before the terrain is read. See HeightAt.</summary>
+    private float[] _height;
     private bool _dirty;
     private DateTime _wrote;
 
@@ -147,6 +150,7 @@ internal sealed class Scouted
         _wanted = null;
         _far = null;
         _drawn = null;
+        _connected = null;
         Stamp++;
         Wash.Forget();
 
@@ -162,6 +166,26 @@ internal sealed class Scouted
                 _ground[ty * _wide + tx] =
                     Safe.Read((gc, at), static x => x.gc.IngameState.Data.GetPathfindingValueAt(x.at), 0)
                     >= 1;
+            }
+        }
+
+        // The terrain's height at each tile's middle, read once, for drawing the layer where the map draws the ground.
+        // See HeightAt.
+        var heights = Safe.Read(gc, static g => g.IngameState.Data.RawTerrainHeightData, null);
+
+        _height = new float[_wide * _high];
+
+        if (heights != null)
+        {
+            for (var ty = 0; ty < _high; ty++)
+            {
+                for (var tx = 0; tx < _wide; tx++)
+                {
+                    var (mx, my) = (tx * Tile + Tile / 2, ty * Tile + Tile / 2);
+
+                    if (my < heights.Length && heights[my] is { } row && mx < row.Length)
+                        _height[ty * _wide + tx] = row[mx];
+                }
             }
         }
 
@@ -201,14 +225,14 @@ internal sealed class Scouted
 
         return $"setting {on}, grand {grand} ({links} explosives), map open {map}, " +
                (grand
-                   ? "searching the whole map"
+                   ? _connected != null ? "searching the ground connected to the detonator" : "searching the whole map"
                    : $"searching within {settings.Display.UnscoutedGround.MarkerRadius.Value:0} grid of each marker" +
                      (settings.Display.UnscoutedGround.ShowUnscoutedFar
                          ? ", plus the sites nobody has walked to (drawn, never counted)"
                          : "")) +
                $", {_wide}x{_high} tiles, {ground} walkable to search, {seen} scouted, {left} not - " +
                $"painted in rgba({colour.R},{colour.G},{colour.B},{colour.A})" +
-               Remaining();
+               Remaining() + PathfindingAgreement(gc);
     }
 
     /// <summary>
@@ -294,6 +318,47 @@ internal sealed class Scouted
         return b2.ToString();
     }
 
+    /// <summary>
+    /// How often the raw pathfinding grid, which TilesConnectedTo floods, agrees with GetPathfindingValueAt, which the
+    /// walkable mask is read from, at the tiles' middles - as read, and with the grid moved a tile each way. Two grids
+    /// that disagree put the connected ground somewhere other than the walkable ground, and the layer is their overlap.
+    /// For the dump only: it reads every tile twice.
+    /// </summary>
+    private string PathfindingAgreement(GameController gc)
+    {
+        if (_ground == null)
+            return "";
+
+        var grid = Safe.Read(gc, static g => g.IngameState.Data.RawPathfindingData, null);
+
+        if (grid is not { Length: > 0 })
+            return "; the raw pathfinding grid could not be read";
+
+        bool RawAt(int x, int y) => y >= 0 && y < grid.Length && grid[y] is { } row && x >= 0 && x < row.Length && row[x] != 0;
+
+        var said = new StringBuilder($"; raw pathfinding grid {grid.Length} rows of {grid[0]?.Length ?? 0}, against the lookup at tile middles:");
+
+        foreach (var (dx, dy) in new[] { (0, 0), (Tile, 0), (-Tile, 0), (0, Tile), (0, -Tile) })
+        {
+            var (agree, all) = (0, 0);
+
+            for (var ty = 0; ty < _high; ty++)
+            {
+                for (var tx = 0; tx < _wide; tx++)
+                {
+                    var (mx, my) = (tx * Tile + Tile / 2, ty * Tile + Tile / 2);
+
+                    all++;
+                    agree += RawAt(mx + dx, my + dy) == _ground[ty * _wide + tx] ? 1 : 0;
+                }
+            }
+
+            said.Append($" moved ({dx},{dy}) {100d * agree / Math.Max(1, all):0.0}%");
+        }
+
+        return said.ToString();
+    }
+
     /// <summary>Marks everything within reach of where the player is standing.</summary>
     public void Mark(GameController gc, Vector2 player, float radius)
     {
@@ -342,8 +407,12 @@ internal sealed class Scouted
     /// about the site in front of them, and a second expedition across the map would leave it
     /// reading partial for ever, which is a warning that is always on and therefore says nothing.
     /// </param>
+    /// <param name="detonator">
+    /// Where the site's detonator stands, in grid; with <paramref name="whole"/>, only the ground connected to it is
+    /// searched. Zero searches every walkable tile. See TilesConnectedTo.
+    /// </param>
     public void Wanted(GameController gc, IReadOnlyList<Vector2> markers,
-        IReadOnlyList<Vector2> elsewhere, float radius, bool whole)
+        IReadOnlyList<Vector2> elsewhere, float radius, bool whole, Vector2 detonator = default)
     {
         Live = this;
 
@@ -358,8 +427,10 @@ internal sealed class Scouted
 
         if (whole)
         {
+            var connected = TilesConnectedTo(gc, detonator);
+
             for (var i = 0; i < _wanted.Length; i++)
-                _wanted[i] = true;
+                _wanted[i] = connected == null || connected[i];
 
             _drawn = _wanted;
             Stamp++;
@@ -389,6 +460,110 @@ internal sealed class Scouted
         Spread(_far, elsewhere, radius);
         _drawn = _far;
     }
+
+    /// <summary>
+    /// Per tile, whether its middle is walkable ground connected to the detonator, or null when that cannot be read:
+    /// the pathfinding grid flood filled cell by cell, eight ways, from the walkable cell nearest the detonator. Worked
+    /// out once per area and detonator and kept. See Wanted.
+    ///
+    /// **A Grand site is searched over its own ground, not the whole map.** The map holds other walkable areas that no
+    /// walk from the dig site reaches - on a Frigid Bluffs site (2026-10-04) four of 200 cells or more, 1,169 to 3,821
+    /// grid from the detonator, one of them 130,895 cells - and they were painted unscouted for as long as nobody went
+    /// there, which nobody can. The detonator's own area held all 443 markers that stand on walkable ground. One flood
+    /// took 18 ms offline on that site's grid. See tools/offline FogAreas.
+    ///
+    /// Cell by cell rather than over the tiles, since a tile stands for its middle and a passage narrower than a tile
+    /// can fall between two middles, which would cut the site in two.
+    /// </summary>
+    private bool[] TilesConnectedTo(GameController gc, Vector2 detonator)
+    {
+        if (detonator == Vector2.Zero)
+            return null;
+
+        var key = ((int)detonator.X, (int)detonator.Y);
+
+        if (_connected != null && _connectedFor == key && _connected.Length == _wide * _high)
+            return _connected;
+
+        var grid = Safe.Read(() => gc.IngameState.Data.RawPathfindingData, null);
+
+        if (grid is not { Length: > 0 })
+            return null;
+
+        var high = grid.Length;
+        var wide = 0;
+
+        foreach (var row in grid)
+            wide = Math.Max(wide, row?.Length ?? 0);
+
+        bool Open(int x, int y) => y >= 0 && y < high && grid[y] is { } row && x >= 0 && x < row.Length && row[x] != 0;
+
+        // The walkable cell nearest the detonator, within a few, since it can stand on a cell the grid closes.
+        var start = -1;
+
+        for (var r = 0; r <= 6 && start < 0; r++)
+        {
+            for (var dy = -r; dy <= r && start < 0; dy++)
+            {
+                for (var dx = -r; dx <= r && start < 0; dx++)
+                {
+                    if (Open(key.Item1 + dx, key.Item2 + dy))
+                        start = (key.Item2 + dy) * wide + key.Item1 + dx;
+                }
+            }
+        }
+
+        if (start < 0)
+            return null;
+
+        var reached = new bool[wide * high];
+        var queue = new Queue<int>();
+
+        reached[start] = true;
+        queue.Enqueue(start);
+
+        while (queue.Count > 0)
+        {
+            var at = queue.Dequeue();
+            var (x, y) = (at % wide, at / wide);
+
+            for (var dy = -1; dy <= 1; dy++)
+            {
+                for (var dx = -1; dx <= 1; dx++)
+                {
+                    var (nx, ny) = (x + dx, y + dy);
+
+                    if ((dx != 0 || dy != 0) && Open(nx, ny) && !reached[ny * wide + nx])
+                    {
+                        reached[ny * wide + nx] = true;
+                        queue.Enqueue(ny * wide + nx);
+                    }
+                }
+            }
+        }
+
+        var tiles = new bool[_wide * _high];
+
+        for (var ty = 0; ty < _high; ty++)
+        {
+            for (var tx = 0; tx < _wide; tx++)
+            {
+                var (mx, my) = (tx * Tile + Tile / 2, ty * Tile + Tile / 2);
+
+                tiles[ty * _wide + tx] = mx < wide && my < high && reached[my * wide + mx];
+            }
+        }
+
+        _connected = tiles;
+        _connectedFor = key;
+
+        return tiles;
+    }
+
+    /// <summary>The tiles connected to the detonator, for the detonator they were worked out from. See TilesConnectedTo.</summary>
+    private bool[] _connected;
+
+    private (int X, int Y) _connectedFor;
 
     private void Spread(bool[] into, IReadOnlyList<Vector2> markers, float radius)
     {
@@ -449,6 +624,66 @@ internal sealed class Scouted
     public int Stamp { get; private set; }
 
     /// <summary>Whether this tile is ground that is being searched and has not been reached.</summary>
+    /// <summary>
+    /// The terrain's height at a tile's middle, in world units, or nought when not read.
+    ///
+    /// **The map draws raised ground further up the screen.** The layer is one image over four projected corners, and
+    /// each corner was projected at the height of the map's own corner, so the whole layer sat where ground at that
+    /// height would be: on an Exhumed Ruins site (2026-10-05) with its detonator at height 125 it drew below the map.
+    /// Radar, which draws the whole walkable map the same way, moves every pixel by its own height. See Wash.
+    /// </summary>
+    public float HeightOfTile(int tx, int ty) =>
+        _height == null || tx < 0 || ty < 0 || tx >= _wide || ty >= _high ? 0f : _height[ty * _wide + tx];
+
+    /// <summary>The terrain's height at a grid position, as its tile's. See HeightOfTile.</summary>
+    public float HeightAt(System.Numerics.Vector2 grid) => HeightOfTile((int)(grid.X / Tile), (int)(grid.Y / Tile));
+
+    /// <summary>
+    /// The middles of the highest and the lowest tile painted unscouted, or none, for measuring the layer's height move
+    /// where it is largest. See Minimap.Unscouted.
+    /// </summary>
+    public (System.Numerics.Vector2 Highest, System.Numerics.Vector2 Lowest)? PaintedHeightExtremes()
+    {
+        // Worked out again only when the picture changes, since the wash line asks every frame the map is open.
+        if (_extremesFor == Stamp)
+            return _extremes;
+
+        _extremesFor = Stamp;
+        _extremes = null;
+
+        if (_height == null)
+            return null;
+
+        var (highest, lowest) = (-1, -1);
+
+        for (var ty = 0; ty < _high; ty++)
+        {
+            for (var tx = 0; tx < _wide; tx++)
+            {
+                if (!Unpainted(tx, ty))
+                    continue;
+
+                var i = ty * _wide + tx;
+
+                if (highest < 0 || _height[i] > _height[highest])
+                    highest = i;
+
+                if (lowest < 0 || _height[i] < _height[lowest])
+                    lowest = i;
+            }
+        }
+
+        System.Numerics.Vector2 Middle(int i) => new((i % _wide) * Tile + Tile / 2f, (i / _wide) * Tile + Tile / 2f);
+
+        _extremes = highest < 0 ? null : (Middle(highest), Middle(lowest));
+
+        return _extremes;
+    }
+
+    private int _extremesFor = -1;
+
+    private (System.Numerics.Vector2 Highest, System.Numerics.Vector2 Lowest)? _extremes;
+
     public bool Unpainted(int tx, int ty)
     {
         if (_ground == null || _drawn == null || _seen == null ||

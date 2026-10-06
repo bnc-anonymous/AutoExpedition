@@ -76,6 +76,15 @@ internal enum Advice
 /// </summary>
 internal static class Reroll
 {
+    /// <summary>
+    /// Whether the player has set this remnant's combination and asked for it to be kept: a combination is chosen and
+    /// Overrule already chosen rewards is off. Such a remnant is never advised for a roll, since a roll replaces the
+    /// choice the setting says to keep. Not a rolled remnant: Liquid Verisium fixes its combination, so what it is set
+    /// to is the game's outcome rather than the player's choice, and it is the plan's pick like any other.
+    /// </summary>
+    public static bool HoldsPlayerChosenCombination(Target target, AutoExpeditionSettings settings) =>
+        target is { Chose.Length: > 0, Rerolled: false } && !Safe.Read(() => settings.Rewards.Overrule.Value, true);
+
     public static Advice For(Target target, AutoExpeditionSettings settings, Valuation valuation,
         GameController gc, Scan scan, Plan plan)
     {
@@ -104,6 +113,9 @@ internal static class Reroll
         // cheerfully recommended ROLL on remnants that could not be rolled.
         if (target.Rerolled)
             return Advice.Rolled;
+
+        if (HoldsPlayerChosenCombination(target, settings))
+            return Advice.Keep;
 
         // **Everything below this was four thresholds and is now one calculation.**
         //

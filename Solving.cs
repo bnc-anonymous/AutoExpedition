@@ -78,10 +78,130 @@ internal static class Solving
     /// A copy. Read by a refining worker, which keeps its first links and rebuilds the rest. See Repair's
     /// RefinedStart.
     /// </summary>
+    /// <summary>
+    /// Each worker's last published record in the running solve, copied, for Repair.LeaderRelinked to relink while the
+    /// workers are still searching. Workers that have published nothing are left out.
+    /// </summary>
+    public static List<List<Vector2>> WorkerBestChains()
+    {
+        lock (_share)
+        {
+            var chains = new List<List<Vector2>>();
+
+            foreach (var chain in _bestChainOfWorker)
+            {
+                if (chain is { Count: > 0 })
+                    chains.Add(new List<Vector2>(chain));
+            }
+
+            return chains;
+        }
+    }
+
+    /// <summary>See WorkerBestChains. Guarded by _share.</summary>
+    private static List<Vector2>[] _bestChainOfWorker = [];
+
     public static (List<Vector2> Chain, double Worth) Leader()
     {
         lock (_share)
             return _shared == null ? (null, double.NegativeInfinity) : (new List<Vector2>(_shared), _sharedWorth);
+    }
+
+    /// <summary>The worker that published the pool's best chain, or -1 before anything is published. See Leader.</summary>
+    public static int LeaderFrom()
+    {
+        lock (_share)
+            return _sharedFrom;
+    }
+
+    private static int _sharedFrom = -1;
+
+    /// <summary>
+    /// What happened in the running solve, in milliseconds from its start: the pool's best rising, and what the workers
+    /// note - an order opened or moved to, a spot search of a worker's own chain, the orders running out. For the dump
+    /// and the offline harness, so the order of events in a press can be read. See TimelineSaid.
+    /// </summary>
+    private static readonly List<(double Ms, int Worker, string What)> _timeline = new();
+
+    private static readonly System.Diagnostics.Stopwatch _timelineClock = System.Diagnostics.Stopwatch.StartNew();
+
+    /// <summary>Notes something a worker did in the running solve. See _timeline.</summary>
+    public static void Happened(int worker, string what)
+    {
+        lock (_timeline)
+            if (_timeline.Count < 400)
+                _timeline.Add((_timelineClock.Elapsed.TotalMilliseconds, worker, what));
+    }
+
+    /// <summary>The running or last solve's timeline, one event a line. See _timeline.</summary>
+    public static List<string> TimelineSaid()
+    {
+        lock (_timeline)
+            return TimelineLines(_timeline, null);
+    }
+
+    /// <summary>
+    /// The timelines of the solves since the last cache clear, before the running one, oldest first: each labelled with
+    /// its run and what asked for it, with what its exhaustive spot search found. An F6 is usually pressed after the
+    /// solve worth reading has been followed by others - continuous solving starts one every few seconds - so every
+    /// solve since a cold start is kept, up to PastTimelinesKept. See _timeline.
+    /// </summary>
+    public static List<(string Label, List<string> Lines)> PastTimelinesSaid()
+    {
+        lock (_timeline)
+            return new List<(string Label, List<string> Lines)>(_pastTimelines);
+    }
+
+    /// <summary>
+    /// Forgets the past timelines and the running one, for a cache clear: the history a dump prints then starts at
+    /// the clear. See PastTimelinesSaid and Caches.Clear.
+    /// </summary>
+    public static void ForgetPastTimelines()
+    {
+        lock (_timeline)
+        {
+            _pastTimelines.Clear();
+            _timeline.Clear();
+            _timelineLabel = "";
+        }
+    }
+
+    /// <summary>
+    /// What the next solve's timeline is labelled with: its run and what asked for it. Set by Planning.Start before the
+    /// pool begins. See PastTimelinesSaid.
+    /// </summary>
+    internal static string NextTimelineLabel;
+
+    /// <summary>The running solve's label. See NextTimelineLabel.</summary>
+    private static string _timelineLabel = "";
+
+    /// <summary>The running or last solve's label, for the dump. See NextTimelineLabel.</summary>
+    public static string RunningTimelineLabel
+    {
+        get
+        {
+            lock (_timeline)
+                return _timelineLabel;
+        }
+    }
+
+    private static readonly List<(string Label, List<string> Lines)> _pastTimelines = new();
+
+    /// <summary>
+    /// How many past solves' timelines are kept. Thirty covers several minutes of continuous solving; the oldest goes
+    /// first. A timeline holds at most 400 events, so this bounds the dump.
+    /// </summary>
+    private const int PastTimelinesKept = 30;
+
+    private static List<string> TimelineLines(List<(double Ms, int Worker, string What)> events, string spotSearch)
+    {
+        var lines = System.Linq.Enumerable.ToList(System.Linq.Enumerable.Select(System.Linq.Enumerable.OrderBy(events, x => x.Ms),
+            x => $"{x.Ms,8:N0} ms  worker {x.Worker}: {x.What}"));
+
+        if (spotSearch != null)
+            lines.Add($"exhaustive spot search: {spotSearch}");
+
+        return lines;
     }
 
     /// <summary>The pool's best score so far, or negative infinity. See Leader.</summary>
@@ -709,7 +829,8 @@ internal static class Solving
             answers == null ? 0 : Distinct(answers),
             partway,
             _pool.ToArray(),
-            slotted));
+            slotted,
+            best?.Points?.ToArray()));
     }
 
     /// <param name="worker">
@@ -724,6 +845,9 @@ internal static class Solving
         var slots = threads;
 
         _said = new string[slots];
+
+        lock (_share)
+            _bestChainOfWorker = new List<Vector2>[slots];
         _best = new double[slots];
         _plain = new double[slots];
         _lean = new string[slots];
@@ -751,6 +875,25 @@ internal static class Solving
             _shared = null;
             _sharedWorth = double.NegativeInfinity;
             _sharedPlain = 0d;
+            _sharedFrom = -1;
+        }
+
+        lock (_timeline)
+        {
+            // The solve before keeps its timeline for the dump, which is otherwise read while later ones are running.
+            // Kept even with no events, so the history shows every run. See PastTimelinesSaid.
+            if (_timelineLabel.Length > 0 || _timeline.Count > 0)
+            {
+                _pastTimelines.Add((_timelineLabel, TimelineLines(_timeline, Repair.SpotSearchSaid)));
+
+                if (_pastTimelines.Count > PastTimelinesKept)
+                    _pastTimelines.RemoveAt(0);
+            }
+
+            _timelineLabel = NextTimelineLabel ?? "";
+            NextTimelineLabel = null;
+            _timeline.Clear();
+            _timelineClock.Restart();
             _rescues = 0;
             _carriedWorth = double.NaN;
             _foundWorth = double.NegativeInfinity;
@@ -779,12 +922,20 @@ internal static class Solving
         // The best of this solve, which is what the pool's improvement window watches.
         var solveBest = double.NegativeInfinity;
 
-        void Publish(List<Vector2> chain)
+        void Publish(List<Vector2> chain, int from)
         {
             if (chain is not { Count: > 0 })
                 return;
 
             var worth = Planner.Score(env, chain);
+
+            // Every worker's own record, whether or not it beats the pool, for relinking while the solve runs. See
+            // WorkerBestChains.
+            lock (_share)
+            {
+                if (from >= 0 && from < _bestChainOfWorker.Length)
+                    _bestChainOfWorker[from] = new List<Vector2>(chain);
+            }
 
             lock (gate)
             {
@@ -822,7 +973,10 @@ internal static class Solving
                 _sharedWorth = worth;
                 _sharedPlain = Planner.Plainly(env, chain);
                 _shared = new List<Vector2>(chain);
+                _sharedFrom = from;
             }
+
+            Happened(from, $"pool's best {Planner.Plainly(env, chain):N0} plain");
         }
 
         var answers = new Plan[threads];
@@ -850,7 +1004,7 @@ internal static class Solving
                 {
                     try
                     {
-                        return worker(n, Publish);
+                        return worker(n, chain => Publish(chain, n));
                     }
                     finally
                     {

@@ -89,7 +89,27 @@ internal static class ThreadRoles
         /// best was 15,097, and four refiners lowered the mean press maximum from 15,135 to 15,036. 50 is chosen,
         /// not measured.
         /// </summary>
-        double RefineAfter = 0.5d);
+        double RefineAfter = 0.5d,
+
+        /// <summary>
+        /// Which remnants this worker searches as though they were must take: none (remnants=free), every one
+        /// (remnants=all), or every one and then fewer in turn (remnants=descending). The chains it finds are judged
+        /// by the pool on what they really score. See Repair.WithMustTake and Repair.SearchDescendingRemnants.
+        /// </summary>
+        RemnantsHeld HoldsRemnants = RemnantsHeld.Free);
+
+    /// <summary>Which remnants a worker searches as though they were must take. See Role.HoldsRemnants.</summary>
+    internal enum RemnantsHeld
+    {
+        /// <summary>Only those the player marked.</summary>
+        Free,
+
+        /// <summary>Every remnant, for the whole search.</summary>
+        All,
+
+        /// <summary>Every remnant, then every one but one, then but two, a slice of the window each. See Repair.SearchDescendingRemnants.</summary>
+        Descending,
+    }
 
     /// <summary>
     /// Which opening a worker starts from.
@@ -123,6 +143,13 @@ internal static class ThreadRoles
         /// pool, since following the pool is what it is for. See Repair's RefinedStart.
         /// </summary>
         Refine,
+
+        /// <summary>
+        /// A chain built from an order of the capturable remnants - the best for the first worker with this opening,
+        /// the second best for the second, and so on - or its own draw when none was built. See RemnantOrder and
+        /// PlanEnvironment.RemnantOrderChains.
+        /// </summary>
+        RemnantOrder,
     }
 
     /// <summary>The operator names a bias may be given, in the order the search numbers them.</summary>
@@ -212,6 +239,11 @@ internal static class ThreadRoles
 
                             break;
 
+                        case "remnant-order":
+                            role = role with { Opening = Opens.RemnantOrder };
+
+                            break;
+
                         default:
                             complaints.Add(
                                 $"worker {worker}: \"{value}\" is not continue, enumerated, fresh, tour or refine");
@@ -245,6 +277,18 @@ internal static class ThreadRoles
 
                     break;
 
+                case "remnants":
+                    if (string.Equals(value, "all", StringComparison.OrdinalIgnoreCase))
+                        role = role with { HoldsRemnants = RemnantsHeld.All };
+                    else if (string.Equals(value, "descending", StringComparison.OrdinalIgnoreCase))
+                        role = role with { HoldsRemnants = RemnantsHeld.Descending };
+                    else if (string.Equals(value, "free", StringComparison.OrdinalIgnoreCase))
+                        role = role with { HoldsRemnants = RemnantsHeld.Free };
+                    else
+                        complaints.Add($"worker {worker}: remnants=\"{value}\" is not free, all or descending");
+
+                    break;
+
                 case "adopt":
                     complaints.Add($"worker {worker}: adopt= no longer does anything - sharing the best chain " +
                                    "between workers was removed - so it can be deleted from the line");
@@ -252,7 +296,7 @@ internal static class ThreadRoles
                     break;
 
                 default:
-                    complaints.Add($"worker {worker}: \"{key}\" is not opening, keep-opening, keep-leader or refine-after");
+                    complaints.Add($"worker {worker}: \"{key}\" is not opening, keep-opening, keep-leader, refine-after or remnants");
 
                     break;
             }
@@ -288,6 +332,9 @@ internal static class ThreadRoles
 
             said += string.Create(CultureInfo.InvariantCulture, $" refine-after={role.RefineAfter * 100d:0}");
         }
+
+        if (role.HoldsRemnants != RemnantsHeld.Free)
+            said += " remnants=" + role.HoldsRemnants.ToString().ToLowerInvariant();
 
         return said;
     }

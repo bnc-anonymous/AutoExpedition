@@ -762,9 +762,15 @@ internal static class Openings
     /// the ground to be asked only about the cells a selection reaches. Anchored does that; the offline harness asks
     /// about every cell, because it lists them all.
     /// </param>
+    /// <param name="anywhere">
+    /// True for a spot anywhere on the site rather than one thrown from <paramref name="from"/>: the reach is not
+    /// tested, the ground is asked only whether a bomb may stand there, and a spot catching a must-avoid is left
+    /// out. <paramref name="from"/> then only sets the direction Toward measures ahead in.
+    /// Planner.EdgePointsTowardNeighbours does that.
+    /// </param>
     internal static void RingSpotsOfAnchor(PlanEnvironment env, PlanTarget anchor, Vector2 from,
         IReadOnlyList<Vector2> already, List<PlanTarget> heavy,
-        List<(Vector2 At, double Caught, double Toward)> spots, bool askGround = true)
+        List<(Vector2 At, double Caught, double Toward)> spots, bool askGround = true, bool anywhere = false)
     {
         var radius = MathF.Max(1f, env.Blast + anchor.Radius - 0.5f);
         var steps = (int)MathF.Ceiling(MathF.Tau * radius);
@@ -779,7 +785,20 @@ internal static class Openings
             if (!seen.Add(at))
                 continue;
 
-            if (askGround)
+            if (anywhere)
+            {
+                var apart = env.CanPlace(at);
+
+                foreach (var had in already)
+                    apart &= Vector2.Distance(had, at) >= env.Apart;
+
+                foreach (var target in env.Targets)
+                    apart &= !(target.Shunned && Planner.Catches(env, at, target));
+
+                if (!apart)
+                    continue;
+            }
+            else if (askGround)
             {
                 Asked++;
                 AskedOnRings++;
@@ -899,7 +918,7 @@ internal static class Openings
     ///
     /// **So the measure is the one greedy already uses:** a marker's own weight plus Rough, which is where a
     /// reward, a local rune and a carried increase are priced together against the explosives still to come.
-    /// See Planner.Adds, which sums the same two terms per covered marker. It is an estimate - a carry scoped
+    /// See Planner.NewWeight, which sums the same two terms per covered marker. It is an estimate - a carry scoped
     /// to chests is priced against the same downstream figure a flat one gets - and the rollout that ranks the
     /// openings afterwards is what decides whether the ground it opened was any good.
     ///
@@ -941,6 +960,60 @@ internal static class Openings
     /// </summary>
     private const double Considerable = 50d;
 
+    /// <summary>
+    /// What a target's switches could pay on this site: each one's percentage of the weight of everything else it
+    /// applies to, as if the chain caught all of it afterwards. A relic whose value is a switch - "Runic Monsters are
+    /// Duplicated", 100% of every rare - has almost no weight and carries nothing, so without this it was never heavy:
+    /// measured on one site (2026-09-30), two such relics were worth 3 and 0 to the heavy test while relics carrying
+    /// into the chain were worth 82 to 284. Optimistic in the way Rough is, and only for ranking what counts as heavy.
+    /// See PlanTarget.NonStacking.
+    /// </summary>
+    internal static double SwitchWorthOfTarget(PlanEnvironment env, PlanTarget target)
+    {
+        if (target.NonStacking is not { Length: > 0 } switches || target.Shunned)
+            return 0d;
+
+        var total = 0d;
+
+        foreach (var (_, tag, percent, _) in switches)
+        {
+            if (percent <= 0f)
+                continue;
+
+            var reached = 0d;
+
+            foreach (var other in env.Targets)
+            {
+                if (ReferenceEquals(other, target) || other.Shunned)
+                    continue;
+
+                if (tag == Tags.Monsters)
+                {
+                    reached += other.MonstersUnearthed;
+
+                    continue;
+                }
+
+                var own = Math.Max(0f, other.Weight);
+
+                foreach (var (mask, part, _) in other.Parts ?? [])
+                {
+                    own -= part;
+
+                    if ((mask & (1L << tag)) != 0L)
+                        reached += part;
+                }
+
+                if ((other.Mask & (1L << tag)) != 0L)
+                    reached += Math.Max(0f, own);
+            }
+
+            total += percent / 100d * reached;
+        }
+
+        return total;
+    }
+
     private static List<PlanTarget> TargetsWorthAtLeast(PlanEnvironment env, int already, double times)
     {
         // Measured in explosives still to come, the unit Rough expects, from the same expression greedy
@@ -950,7 +1023,8 @@ internal static class Openings
 
         foreach (var target in env.Targets)
         {
-            var worth = Planner.WorthOfTarget(target) + Math.Max(0f, target.Rough(downstream));
+            var worth = Planner.WorthOfTarget(target) + Math.Max(0f, target.Rough(downstream)) +
+                        SwitchWorthOfTarget(env, target);
 
             if (worth > 0d)
                 ranked.Add((target, worth));

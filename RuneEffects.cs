@@ -37,7 +37,10 @@ internal static class RuneEffects
 
         ["Opulent"] = "Increased Monster Rarity",
         ["Death"] = "Slain Monsters may merge into stronger Monsters",
-        ["Bond"] = "Rare Monsters may transfer a Mod on death",
+        // Both halves, as the game's tooltip reads them (2026-09-30). The remnant half was missing: the game's
+        // text for Bond runs past the ~252 characters ExileCore reads of it, so it was never seen in a dump.
+        ["Bond"] = "Rare Monsters may transfer a Mod on death / Remnant gains: Increased chance to spawn Rare " +
+                   "Monsters / Rare Monsters have more Monster Modifiers",
         ["Oath"] = "A Monster summons Allies",
         ["Time"] = "Slain Monsters may respawn as a higher Rarity",
         ["Rebirth"] = "Chance to Rebirth on death",

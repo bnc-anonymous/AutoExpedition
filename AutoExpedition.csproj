@@ -9,6 +9,13 @@
     <PathMap>$(MSBuildProjectDirectory)=$(MSBuildProjectName)</PathMap>
     <EmbedAllSources>true</EmbedAllSources>
     <!-- The HUD sets the output path itself when the source lives in Plugins/Source -->
+    <!--
+      Optimised whatever the configuration. The HUD builds this project through MSBuild without naming a
+      configuration, so it got Debug's defaults and the JIT optimiser switched off: the DLL in Plugins/Temp
+      carried DebuggingModes 0x107. Measured offline on one Grand site (2026-09-30): scoring a chain took 174us
+      unoptimised against 28us optimised, with identical scores to the last bit.
+    -->
+    <Optimize>true</Optimize>
   </PropertyGroup>
 
   <ItemGroup>

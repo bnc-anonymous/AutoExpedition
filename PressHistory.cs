@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Numerics;
@@ -58,7 +59,10 @@ internal static class PressHistory
         /// expedition_solve_plan.md 7.15 step 0, which exists to decide exactly that. Indexed by slot, which is
         /// the worker's stream.
         /// </summary>
-        double[] ByWorker = null);
+        double[] ByWorker = null,
+
+        // The press's own answer, link by link, so two presses at nearly the same score can be told apart.
+        Vector2[] Chain = null);
 
     /// <summary>
     /// Every chain every press of this batch produced, with the draw it came from, best first.
@@ -119,6 +123,17 @@ internal static class PressHistory
     {
         lock (_gate)
             _presses.Clear();
+    }
+
+    /// <summary>The chain of the highest-scoring press kept, by plain score, or null when none recorded one.</summary>
+    public static Vector2[] BestPressChain
+    {
+        get
+        {
+            lock (_gate)
+                return _presses.Where(p => p.Chain is { Length: > 0 }).OrderByDescending(p => p.Plain)
+                    .Select(p => p.Chain).FirstOrDefault();
+        }
     }
 
     public static int Count
@@ -323,6 +338,17 @@ internal static class PressHistory
                 $"{press.PoolBest,10:N0} {press.PoolMid,8:N0} {press.PoolWorst,8:N0} " +
                 $"{press.Winner,3} {press.Rounds,7:N0} {press.Bests,5} " +
                 $"{zones,17} {press.Relinked,7:N0} {press.Ms,6:N0}");
+        }
+
+        // Each press's answer, link by link: two presses a few points apart on what looks like the same route differ
+        // somewhere in these, and the score alone cannot say where.
+        text.AppendLine("  each press's chain:");
+
+        foreach (var press in had)
+        {
+            text.AppendLine($"   {press.Draw,4} {press.Plain,8:N0}  " +
+                            string.Join(" ", (press.Chain ?? []).Select(p =>
+                                $"({p.X.ToString("0", CultureInfo.InvariantCulture)},{p.Y.ToString("0", CultureInfo.InvariantCulture)})")));
         }
 
         BySlot(text);

@@ -49,7 +49,23 @@ namespace AutoExpedition;
 internal static class Rolls
 {
     /// <summary>
-    /// How many sockets a remnant comes up with. Shares, summing to one.
+    /// How many sockets a roll comes up with. Shares, summing to one.
+    ///
+    /// **Counted from rolled remnants, 976 of them**, recorded by Census from 2026-09-26 to 2026-10-05 at area levels
+    /// 78 to 82, each remnant once, leaving out 2 readings of no sockets as misreads. A roll's own outcomes rather than
+    /// the fresh population standing in for them.
+    ///
+    /// **Rows from a map with a floor on rune slots count only above the floor.** Such a map holds no remnant below its
+    /// floor, so its rows say nothing about how common the smaller counts are. The 948 rows from maps with no floor give
+    /// three, four, and five or more; the five-or-more share is split between five and nine by those rows and the 28
+    /// from maps with a floor of five together: 234, 337 and 377 of 948, then 241, 119, 28, 15 and 2 of 405. On a map
+    /// with a floor the counts below it are left out of the draw. See MapSlotFloor and Rolling.ShapesARollCouldProduce.
+    ///
+    /// Fresh remnants over the same days, 1,007 from maps with no floor, came out close: 20.3%, 33.3%, 25.6%, 14.5%,
+    /// 3.5%, 2.5%, 0.4% from three sockets to nine.
+    ///
+    /// Before this the table was 476 fresh remnants of 2026-09-18, with seven, eight and nine sockets at 0.63% each from
+    /// three sightings apiece; the larger sample puts seven and eight at about four and two times that.
     ///
     /// **Seven, eight and nine are listed rather than folded into six, which is a change.** They are
     /// three observations each out of the 476 and were collapsed on the reasoning that a
@@ -72,14 +88,25 @@ internal static class Rolls
     /// </summary>
     public static readonly (int Sockets, float Share)[] Sockets =
     {
-        (3, 0.221f),
-        (4, 0.362f),
-        (5, 0.240f),
-        (6, 0.158f),
-        (7, 0.0063f),
-        (8, 0.0063f),
-        (9, 0.0063f),
+        (3, 0.2468f),
+        (4, 0.3555f),
+        (5, 0.2367f),
+        (6, 0.1168f),
+        (7, 0.0275f),
+        (8, 0.0147f),
+        (9, 0.0020f),
     };
+
+    /// <summary>
+    /// The fewest rune slots any remnant in this map has, from its "All Verisium Remnants have at least X rune slots"
+    /// modifier, or nought when it has none or the stat cannot be read. See Sockets and Census.
+    /// </summary>
+    public static int MapSlotFloor(ExileCore2.GameController gc) =>
+        MapStat(gc, ExileCore2.Shared.Enums.GameStat.MapExpedition2RemnantsHaveAtLeastXSlots);
+
+    /// <summary>One of the map's visible stats, or nought when it has none or the stat cannot be read.</summary>
+    public static int MapStat(ExileCore2.GameController gc, ExileCore2.Shared.Enums.GameStat stat) =>
+        Safe.Read(() => gc.IngameState.Data.MapStatsVisible.TryGetValue(stat, out var said) ? said : 0, 0);
 
     /// <summary>
     /// The chance of a remnant carrying two propagating slots rather than one, as a fraction.
@@ -119,7 +146,7 @@ internal static class Rolls
     /// to. See Wrt.Row.Share.
     ///
     /// Normalised on use rather than here, because the shares are a measurement and will not sum to
-    /// exactly one - Rolling.Enumerated divides by the weight it accumulated for that reason, and
+    /// exactly one - Rolling.ScoreRollOutcomes divides by the weight it accumulated for that reason, and
     /// anything else added later should do the same.
     /// </summary>
     public static (string Rune, float Share)[] Runes
@@ -229,49 +256,6 @@ internal static class Rolls
     /// the open question described on Reward.
     /// </summary>
     public const double Average = 64.9;
-
-    /// <summary>Draws a socket count.</summary>
-    public static int Socketed(Random random) => Pick(random, Sockets);
-
-    /// <summary>Draws how many propagating slots, which is one or two and never three.</summary>
-    public static int Slots(Random random, AutoExpeditionSettings settings) =>
-        random.NextDouble() < TwoSlots(settings) ? 2 : 1;
-
-    /// <summary>Draws a rune name.</summary>
-    public static string Rune(Random random)
-    {
-        var roll = random.NextDouble();
-        var seen = 0d;
-
-        foreach (var (rune, share) in Runes)
-        {
-            seen += share;
-
-            if (roll <= seen)
-                return rune;
-        }
-
-        return Runes[^1].Rune;
-    }
-
-    /// <summary>Draws a locked reward, in exalts. See Reward for what it is drawn from.</summary>
-    public static double Paid(Random random) => Reward[random.Next(Reward.Length)];
-
-    private static int Pick(Random random, (int Value, float Share)[] from)
-    {
-        var roll = random.NextDouble();
-        var seen = 0d;
-
-        foreach (var (value, share) in from)
-        {
-            seen += share;
-
-            if (roll <= seen)
-                return value;
-        }
-
-        return from[^1].Value;
-    }
 
     /// <summary>
     /// How often each (socket count, rune, slot) has been the pinned one, counted rather than shared.

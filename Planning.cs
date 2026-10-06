@@ -110,6 +110,9 @@ internal sealed class Planning
 
     private DateTime _until;
 
+    /// <summary>The remnant orders this solve is building across threads, while it builds them. See Expire.</summary>
+    private System.Threading.Tasks.Task _ordering;
+
     /// <summary>How many search workers are running now, across every solve including cancelled ones.</summary>
     private static int _workersRunning;
 
@@ -125,7 +128,7 @@ internal sealed class Planning
     /// Replaced, not resized, when the thread setting changes; workers holding the old one release it as they
     /// finish, so for one solve the two can overlap.
     /// </summary>
-    private static SemaphoreSlim WorkerSlots(int threads)
+    internal static SemaphoreSlim WorkerSlots(int threads)
     {
         lock (WorkerSlotsGate)
         {
@@ -140,6 +143,116 @@ internal sealed class Planning
     }
 
     private static readonly object WorkerSlotsGate = new();
+
+    /// <summary>
+    /// The remnant order search for this site's stops: the one already running when it is for the same stops, so a pass
+    /// joins it, or a new one, the old one cancelled. It belongs to no pass: it runs until it is done, the stops change,
+    /// orders are forgotten or the zone ends, on the shared worker slots.
+    ///
+    /// **Not cancelled with the pass that started it.** A presolve pass is stopped whenever the site changes under it,
+    /// and the search went with it: on a Frigid Bluffs site (2026-10-04) sixteen passes in 38 s of scouting each
+    /// started the 8 s search again, none finished it, and the order workers waited the whole time. So the search
+    /// carries on through markers that are not stops, and a later pass searches again for what has arrived since: the
+    /// order of the stops does depend on them. Offline, on a recording of that site being scouted, orders searched with
+    /// 207 or 343 of its 448 markers in reached 45,000 to 53,000 on the whole site where its own reached 73,000 and
+    /// more, used as they were or re-laid along the same stops. See RemnantOrder.StopsKeyOf and tools/offline
+    /// ReseedCheck.
+    /// </summary>
+    internal static System.Threading.Tasks.Task<IReadOnlyList<List<Vector2>>> OrderSearchFor(PlanEnvironment env,
+        int parts, SemaphoreSlim slots, CancellationToken zone)
+    {
+        var stops = RemnantOrder.StopsKeyOf(env);
+
+        lock (OrderSearchGate)
+        {
+            if (_orderSearch.Running is { IsCompleted: false } running && _orderSearch.Stops == stops)
+                return running;
+
+            _orderSearch.Cancel?.Cancel();
+
+            var cancel = CancellationTokenSource.CreateLinkedTokenSource(zone);
+            var stop = cancel.Token;
+
+            var search = System.Threading.Tasks.Task.Run(() => RemnantOrder.SearchAcrossThreads(env, parts,
+                part => System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        slots.Wait(stop);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    try
+                    {
+                        part();
+                    }
+                    finally
+                    {
+                        slots.Release();
+                    }
+                }),
+                () => stop.IsCancellationRequested));
+
+            _orderSearch = (stops, search, cancel);
+
+            return search;
+        }
+    }
+
+    /// <summary>
+    /// The remnant orders a solve's workers start from: those to hand out at once, and the search to wait for when there
+    /// are none. Without remnant orders first, whatever the background has published, never waited for. See
+    /// DestroyAndRepairSettings.RemnantOrdersFirst.
+    ///
+    /// **With remnant orders first.** Finished for exactly this site state: taken, no search. Built on this ground with
+    /// only what the remnants offer changed - a reroll: handed out at once, and the background builds the new ones.
+    /// Markers arrived since: the search on the workers' threads, joined if one is running for the same stops. Orders
+    /// built while a site was scouted were otherwise taken as current for the rest of it: on a Frigid Bluffs site
+    /// (2026-10-04) every pass after the first climbed the orders of a 203 marker site, 58,000 to 59,000, while 245
+    /// more markers arrived. See OrderSearchFor.
+    ///
+    /// **Not the orders of the same ground for a held first solve** (reuseGround false). The ground leaves out which
+    /// markers are must take, so those would be the orders built before every remnant was held, and the held solve
+    /// needs its own. See HeldFirstSolve.
+    /// </summary>
+    internal static (IReadOnlyList<List<Vector2>> Chains, System.Threading.Tasks.Task<IReadOnlyList<List<Vector2>>> Ordering)
+        OrdersForSolve(PlanEnvironment env, int parts, SemaphoreSlim slots, CancellationToken zone, bool reuseGround = true)
+    {
+        if (parts == 0)
+            return (null, null);
+
+        if (!env.RemnantOrdersFirst)
+            return (RemnantOrder.Latest(env), null);
+
+        if (RemnantOrder.FinishedFor(env) is { } finished)
+            return (finished, null);
+
+        if (reuseGround && RemnantOrder.PublishedForGround(env) is { } rerolled)
+        {
+            RemnantOrder.Latest(env);
+
+            return (rerolled, null);
+        }
+
+        return (null, OrderSearchFor(env, parts, slots, zone));
+    }
+
+    /// <summary>Stops the order search in flight, for a reset that forgets the orders. See OrderSearchFor.</summary>
+    internal static void CancelOrderSearch()
+    {
+        lock (OrderSearchGate)
+        {
+            _orderSearch.Cancel?.Cancel();
+            _orderSearch = default;
+        }
+    }
+
+    private static (long Stops, System.Threading.Tasks.Task<IReadOnlyList<List<Vector2>>> Running, CancellationTokenSource Cancel) _orderSearch;
+
+    private static readonly object OrderSearchGate = new();
 
     private static SemaphoreSlim _workerSlots;
 
@@ -165,6 +278,12 @@ internal sealed class Planning
     /// this counts down honestly rather than jumping to zero early.
     /// </summary>
     public float Left => Searching ? MathF.Max(0f, (float)(_until - DateTime.UtcNow).TotalSeconds) : 0f;
+
+    /// <summary>
+    /// Whether the solve is running on past its window for the remnant order search, which the workers that open on
+    /// orders wait for. See the guard in Expire.
+    /// </summary>
+    public bool WaitingForOrders => Searching && _ordering is { IsCompleted: false };
 
     /// <summary>
     /// How long the countdown counts from, in seconds.
@@ -208,6 +327,50 @@ internal sealed class Planning
     /// Rehearsal.Continuing.
     /// </summary>
     public static bool RunningContinuous { get; private set; }
+
+    /// <summary>
+    /// Each worker's chain carried from one solve to the next, and the site, laid count, explosives in hand and worker
+    /// count it belongs to. See WorkerChains.
+    /// </summary>
+    internal static WorkerChains ChainsOfWorkers { get; private set; } = new(0);
+
+    /// <summary>
+    /// Set by the cold start button and cleared by the next start the player asks for: until then Start refuses every
+    /// other cause - the presolve, the continuous mode, a roll, a weight change. Any solve in between rebuilds the
+    /// routing, the ground and the remnant orders, so the press that follows starts warm. On Craggy Peninsula
+    /// (2026-10-05) a solve between the cold start and the press had a remnant order search finished or nearly so when
+    /// the press began, and the press reached 28,914 in 2.5 s where cold offline solves took 4 to 6 s to have any
+    /// orders at all.
+    /// </summary>
+    internal static volatile bool HeldAfterColdStart;
+
+    private static (Vector2 Site, int Laid, int Explosives, int Threads) _chainsOfWorkersFor;
+
+    /// <summary>
+    /// The site, laid count, explosives and marker taken last that a held first solve last ran its window out for, so
+    /// the solves after it search the real objective. See HeldFirstSolve.
+    /// </summary>
+    private static (Vector2 Site, int Laid, int Explosives, Vector2 TakenLast) _heldFirstSolveFor;
+
+    /// <summary>The key of the held first solve running now, or null when the running solve is not one. See HeldFirstSolve.</summary>
+    private (Vector2 Site, int Laid, int Explosives, Vector2 TakenLast)? _heldKeyOfSearch;
+
+    /// <summary>
+    /// Whether this solve's whole pool searches with every remnant must take: the first solve with a marker taken last,
+    /// until one is collected by Poll - a solve superseded by another is never collected. The pool's best and every worker's search are on that environment; what reaches
+    /// the screen is still judged on the real one, in Better, so only a chain ending on the marker is shown. The solves
+    /// after it search the real objective, each worker carrying on from its chain. See Repair.WithEveryRemnantMustTake.
+    ///
+    /// **Why the whole pool and not some workers.** On a Grazed Prairie site (2026-10-06, offline, take last at
+    /// (691,794)) two 5 s presses reached 10,992 and 10,992; with the first press held across the pool they reached
+    /// 11,584 by 5 s on both draws and ended at 11,584 and 11,620, against 11,639 found in game by marking every remnant
+    /// by hand. Workers holding every remnant inside a pool judged on the real objective ended on chains of 11.5k to
+    /// 11.9k that did not end on the marker - holding all eight remnants but not the marker last ties, at one credit
+    /// each, with holding the marker last and seven - and the pool could use none of them. Weighting the player's marks
+    /// above the added ones broke that tie and held the score at about 11,050, held or not.
+    /// </summary>
+    private static bool HeldFirstSolve(PlanEnvironment env, (Vector2 Site, int Laid, int Explosives, Vector2 TakenLast) key) =>
+        env.TakenLast >= 0 && key != _heldFirstSolveFor;
 
     /// <summary>
     /// When a solve last published a chain better than the one drawn, in UTC, or MinValue before any has. Read by
@@ -324,6 +487,13 @@ internal sealed class Planning
         int Markers, int Loaded, int Readable, int Links, bool Live, bool Inside, int Table,
         Improvement[] Steps);
 
+    /// <summary>
+    /// The cause a solve records when a must take was marked or cleared. Named once because Rehearsal reads it: such a
+    /// solve maximises a different thing, so its loot may fall below the run before without the floor failing. See
+    /// Rehearsal.Recounted.
+    /// </summary>
+    internal const string MustTakeChangedCause = "a must take was marked or cleared";
+
     /// <summary>Every solve at this dig site, oldest first. See Run and Journeyed.</summary>
     public static IReadOnlyList<Run> Journey => _journey;
 
@@ -390,7 +560,10 @@ internal sealed class Planning
         // settles the plan before this is read. Seen disagreeing on a stopped run - the series
         // ended at 6,839 and the run filed 6,793.1, its own opening floor - so the two are printed
         // together rather than leaving a reader to spot it by eye across two lines.
-        if (run.Steps is { Length: > 0 } steps &&
+        //
+        // Not while the run is still going: it has handed nothing over yet, so After is still its opening floor, and
+        // a run that had climbed from 68,020 to 72,533 on screen was reported as disagreeing.
+        if (run.Ended != "still running" && run.Steps is { Length: > 0 } steps &&
             Math.Abs(steps[^1].Plain - run.After) > 0.05d)
         {
             b.Append($"  [PLAN DISAGREES: the search last published {steps[^1].Plain:N1}, " +
@@ -485,6 +658,9 @@ internal sealed class Planning
     /// </summary>
     private List<Vector2> _standing;
 
+    /// <summary>The chain a solve started from and keeps as its floor, carried from before it; null when none.</summary>
+    public List<Vector2> Standing => _standing;
+
     private double _floor;
 
     /// <summary>
@@ -546,11 +722,21 @@ internal sealed class Planning
     /// <summary>How many presses to keep. Enough to see a curve, few enough to read.</summary>
     private const int Climbs = 20;
 
-    /// <summary>Forgets the climb, for a reset that takes the floor away with it. See Climb.</summary>
+    /// <summary>
+    /// Forgets the climb and the chains the workers carry from one solve to the next, for a reset that takes the
+    /// floor away with it. See Climb and ChainsOfWorkers.
+    ///
+    /// **The carried chains go too**, or the next solve is not a fresh one: after a reset on a Frigid Bluffs site
+    /// (2026-10-04) a worker opened at 72,571 from its carried copy of the 73,966 chain the reset was meant to
+    /// forget, which read as the search finding it at once.
+    /// </summary>
     public static void Forgetting()
     {
         lock (_climb)
             _climb.Clear();
+
+        _chainsOfWorkersFor = default;
+        _heldFirstSolveFor = default;
     }
 
     /// <summary>What the climb says, for the dump.</summary>
@@ -746,10 +932,17 @@ internal sealed class Planning
     /// </summary>
     public void Announce(string detail) => Say("", detail);
 
-    public void Adopt(Plan plan)
+    /// <param name="site">
+    /// The dig site the plan is for, when no plan holds one - after the plan was deleted. Without it the next solve
+    /// would not take the adopted chain as its floor, since that needs Site to be the detonator's. See the seed in Start.
+    /// </param>
+    public void Adopt(Plan plan, Vector2 site = default)
     {
         if (plan is not { Points.Count: > 0 })
             return;
+
+        if (Site == Vector2.Zero && site != Vector2.Zero)
+            Site = site;
 
         Plan = plan;
         _live = null;
@@ -786,7 +979,13 @@ internal sealed class Planning
 
     private List<Vector2> _split;
     private int _splitAt = -1;
-    private List<(double Content, double Carried)> _each;
+    private List<(double Added, double ToLaterBlasts)> _each;
+
+    /// <summary>
+    /// What the blast circles were last drawn from, over the whole route, laid links included, with the chain's own
+    /// figures to check them against. Null before any. See Breakdown and Planner.ScoreOfEachBlast.
+    /// </summary>
+    internal Planner.BlastScores BlastScores { get; private set; }
 
     /// <summary>
     /// What the last detailed pass actually covered, for the dump.
@@ -816,13 +1015,17 @@ internal sealed class Planning
     ///
     /// Worked out fresh each time it is asked, which is once a frame at most and only while the
     /// setting is on and the circle is up.
+    ///
+    /// The same figure a planned circle carries first: content and propagation together, what the blast adds. A
+    /// chain of one has no blasts after it, so there is no bracket. With explosives down they are scored ahead of it
+    /// and the figure is the last link's, the spot's own. See Planner.ScoreOfEachBlast.
     /// </summary>
-    public (double Content, double Carried) Spot(Vector2 at)
+    public double Spot(Vector2 at)
     {
         var env = _env;
 
         if (env == null || at == Vector2.Zero)
-            return (0d, 0d);
+            return 0d;
 
         // **The detailed pass publishes to shared statics, and this one must not.**
         //
@@ -862,36 +1065,9 @@ internal sealed class Planning
 
         Planner.Restore(published);
 
-        return each is { Count: > 0 } ? each[0] : (0d, 0d);
+        return each is { Count: > 0 } ? each[^1].Content + each[^1].Carried : 0d;
     }
 
-    /// <summary>
-    /// What each blast is worth: what it catches, and what the chain would lose without it.
-    ///
-    /// **The second figure is a counterfactual, not a share of the total.** Propagation is a
-    /// property of the chain rather than of any one blast - a rune booked at link nought pays out
-    /// over every link after it - so the scoring loop credits it to the blast that BOOKED the rune.
-    /// That answers "where did this number come from", which is a question about the arithmetic,
-    /// while the number drawn in a blast circle is read as an answer to "what do I get for putting
-    /// this one here", which is a question about a decision. The two are different, and where they
-    /// differ the credited figure misleads in both directions: an early propagating remnant is
-    /// charged with propagation that only exists because of the links that follow it, and those
-    /// links show nothing for carrying it.
-    ///
-    /// So the propagation each link is shown is the chain's propagation less the propagation of the
-    /// same chain WITHOUT that link. That is what dropping the blast would actually cost, which is
-    /// the decision in front of the player.
-    ///
-    /// **These do not sum to the total, and should not.** Propagation is superadditive: two links
-    /// each carrying a rune to the other's monsters are each worth more alone than half the pair.
-    /// A column of marginal values adding up to more than the chain is the honest shape of that,
-    /// not an error to be normalised away - and normalising it would put the misleading number
-    /// back.
-    ///
-    /// Cost is one extra scoring pass per link, none of them detailed, and only when the chain
-    /// object changes. The detailed pass is run LAST so the shared figures the dump reads -
-    /// Propagated, Pooled, RuneTallyByRemnant - are the ones belonging to the real chain.
-    /// </summary>
     /// <summary>
     /// Scores the explosives already down when there is no plan, so the readout is right on arrival.
     ///
@@ -944,7 +1120,28 @@ internal sealed class Planning
     /// <summary>Which site and how many down the readout was last built for. See Showing.</summary>
     private (Vector2 Site, int Placed) _showed = (Vector2.Zero, -1);
 
-    public List<(double Content, double Carried)> Breakdown(List<Vector2> tail)
+    /// <summary>
+    /// What the plan credits the whole route with - laid links and planned ones - per link and in total, or null with no
+    /// route or no environment. One detailed scoring pass, for the spawn census to set against what the site produced.
+    /// See Spawns.Observe.
+    /// </summary>
+    public (List<(double Content, double Carried)> Each, double Content, double Propagation)? CreditOfRoute()
+    {
+        var env = _env;
+
+        if (env == null || _chain.Count == 0)
+            return null;
+
+        var verdict = Safe.Read(() => Planner.Evaluate(env, new List<Vector2>(_chain), detail: true), null);
+
+        return verdict == null ? null : (verdict.Each ?? [], verdict.Content, verdict.Propagation);
+    }
+
+    /// <summary>
+    /// What each blast still to place adds to the score, and what the objects it catches add to the blasts after it -
+    /// the two figures in its circle - scored over the whole route, laid links included. See Planner.ScoreOfEachBlast.
+    /// </summary>
+    public List<(double Added, double ToLaterBlasts)> Breakdown(List<Vector2> tail)
     {
         var env = _env;
 
@@ -992,29 +1189,16 @@ internal sealed class Planning
 
         chain.AddRange(tail);
 
-        // Without each link in turn, before the detailed pass, so nothing it publishes is stale.
-        var without = new double[chain.Count];
+        // What each blast adds, before the detailed pass so nothing it publishes is stale. See
+        // Planner.ScoreOfEachBlast.
+        var scores = Planner.ScoreOfEachBlast(env, chain);
 
-        if (chain.Count > 1)
-        {
-            var shorter = new List<Vector2>(chain.Count - 1);
-
-            for (var i = 0; i < chain.Count; i++)
-            {
-                shorter.Clear();
-
-                for (var k = 0; k < chain.Count; k++)
-                {
-                    if (k != i)
-                        shorter.Add(chain[k]);
-                }
-
-                without[i] = Planner.Rate(env, shorter).Propagation;
-            }
-        }
+        BlastScores = scores;
 
         var full = Planner.Evaluate(env, chain, detail: true);
-        var all = full.Each;
+        var all = scores is { } known && known.Each.Count == chain.Count
+            ? known.Each.Select(x => (x.Content + x.Propagation, x.ToLaterBlasts)).ToList()
+            : full.Each?.Select(x => (x.Content + x.Carried, 0d)).ToList();
 
         Detailed = $"{chain.Count} links ({head} laid + {tail.Count} planned), " +
                    $"{DateTime.UtcNow:HH:mm:ss}";
@@ -1069,13 +1253,9 @@ internal sealed class Planning
             return null;
         }
 
-        for (var i = 0; i < all.Count && i < without.Length; i++)
-        {
-            // Never below nothing. A link whose removal RAISES the chain's propagation is
-            // possible - it can free an explosive the rest use better - and "this blast is
-            // worth minus four" in a circle on the ground is not a thing worth drawing.
-            all[i] = (all[i].Content, Math.Max(0d, full.Propagation - without[i]));
-        }
+        // **What the blast adds, and in brackets what it adds to the blasts after it.** These were what the chain loses
+        // without the blast, a second scoring of the chain rather than a split of the first: a Power remnant two blasts
+        // both reached was lost with neither, so neither label showed it (Exhumed Ruins, 2026-10-05).
 
         // The slice the caller asked about, so its indices still line up with the circles it draws.
         _each = head > 0 && head < all.Count
@@ -1301,7 +1481,25 @@ internal sealed class Planning
                 Named: Weighing.Names(t, settings, Pinned(t, settings, valuation)),
                 // What identifies each of those, same order, so the readouts can say which row the
                 // planner took without joining on what it yields. See Weighing.RecipeIdsOfTarget.
-                Recipes: Weighing.RecipeIdsOfTarget(t, settings, Pinned(t, settings, valuation))))
+                Recipes: Weighing.RecipeIdsOfTarget(t, settings, Pinned(t, settings, valuation)),
+                // What each of those adds of magic and rare waves over the remnant's own recipe, same order, for
+                // Gaining Traction to scale. See Weighing.MagicAndRareWavesOfChoices.
+                MagicAndRareWavesOfChoices: Weighing.MagicAndRareWavesOfChoices(t, settings,
+                    Pinned(t, settings, valuation)),
+                // What each of those holds of runes whose effects reach this remnant's own waves, same order. See
+                // Weighing.OwnEffectsOfChoices.
+                OwnEffectsOfChoices: Weighing.OwnEffectsOfChoices(t, settings, Pinned(t, settings, valuation)),
+                // And the empowering lift each holds, which empowers what it propagates. See PlanTarget.HeldLiftOfChoice.
+                HeldLiftOfChoices: Weighing.HeldLiftOfChoices(t, settings, Pinned(t, settings, valuation)),
+                // And the share of its own waves each propagated rune is on. See PlanTarget.WaveShareOfCarried.
+                CarriedWaveSharesOfChoices: Weighing.CarriedWaveSharesOfChoices(t, Pinned(t, settings, valuation)),
+                SlotRunesOfChoices: Weighing.SlotRunesOfChoices(t, Pinned(t, settings, valuation)),
+                CreatedOfChoices: Weighing.CreatedOfChoices(t, Pinned(t, settings, valuation)),
+                // And what Gaining Traction does to its waves by its place in the chain. See Weighing.TractionByBeforeOfTarget.
+                TractionByBefore: Weighing.TractionByBeforeOfTarget(t,
+                    Safe.Read(() => settings.Debug.GainingTraction.Value, true)),
+                // And how many waves it brings, for what a lift passed in reaches. See PlanTarget.ShareOfWavesPassedLift.
+                WaveCount: Weighing.WavesOfRemnant(t)))
             .ToList();
 
         var targets = Project(content);
@@ -1331,6 +1529,15 @@ internal sealed class Planning
         }
 
         var refused = musts > 0 ? ceiling : 0d;
+
+        // The marker the player wants taken last, if it is here and still must take. See PlanEnvironment.TakenLast.
+        var takenLast = -1;
+
+        for (var i = 0; i < targets.Count; i++)
+        {
+            if (targets[i].Must && Insisted.Here.IsTakenLast(targets[i].Grid))
+                takenLast = i;
+        }
 
         // Every effect name this site can produce, numbered, so the scoring loop compares integers.
         // Ordinal-ignore-case because that is what the scan it replaces used, and the names come
@@ -1377,26 +1584,15 @@ internal sealed class Planning
         // migration.
         // Read here and carried, for the reason the numbering itself is: Combining runs inside this
 
-        var bands = new int[effects.Count];
-        var named = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) { [""] = 0 };
+        var (bands, groupCount, empowering, amplified, groupNames) = GroupsOfEffects(effects);
 
-        foreach (var (id, key) in effects)
-        {
-            var group = Weighing.GroupKeyOfEffect(id);
-
-            if (!named.TryGetValue(group, out var band))
-            {
-                band = named.Count;
-                named[group] = band;
-            }
-
-            bands[key] = band;
-        }
-
-        // Which band number the empowering effects landed on, or -1 when nothing in this site
-        // empowers - in which case the whole mechanism is inert and the score is unchanged to the
-        // penny. See PlanEnvironment.Empowering.
-        var empowering = named.TryGetValue(Weighing.Empowering, out var lift) ? lift : -1;
+        // **The map's own increases as the start of the matching stat groups**, so a relic's "+50% increased number of
+        // rare monsters" adds to what the map, tablets and atlas already give rather than multiplying on its own.
+        // Behind a Debug checkbox, since it assumes the map's increases reach expedition monsters. See
+        // PlanEnvironment.IncreaseBaseOfGroup.
+        var increaseBases = Safe.Read(() => settings.Debug.MapMonsterIncreases.Value, true)
+            ? IncreaseBases(groupNames, groupCount, AtlasStats.MapMonsterIncreases(gc), amplified)
+            : null;
 
         if (!targets.Any(t => t.Wanted))
         {
@@ -1497,7 +1693,13 @@ internal sealed class Planning
             ? Obstacles.Read(gc, Detonator.DetonatorGridPosition(gc), range * Math.Max(1, Detonator.ExplosivesInHand(gc)))
             : null;
 
-        return new PlanEnvironment(Detonator.LastExplosiveGridPosition(gc), range, radius.Value,
+        // Gaining Traction's rates from the table, while the checkbox says the node is allocated - the checkbox rather
+        // than the atlas read, so a read that breaks cannot change the plans unseen. See DebugSettings.GainingTraction.
+        var traction = Safe.Read(() => settings.Debug.GainingTraction.Value, true)
+            ? Safe.Read(Weighing.GainingTractionRates, (0f, 0f))
+            : (0f, 0f);
+
+        var built = new PlanEnvironment(Detonator.LastExplosiveGridPosition(gc), range, radius.Value,
             Math.Max(1, Detonator.ExplosivesInHand(gc)), targets,
             Placeable(terrain, blocking),
             Reachable(terrain, blocking, range),
@@ -1506,33 +1708,20 @@ internal sealed class Planning
             Detonator.PlacedExplosiveGridPositions(gc),
             Secured(caught, settings, valuation),
             Banked,
-            // Always carried for the strategies that are nothing but bands, or that open from them:
-            // with the seed toggle off this was null and the mode fell back to hardcoded defaults,
-            // quietly ignoring the very sliders it exists to test.
-            //
-            // **Destroy and repair and GRASP were added to this list the hard way.** Both open from
-            // the band search now - it reaches 9,395.6 in under a second on a site where ten
-            // randomised greedy builds reach 4,345 - and both guard that call on Seeding being
-            // present. It was not, because only Edge only and Mixed were named here, so the opening
-            // silently fell back to greedy and the mode scored 4,345.0 twice in a row to the decimal
-            // while its counters barely moved. A null here does not fail, it quietly does less.
-            // **Always.** This was a switch, plus a list of the modes that open from the band
-            // search, and getting that list wrong was expensive - a mode missing from it fell back
-            // to greedy and scored 4,345.0 twice over to the decimal while its counters barely
-            // moved. One mode is left and it opens from the bands, so both the list and the switch
-            // are gone and the families are simply built.
-            new SeedFamilies(settings.Solver.Advanced.CandidateSpots.SpotsPerPair.Value, settings.Solver.Advanced.CandidateSpots.SpotsPerRare.Value,
-                settings.Solver.Advanced.CandidateSpots.SpotsPerRemnant.Value, settings.Solver.Advanced.CandidateSpots.SpotSpread.Value,
-                settings.Solver.Advanced.CandidateSpots.SpotSlack.Value / 100f, settings.Solver.Advanced.CandidateSpots.LeanHeavy.Value,
-                settings.Solver.Advanced.CandidateSpots.CellsPerBand.Value,
-                settings.Solver.Advanced.BandSearch.EdgeChainLinks.Value, settings.Solver.Advanced.BandSearch.EdgeBranches.Value,
-                settings.Solver.Advanced.BandSearch.EdgeHorizon.Value),
+            // Always carried: the shortlist reads the edge point settings from it, and a null here would quietly
+            // offer no edge points rather than fail. See Repair.Shortlist.
+            new SeedFamilies
+            {
+                HeavyEdgePoints = settings.Solver.Advanced.CandidateSpots.HeavyEdgePoints,
+                RareEdgePoints = settings.Solver.Advanced.CandidateSpots.RareEdgePoints,
+                EdgePointStepGrid = settings.Solver.Advanced.CandidateSpots.EdgePointStepGrid.Value,
+            },
             null,
             Math.Max(1, Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.TearLeast.Value, 1)),
             Math.Max(1, Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.TearMost.Value, 4)),
             effects,
             bands,
-            named.Count,
+            groupCount,
             musts, refused,
 
             // Read here, on the main thread, and carried on the environment. The search runs off the
@@ -1556,8 +1745,267 @@ internal sealed class Planning
                 () => settings.Solver.Advanced.DestroyAndRepair.ReverseRuns.Value, true),
             Relink: Safe.Read(
                 () => settings.Solver.Advanced.DestroyAndRepair.Relink.Value, true),
+            TakenLast: takenLast,
             OpeningMs: Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.OpeningMs.Value, 0),
-            UseEnumeratedSolve: Safe.Read(() => settings.Solver.Advanced.UseEnumeratedSolve.Value, true));
+            UseEnumeratedSolve: Safe.Read(() => settings.Solver.Advanced.UseEnumeratedSolve.Value, true),
+            // Here, where every environment is built, and not only on the search's: the score area and the score
+            // card build their own, and scoring one without these made the screen disagree with the workers.
+            MagicPacksPerRemnantCompleted: traction.Item1,
+            RarePacksPerRemnantCompleted: traction.Item2,
+            RareIncreaseOfMap: Safe.Read(() => AtlasStats.MapMonsterIncreases(gc).Rare / 100f, 0f),
+            MagicIncreaseOfMap: Safe.Read(() => AtlasStats.MapMonsterIncreases(gc).Magic / 100f, 0f),
+            RareModifierShareOfRare: Safe.Read(Weighing.RareModifierShareOfRare, 0f),
+            RemnantsCompletedInArea: Safe.Read(() =>
+                scan.Targets.Count(t => t.Kind == TargetKind.Remnant && t.Spent), 0),
+            LinkOfCaught: LinksOfCaught(caught, remaining ? Detonator.PlacedExplosiveGridPositions(gc) : null,
+                radius.Value),
+            Amplified: amplified,
+            IncreaseBaseOfGroup: increaseBases);
+
+        // **The whole site beside it, when explosives are down, which every score is then taken on.** The same site
+        // with nothing taken out, from the detonator, holding the explosives down as well as those in hand - the
+        // environment the score on screen is worked out in. See PlanEnvironment.Whole.
+        var down = remaining ? Detonator.PlacedExplosiveGridPositions(gc) : null;
+
+        if (down is not { Length: > 0 })
+            return built;
+
+        var whole = Build(gc, settings, scan, blast, valuation, withTerrain, false, out _, out _);
+
+        return whole == null
+            ? built
+            : built with
+            {
+                Whole = whole with
+                {
+                    Origin = Detonator.DetonatorGridPosition(gc),
+                    Explosives = down.Length + built.Explosives,
+                    Placed = down,
+                },
+                Head = down,
+            };
+    }
+
+    /// <summary>
+    /// Which group each numbered effect adds inside of, how many groups there are, which group the pure amplifiers
+    /// landed on (-1 for none), and how the site's amplifiers lift the rest (null when nothing lifts anything). Shared
+    /// with the offline harness, which rebuilds a saved layout's groups the same way. See Weighing.GroupKeyOfEffect,
+    /// Weighing.AmplifiedClassesOfRune and Amplification.
+    /// </summary>
+    internal static (int[] Bands, int Count, int Empowering, Amplification Amplified,
+        IReadOnlyDictionary<string, int> Named) GroupsOfEffects(IReadOnlyDictionary<string, int> effects)
+    {
+        var bands = new int[effects.Count];
+        var named = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) { [""] = 0 };
+        var twinned = new List<(int Group, int Twin, long Mask)>();
+        var classes = Weighing.AmplifierTags().Length;
+        var liftsOfEffect = new float[effects.Count][];
+        var maskOfEffect = new long[effects.Count];
+
+        int BandOf(string group)
+        {
+            if (!named.TryGetValue(group, out var band))
+            {
+                band = named.Count;
+                named[group] = band;
+            }
+
+            return band;
+        }
+
+        // Which classes something in this site lifts. A share is only twinned for those, so a site with no amplifier
+        // numbers its groups exactly as it did before twins existed.
+        var lifting = 0L;
+
+        foreach (var (id, key) in effects)
+        {
+            var lifts = Weighing.LiftsOfRune(Weighing.BaseOfLiftKey(id));
+
+            liftsOfEffect[key] = lifts;
+            maskOfEffect[key] = Weighing.AmplifiedClassesOfRune(Weighing.BaseOfLiftKey(id));
+
+            for (var a = 0; a < classes && lifts != null; a++)
+            {
+                if (lifts[a] > 0f)
+                    lifting |= 1L << a;
+            }
+        }
+
+        foreach (var (id, key) in effects)
+        {
+            var group = Weighing.GroupKeyOfEffect(id);
+
+            // **A share an amplifier lifts goes in a twin of its group for the classes lifting it**, added into the
+            // same sum by the payout with only its own part lifted. A pure amplifier's group holds no share to lift.
+            // See Planner.Multiplied.
+            var mask = maskOfEffect[key] & lifting;
+
+            if (mask != 0L && !string.Equals(group, Weighing.Empowering, StringComparison.OrdinalIgnoreCase))
+            {
+                var plain = BandOf(group);
+                var twin = BandOf(group + EmpowerableTwinSuffix + (mask == 1L ? "" : mask.ToString()));
+
+                if (!twinned.Contains((plain, twin, mask)))
+                    twinned.Add((plain, twin, mask));
+
+                bands[key] = twin;
+
+                continue;
+            }
+
+            bands[key] = BandOf(group);
+        }
+
+        // Which band number the pure amplifiers landed on, or -1 when none is in this site. See
+        // PlanEnvironment.Empowering.
+        var empowering = named.TryGetValue(Weighing.Empowering, out var lift) ? lift : -1;
+
+        if (lifting == 0L)
+            return (bands, named.Count, empowering, null, named);
+
+        var count = named.Count;
+        var maskOfGroup = new long[count];
+        var plainOfGroup = Enumerable.Repeat(-1, count).ToArray();
+        var twinsOfGroup = new int[count][];
+        var twinOf = Enumerable.Repeat(-1, count * (1 << classes)).ToArray();
+
+        foreach (var (plain, twin, mask) in twinned)
+        {
+            maskOfGroup[twin] = mask;
+            plainOfGroup[twin] = plain;
+            twinsOfGroup[plain] = [.. twinsOfGroup[plain] ?? [], twin];
+            twinOf[plain * (1 << classes) + (int)mask] = twin;
+        }
+
+        // Which classes lift each class's own lift: those lifting any rune that lifts it.
+        var amplifiedBy = new long[classes];
+
+        foreach (var (_, key) in effects)
+        {
+            for (var a = 0; a < classes && liftsOfEffect[key] != null; a++)
+            {
+                if (liftsOfEffect[key][a] > 0f)
+                    amplifiedBy[a] |= maskOfEffect[key] & lifting & ~(1L << a);
+            }
+        }
+
+        var runeClass = Array.FindIndex(Weighing.AmplifierTags(),
+            x => string.Equals(x, Tags.Known[Tags.Runes], StringComparison.OrdinalIgnoreCase));
+
+        // **How much of Power's lift reaches a rune that writes its share twice.** Its plain group and twins take
+        // (factor - 1) / Power's lift of it, so a lifted share comes to the empowered share: Bond's 15% under a Power
+        // doubling others becomes 18%, not 30%. The table's check keeps such a share out of any stat pool, so these
+        // groups are the rune's alone. See Weighing.PowerFactorOfRune and Amplification.LiftedFactorOfGroup.
+        var powerLift = 0f;
+
+        for (var key = 0; key < liftsOfEffect.Length && runeClass >= 0; key++)
+        {
+            if (liftsOfEffect[key] is { } of && runeClass < of.Length)
+                powerLift = Math.Max(powerLift, of[runeClass]);
+        }
+
+        double[] reachOfGroup = null;
+
+        foreach (var (id, key) in effects)
+        {
+            if (powerLift <= 0f || Weighing.IsLiftKey(id))
+                continue;
+
+            var factor = Weighing.PowerFactorOfRune(id);
+
+            if (factor <= 0f)
+                continue;
+
+            var band = bands[key];
+            var plain = band >= 0 && band < count && plainOfGroup[band] >= 0 ? plainOfGroup[band] : band;
+
+            if (plain < 0 || plain >= count)
+                continue;
+
+            reachOfGroup ??= Enumerable.Repeat(1d, count).ToArray();
+            reachOfGroup[plain] = (factor - 1d) / powerLift;
+
+            foreach (var twin in twinsOfGroup[plain] ?? [])
+                reachOfGroup[twin] = reachOfGroup[plain];
+        }
+
+        return (bands, count, empowering,
+            new Amplification(classes, liftsOfEffect, maskOfEffect, maskOfGroup, plainOfGroup, twinsOfGroup, twinOf,
+                amplifiedBy, runeClass, reachOfGroup),
+            named);
+    }
+    /// <summary>
+    /// Each group's starting increase as a fraction: the map's increased number of rare monsters for the group whose
+    /// rows name increased_number_of_rare_monsters, magic likewise, their amplified twins the same; nought for every
+    /// other group. Null when the map adds none. See PlanEnvironment.IncreaseBaseOfGroup.
+    /// </summary>
+    internal static float[] IncreaseBases(IReadOnlyDictionary<string, int> named, int count, (int Rare, int Magic) map,
+        Amplification amplified)
+    {
+        if (map.Rare <= 0 && map.Magic <= 0)
+            return null;
+
+        var bases = new float[count];
+
+        void Set(string stat, int percent)
+        {
+            if (named.TryGetValue("+" + stat, out var group) && group < count)
+                bases[group] = percent / 100f;
+        }
+
+        Set(RareMonsterIncreaseStat, map.Rare);
+        Set(MagicMonsterIncreaseStat, map.Magic);
+
+        // A twin adds into its plain group's sum, so it starts from the same base.
+        for (var g = 0; g < count && amplified != null; g++)
+        {
+            var plain = g < amplified.PlainOfGroup.Length ? amplified.PlainOfGroup[g] : -1;
+
+            if (plain >= 0)
+                bases[g] = bases[plain];
+        }
+
+        return bases;
+    }
+
+    /// <summary>The stat a row names for an increased number of rare monsters. See IncreaseBases.</summary>
+    private const string RareMonsterIncreaseStat = "increased_number_of_rare_monsters";
+
+    /// <summary>The stat a row names for an increased number of magic monsters. See IncreaseBases.</summary>
+    private const string MagicMonsterIncreaseStat = "increased_number_of_magic_monsters";
+
+    /// <summary>What marks a group key as the empowerable twin of the group named before it. See Bands.</summary>
+    private const string EmpowerableTwinSuffix = "empowerable";
+
+    /// <summary>
+    /// For each caught marker, by cell, the number of the first placed explosive that catches it, from one in the
+    /// order the game holds them - the same test and the same cells as Taken and Secured. Null with nothing down.
+    /// See PlanEnvironment.LinkOfCaught.
+    /// </summary>
+    private static Dictionary<(int X, int Y), int> LinksOfCaught(List<Target> caught, Vector2[] placed,
+        float radius)
+    {
+        if (caught is not { Count: > 0 } || placed is not { Length: > 0 })
+            return null;
+
+        var links = new Dictionary<(int X, int Y), int>();
+
+        foreach (var target in caught)
+        {
+            var reach = radius + Extents.Of(target);
+
+            for (var i = 0; i < placed.Length; i++)
+            {
+                if (Vector2.DistanceSquared(placed[i], target.Grid) > reach * reach)
+                    continue;
+
+                links[((int)MathF.Round(target.Grid.X), (int)MathF.Round(target.Grid.Y))] = i + 1;
+
+                break;
+            }
+        }
+
+        return links;
     }
 
     /// <summary>
@@ -2089,13 +2537,23 @@ internal sealed class Planning
     /// </param>
     public string Start(GameController gc, AutoExpeditionSettings settings, Scan scan,
         Blast blast, Valuation valuation, CancellationToken zone, bool mend = false,
-        bool rehearsing = false, string cause = "the action key", bool looped = false, bool continuous = false)
+        bool rehearsing = false, string cause = "the action key", bool looped = false, bool continuous = false,
+        bool askedByPlayer = false)
     {
+        // Refused before anything is read or built, so a refused start leaves nothing warm behind. See HeldAfterColdStart.
+        if (HeldAfterColdStart && !askedByPlayer)
+            return Say("Held after a cold start", $"{cause}: nothing solves until the action key is pressed");
+
+        HeldAfterColdStart = false;
         Asked = cause;
 
         // Timed as a whole and at its environment build, because a start on a cold Grand site was seen stopping the
         // game's thread for five seconds with no solver running. See Spent.LongGaps.
         using var starting = Spent.On("Planning.Start");
+
+        // What the atlas grants, kept current for the dump. See AtlasStats.
+        using (Spent.On("Planning.Start/AtlasStats"))
+            AtlasStats.Refresh(gc);
 
         Planner.Unfetch();
         Planner.ForgetEnumeratedSolve();
@@ -2139,6 +2597,12 @@ internal sealed class Planning
         // it. See Terrain.Broken and the repair procedure in Offsets.
         if (Terrain.Broken != null)
             return Say("Offsets are broken", Terrain.Broken);
+
+        // A Grand site already set off has nothing left to plan. Its panel reads 0 of 0 once the player has been away,
+        // so the explosive count below falls back to an assumed full set and would plan it afresh. See
+        // Detonator.GrandSiteSetOff.
+        if (Detonator.GrandSiteSetOff(gc))
+            return Say("Set off", "this expedition has been detonated");
 
         var explosives = Detonator.ExplosivesInHand(gc);
 
@@ -2495,11 +2959,19 @@ internal sealed class Planning
             var (_, _, missing, remnants) = scan?.Reach(where) ?? (0, 0, 0, 0);
             var stood = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
 
+            // The floor as plain worth, which is what the run's end is reported in (see CloseRun). _floor itself is a
+            // Total, carrying the weight for holding a must take, and logging the two side by side showed every run
+            // on a site with one as a loss of that weight - "-21,866.2" on a Craggy Peninsula site.
+            var floorPlain = _standing == null ? 0d : Planner.Plainly(env, _standing);
+
+            // The label the solve's timeline is kept under, for the dump's history. See Solving.PastTimelinesSaid.
+            Solving.NextTimelineLabel = $"run {_runs}, asked for by {cause}";
+
             _pending = new Run(_runs,
                 Rehearsal.Sighted == DateTime.MinValue
                     ? 0d
                     : (_began - Rehearsal.Sighted).TotalMilliseconds,
-                0d, cause, rehearsing, Showing(where), _floor, _floor, 0, "still running",
+                0d, cause, rehearsing, Showing(where), floorPlain, floorPlain, 0, "still running",
                 env.Targets.Count, Loaded(scan, where), remnants - missing,
                 Detonator.ExplosiveCount(gc), Detonator.PanelReady(gc),
                 stood != Vector2.Zero &&
@@ -2539,7 +3011,12 @@ internal sealed class Planning
         // The best score that has actually reached the screen, which starts at the standing plan's.
         // Single search thread, so a plain captured local is enough - see Planner, which has no
         // Parallel and no Task of its own.
-        var shown = _floor;
+        // **Nothing standing, so the first chain shows whatever it scores.** A floor of nought hid every chain scoring
+        // below it, and a chain catching a marker the player said to avoid scores below nought by the ceiling: on a
+        // Grazed Prairie site (2026-10-06) two presses reached 11,600 in the pool and published nothing, most likely so
+        // (the marks were being cycled through avoid; not confirmed). The best of a bad lot is still the plan to show.
+        // See Insisted.Said.Avoid.
+        var shown = _standing == null ? double.NegativeInfinity : _floor;
 
         void Better(List<Vector2> chain)
         {
@@ -2618,9 +3095,11 @@ internal sealed class Planning
             PressWindowMs = pressWindowMs,
             StallRestartMs = Math.Max(0,
                 Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.StallRestartMs.Value, 0)),
+            ForcedShortlistSpots = SpotsOfText(Safe.Read(() => settings.Debug.ForcedShortlistSpots.Value, "")),
             Roles = ThreadRoles.Read(
                 Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.ThreadRoles.Value, ""),
                 Math.Max(1, Safe.Read(() => settings.Solver.Threads.Value, 8))),
+            RemnantOrdersFirst = Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.RemnantOrdersFirst.Value, true),
         };
 
         // The environment the workers search under, roles included, so a reader of Env - the chain panel's list of
@@ -2638,9 +3117,13 @@ internal sealed class Planning
         Repair.ForgetOpeningTallies();
 
         var wanted = false;
+        var remnantOrdersWanted = 0;
 
         foreach (var role in env.Roles ?? [])
+        {
             wanted |= role.Opening == ThreadRoles.Opens.Enumerated;
+            remnantOrdersWanted += role.Opening == ThreadRoles.Opens.RemnantOrder ? 1 : 0;
+        }
 
         // Read here, on the game's thread, because the settings tree is not the search's to touch.
         var openingLinks = Safe.Read(() => settings.Solver.Advanced.DestroyAndRepair.OpeningLinks.Value, 2);
@@ -2655,6 +3138,29 @@ internal sealed class Planning
         // the game's thread, so the enumeration can too; Openings.Generate takes a lock for passes that overlap.
         // Its own thread at low priority, not a pool thread: it waits on the workers for the whole window. See
         // BackgroundWork.StartAtLowPriority.
+        // **Each worker's chain from the last solve, for it to carry on from.** Kept while solves follow one another on
+        // the same site with the same explosives in hand and the same number laid; anything else is a different search
+        // and every worker starts afresh. See WorkerChains.
+        var workerKey = (Site, _laid, explosives, threads);
+
+        if (workerKey != _chainsOfWorkersFor || ChainsOfWorkers.Workers != threads)
+        {
+            ChainsOfWorkers = new WorkerChains(threads);
+            _chainsOfWorkersFor = workerKey;
+        }
+
+        var chainsOfWorkers = ChainsOfWorkers;
+
+        // See HeldFirstSolve. Decided here, on the game's thread, and marked done only by a solve that ran its window out.
+        var heldKey = (Site, _laid, explosives, env.TakenLast >= 0 ? env.Targets[env.TakenLast].Grid : Vector2.Zero);
+        var heldSolve = HeldFirstSolve(env, heldKey);
+
+        _heldKeyOfSearch = heldSolve ? heldKey : null;
+
+        // Named in the solve's timeline label, since Solving.Across clears the timeline as it starts.
+        if (heldSolve)
+            Solving.NextTimelineLabel = (Solving.NextTimelineLabel ?? "solve") + ", every remnant held across the pool";
+
         _search = BackgroundWork.StartAtLowPriority(() => MeasuredSearch(() =>
         {
             var run = env;
@@ -2667,6 +3173,41 @@ internal sealed class Planning
             if (wanted)
                 RunningAtEnumeration = Volatile.Read(ref _workersRunning);
 
+            var slots = WorkerSlots(threads);
+
+            // The remnant orders as they stand, at once: built in the background and never waited for. See RemnantOrder.Latest.
+            // **Or, with remnant orders first and none yet for this ground, built now on the threads of the workers that
+            // open on them**, which wait for them below without holding a slot. After a reroll the ground is the same,
+            // so the orders from before it are handed out at once and the background builds the new ones, as without.
+            // See DestroyAndRepairSettings.RemnantOrdersFirst.
+            // On the threads of the order workers that wait for them. See Repair.OrderWorkersWaiting.
+            // **On the held environment for a held first solve.** There every remnant is must take, so the order search
+            // treats each as worth a detour and scores its orders with the credit for holding them, and its orders aim at
+            // every remnant with the marker taken last. Built on the real environment they did not: on a Grazed Prairie
+            // site (2026-10-06, offline, four draws) a held 10 s press reached 10,923 to 10,968 with orders built on the
+            // real environment and 11,608 to 11,622 with them built on the held one. See HeldFirstSolve.
+            var ordersEnv = heldSolve ? Repair.WithEveryRemnantMustTake(env) : env;
+            var (orderChains, ordering) = OrdersForSolve(ordersEnv, Repair.OrderSearchParts(remnantOrdersWanted), slots, zone,
+                reuseGround: !heldSolve);
+
+            if (remnantOrdersWanted > 0 && env.RemnantOrdersFirst)
+            {
+                // The window starts again when the orders arrive, so the workers that waited for them have a whole one.
+                if (ordering != null)
+                {
+                    _ordering = ordering;
+                    ordering.ContinueWith(_ =>
+                    {
+                        if (!token.IsCancellationRequested)
+                            _until = DateTime.UtcNow + settle;
+                    });
+                }
+
+            }
+
+            if (orderChains is { Count: > 0 })
+                run = run with { RemnantOrderChains = orderChains };
+
             var enumerated = wanted
                 ? BackgroundWork.StartAtLowPriority(() =>
                 {
@@ -2674,14 +3215,22 @@ internal sealed class Planning
                     if (token.IsCancellationRequested)
                         return env;
 
-                    Openings.Generate(env, openingLinks);
+                    var seeded = orderChains is { Count: > 0 } ? env with { RemnantOrderChains = orderChains } : env;
 
-                    var seeds = new List<List<Vector2>>();
+                    if (wanted)
+                    {
+                        Openings.Generate(env, openingLinks);
 
-                    foreach (var opening in Openings.Last)
-                        seeds.Add(opening.Links);
+                        var seeds = new List<List<Vector2>>();
 
-                    return seeds.Count > 0 ? env with { Openings = seeds } : env;
+                        foreach (var opening in Openings.Last)
+                            seeds.Add(opening.Links);
+
+                        if (seeds.Count > 0)
+                            seeded = seeded with { Openings = seeds };
+                    }
+
+                    return seeded;
                 })
                 : null;
 
@@ -2705,9 +3254,14 @@ internal sealed class Planning
             if (!token.IsCancellationRequested)
                 _until = DateTime.UtcNow + settle;
 
-            var slots = WorkerSlots(threads);
+            // The real environment, for what is kept of the workers' chains; the pool searches the held one. See
+            // HeldFirstSolve.
+            var real = run;
 
-            return Solving.Across(run, threads, Better,
+            if (heldSolve)
+                run = Repair.WithEveryRemnantMustTake(run);
+
+            var across = Solving.Across(run, threads, Better,
                 (n, publish) =>
                 {
                     var mine = run;
@@ -2730,6 +3284,30 @@ internal sealed class Planning
                         }
                     }
 
+                    // The orders being built on the slots of the workers that wait for them, waited for before taking a
+                    // slot of their own for the same reason. **The finished search, not its first publication**: while
+                    // it runs the threads are its own, so a worker starting on early orders only takes a slot from it -
+                    // after a reset on a Frigid Bluffs site (2026-10-04) workers released by the quick pass held every
+                    // slot the full pass needed. See RemnantOrder.SearchAcrossThreads.
+                    if (ordering != null && Repair.WaitsForOrders(run, n))
+                    {
+                        try
+                        {
+                            ordering.Wait(token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            return Plan.Empty;
+                        }
+                        catch (AggregateException)
+                        {
+                        }
+
+                        if (ordering.Status == System.Threading.Tasks.TaskStatus.RanToCompletion &&
+                            ordering.Result is { Count: > 0 } built)
+                            mine = mine with { RemnantOrderChains = built };
+                    }
+
                     // A slot of the thread count, shared with every solve still running. See WorkerSlots.
                     try
                     {
@@ -2740,11 +3318,32 @@ internal sealed class Planning
                         return Plan.Empty;
                     }
 
+                    // **The orders as they stand when the worker starts, not as they stood when it stopped waiting.** It
+                    // waits for the first orders and then for a slot, and while the order search runs most slots are its
+                    // parts', so most order workers started when it ended - on the first orders, which are the weakest,
+                    // with the last ones marked as taken. On a Frigid Bluffs site (2026-10-04) all six began on 21,629 or
+                    // 24,845 and the solve ended at 68,029; the next, begun on the last orders, reached 74,072 in 1.4 s.
+                    if (ordering != null && Repair.WaitsForOrders(run, n) &&
+                        RemnantOrder.PublishedFor(ordersEnv) is { Count: > 0 } latest)
+                        mine = mine with { RemnantOrderChains = latest };
+
                     Interlocked.Increment(ref _workersRunning);
 
                     try
                     {
-                        return Repair.Search(mine, share, settling, token, publish, n, seed);
+                        // With the remnants its role holds as must take; the pool judges what it publishes on the real
+                        // environment. See Repair.SearchHoldingRemnants.
+                        // Held again after the waits above, which hand back the real environment with the openings or
+                        // orders on it.
+                        if (heldSolve)
+                            mine = Repair.WithEveryRemnantMustTake(mine);
+
+                        var ended = Repair.SearchHoldingRemnants(mine, share, settling, token, publish, n, seed, chainsOfWorkers.Of(n));
+
+                        if (ended?.Points is { Count: > 0 } points)
+                            chainsOfWorkers.Ended(n, points);
+
+                        return ended;
                     }
                     finally
                     {
@@ -2753,6 +3352,14 @@ internal sealed class Planning
                     }
                 },
                 "repair");
+
+            // Once every worker has ended: which carried chains are still in contention. See WorkerChains.
+            if (!token.IsCancellationRequested)
+                chainsOfWorkers.Settle(real);
+
+            // Described on the real environment, since Poll weighs it against a floor on that one. The held weight
+            // carries a credit for every remnant held.
+            return heldSolve && across?.Points is { Count: > 0 } heldPoints ? Planner.Describe(real, heldPoints) : across;
         }), token);
 
         return Say("Solving path", $"planning {explosives} explosives over {env.Targets.Count} markers");
@@ -2851,6 +3458,14 @@ internal sealed class Planning
         if (target.Rerolled)
             return Safe.Read(() => valuation?.ChosenRecipeId(target.Entity), null);
 
+        // **A must take with a reward the player chose on it is fixed to that reward**, whatever Overrule says. The
+        // mark says the remnant is to be taken; the player's choice says which, and the planner is not to argue with
+        // either. Outranks the reward-value pin below, which would otherwise put the richest option back. A reward the
+        // placement run set is not the player's choice. See Valuation.ChosenByPlayer.
+        if (Safe.Read(() => Insisted.Here.Wants(target.Grid), false) &&
+            Safe.Read(() => valuation?.ChosenByPlayer(target.Entity), null) is { Length: > 0 } fixedChoice)
+            return fixedChoice;
+
         // **A must take earned by a reward's price pins that reward.**
         //
         // Insisted.Automatic reads Reroll.Worth, which is the price of the richest offer, so a remnant
@@ -2889,6 +3504,34 @@ internal sealed class Planning
     /// </summary>
     private static bool Placeable(PlanEnvironment env, List<Vector2> chain) =>
         Placeable(env, chain, out _);
+
+    /// <summary>
+    /// Whether the links of the chain not yet down still hold on the ground as it reads now: every spot
+    /// placeable and every throw landing. True when there is nothing left to check or no environment can be
+    /// built, since neither is evidence the plan is wrong.
+    ///
+    /// **For ground that changes after the plan was made.** Objects that rise mid-site - the Runed Monoliths of
+    /// a stone circle - are written into the ground the game routes over only once they are up. On Caldera a
+    /// chain planned before they rose aimed a link the game then put 4 grid short, and the ring still read green,
+    /// because nothing asked the ground again. See AutoExpedition, which asks when the placement tool appears.
+    /// </summary>
+    public bool StillHolds(GameController gc, AutoExpeditionSettings settings, Scan scan, Blast blast,
+        Valuation valuation, out string why)
+    {
+        why = "";
+
+        var down = Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0);
+
+        if (_chain == null || down >= _chain.Count)
+            return true;
+
+        var env = Build(gc, settings, scan, blast, valuation, true, true, out _, out _);
+
+        if (env == null)
+            return true;
+
+        return Placeable(env, _chain.Skip(Math.Max(0, down)).ToList(), out why);
+    }
 
     private static bool Placeable(PlanEnvironment env, List<Vector2> chain, out string why)
     {
@@ -3004,9 +3647,6 @@ internal sealed class Planning
         }
     }
 
-    /// <summary>How little content makes a site too sparse for the band search to be worth running.</summary>
-    private const int Sparse = 30;
-
     /// <summary>
     /// Collects the answer once the search has one. Called every tick; costs nothing until it does.
     /// </summary>
@@ -3023,6 +3663,14 @@ internal sealed class Planning
         if (search.IsCanceled)
             return;
 
+        // A held first solve collected here has done its job, and the solves after it search the real objective. Not
+        // marked where the solve ends, since its window ending cancels its token as being superseded does. See
+        // HeldFirstSolve.
+        if (_heldKeyOfSearch is { } heldKey && !search.IsFaulted)
+            _heldFirstSolveFor = heldKey;
+
+        _heldKeyOfSearch = null;
+
         if (search.IsFaulted)
         {
             Say("Failed", "the search failed: " + (search.Exception?.GetBaseException().Message ?? "unknown"));
@@ -3038,15 +3686,16 @@ internal sealed class Planning
             ? Planner.Describe(_env, _standing)
             : search.Result;
 
-        // **What was on screen wins a tie, because a tie is not an improvement.**
+        // **The search's result wins a tie with what was on screen.**
         //
-        // The search publishes only what beats what is drawn, and then hands back whatever it
-        // finished holding - which can be a different chain of exactly equal worth. Under the
-        // objective those two are the same answer; on screen they are two different routes, and the
-        // plan quietly became the one nobody had been looking at. Keeping the published one costs
-        // nothing by construction and makes what you watched be what you get.
+        // The search publishes only what beats what is drawn, so of several chains of equal worth the
+        // first one found stays on screen, and it hands back its own winner, which can be a different
+        // one of them. Keeping the published chain made the plan differ from the chain the press
+        // history and the dump report as the winner: on one site (2026-09-30) the screen showed the
+        // last explosive on a must-take remnant's centre while every readout had it 29 grid off.
+        // Only a published chain scoring strictly higher replaces the result.
         if (_live is { Count: > 0 } && _env != null && Plan.Points.Count > 0 &&
-            Planner.Score(_env, _live) >= Planner.Score(_env, Plan.Points) - 0.0001d &&
+            Planner.Score(_env, _live) > Planner.Score(_env, Plan.Points) + 0.0001d &&
             !ReferenceEquals(_live, Plan.Points))
             Plan = Planner.Describe(_env, _live);
 
@@ -3059,13 +3708,12 @@ internal sealed class Planning
 
         Progress = $"env at ({_env?.Origin.X ?? 0f:0},{_env?.Origin.Y ?? 0f:0}) over " +
                    $"{_env?.Targets.Count ?? 0} markers, {_env?.Explosives ?? 0} explosives; " +
-                   $"run {_runs} of this site on random stream {Planner.Stream}, " +
+                   $"run {_runs} of this site, " +
                    (_floor > 0d
                        ? $"opened with {_floor:N1} inherited"
                        : "opened from nothing") +
                    $", ended at {Plan.Plain:N1} - " +
-                   $"{_found} improvement{(_found == 1 ? "" : "s")} drawn over " +
-                   $"{Planner.Rounds} restart round{(Planner.Rounds == 1 ? "" : "s")}" +
+                   $"{_found} improvement{(_found == 1 ? "" : "s")} drawn" +
                    (double.IsNaN(last)
                        ? "; nothing was published to the screen during it"
                        : $"; the last chain published to the screen scored {last:N1} over " +
@@ -3116,6 +3764,24 @@ internal sealed class Planning
                 Plan = Planner.Describe(_env, full);
         }
 
+        // Kept past a deleted plan, so a later solve can be checked against what this one reached. See SiteBestChains.
+        //
+        // **The whole route from the detonator, with the explosives already down as its first links.** The plan holds
+        // only the links still to place, from the last explosive down, so a route found after placing some by hand was
+        // filed as its tail: undone, it read "start moved" with three links missing, and could not be scored, loaded
+        // or saved as the route it was.
+        if (_env != null && Plan.Points.Count > 0)
+        {
+            var placed = _env.Placed ?? [];
+            var whole = new List<Vector2>(placed.Count + Plan.Points.Count);
+
+            whole.AddRange(placed);
+            whole.AddRange(Plan.Points);
+
+            SiteBestChains.Record(_areaHash, Site, whole, placed.Count > 0 ? Site : _env.Origin,
+                Planner.Plainly(_env, Plan.Points), _runs, Draws, Wrt.Revision);
+        }
+
         _live = null;
 
         Solves++;
@@ -3145,7 +3811,7 @@ internal sealed class Planning
             Trials.Record(plugin, _strategy, _area, _level, _env.Origin, Plan,
                 _env.Targets.Count, remnants, rares, _env.Explosives,
                 (DateTime.UtcNow - _began).TotalSeconds,
-                Edges.Last);
+                "");
         }
 
         if (Plan.Points.Count == 0)
@@ -3379,6 +4045,27 @@ internal sealed class Planning
     /// </summary>
     public static int Draws { get; set; }
 
+    /// <summary>
+    /// The grid spots written in a setting, or null when it names none. Takes "x,y; x,y" and the dump's own
+    /// "(x,y) (x,y)", so a chain can be pasted from a dump as it stands. Anything that is not a pair of numbers
+    /// is skipped.
+    /// </summary>
+    internal static List<Vector2> SpotsOfText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        var found = new List<Vector2>();
+
+        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text,
+                     @"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)"))
+            found.Add(new Vector2(
+                float.Parse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture),
+                float.Parse(m.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture)));
+
+        return found.Count > 0 ? found : null;
+    }
+
     /// <summary>Says one thing two ways: a word for the HUD, a sentence for the debug line.</summary>
     private string Say(string status, string detail)
     {
@@ -3439,8 +4126,7 @@ internal sealed class Planning
     ///
     /// **The countdown used to be a readout of a stop rather than the stop itself.** The search kept
     /// its own clock and only consulted it between operators, so one polish pass over a three
-    /// hundred marker site, or the band slice the mixed strategy runs first, could carry it well
-    /// past zero - and "Solving 0.0s" sat on screen looking like a hang. Two clocks that agree most
+    /// hundred marker site could carry it well past zero - and "Solving 0.0s" sat on screen looking like a hang. Two clocks that agree most
     /// of the time are worse than one, because the times they disagree are the times somebody is
     /// watching.
     ///
@@ -3456,6 +4142,13 @@ internal sealed class Planning
     private void Expire()
     {
         if (_search is not { IsCompleted: false } || DateTime.UtcNow <= _until)
+            return;
+
+        // **Not while the solve's remnant orders are still being built.** The order workers wait for them without
+        // improving anything, so the window ran out on the other workers' last gain: after a reload on a Frigid Bluffs
+        // site (2026-10-04) it ended the solve at 11.8 s, cancelling the order search part way through its second pass,
+        // and no order worker ever started. See RemnantOrder.SearchAcrossThreads.
+        if (_ordering is { IsCompleted: false })
             return;
 
         if (_live is { Count: > 0 } || Plan.Points.Count > 0)

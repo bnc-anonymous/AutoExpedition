@@ -178,6 +178,82 @@ internal static class Panels
     /// Reports the element by its text or texture, which is what identifies it to somebody looking
     /// at the screen, and the verdict Allowed reached about it.
     /// </summary>
+    /// <summary>
+    /// What would take a click at this spot, named in a few words for the player. Why is the full diagnostic, for the
+    /// dump. See Placement's Click location obscured.
+    /// </summary>
+    public static string Blocker(GameController gc, Vector2 at)
+    {
+        if (Furnished(gc, at))
+            return InBuffBar(gc, at) ? "the buff bar" : "the bottom bar";
+
+        var ui = Safe.Read(gc, static g => (Element)g.IngameState.IngameUi, null);
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default);
+        var hit = ui == null || window.Width <= 0f ? null : Over(ui, at, window.Width * window.Height * 0.6f, 0);
+
+        if (hit == null)
+            return "part of the interface";
+
+        if (IsEnemyHealthBar(hit))
+            return "an enemy health bar";
+
+        if (InChat(gc, hit))
+            return "the chat";
+
+        var text = (Safe.Read(hit, static e => e.Text, null) ?? "").Trim();
+
+        if (text.Length > 0)
+            return text.Length > 40 ? $"\"{text[..40]}...\"" : $"\"{text}\"";
+
+        var texture = Safe.Read(hit, static e => e.TextureName, null) ?? "";
+
+        return texture.Length > 0 ? System.IO.Path.GetFileNameWithoutExtension(texture) : "part of the interface";
+    }
+
+    /// <summary>Whether an element is, or sits inside, one of the enemy health bars, by its texture.</summary>
+    private static bool IsEnemyHealthBar(Element element)
+    {
+        // The hit element and up to three parents: the ornament, the bar and its fill are separate elements.
+        var at = element;
+
+        for (var step = 0; at != null && step < 4; step++, at = Safe.Read(at, static e => e.Parent, null))
+        {
+            var texture = Safe.Read(at, static e => e.TextureName, null) ?? "";
+
+            if (texture.Contains("/EnemyHealthBars/", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Whether any rare or unique monster is alive among the loaded entities.</summary>
+    private static bool AnyLivingRareOrUnique(GameController gc)
+    {
+        var monsters = Safe.Read(gc, static g =>
+            g.EntityListWrapper.ValidEntitiesByType.TryGetValue(ExileCore2.Shared.Enums.EntityType.Monster, out var of)
+                ? of
+                : null, null);
+
+        if (monsters == null)
+            return true;
+
+        foreach (var monster in monsters)
+        {
+            if (!Safe.Read(monster, static e => e.IsAlive, false))
+                continue;
+
+            var rarity = Safe.Read(monster, static e =>
+                e.GetComponent<ExileCore2.PoEMemory.Components.ObjectMagicProperties>()?.Rarity ??
+                ExileCore2.Shared.Enums.MonsterRarity.White, ExileCore2.Shared.Enums.MonsterRarity.White);
+
+            if (rarity is ExileCore2.Shared.Enums.MonsterRarity.Rare or ExileCore2.Shared.Enums.MonsterRarity.Unique)
+                return true;
+        }
+
+        return false;
+    }
+
     public static string Why(GameController gc, Vector2 at)
     {
         var ui = Safe.Read(gc, static g => (Element)g.IngameState.IngameUi, null);
@@ -187,7 +263,7 @@ internal static class Panels
             return "no interface to test against";
 
         if (Furnished(gc, at))
-            return $"BLOCKED by the bottom bar - {Furnishings(gc)}";
+            return $"BLOCKED by {(InBuffBar(gc, at) ? "the buff bar" : "the bottom bar")} - {Furnishings(gc)}";
 
         var hit = Over(ui, at, window.Width * window.Height * 0.6f, 0);
 
@@ -619,6 +695,13 @@ internal static class Panels
     /// <returns>Whether a click may pass, and what decided it, for the readout.</returns>
     private static (bool Allowed, string Why) Allowed(GameController gc, Element hover)
     {
+        // **An enemy health bar with no rare or unique monster alive.** The bar at the top of the screen stays in the
+        // element tree reporting IsVisible true after its monster dies, and paints nothing. Seen 2026-10-02: a spot
+        // refused under RareOrnament.dds at (1001,34 558x71) with no living rare loaded. Blocking only while one is
+        // alive keeps the refusal for a bar that may really be drawn.
+        if (IsEnemyHealthBar(hover) && !AnyLivingRareOrUnique(gc))
+            return (true, "an enemy health bar, with no rare or unique monster alive to show it");
+
         // **The chat panel, which is on screen for hours after it stops being on screen.**
         //
         // Seen in a dump taken over a dig site: three lines from LOGIN - two channel joins and the
@@ -886,6 +969,9 @@ internal static class Panels
         if (ui == null)
             return;
 
+        if (BuffBarRect(ui) is { Width: > 0f, Height: > 0f } buffs)
+            _furniture.Add(buffs);
+
         foreach (var path in Furniture)
         {
             var element = Resolve(ui, path);
@@ -922,6 +1008,139 @@ internal static class Panels
                 Wide++;
         }
     }
+
+    /// <summary>
+    /// The largest band of the screen that no open side panel and no part of the Escape menu covers: the whole window
+    /// when nothing is open, empty when nothing is clear. See DisplaySettings.HideBehindPanels.
+    ///
+    /// A side panel - the inventory, the character sheet, the stash - is a visible top level child of the interface
+    /// that runs at least nine tenths of the window's height, touches its left or right edge, and is narrower than half
+    /// of it. Read off the tree rather than through OpenLeftPanel and OpenRightPanel; see Hidden for why those are not
+    /// read. On a 2560x1440 window (2026-10-06) the character sheet was child 33 at (0,0 887x1440) and the inventory
+    /// child 34, its title at x 1673.
+    ///
+    /// The Escape menu is not under IngameUi. It is looked for under EscapeState.UIRoot while TheGame.IsEscapeState,
+    /// taking the first elements down from that root smaller than three fifths of the window. In this client that root
+    /// does not resolve - it reads as invisible, with an infinite rectangle and no children (2026-10-06) - and the menu
+    /// is not under IngameState.UIRoot either, so nothing is found. The answer is then empty, and the caller draws
+    /// nothing while the menu is open rather than drawing over it.
+    ///
+    /// One band, because a draw list clips to one rectangle: with a menu in the middle of the screen the drawing keeps
+    /// the larger of the strips beside, above or below it. See Clearest.
+    /// </summary>
+    public static RectangleF ClearOfPanels(GameController gc)
+    {
+        if (_clearOfPanelsAt == Frame.Number)
+            return _clearOfPanels;
+
+        _clearOfPanelsAt = Frame.Number;
+        SidePanels = 0;
+        EscapeMenuOpen = false;
+        _panelsToClear.Clear();
+
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default(RectangleF));
+
+        // Client coordinates, as the interface rectangles are.
+        var whole = new RectangleF(0f, 0f, window.Width, window.Height);
+
+        _clearOfPanels = whole;
+
+        if (window.Width <= 0f || window.Height <= 0f)
+            return _clearOfPanels;
+
+        var ui = Safe.Read(gc, static g => (Element)g.IngameState.IngameUi, null);
+        var kids = ui == null ? null : Safe.Kids(ui);
+        var edge = 4f;
+
+        if (kids != null)
+        {
+            foreach (var kid in kids)
+            {
+                if (kid == null || !Safe.Read(kid, static e => e.IsVisible, false))
+                    continue;
+
+                var rect = Safe.Read(kid, static e => e.GetClientRectCache, default(RectangleF));
+
+                if (rect.Height < window.Height * 0.9f || rect.Width <= 0f || rect.Width >= window.Width * 0.5f)
+                    continue;
+
+                if (rect.Left <= edge || rect.Right >= window.Width - edge)
+                {
+                    _panelsToClear.Add(rect);
+                    SidePanels++;
+                }
+            }
+        }
+
+        if (Safe.Read(gc, static g => g.Game.IsEscapeState, false))
+        {
+            EscapeMenuOpen = true;
+
+            var before = _panelsToClear.Count;
+
+            EscapeMenuParts(Safe.Read(gc, static g => g.Game.EscapeState.UIRoot, null), window.Width * window.Height * 0.6f, 0);
+
+            EscapeMenuRects = _panelsToClear.Count - before;
+
+            if (EscapeMenuRects == 0)
+            {
+                _clearOfPanels = new RectangleF(0f, 0f, 0f, 0f);
+
+                return _clearOfPanels;
+            }
+        }
+
+        if (_panelsToClear.Count > 0)
+            _clearOfPanels = Clearest(whole, _panelsToClear, 0f);
+
+        return _clearOfPanels;
+    }
+
+    /// <summary>Adds the Escape menu's elements under this one to the rectangles to keep clear. See ClearOfPanels.</summary>
+    private static void EscapeMenuParts(Element at, float windowSized, int depth)
+    {
+        var kids = at == null || depth > 3 ? null : Safe.Kids(at);
+
+        if (kids == null)
+            return;
+
+        foreach (var kid in kids)
+        {
+            if (kid == null || !Safe.Read(kid, static e => e.IsVisible, false))
+                continue;
+
+            var rect = Safe.Read(kid, static e => e.GetClientRectCache, default(RectangleF));
+
+            if (rect.Width <= 0f || rect.Height <= 0f)
+                continue;
+
+            if (rect.Width * rect.Height >= windowSized)
+                EscapeMenuParts(kid, windowSized, depth + 1);
+            else
+                _panelsToClear.Add(rect);
+        }
+    }
+
+    /// <summary>How many side panels ClearOfPanels last found, for the dump.</summary>
+    public static int SidePanels { get; private set; }
+
+    /// <summary>Whether ClearOfPanels last found the Escape menu open, for the dump.</summary>
+    public static bool EscapeMenuOpen { get; private set; }
+
+    /// <summary>How many rectangles of the Escape menu ClearOfPanels last found, for the dump.</summary>
+    public static int EscapeMenuRects { get; private set; }
+
+    /// <summary>What ClearOfPanels last answered, for the dump.</summary>
+    public static RectangleF LastClearOfPanels => _clearOfPanels;
+
+    /// <summary>The rectangles ClearOfPanels last kept clear, for the dump. Not to be written to.</summary>
+    public static IReadOnlyList<RectangleF> LastPanelsToClear => _panelsToClear;
+
+    private static readonly List<RectangleF> _panelsToClear = new();
+
+    private static RectangleF _clearOfPanels;
+
+    private static int _clearOfPanelsAt = -1;
 
     /// <summary>Whether a point falls in any of these. See Snapshot.</summary>
     private static bool Inside(List<RectangleF> rects, Vector2 at)
@@ -1046,8 +1265,88 @@ internal static class Panels
             area += rect.Width * rect.Height;
         }
 
+        var buffs = BuffBarRect(ui);
+
         return $"{found} of {Furniture.Length} controls resolved, {area:N0} px blocked" +
-               (said.Count > 0 ? " - " + string.Join("; ", said) : "");
+               (said.Count > 0 ? " - " + string.Join("; ", said) : "") +
+               $"; buff bar {string.Join("->", BuffBar)} " +
+               (buffs.Width > 0f ? $"estimated at ({buffs.X:0},{buffs.Y:0} {buffs.Width:0}x{buffs.Height:0})" : "not found or empty");
+    }
+
+    /// <summary>Whether a point is inside the estimated buff bar, for naming what blocked it. See BuffBarRect.</summary>
+    private static bool InBuffBar(GameController gc, Vector2 at)
+    {
+        var rect = BuffBarRect(Safe.Read(gc, static g => (Element)g.IngameState.IngameUi, null));
+
+        return at.X >= rect.Left && at.X <= rect.Right && at.Y >= rect.Top && at.Y <= rect.Bottom && rect.Width > 0f;
+    }
+
+    /// <summary>The buff bar at the top left, by path. See BuffBarRect.</summary>
+    private static readonly int[] BuffBar = [17, 6, 0];
+
+    /// <summary>
+    /// The screen the buff bar covers, estimated, or empty when it is not found or shows no buff.
+    ///
+    /// **Estimated, because its icons report a position and no size.** A click over a buff is taken by the bar, so the
+    /// cursor must not be sent there - and the rectangle tests let it through: on a Grazed Prairie site (2026-10-06) a
+    /// spot at (203,50) read as clear and the hover check then refused it, over [17,6,0,3] reading (202,5 0x0). So the
+    /// left and top are the least of the visible icons' positions, an icon's width is the commonest gap between
+    /// neighbouring icons (about 95 px at 2560x1440; 96 when there is one icon), and the bottom is the lowest of their
+    /// charge counts, which do report a size, or one icon below the top when none shows. Path [17,6,0] was the bar in two
+    /// dumps that day.
+    /// </summary>
+    private static RectangleF BuffBarRect(Element ui)
+    {
+        var bar = ui == null ? null : Resolve(ui, BuffBar);
+        var icons = bar == null ? null : Safe.Kids(bar);
+
+        if (icons == null)
+            return default;
+
+        var xs = new List<float>();
+        var top = float.MaxValue;
+        var bottom = float.MinValue;
+
+        foreach (var icon in icons)
+        {
+            if (icon == null || !Safe.Read(icon, static e => e.IsVisible, false))
+                continue;
+
+            var at = Safe.Read(icon, static e => e.GetClientRectCache, default(RectangleF));
+
+            xs.Add(at.X);
+            top = MathF.Min(top, at.Y);
+
+            // The charge count sits two levels down, at [icon,1,0], and is the one part with a size.
+            foreach (var part in Safe.Kids(icon) ?? [])
+            foreach (var text in (part == null ? null : Safe.Kids(part)) ?? [])
+            {
+                var rect = text == null ? default : Safe.Read(text, static e => e.GetClientRectCache, default(RectangleF));
+
+                if (rect.Height > 0f)
+                    bottom = MathF.Max(bottom, rect.Bottom);
+            }
+        }
+
+        if (xs.Count == 0)
+            return default;
+
+        xs.Sort();
+
+        var gaps = new List<float>();
+
+        for (var i = 1; i < xs.Count; i++)
+        {
+            if (xs[i] - xs[i - 1] >= 20f)
+                gaps.Add(MathF.Round(xs[i] - xs[i - 1]));
+        }
+
+        var width = gaps.Count > 0 ? gaps.GroupBy(g => g).OrderByDescending(g => g.Count()).First().Key : 96f;
+
+        if (bottom < top + width)
+            bottom = top + width;
+
+        return new RectangleF(xs[0], top, xs[^1] + width - xs[0], bottom - top);
     }
 
     private static Element Resolve(Element from, int[] path)

@@ -60,6 +60,9 @@ internal static class Dump
     /// <summary>The whole route and how far along it the chain is. See Planning.Chain.</summary>
     public static IReadOnlyList<System.Numerics.Vector2> Chain { get; set; }
 
+    /// <summary>What the blast circles were last drawn from. See Planning.BlastScores and BlastLabelsChecked.</summary>
+    public static Planner.BlastScores BlastScores { get; set; }
+
     /// <summary>
     /// How many of the chain's links have an explosive on them.
     ///
@@ -125,7 +128,7 @@ internal static class Dump
     /// </summary>
     private static string Advising(GameController gc, Scan scan)
     {
-        if (Rolling.Here.Best is not { } best)
+        if (Rolling.Here.Advised is not { } best)
             return "nothing advised, so no figures are drawn";
 
         // The fifth condition, and the one that looks most like a fault: everything else is in
@@ -330,6 +333,8 @@ internal static class Dump
                            $"({(DateTime.UtcNow - ran.When).TotalSeconds:N1}s ago)"));
 
         var took = Placement.Picked;
+
+        b.AppendLine($"  waiting for a second remnant's window after a reward: {Placement.NextWindowSaid}");
 
         b.AppendLine("  the last reward this run clicked: " +
                      (took.When == default
@@ -767,6 +772,7 @@ internal static class Dump
         Labels(b, gc);
         TerrainGrid(b, gc, Scan);
         MapStats(b, gc);
+        MonsterRarityStats(b, gc);
         RuneTable(b, gc);
         WeightTable(b);
         Guards(b);
@@ -779,6 +785,82 @@ internal static class Dump
     }
 
     // ------------------------------------------------------------------ detonator
+
+    /// <summary>
+    /// The Escape menu's element tree, five levels down from EscapeState.UIRoot, for finding which elements are the menu.
+    /// See Panels.ClearOfPanels.
+    /// </summary>
+    private static void EscapeMenuTree(StringBuilder b, GameController gc)
+    {
+        SectionHeader(b, "=== the Escape menu's elements (EscapeState.UIRoot) ===");
+
+        var open = Safe.Read(gc, static g => g.Game.IsEscapeState, false);
+        var root = Safe.Read(gc, static g => g.Game.EscapeState.UIRoot, null);
+
+        b.AppendLine($"  IsEscapeState {open}, UIRoot {(root == null ? "not readable" : "read")}");
+
+        void Walk(ExileCore2.PoEMemory.Element at, string path, int depth)
+        {
+            var kids = depth > 5 ? null : Safe.Kids(at);
+
+            if (kids == null)
+                return;
+
+            for (var i = 0; i < kids.Count && i < 60; i++)
+            {
+                var kid = kids[i];
+
+                if (kid == null)
+                    continue;
+
+                var rect = Safe.Read(kid, static e => e.GetClientRectCache, default(ExileCore2.Shared.RectangleF));
+                var visible = Safe.Read(kid, static e => e.IsVisible, false);
+                var text = (Safe.Read(kid, static e => e.Text, null) ?? "").Trim();
+                var texture = Safe.Read(kid, static e => e.TextureName, null) ?? "";
+
+                b.AppendLine($"  {new string(' ', depth * 2)}[{path}{i}] visible {visible} ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0})" +
+                             $" kids {Safe.Read(kid, static e => (int)e.ChildCount, 0)}" +
+                             (text.Length > 0 ? $" \"{(text.Length > 40 ? text[..40] : text)}\"" : "") +
+                             (texture.Length > 0 ? $" {System.IO.Path.GetFileNameWithoutExtension(texture)}" : ""));
+
+                if (visible)
+                    Walk(kid, $"{path}{i},", depth + 1);
+            }
+        }
+
+        if (root != null)
+        {
+            b.AppendLine($"  root visible {Safe.Read(root, static e => e.IsVisible, false)} " +
+                         $"rect {Safe.Read(root, static e => e.GetClientRectCache, default(ExileCore2.Shared.RectangleF))}");
+            Walk(root, "", 0);
+        }
+
+        // **And the game's own interface root, which IngameUi is one child of.** EscapeState.UIRoot read as invisible
+        // with an infinite rectangle and no children on 2026-10-06, so the menu is looked for here as well. IngameUi's
+        // own subtree is listed by address and not walked, since the label section below covers it.
+        var whole = Safe.Read(gc, static g => g.IngameState.UIRoot, null);
+        var ingame = Safe.Read(gc, static g => (long)g.IngameState.IngameUi.Address, 0L);
+
+        b.AppendLine($"  IngameState.UIRoot {(whole == null ? "not readable" : "read")}, IngameUi at {ingame:X}");
+
+        var tops = whole == null ? null : Safe.Kids(whole);
+
+        for (var i = 0; tops != null && i < tops.Count && i < 60; i++)
+        {
+            var top = tops[i];
+            var address = Safe.Read(top, static e => (long)e.Address, 0L);
+            var visible = Safe.Read(top, static e => e.IsVisible, false);
+            var rect = Safe.Read(top, static e => e.GetClientRectCache, default(ExileCore2.Shared.RectangleF));
+
+            b.AppendLine($"  top [{i}] at {address:X}{(address == ingame ? " (IngameUi)" : "")} visible {visible} " +
+                         $"({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}) kids {Safe.Read(top, static e => (int)e.ChildCount, 0)}");
+
+            if (visible && address != ingame)
+                Walk(top, $"top {i},", 1);
+        }
+
+        b.AppendLine();
+    }
 
     private static void DetonatorSection(StringBuilder b, GameController gc)
     {
@@ -831,6 +913,41 @@ internal static class Dump
         // on the landing cell alone and cannot hold that; Settled already keys on a pair. See
         // Refused.Allowed and NOTES section 9.
         var cursor = Safe.Read(() => gc.IngameState.ServerData.GridMousePosition, default);
+
+        // The cursor's world position in grid units, beside the cell the game names for it. The cell is the
+        // position rounded down, read off three dumps on 2026-09-30. See Placement.Screen.
+        var cursorWorld = Safe.Read(() =>
+        {
+            var world = gc.IngameState.ServerData.WorldMousePosition;
+
+            return new System.Numerics.Vector2(world.X, world.Y);
+        }, default(System.Numerics.Vector2));
+
+        b.AppendLine($"  cursor in grid units: ({cursorWorld.X / Detonator.GridToWorld:0.###},{cursorWorld.Y / Detonator.GridToWorld:0.###})" +
+                     $"  game's cursor cell ({cursor.X},{cursor.Y})");
+
+        // **Whether the placement run's aim height matches the game's pick, at the cursor.** The game's cursor ground
+        // point, which it gives without a height, projected at Placement.BlendedHeight - the height the run aims
+        // with - and set against the cursor pixel. Near zero means an aim here lands on the cell it was aimed at;
+        // the cell's own height-map value is printed beside it for comparison. See Placement.AimRect.
+        var cursorPixel = Safe.Read(() => new System.Numerics.Vector2(gc.IngameState.MousePosX, gc.IngameState.MousePosY),
+            System.Numerics.Vector2.Zero);
+        var cursorGrid = cursorWorld / Detonator.GridToWorld;
+        var projectionCamera = Safe.Read(() => gc.IngameState.Camera, null);
+        var ingameData = Safe.Read(() => gc.IngameState.Data, null);
+
+        if (projectionCamera != null && ingameData != null && cursorGrid != System.Numerics.Vector2.Zero)
+        {
+            var blended = Placement.BlendedHeight(ingameData, cursorGrid);
+            var stepped = Safe.Read(() => ingameData.ToWorldWithTerrainHeight(
+                new System.Numerics.Vector2(MathF.Floor(cursorGrid.X), MathF.Floor(cursorGrid.Y))).Z, float.NaN);
+            var projected = Safe.Read(() => projectionCamera.WorldToScreen(
+                new System.Numerics.Vector3(cursorWorld, blended)), System.Numerics.Vector2.Zero);
+
+            b.AppendLine($"  aim height at the cursor: blended {blended:0.##} (the cell's own {stepped:0.##}); the game's " +
+                         $"cursor point at that height is {System.Numerics.Vector2.Distance(projected, cursorPixel):0.##}px " +
+                         $"from the cursor pixel ({cursorPixel.X:0},{cursorPixel.Y:0})");
+        }
 
         b.AppendLine(pointed != default
             ? $"  indicator entity: landing ({pointed.X:0.###},{pointed.Y:0.###})  " +
@@ -929,11 +1046,180 @@ internal static class Dump
     }
 
     /// <summary>
+    /// Each remnant the chain catches, scored by taking it away: the chain as planned against the chain with the remnant
+    /// out of every blast's reach, and against it with the remnant's own effects removed - and each again with every
+    /// Power and Bait rune taken off the site. Plain worth, the reward included, as the plan is scored.
+    ///
+    /// **A link's credit is not a remnant's worth.** A blast's "+395 (300)" is what the payout booked at that link,
+    /// while a remnant's runes pay on every link after it and its own effects on its own waves, so the figure a remnant
+    /// is picked for was nowhere on screen (2026-10-05). Own effects a Power held on the same remnant already lifted
+    /// stay lifted in the figures without Power, since they are lifted when the site is built.
+    /// </summary>
+    private static string WorthOfRemnantsOnChain(PlanEnvironment env, List<System.Numerics.Vector2> chain)
+    {
+        if (env == null || chain is not { Count: > 0 })
+            return "    no chain";
+
+        var noPower = WithoutLiftingRunes(env);
+        var full = Planner.Plainly(env, chain);
+        var fullNoPower = Planner.Plainly(noPower, chain);
+        var lines = new List<string>
+        {
+            $"    the chain scores {full:N1}; with no Power or Bait anywhere {fullNoPower:N1}, so they add {full - fullNoPower:+#,##0.0;-#,##0.0;0}",
+        };
+
+        static PlanEnvironment With(PlanEnvironment site, int index, PlanTarget replaced)
+        {
+            var targets = site.Targets.ToList();
+            targets[index] = replaced;
+
+            return site with { Targets = targets };
+        }
+
+        // Out of every blast's reach, its index kept so what other targets set off still points at the right ones.
+        static PlanTarget Away(PlanTarget target) => target with { Grid = new System.Numerics.Vector2(-100000f, -100000f) };
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            var target = env.Targets[i];
+
+            if (target.Kind != TargetKind.Remnant)
+                continue;
+
+            var link = chain.FindIndex(spot => Planner.Catches(env, spot, target));
+
+            if (link < 0)
+                continue;
+
+            var worth = full - Planner.Plainly(With(env, i, Away(target)), chain);
+            var own = full - Planner.Plainly(With(env, i, target with { OwnEffectsOfChoices = null }), chain);
+            var worthNoPower = fullNoPower - Planner.Plainly(With(noPower, i, Away(noPower.Targets[i])), chain);
+            var ownNoPower = fullNoPower -
+                             Planner.Plainly(With(noPower, i, noPower.Targets[i] with { OwnEffectsOfChoices = null }), chain);
+
+            lines.Add($"    ({target.Grid.X:0},{target.Grid.Y:0}) first caught at link {link + 1}: worth {worth:N1} to the chain, " +
+                      $"{worthNoPower:N1} without Power, so Power adds {worth - worthNoPower:+#,##0.0;-#,##0.0;0} through it; " +
+                      $"its own effects {own:+#,##0.0;-#,##0.0;0}, {ownNoPower:+#,##0.0;-#,##0.0;0} without Power");
+        }
+
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// Each blast's label with what it is made of, the score of the chain before it, and the remnants it catches with
+    /// any other blast that catches them too. At the head, whether what the blasts add sums to the chain's score - the
+    /// check that the labels are the planner's own figures. See Planner.ScoreOfEachBlast.
+    /// </summary>
+    private static string BlastLabelsChecked(PlanEnvironment env, List<System.Numerics.Vector2> chain,
+        Planner.BlastScores scores, int laid)
+    {
+        if (env == null || chain is not { Count: > 0 })
+            return "    no chain";
+
+        if (scores == null || scores.Each.Count != chain.Count)
+            return $"    no labels for this chain ({scores?.Each.Count ?? 0} against {chain.Count} links)";
+
+        var sumContent = scores.Each.Sum(x => x.Content);
+        var sumPropagation = scores.Each.Sum(x => x.Propagation);
+        var lines = new List<string>
+        {
+            $"    what the blasts add sums to content {sumContent:N1} + propagation {sumPropagation:N1}; the chain scores " +
+            $"content {scores.ChainContent:N1} + propagation {scores.ChainPropagation:N1}, off by " +
+            $"{sumContent - scores.ChainContent:+0.0;-0.0;0} and {sumPropagation - scores.ChainPropagation:+0.0;-0.0;0}" +
+            (Math.Abs(scores.PinnedContent + scores.PinnedPropagation - scores.ChainContent - scores.ChainPropagation) > 0.05
+                ? $"; COMBINATIONS PINNED SCORE DIFFERENTLY: {scores.PinnedContent:N1} + {scores.PinnedPropagation:N1}"
+                : ""),
+        };
+
+        var before = 0d;
+
+        for (var i = 0; i < chain.Count; i++)
+        {
+            var (content, propagation, toLater) = scores.Each[i];
+
+            // The remnants this blast catches, and which other blasts catch each.
+            var caught = new List<string>();
+
+            foreach (var target in env.Targets)
+            {
+                if (target.Kind != TargetKind.Remnant || !Planner.Catches(env, chain[i], target))
+                    continue;
+
+                var others = Enumerable.Range(0, chain.Count)
+                    .Where(k => k != i && Planner.Catches(env, chain[k], target)).Select(k => $"#{k + 1}").ToList();
+
+                caught.Add($"({target.Grid.X:0},{target.Grid.Y:0})" + (others.Count > 0 ? $" also caught by {string.Join(", ", others)}" : ""));
+            }
+
+            lines.Add($"    #{i + 1}{(i < laid ? " (laid)" : "")}: adds {content + propagation:N1} (content {content:N1}, " +
+                      $"propagation {propagation:N1}) to {before:N1}; adds {toLater:N1} to the blasts after it" +
+                      (caught.Count > 0 ? $"; remnants {string.Join("; ", caught)}" : ""));
+
+            before += content + propagation;
+        }
+
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// The site with every rune that lifts others - Power and Bait - taken out of what each remnant holds: out of its
+    /// passed and kept runes, its carry, and its held lifts. See WorthOfRemnantsOnChain.
+    /// </summary>
+    private static PlanEnvironment WithoutLiftingRunes(PlanEnvironment env)
+    {
+        static bool Lifting(string id) =>
+            id != null && (Weighing.IsLiftKey(id) || Weighing.Lift(Weighing.BaseOfLiftKey(id)) > 0f);
+
+        var targets = env.Targets.Select(target =>
+        {
+            if (target.Choices is not { Length: > 0 } choices)
+                return target;
+
+            var weights = target.PropagatingRuneWeights ?? target.Runes ?? [];
+
+            var stripped = choices.Select(choice =>
+            {
+                var removed = 0f;
+
+                foreach (var id in choice.Runes ?? [])
+                {
+                    if (!Lifting(id))
+                        continue;
+
+                    foreach (var (named, weight) in weights)
+                    {
+                        if (string.Equals(named, id, StringComparison.OrdinalIgnoreCase))
+                            removed += weight;
+                    }
+                }
+
+                return choice with
+                {
+                    Carries = MathF.Max(0f, choice.Carries - removed),
+                    Runes = choice.Runes?.Where(id => !Lifting(id)).ToArray(),
+                    Locals = choice.Locals?.Where(x => !Lifting(x.Id)).ToArray(),
+                };
+            }).ToArray();
+
+            return target with
+            {
+                Choices = stripped,
+                Runes = target.Runes?.Where(x => !Lifting(x.Id)).ToArray(),
+                PropagatingRuneWeights = target.PropagatingRuneWeights?.Where(x => !Lifting(x.Id)).ToArray(),
+                HeldLiftOfChoices = null,
+            };
+        }).ToList();
+
+        return env with { Targets = targets };
+    }
+
+    /// <summary>
     /// What Cleared is waiting on, which is one number and was nowhere in this file.
     ///
-    /// **The yellow chain retracts link by link as its blasts are fought out, and only then.** A
-    /// ring goes when its explosive is down; a LINE goes when nothing it unearthed is left standing
-    /// - see Cleared. The whole of that rests on Detonator.ExplosivesDetonated answering one or more, and it
+    /// **The yellow chain retracts link by link as its explosives go off, and only then.** A ring
+    /// goes when its explosive is down; a LINE goes when its explosive, or one after it, is gone
+    /// - see Cleared, whose findings are printed here link by link. The whole of that rests on the site
+    /// reading as set off, which rests on Detonator.ExplosivesDetonated answering one or more, and it
     /// answers by finding the detonator icon within three grid units of Site and reading its
     /// "activated" state.
     ///
@@ -950,12 +1236,15 @@ internal static class Dump
         b.AppendLine();
         b.AppendLine($"  Detonated() = {said}" +
                      (Detonator.SetOffHere(gc)
-                         ? "  - set off (live or latched), so no link of the chain is drawn"
+                         ? "  - set off (live or latched), so each link is drawn until its explosive, or one after it, is gone"
                          : "  - not set off, so the chain is drawn") +
                      (said < 1 && Detonator.SetOffHere(gc)
                          ? "; the live read is below one because the detonator is not loaded, and the latch answers"
                          : ""));
+        b.AppendLine($"  the chain's explosives: {Cleared.Said}");
         b.AppendLine($"  Site() = {Describe(site)}, matched against icons within 3 grid units");
+        b.AppendLine("  set-off latch writes this area: " +
+                     (Detonator.SetOffEvidence.Count == 0 ? "none" : string.Join("; ", Detonator.SetOffEvidence)));
 
         // The same list Detonated reads, so the diagnostic and the thing it diagnoses cannot
         // disagree about what is there. See Detonator.ExplosivesDetonated.
@@ -1301,6 +1590,7 @@ internal static class Dump
             b.AppendLine($"      remnant ({target.Grid.X:0},{target.Grid.Y:0})  " +
                          $"{System.Numerics.Vector2.Distance(player, target.Grid):0.#} away  " +
                          $"rewards {target.Rewards.Count}  activated {target.State("activated")}  " +
+                         $"dig site: {Scan.MembershipSaid(target)}  " +
                          $"selected {chosen ?? "-"}  " +
                          $"offers {string.Join(", ", target.Rewards.Take(3).Select(r => r.Name))}" +
                          pinned +
@@ -1474,7 +1764,8 @@ internal static class Dump
                                  Safe.Read(entity, static e => e.Id, 0u)) is { At.X: > 0f } spot
                                  ? $"  clickable at ({spot.At.X:0},{spot.At.Y:0}) room {spot.Room:0.#}"
                                  : "  ENTIRELY COVERED"
-                             : ""));
+                             : "") +
+                         $"  {WalkableFromPlayer.Describe(gc, player, grid)}");
         }
 
         if (found == 0)
@@ -1550,6 +1841,7 @@ internal static class Dump
             Safe.Read(gc, static g => g.IngameState.MousePosY, 0f));
 
         b.AppendLine($"  what covers the cursor at ({cursor.X:0},{cursor.Y:0}): {Panels.Why(gc, cursor)}");
+        b.AppendLine($"  fixed controls the cursor is kept off: {Panels.Furnishings(gc)}");
 
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
 
@@ -1574,6 +1866,7 @@ internal static class Dump
             }
         }
         b.AppendLine();
+        EscapeMenuTree(b, gc);
         SectionHeader(b, "=== every visible label in the interface (find popups here) ===");
 
         var root = Safe.Read(() => gc.IngameState.IngameUi, null);
@@ -1839,6 +2132,8 @@ internal static class Dump
         SectionHeader(b, "=== what the markers have unearthed so far ===");
         b.AppendLine("  " + (Spawns?.Describe() ?? "not wired up"));
         b.AppendLine("  (written to dumps/spawns.csv when you leave the area, one row per marker)");
+        b.AppendLine("  rares and magic from the waves so far, by the chain link that caught each remnant:");
+        b.AppendLine(Spawns?.WavesSoFar() ?? "  not wired up");
         b.AppendLine();
         // **The terrain struct itself, past what ExileCore2 surfaces.** Every published terrain source
         // has been measured against the game's own verdicts and none of them is the placement rule, so
@@ -1928,9 +2223,9 @@ internal static class Dump
                      (Rolling.Here.Stale ? ", STALE - the chain it was weighed against has been replaced" : "") +
                      (Rolling.Here.Diverted.Length > 0 ? $"; {Rolling.Here.Diverted}" : ""));
 
-        b.AppendLine("    " + (Rolling.Here.Best is { } best
+        b.AppendLine("    " + (Rolling.Here.Advised is { } best
             ? $"ROLL the remnant at ({best.Grid.X:0},{best.Grid.Y:0}) - {best.Why}"
-            : "nothing advised: " + Rolling.Here.Quiet));
+            : "nothing advised: " + Rolling.Here.NoAdviceReason));
         b.AppendLine("    the first advice at this site: " +
                      (Rolling.Here.Waiting.Length > 0
                          ? $"WAITING - {Rolling.Here.Waiting}, {Rolling.Here.WaitProgress * 100f:0}% of the longest wait"
@@ -1986,6 +2281,12 @@ internal static class Dump
         b.AppendLine("    " + Advising(gc, Scan));
         b.AppendLine("    every remnant weighed:");
         b.AppendLine(Rolling.Here.Verdicts());
+
+        b.AppendLine($"    a roll's shapes by socket count, before rescaling each count to its share: {Rolling.ShapeSharesSaid}");
+
+        // The outcomes behind each remnant's figure, which the figure alone does not show. See Rolling.OutcomesOfRemnant.
+        foreach (var (cell, said) in Rolling.OutcomesOfRemnant.OrderBy(x => x.Key.X).ThenBy(x => x.Key.Y))
+            b.AppendLine($"    a roll of ({cell.X},{cell.Y}), {said}");
         SectionPartTiming("rolling verdicts");
         // **Printed as a share, because the absolute number says nothing about whether it is
         // reasonable.** It is a guess multiplied by however many runes a chain happens to carry, and
@@ -2069,14 +2370,24 @@ internal static class Dump
             var lift = Safe.Read(() => Weighing.Lift(name), -1f);
             var effect = Safe.Read(() => Wrt.Of(Wrt.Id.Rune(name))?.Effect, null) ?? "<none>";
 
+            // A rune that adds and lifts - Rebirth's monster weight beside its lift on spawner runes - is grouped by its
+            // share, so its group key is not Empowering; its lift reaches the scoring through LiftsOfRune instead.
+            var classLifts = Safe.Read(() => Weighing.LiftsOfRune(name), null);
+            var liftsAnything = classLifts != null && classLifts.Any(x => x > 0f);
+            var dualRole = liftsAnything && Safe.Read(() => Weighing.HasShareEffect(name), false);
+
             b.AppendLine($"    asked as the scoring asks: \"{name}\" -> combines \"{word}\", " +
                          $"effect \"{effect}\", lift {lift:0.##}" +
                          (string.Equals(word, Weighing.Empowering, StringComparison.OrdinalIgnoreCase)
                              ? Math.Abs(lift - percent) < 0.01f
                                  ? " - SOUND, the branch is taken and the rate agrees with the table"
                                  : $" - the branch is taken but the rate disagrees with the table's {percent:0.##}"
-                             : " - NOT EMPOWERING to the scoring: this rune is being dropped as an " +
-                               "ordinary one, so the table's rate reaches nothing"));
+                             : dualRole
+                                 ? " - SOUND, adds and lifts: grouped by its own share, with lifts per amplifier class [" +
+                                   string.Join(" ", classLifts.Select(x => x.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture))) +
+                                   $"] over [{string.Join(" ", Weighing.AmplifierTags())}]"
+                                 : " - NOT EMPOWERING to the scoring: this rune is being dropped as an " +
+                                   "ordinary one, so the table's rate reaches nothing"));
         }
         b.AppendLine($"  propagation: {Planner.Propagated:N1} grouped, {Planner.Pooled:N1} pooled" +
                      (Math.Abs(Planner.Propagated - Planner.Pooled) < 0.05d
@@ -2134,6 +2445,65 @@ internal static class Dump
             return false;
         }
 
+        // The "own" effects of the combination a remnant took, in words, with what they change in its waves at face
+        // value; empty when it holds none. Found by the recipe id the pick names. See PlanTarget.OwnOfChoice.
+        // remnantsBefore: the remnants gone off before this one in the area and up the chain, which Gaining Traction scales
+        // its waves by - the figure the scoring pays. Face value is printed beside it.
+        static string OwnEffectsTaken(PlanEnvironment env, (int X, int Y) cell, Planner.Picked picked, int remnantsBefore)
+        {
+            foreach (var mark in env?.Targets ?? [])
+            {
+                if (Celled(mark.Grid) != cell || mark.OwnEffectsOfChoices is not { } all || mark.Recipes is not { } ids)
+                    continue;
+
+                var c = Array.IndexOf(ids, picked.Recipe);
+
+                if (c < 0 || c >= all.Length || all[c] is not { Length: > 0 } effects)
+                    return "";
+
+                var said = effects.Select(x =>
+                    $"{Tags.Known[x.Tag]} {(x.Count ? "count" : "weight")} x{x.Factor:0.##}" +
+                // The factor reaches every wave; WaveShare is only how much of a passed-in Power reaches it. See
+                // Weighing.OwnEffectsOfRunes.
+                (x.WaveShare < 1f ? $" (a passed-in Power reaches {x.WaveShare:P0} of its waves)" : ""));
+
+                var (magicScale, rareScale) = Planner.TractionScales(env, remnantsBefore);
+
+                return string.Join(", ", said) +
+                       $"; its waves {mark.OwnOfChoice(c, magicScale, rareScale):+0.#;-0.#} as scored, with Gaining Traction " +
+                       $"from {remnantsBefore} remnant(s) before it (magic x{magicScale:0.##}, rares x{rareScale:0.##}); " +
+                       $"{mark.OwnOfChoice(c, 1f, 1f):+0.#;-0.#} at face value" +
+                       (mark.CreatedByOwnEffects(c, magicScale, rareScale, 0d) is var made && made != 0f
+                           ? $"; of which {made:+0.#;-0.#} monsters it adds" : "") +
+                       (Planner.OwnEffectsUnderPassedPower.TryGetValue(cell, out var underPower)
+                           ? $"; {underPower.Own:+0.#;-0.#} as scored with the Power reaching it from earlier links " +
+                             $"(lift {underPower.Lift:0.##} passed in; wave 1 cut for runes in slots 1-2)"
+                           : "");
+            }
+
+            return "";
+        }
+
+        // The share of its own waves each rune it propagates is on, where less than all of them. See
+        // PlanTarget.WaveShareOfCarried.
+        static string CarriedWaveSharesTaken(PlanEnvironment env, (int X, int Y) cell, Planner.Picked picked)
+        {
+            foreach (var mark in env?.Targets ?? [])
+            {
+                if (Celled(mark.Grid) != cell || mark.CarriedWaveSharesOfChoices is not { } all || mark.Recipes is not { } ids)
+                    continue;
+
+                var c = Array.IndexOf(ids, picked.Recipe);
+
+                if (c < 0 || c >= all.Length || all[c] is not { Length: > 0 } shares)
+                    return "";
+
+                return string.Join(", ", shares.Where(x => x.Share < 1f).Select(x => $"{x.Id} {x.Share:P0}"));
+            }
+
+            return "";
+        }
+
         var route = Chain;
 
         if (route is not { Count: > 0 })
@@ -2142,10 +2512,15 @@ internal static class Dump
         }
         else
         {
+            // Remnants gone off before each link, for the own effects' Gaining Traction. Counted from the remnants the
+            // plan takes at each link, so a remnant caught with no combination read is not counted.
+            var remnantsBefore = Env?.RemnantsCompletedInArea ?? 0;
+
             for (var i = 0; i < route.Count; i++)
             {
                 var spot = route[i];
                 var laid = i < LinksDown;
+                var takenHere = 0;
 
                 b.AppendLine($"    blast {i + 1} at ({spot.X:0},{spot.Y:0})" +
                              (laid ? "  [already placed]" : "  [planned]"));
@@ -2318,8 +2693,23 @@ internal static class Dump
                                      ? $"->{picked.Held:0.#}"
                                      : "") +
                                  (Planner.RuneTallyByRemnant.TryGetValue(cell, out var landed)
-                                     ? $"  -> waves {Propagation.Waves(landed)}"
+                                     ? $"  -> runes on each wave {Propagation.RunesOnWaves(landed)}" +
+                                       // The last wave has every slot in force, so its figure is the total the
+                                       // bracket makes up. See Planner.RuneTally.PerWave.
+                                       (landed.PerWave is { Length: > 0 } waves && waves[^1] != landed.Total
+                                           ? $" LAST WAVE {waves[^1]} AGAINST A TOTAL OF {landed.Total}"
+                                           : landed.PerWave == null ? " (slots not known)" : "")
                                      : ""));
+
+                    // What the combination's runes do to this remnant's own waves - the table's "own" effects - when
+                    // it holds any. See PlanTarget.OwnOfChoice.
+                    takenHere++;
+
+                    if (OwnEffectsTaken(Env, cell, picked, remnantsBefore) is { Length: > 0 } ownSaid)
+                        b.AppendLine($"          own effects: {ownSaid}");
+
+                    if (CarriedWaveSharesTaken(Env, cell, picked) is { Length: > 0 } sharesSaid)
+                        b.AppendLine($"          propagated runes on its own waves: {sharesSaid} (the rest from its slot's wave on)");
 
                     // **Why that one, and not the others it was offered.** The choice a remnant
                     // makes is the single decision its worth turns on, and only the winner was ever
@@ -2371,6 +2761,9 @@ internal static class Dump
 
                 if (said == 0)
                     b.AppendLine("        no remnant - this blast is for monsters and chests");
+
+                if (!laid)
+                    remnantsBefore += takenHere;
             }
         }
 
@@ -2381,6 +2774,13 @@ internal static class Dump
         // accounted for a sixty point gap meant guessing at mechanisms. It took three wrong ones.
         //
         // So both picks go down side by side, per remnant, with the disagreements called out.
+        // What each remnant on the chain is worth to it, and what Power adds - by scoring the chain again rather than by
+        // reading a link's credit, which splits a remnant's worth across links. See WorthOfRemnantsOnChain.
+        b.AppendLine("  what each remnant on the chain is worth, by scoring the chain again without it:");
+        b.AppendLine(WorthOfRemnantsOnChain(Env, Chain?.ToList()));
+        b.AppendLine("  each blast's label - what it adds, and what it adds to the blasts after it:");
+        b.AppendLine(BlastLabelsChecked(Env, Chain?.ToList(), BlastScores, LinksDown));
+
         b.AppendLine("  what the solver picked against what is set on the ground:");
 
         var differing = 0;
@@ -2479,7 +2879,17 @@ internal static class Dump
                           (runes.FirstSourced is { Length: > 0 } ? "  first: " + string.Join(", ", runes.FirstSourced) : "") +
                           (runes.Sockets + runes.Inherited - runes.Wasted == runes.Total
                               ? ""
-                              : "   DOES NOT RECONCILE"));
+                              : "   DOES NOT RECONCILE") +
+                          // What the model expects its waves to bring, as the census will record it. See
+                          // Planner.WavesPredictedByRemnant.
+                          (Planner.WavesPredictedByRemnant.TryGetValue(cell, out var expected)
+                              ? $"  expects normal {expected.Normal:0.#} magic {expected.Magic:0.#} rare {expected.Rare:0.#}" +
+                                (Math.Abs(expected.Normal - expected.NormalWithoutOwn) + Math.Abs(expected.Magic - expected.MagicWithoutOwn) +
+                                 Math.Abs(expected.Rare - expected.RareWithoutOwn) > 0.05f
+                                    ? $" (without its own effects {expected.NormalWithoutOwn:0.#} {expected.MagicWithoutOwn:0.#} {expected.RareWithoutOwn:0.#})"
+                                    : "") +
+                                (expected.EachWave.Length > 0 ? $"; by wave n/m/r {expected.EachWave}" : "")
+                              : ""));
             }
 
             lines.Sort(StringComparer.Ordinal);
@@ -2507,7 +2917,10 @@ internal static class Dump
         foreach (var (cell, why) in Planner.PropagationTrailByRemnant)
             b.AppendLine($"    ({cell.X},{cell.Y}) {why}");
 
+        b.AppendLine($"  arriving at this site: {SiteArrival.Said}");
         b.AppendLine($"  presolving this site: {Rehearsal?.Describe() ?? "not wired up"}");
+        b.AppendLine($"  remnant orders for the workers with that role: {RemnantOrder.FeedSaid}; last search {RemnantOrder.LastTimings}");
+        b.AppendLine($"  the ground the remnant orders and the exhaustive spot search share: {SpotGround.LastBuiltSaid}");
         b.AppendLine($"  what the last solve did with the previous chain: {Planning.Seeded}");
         b.AppendLine($"  the best chain on file here: {Kept.Describe()}");
         SectionPartTiming("through Kept.Describe");
@@ -2521,8 +2934,6 @@ internal static class Dump
         b.AppendLine($"  last beam search: {Beam.Last}");
         b.AppendLine("  the chain in hand, scored as a whole site: " + Whole(gc));
         b.AppendLine($"  last search operators: {Planner.Operators}");
-        b.AppendLine($"  restart openings drawn from: {Planner.Openings}; " +
-                     $"the seeding phases {Planner.Sowing}");
 
         // **Why a press started from nothing, which took a session of guessing to ask.** Three
         // things clear the site's learnt state - the settings button, the cold key, and each step of
@@ -2535,6 +2946,10 @@ internal static class Dump
         b.AppendLine("  links the router did not reach: treated as walls, which is what the " +
                      "REFUSED UNROUTED count above cost");
         b.AppendLine($"  threads: {Solving.Spread}");
+
+        // Which workers carry their chain into the next solve and which were retired, as a share of the pool's best.
+        b.AppendLine("  worker chains carried after the last solve: " +
+                     (Planning.ChainsOfWorkers.Said is { Length: > 0 } carried ? carried : "none yet"));
         b.AppendLine($"  threads that gave up on a dead chain: {Solving.Rescues:N0}");
         b.AppendLine($"  threads, per compared strategy: {Bakeoff.Threads}");
         // **What the search was configured to do, beside what it did.**
@@ -2558,6 +2973,27 @@ internal static class Dump
         b.AppendLine($"  keeping them: {Repair.KeepOpeningSaid}");
         b.AppendLine($"  touring: {Repair.TouringSaid}");
         b.AppendLine($"  refining: {Repair.RefiningSaid}");
+        b.AppendLine($"  exhaustive spot search, in the solve running now or else the last: {Repair.SpotSearchSaid}");
+        b.AppendLine($"  relinking the workers' records while solving, since the plugin loaded: {Repair.RelinksDuringSolveSaid}");
+        b.AppendLine($"  workers done with their remnant order: {Repair.SpareOrdersSaid}");
+        b.AppendLine($"  remnant-order workers after the orders ran out: {Repair.OrdersRanOutSaid}");
+        b.AppendLine($"  the solve's timeline ({(Solving.RunningTimelineLabel is { Length: > 0 } runningLabel ? runningLabel : "no label")}), in ms from its start:");
+
+        foreach (var line in Solving.TimelineSaid())
+            b.AppendLine("    " + line);
+
+        // Every solve since the last cache clear, oldest first, so a solve followed by others is still here.
+        var past = Solving.PastTimelinesSaid();
+
+        b.AppendLine($"  the {past.Count} solve(s) before it since the last cache clear, oldest first, each in ms from its start:");
+
+        foreach (var (label, lines) in past)
+        {
+            b.AppendLine($"    {(label.Length > 0 ? label : "a solve with no label")}:");
+
+            foreach (var line in lines.Count > 0 ? lines : ["nothing happened"])
+                b.AppendLine("      " + line);
+        }
         b.AppendLine($"  tail rollouts: {Repair.RollingTailsSaid}");
         // **The line as typed, then the table it was understood as.** Both, because they are different
         // claims: the first says what the pool was configured to be and the second says what it became, and a
@@ -2580,6 +3016,9 @@ internal static class Dump
 
         b.AppendLine($"  relinking the pool: {Solving.Relinking}");
         b.AppendLine($"  reversing the relinked chain, since the plugin loaded: {Solving.RelinkReversal}");
+        b.AppendLine("  shared detonator tour builds, the last twelve:");
+        b.AppendLine(Planner.SharedTourBuildsSaid);
+        b.AppendLine(Repair.BestPressChainSaid(Env));
 
         // **What the pool is stuck on, which no counter could say.** See Solving.Divergence.
         b.AppendLine("  the winning chain against the median worker's:");
@@ -2587,9 +3026,18 @@ internal static class Dump
 
         b.AppendLine("  every solve here, as a distribution:");
         b.AppendLine(PressHistory.Spelled());
+        // Read again first: this line comes before the atlas section that used to be the only refresh, so it said the
+        // atlas had not been readable while the same dump read it further down.
+        AtlasStats.Refresh(gc);
+        b.AppendLine($"  atlas: {AtlasStats.Said(Settings?.Debug.GainingTraction.Value ?? true)}");
+        b.AppendLine(Env == null
+            ? "  Gaining Traction as the last solve scored it: no solve yet, so nothing to report"
+            : $"  Gaining Traction as the last solve scored it: +{Env.MagicPacksPerRemnantCompleted * 100f:0.#}% " +
+              $"magic and +{Env.RarePacksPerRemnantCompleted * 100f:0.#}% rare packs per remnant completed " +
+              $"before (the table's {Weighing.GainingTractionRow} row), each extra rare modifier " +
+              $"+{Env.RareModifierShareOfRare * 100f:0.#}% of a rare; {Env.RemnantsCompletedInArea} " +
+              "remnant(s) already completed in the map before the chain");
         b.AppendLine($"  search switches: " +
-
-
                      $"bridge links {Settings?.Solver.Advanced.DestroyAndRepair.BridgeLinks.Value ?? -1}, " +
                      $"reverse runs {Settings?.Solver.Advanced.DestroyAndRepair.ReverseRuns.Value}, " +
                      $"accept slack {Settings?.Solver.Advanced.DestroyAndRepair.AcceptSlack.Value:0.#}%, " +
@@ -2599,7 +3047,7 @@ internal static class Dump
                      $"opening cap {(Settings?.Solver.Advanced.DestroyAndRepair.OpeningMs.Value is > 0 and var ms ? $"{ms}ms" : "none")}, " +
                      $"at a kick, restart if behind the pool by {Settings?.Solver.Advanced.DestroyAndRepair.RescueBelow.Value:0.#}% " +
                      $"(shaken {Settings?.Solver.Advanced.DestroyAndRepair.RestartShakes.Value}), " +
-                     $"frozen prices {Settings?.Debug.FreezePrices.Value} ({Valuation.Freezer}), " +
+                     $"frozen prices {Settings?.Debug.FreezePrices.Value} (stored prices: {Valuation.PricesFileSaid}), " +
                      $"kick after no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StagnationKickPercent.Value ?? -1}% of the window " +
                      $"or {Settings?.Solver.Advanced.DestroyAndRepair.StagnationKickRounds.Value ?? -1} rounds (0 = off), " +
                      $"at a kick, restart if no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StallRestartMs.Value ?? -1}ms (0 = off), " +
@@ -2614,6 +3062,15 @@ internal static class Dump
 
         b.AppendLine($"  destroy and repair: {Repair.Telling}");
         b.AppendLine($"  published plans checked against the ceiling: {Planner.Bounds}");
+        var offered = Settings?.Solver.Advanced.CandidateSpots;
+
+        if (offered != null)
+        {
+            b.AppendLine($"  candidate spots offered: " +
+                         $"heavy edge points {(offered.HeavyEdgePoints ? "on" : "off")}, rare edge points " +
+                         $"{(offered.RareEdgePoints ? "on" : "off")}, step {offered.EdgePointStepGrid.Value} grid");
+        }
+
         b.AppendLine($"  what the shortlist kept: {Repair.Listed}");
         b.AppendLine($"  the connective half of it: {Repair.Spreading}");
         b.AppendLine($"  how far reach's bridges really walk: {Repair.Detoured}");
@@ -2659,11 +3116,6 @@ internal static class Dump
         {
             b.AppendLine("  the running score: not worked out yet");
         }
-        b.AppendLine($"  endgame committed: {Planner.Committed} links");
-        b.AppendLine($"  committing: {Planner.Committing}");
-        b.AppendLine($"  narrow chains examined: {Planner.Enumerated:N0} in {Planner.EnumeratedMs:N0}ms " +
-                     $"over {Planner.Banded} bands");
-        b.AppendLine($"  edge only mode: {Edges.Last}");
         // The score of the plan that is actually on screen.
         //
         // **The dump described every part of the search except its answer.** Comparing two runs
@@ -2692,7 +3144,7 @@ internal static class Dump
         //
         // A plan came back with its first link on a cell the same solve had just refused as ground -
         // Placeable dropped the previous chain for standing on it, and the new chain stood on it
-        // too. The candidate builder, the bands, the bridges and the polish all consult CanPlace, so
+        // too. The candidate builder, the bridges and the polish all consult CanPlace, so
         // one of them is not asking, or is asking about a different cell. Printing the answers per
         // spot says which: a spot that CanPlace accepts while Refused covers it means the two
         // disagree about the cell, and a spot both refuse means something bypassed CanPlace
@@ -2879,15 +3331,9 @@ internal static class Dump
                      (Bakeoff.Showing.Count > 0
                          ? string.Join("; ", Bakeoff.Showing.Select(l => l.Best ? l.Text + " <-" : l.Text))
                          : "not run"));
-        b.AppendLine($"  narrow walk: {Planner.Walked}");
-        b.AppendLine($"  rolling pass (bands redrawn each link): {Planner.RolledBest:N1}");
-        b.AppendLine("  family seeding: " + (Planner.Seeded > 0
-            ? $"{Planner.Seeded} spots, best narrow chain {Planner.SeededBest:N1}, " +
-              $"{Planner.SeededMs:N0}ms before polishing"
-            : "none - off, or the site has no families"));
         b.AppendLine();
-        Spots(b);
-        SectionPartTiming("through Spots");
+        EdgePoints(b);
+        SectionPartTiming("through EdgePoints");
         b.AppendLine();
         Links(b, gc);
         SectionPartTiming("Links");
@@ -2931,24 +3377,6 @@ internal static class Dump
     /// <see cref="Unexpected"/>.
     /// </summary>
     /// <summary>
-    /// The spots the overlay last ringed, and how the plan's links line up with them.
-    ///
-    /// Written to answer one question: does a chain worth having actually pass through the best few
-    /// places to catch a remnant or a rare? If it does, the search can be given a space twenty times
-    /// smaller and search it properly; if it does not, the idea is dead and the number here says so.
-    ///
-    /// The distance column is the whole of it. A link sitting exactly on a ringed spot is the wager
-    /// paying off; one sitting fifteen grid away is a chain the narrowed search could never have
-    /// built.
-    /// </summary>
-    /// <summary>
-    /// The bands as the search holds them: how many cells each has, how far it spreads, and which
-    /// cells survive as corners.
-    ///
-    /// The drawing shows where they are; this says whether they are anything. A band of two cells
-    /// offers the chain no choice at all, and no amount of leaning finds reach in it.
-    /// </summary>
-    /// <summary>
     /// A multi-line trace broken into lines, without a character literal nobody can type safely.
     ///
     /// Written as a helper because the obvious spelling is a newline inside single quotes, and every
@@ -2957,106 +3385,14 @@ internal static class Dump
     private static string[] Split(string text) =>
         (text ?? string.Empty).Split((char)10);
 
-    private static void Bands(StringBuilder b)
+    /// <summary>The edge points toward neighbours last worked out for drawing, when there are any.</summary>
+    private static void EdgePoints(StringBuilder b)
     {
-        var bands = Planner.Shapes;
-
-        if (bands.Count == 0)
+        if (Planner.Shapes.Count == 0 || !Planner.TowardNeighbours)
             return;
 
-        SectionHeader(b, "=== the bands last drawn ===");
-        b.AppendLine("  how the tree of edge chains grows:");
-        b.AppendLine(Planner.Fanned);
-        b.AppendLine();
-
-        foreach (var (name, corners, all) in bands)
-        {
-            var low = all[0];
-            var high = all[0];
-
-            foreach (var cell in all)
-            {
-                low = new System.Numerics.Vector2(MathF.Min(low.X, cell.X), MathF.Min(low.Y, cell.Y));
-                high = new System.Numerics.Vector2(MathF.Max(high.X, cell.X), MathF.Max(high.Y, cell.Y));
-            }
-
-            b.AppendLine($"  {name,-10} {all.Count,3} cells, spans {high.X - low.X:0}x{high.Y - low.Y:0} grid " +
-                         $"from ({low.X:0},{low.Y:0}) to ({high.X:0},{high.Y:0}), {corners.Count} corners");
-            b.AppendLine("      corners: " +
-                         string.Join(" ", corners.ConvertAll(c => $"({c.X:0},{c.Y:0})")));
-        }
-
-        b.AppendLine();
-    }
-
-    private static void Spots(StringBuilder b)
-    {
-        Bands(b);
-
-        var spots = Planner.Spots;
-
-        SectionHeader(b, "=== the best spots last drawn ===");
-
-        if (spots.Count == 0)
-        {
-            b.AppendLine("  none drawn - press one of the best-spot buttons in Debug first");
-            b.AppendLine();
-
-            return;
-        }
-
-        b.AppendLine($"  {spots.Count} spots, " +
-                     (Planner.Family
-                         ? $"every family: {Planner.Counts.Pairs} per pair, " +
-                           $"{Planner.Counts.Rares} per rare, {Planner.Counts.Remnants} per remnant"
-                         : Planner.Paired
-                             ? "one per remnant and neighbour a single blast can take together"
-                         : Planner.PerKind == null
-                             ? "ranked over the site"
-                             : $"the best few per {Planner.PerKind.ToString()?.ToLowerInvariant()}"));
-
-        foreach (var (at, worth, note) in spots)
-            b.AppendLine($"    {note,-16} ({at.X:0},{at.Y:0})   worth {worth,8:N1}");
-
-        if (Planner.Family)
-        {
-            b.AppendLine();
-            b.AppendLine("  which spot can follow which, as the search sees it:");
-            b.AppendLine(Planner.Linked);
-        }
-
-        if (Plan == null || Plan.Points.Count == 0)
-        {
-            b.AppendLine("  no plan to compare them against");
-            b.AppendLine();
-
-            return;
-        }
-
-        b.AppendLine();
-        b.AppendLine("  the plan's links against them:");
-
-        for (var i = 0; i < Plan.Points.Count; i++)
-        {
-            var link = Plan.Points[i];
-            var nearest = float.MaxValue;
-            var which = "";
-
-            foreach (var (at, _, note) in spots)
-            {
-                var away = System.Numerics.Vector2.Distance(at, link);
-
-                if (away >= nearest)
-                    continue;
-
-                nearest = away;
-                which = note;
-            }
-
-            b.AppendLine($"    {i + 1}  ({link.X:0},{link.Y:0})  nearest ringed spot {which} " +
-                         $"at {nearest:0.#} grid");
-        }
-
+        SectionHeader(b, "=== edge points toward neighbours, last drawn ===");
+        b.AppendLine(Planner.EdgePointsSaid);
         b.AppendLine();
     }
 
@@ -3236,6 +3572,73 @@ internal static class Dump
                     b.AppendLine($"    {key} = {value}");
             }
         }
+    }
+
+    /// <summary>
+    /// Every map, visible map and server atlas stat whose name concerns rare or magic monsters or packs, with its value.
+    ///
+    /// Printed raw and not combined. Which of these are "increased" (summed), "more" (multiplied) or a total the game
+    /// has already summed is not known from the names - MapPackSizePct sits beside a larger MapPackSizePctFinalFromMap,
+    /// which reads as a total - so they are to be matched against what the game shows for the map before anything
+    /// adds them up. Nothing in the scoring reads them yet: the remnant wave row was measured on maps carrying the
+    /// player's usual modifiers. See NOTES.md, "Map modifiers on rare and magic monsters".
+    /// </summary>
+    private static void MonsterRarityStats(StringBuilder b, GameController gc)
+    {
+        b.AppendLine();
+        SectionHeader(b, "=== map and atlas stats on rare and magic monsters, and the biome ===");
+
+        var sources = new (string Name, Func<Dictionary<GameStat, int>> Read)[]
+        {
+            ("MapStats", () => gc.IngameState.Data.MapStats),
+            ("MapStatsVisible", () => gc.IngameState.Data.MapStatsVisible),
+            ("ServerData.AtlasStats", () => gc.IngameState.ServerData.AtlasStats),
+        };
+
+        foreach (var (name, read) in sources)
+        {
+            var stats = Safe.Read(read, null);
+            var shown = 0;
+
+            b.AppendLine($"  {name} ({stats?.Count.ToString() ?? "unreadable"} stats):");
+
+            foreach (var (stat, value) in stats ?? new Dictionary<GameStat, int>())
+            {
+                var key = stat.ToString();
+
+                // The biome as well, since several of these apply in one biome only ("map_forest_number_of_rare_packs")
+                // and an atlas node can make one biome count as another ("OceansCountAsForest").
+                if (!AtlasStats.ConcernsMonsterRarity(key) && !key.Contains("Biome", StringComparison.Ordinal) &&
+                    !key.Contains("CountAs", StringComparison.Ordinal))
+                    continue;
+
+                b.AppendLine($"    {key} = {value}");
+                shown++;
+            }
+
+            if (shown == 0)
+                b.AppendLine("    none naming rare or magic monsters or packs");
+        }
+
+        // What the scoring takes from these. See AtlasStats.MapMonsterIncreases and DebugSettings.MapMonsterIncreases.
+        var (rare, magic) = Safe.Read(() => AtlasStats.MapMonsterIncreases(gc), (0, 0));
+        var adding = Safe.Read(() => Settings?.Debug.MapMonsterIncreases.Value ?? true, true);
+
+        b.AppendLine($"  increased number of rare monsters {rare}%, magic {magic}% (map + atlas; the map figure includes the biome's atlas bonus) - " +
+                     (adding
+                         ? "rows' increases to the same stats add to these"
+                         : "the Debug checkbox is off, so rows' increases count alone"));
+
+        // What remnant waves are built from on this map, and a five-wave remnant's packs and worth. See Weighing.PacksOfRemnant.
+        var waveMap = TableGrammar.MapForRemnantWaves;
+        var packs = Safe.Read(() => Weighing.PacksOfRemnant(5, waveMap), default);
+        var (rareSplit, magicSplit, normalSplit) = Safe.Read(() => Weighing.TierWorthOfParts(Weighing.PartsOfWaves(5)),
+            (0f, 0f, 0f));
+
+        b.AppendLine($"  remnant waves on this map: rare packs +{waveMap.RareIncrease:P0}, magic +{waveMap.MagicIncrease:P0}, " +
+                     $"more magic and rare {waveMap.More:P0}, pack size {waveMap.PackSize:P0}; a five-wave remnant holds " +
+                     $"{packs.Rare:0.##} rare, {packs.Magic:0.##} magic and {packs.Normal:0.##} normal packs, worth rare " +
+                     $"{rareSplit:0.#} + magic {magicSplit:0.#} + normal {normalSplit:0.#} = {rareSplit + magicSplit + normalSplit:0.#}");
     }
 
     // ------------------------------------------------------------------ entities
@@ -3464,6 +3867,9 @@ internal static class Dump
                      $"{Environment.ProcessorCount} processors - workstation mode stops every " +
                      "thread for a gen0, and the search allocates from several at once");
 
+        // Whether the HUD compiled this copy with the JIT optimiser on, which it once did not. See CompiledBuild.
+        b.AppendLine($"  this plugin was compiled {(CompiledBuild.Optimised ? "OPTIMISED" : "UNOPTIMISED - the solver runs several times slower")}");
+
         var copying = Planner.Copying;
 
         // A List<Vector2> is 24 bytes of header plus an array of 8 (its own header and length) plus
@@ -3478,12 +3884,14 @@ internal static class Dump
         b.AppendLine($"  the search built {Planner.Verdicts:N0} verdicts, one per scored chain, " +
                      $"which is roughly {Planner.Verdicts * 88 / 1024 / 1024:N0}MB");
 
-        b.AppendLine("  where a search's allocation goes, by phase - each counts only what it " +
-                     "allocated ITSELF, so the lines add up rather than nesting inside each other:");
+        b.AppendLine("  where a search's allocation and time go, by phase - each counts only what it " +
+                     "allocated and spent ITSELF, so the lines add up rather than nesting inside each other; " +
+                     "time is summed over every worker, so it can be many times a press:");
 
-        foreach (var (name, bytes, calls) in Planner.PhaseTotals())
+        foreach (var (name, bytes, calls, ms) in Planner.PhaseTotals())
             if (calls > 0)
-                b.AppendLine($"    {name,-14} {bytes / 1024 / 1024,8:N0}MB over {calls,12:N0} calls");
+                b.AppendLine($"    {name,-14} {bytes / 1024 / 1024,8:N0}MB {ms,10:N0}ms over {calls,12:N0} calls" +
+                             $" ({ms * 1000d / calls:N1}us a call)");
 
         var routing = Wire.Routing;
         var asked = routing.Hits + routing.Misses;
@@ -3578,6 +3986,12 @@ internal static class Dump
                      $"{Panels.Culled:N0} were culled by the rectangle test against " +
                      $"{Panels.Rects} top level rects, of which {Panels.Wide:N0} sightings were " +
                      "screen sized - a cull that never fires is one whose rects cover everything");
+        var clearOfPanels = Panels.LastClearOfPanels;
+
+        b.AppendLine($"  panels at the last draw (read only while Hide behind panels is on): {Panels.SidePanels} side " +
+                     $"panels, Escape menu {(Panels.EscapeMenuOpen ? $"open with {Panels.EscapeMenuRects} rects found" : "closed")}; " +
+                     $"drawing clipped to ({clearOfPanels.X:0},{clearOfPanels.Y:0} {clearOfPanels.Width:0}x{clearOfPanels.Height:0}); kept clear: " +
+                     string.Join(", ", Panels.LastPanelsToClear.Select(r => $"({r.X:0},{r.Y:0} {r.Width:0}x{r.Height:0})")));
         b.AppendLine($"  placement dots: {Forbidden.Held:N0} held, {Forbidden.Drew:N0} drawn " +
                      $"last frame ({(Forbidden.Held > 0 ? 100f - Forbidden.Drew * 100f / Forbidden.Held : 0f):0}% " +
                      $"culled as off screen before being projected), " +
@@ -3665,6 +4079,14 @@ internal static class Dump
         {
             complaints++;
             body.AppendLine($"  !!   Catalogue.Surfaced: {claim}");
+        }
+
+        // **And what each drawn row shows against what it stores.** A column existing is not the column showing the
+        // value. See Catalogue.DrawnCellsAgainstStored.
+        foreach (var differs in Safe.Read(() => Catalogue.DrawnCellsAgainstStored(Settings, Scan), Array.Empty<string>()))
+        {
+            complaints++;
+            body.AppendLine($"  !!   {differs}");
         }
 
         // **A rune with no share is a rune the reroll pricing says can never be drawn.**
@@ -3914,6 +4336,26 @@ internal static class Dump
     {
         b.AppendLine();
         SectionHeader(b, "=== atlas passives ===");
+
+        AtlasStats.Refresh(gc);
+        b.AppendLine($"  {AtlasStats.Said(Settings?.Debug.GainingTraction.Value ?? true)}");
+
+        // What the server says the atlas grants, which needs no panel open: whether choosers such as Double or Nothing
+        // show their choice here is what this is for. See AtlasStats.
+        var serverStats = Safe.Read(() => gc.IngameState.ServerData.AtlasStats, null);
+        var serverIds = Safe.Read(() => gc.IngameState.ServerData.AtlasPassiveSkillIds, null);
+
+        b.AppendLine($"  the server's atlas passive ids: {serverIds?.Count.ToString() ?? "unreadable"}; the server's atlas " +
+                     $"stats: {serverStats?.Count.ToString() ?? "unreadable"}, those naming expedition or remnant:");
+
+        foreach (var (stat, value) in serverStats ?? new Dictionary<GameStat, int>())
+        {
+            var key = stat.ToString();
+
+            if (key.Contains("xpedition", StringComparison.OrdinalIgnoreCase) ||
+                key.Contains("emnant", StringComparison.OrdinalIgnoreCase))
+                b.AppendLine($"    {key} = {value}");
+        }
 
         var panel = Safe.Read(gc, static g => g.IngameState.IngameUi.AtlasTreePanel, null);
         var passives = Safe.Read(() => panel?.Passives, null);
@@ -4616,6 +5058,36 @@ internal static class Dump
         var expedition = all.Where(x => Mentions(x, "expedition")).ToList();
         Section(b, $"mentions \"expedition\" ({expedition.Count})", expedition);
 
+        // **Everything beside the next wire, whatever it is.** The game has put an explosive short of a spot the
+        // plugin's own grids say it reaches in a straight line - on Caldera, 4 grid short with a Runed Monolith
+        // spawned between the two points - so something the wire goes round is not in those grids. This lists
+        // every entity near that stretch, of any type and name, so the next dump shows what it is and what it
+        // carries rather than leaving it to be guessed from a label on screen.
+        var seat = Safe.Read(() => Detonator.LastExplosiveGridPosition(gc), System.Numerics.Vector2.Zero);
+        var next = Chain is { } chain && LinksDown >= 0 && LinksDown < chain.Count
+            ? chain[LinksDown]
+            : System.Numerics.Vector2.Zero;
+
+        // With no planned link left, the spot the player is aiming at by hand, while the placement tool is up.
+        if (next == System.Numerics.Vector2.Zero && Detonator.Placing(gc))
+        {
+            var aim = Safe.Read(() => Detonator.Info(gc).PlacementIndicatorGridPosition, default);
+
+            next = new System.Numerics.Vector2(aim.X, aim.Y);
+        }
+
+        if (seat != System.Numerics.Vector2.Zero && next != System.Numerics.Vector2.Zero)
+        {
+            var beside = all.Where(x => !Mentions(x, "expedition") &&
+                                        Safe.Read(() => x.GridPos, System.Numerics.Vector2.Zero) is var at &&
+                                        at != System.Numerics.Vector2.Zero &&
+                                        FromSegment(at, seat, next) <= NextWireWidth)
+                .ToList();
+
+            Section(b, $"everything within {NextWireWidth:0} grid of the next wire, ({seat.X:0},{seat.Y:0}) to " +
+                       $"({next.X:0},{next.Y:0}) ({beside.Count})", beside);
+        }
+
         // And then the two kinds this plugin exists to stop ignoring, by type rather than by name,
         // so the dump shows what they are actually called rather than confirming a guess.
         var chests = all.Where(x => Safe.Read(() => x.Type, EntityType.Error) == EntityType.Chest)
@@ -4666,6 +5138,18 @@ internal static class Dump
                          $"states=[{States(entity)}] " +
                          $"{Safe.Read(() => entity.Metadata, "?")}");
         }
+    }
+
+    /// <summary>How far either side of the next wire the dump lists entities. See Entities.</summary>
+    private const float NextWireWidth = 25f;
+
+    /// <summary>The distance from a point to the segment between two others, in grid.</summary>
+    private static float FromSegment(System.Numerics.Vector2 at, System.Numerics.Vector2 a, System.Numerics.Vector2 b)
+    {
+        var ab = b - a;
+        var t = ab.LengthSquared() <= 0f ? 0f : Math.Clamp(System.Numerics.Vector2.Dot(at - a, ab) / ab.LengthSquared(), 0f, 1f);
+
+        return System.Numerics.Vector2.Distance(at, a + ab * t);
     }
 
     private static void Section(StringBuilder b, string title, List<Entity> entities)

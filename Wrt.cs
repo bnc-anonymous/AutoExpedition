@@ -79,9 +79,9 @@ internal static class Wrt
         public bool? Stacks;
 
         /// <summary>
-        /// What else you get for blowing this up - "monster.rare x1, remnant.wave x3".
+        /// What else you get for blowing this up - "monster.rare x1, remnant.wave x recipe.Runes".
         ///
-        /// **The cell that ends the hardcoded composition.** A remnant being three waves of so many
+        /// **The cell that ends the hardcoded composition.** A remnant being one wave per rune of so many
         /// monsters, a monstermarker being a weighted average of white and blue, a strongbox's packs
         /// splitting by rarity: all facts about the game, all of them in a switch in Weighing until
         /// now. A count is a float so a fraction is a probability, and a count may name a value the
@@ -163,7 +163,11 @@ internal static class Wrt
         /// </summary>
         public string NameInGame;
 
-        /// <summary>What the scan classified this as when it filed it, for rows nothing else names.</summary>
+        /// <summary>
+        /// What the scan classified this as when it filed it, for rows nothing else names; on a path: row, what the
+        /// scan classifies whatever the row matches as. Ignored on a path: row drops what it matches from the scan
+        /// altogether. See Scan.IgnoredByTable.
+        /// </summary>
         public string Kind;
 
         /// <summary>Which object granted this effect, where one did. See Unknowns.Granted.</summary>
@@ -193,11 +197,19 @@ internal static class Wrt
             Alike(Effect, other.Effect) &&
             Alike(Matches, other.Matches) &&
             Nearly(Share, other.Share) &&
-            Set == other.Set &&
+            Decided(Set) == Decided(other.Set) &&
             Alike(Kind, other.Kind) &&
             Alike(NameInGame, other.NameInGame) &&
             Alike(Granter, other.Granter) &&
             Alike(Tags, other.Tags);
+
+        /// <summary>
+        /// Whether a Set cell says the weight is decided. Blank counts as decided, because a blank Set on a shipped row
+        /// means an answer somebody wrote, and on a custom row means no opinion, which inherits the shipped row's. So a
+        /// row marked decided agrees with a shipped row, and only one marked undecided differs from it: "custom" is a
+        /// value changed from the shipped one, not a row somebody confirmed.
+        /// </summary>
+        public static bool Decided(bool? set) => set != false;
 
         // Seen and First are deliberately absent above. They are observations rather than answers, so
         // two rows that agree about everything decided are the same row whether or not one was met
@@ -410,10 +422,110 @@ internal static class Wrt
     public static string Source { get; set; } = "";
 
     public const string Defaults = "weight_reference_table_defaults.json";
+
+    /// <summary>
+    /// A short fingerprint of the table's two files, the shipped defaults and the player's own, so records made under
+    /// different tables can be told apart: the census writes it beside each remnant's predicted counts. Revision
+    /// restarts at every load and cannot do that. Worked out again when Revision moves; an edit reaches it once it has
+    /// been saved. Empty before the table has a home. See Spawns.
+    /// </summary>
+    public static string TableFingerprint
+    {
+        get
+        {
+            var revision = Revision;
+
+            if (_tableFingerprintAt == revision && _tableFingerprint != null)
+                return _tableFingerprint;
+
+            if (Home.Length == 0)
+                return "";
+
+            var text = new System.Text.StringBuilder();
+
+            foreach (var path in new[] { Path.Combine(Source.Length > 0 ? Source : Home, Defaults), Path.Combine(Folder(), Custom) })
+                text.Append(Safe.Read(() => File.Exists(path) ? File.ReadAllText(path) : "", "")).Append('');
+
+            var hash = System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(text.ToString()));
+
+            _tableFingerprint = Convert.ToHexString(hash, 0, 4).ToLowerInvariant();
+            _tableFingerprintAt = revision;
+
+            return _tableFingerprint;
+        }
+    }
+
+    private static string _tableFingerprint;
+
+    private static int _tableFingerprintAt = -1;
     public const string Custom = "weight_reference_table_custom.json";
 
-    public static Row Of(string id) =>
-        string.IsNullOrEmpty(id) ? null : Resolved.GetValueOrDefault(id);
+    public static Row Of(string id)
+    {
+        if (string.IsNullOrEmpty(id))
+            return null;
+
+        if (Resolved.TryGetValue(id, out var row))
+            return row;
+
+        return id.StartsWith("found:", StringComparison.Ordinal) ? FoundWithUnreadFields(id) : null;
+    }
+
+    /// <summary>Whether a row is stored under exactly this id, without the fallback Of makes for a discovered object.</summary>
+    public static bool HasExactly(string id) => !string.IsNullOrEmpty(id) && Resolved.ContainsKey(id);
+
+    /// <summary>
+    /// The row a discovered object answers to when its id has an empty art, minimap icon or state list: the one row
+    /// for the same object with those filled, where exactly one exists. Null when none does, or several could and it
+    /// cannot be told which.
+    ///
+    /// **Those three are read off the live entity, and an entity out of load range reads them as empty.** An id built
+    /// then matched no row, so the object was worth nothing and had no candidate spots: two encased Vaal Zealots on
+    /// a Frigid Bluffs site (2026-10-04) lost their shipped weight of 2 whenever the player stood too far away, and
+    /// with their spots went the ones a 74,000 chain was built on - every cold start from there topped out at
+    /// 68,000. The same rule as the load's MergedOnMissingArtOrIcon, asked at lookup time; cached per revision.
+    /// </summary>
+    private static Row FoundWithUnreadFields(string id)
+    {
+        if (_foundFallbackAt != Revision)
+        {
+            _foundFallback.Clear();
+            _foundFallbackAt = Revision;
+        }
+
+        return _foundFallback.GetOrAdd(id, key =>
+        {
+            var parts = key["found:".Length..].Split('|');
+
+            if (parts.Length < 5 || (parts[2].Length > 0 && parts[3].Length > 0 && parts[4].Length > 0))
+                return null;
+
+            var prefix = "found:" + parts[0] + "|";
+            Row only = null;
+            var matched = 0;
+
+            foreach (var (other, row) in Resolved)
+            {
+                if (!other.StartsWith(prefix, StringComparison.Ordinal))
+                    continue;
+
+                var theirs = other["found:".Length..].Split('|');
+
+                if (theirs.Length != parts.Length ||
+                    !Enumerable.Range(0, parts.Length).All(i => theirs[i] == parts[i] || (i is 2 or 3 or 4 && parts[i].Length == 0)))
+                    continue;
+
+                only = row;
+                matched++;
+            }
+
+            return matched == 1 ? only : null;
+        });
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Row> _foundFallback = new(StringComparer.Ordinal);
+
+    private static int _foundFallbackAt = -1;
 
     /// <summary>Every row as it finally reads, yours layered over the shipped answer. See Of.</summary>
     private static readonly Dictionary<string, Row> Resolved = new(StringComparer.Ordinal);
@@ -733,12 +845,29 @@ internal static class Wrt
         LastMovedBy = $"{why} (revision {Revision}, {DateTime.UtcNow:HH:mm:ss} UTC)";
     }
 
+    /// <summary>
+    /// The table's answer changed although no row did: something the rows are read against, such as the map
+    /// modifiers that scale the remnant wave row, moved. Bumps Revision so every reader re-prices, and writes nothing.
+    /// See TableGrammar.SetRemnantWaveScales.
+    /// </summary>
+    public static void Repriced(string why)
+    {
+        Revision++;
+        Noting(why);
+    }
+
     /// <summary>Everything you have changed, for the dump and for handing to somebody.</summary>
     public static IEnumerable<KeyValuePair<string, Row>> Yours => Mine;
 
     public static int Changed => Mine.Count;
 
     public static int Known => Shipped.Count;
+
+    /// <summary>Whether the shipped table has a row under this id.</summary>
+    public static bool HasShippedRow(string id) => id != null && Shipped.ContainsKey(id);
+
+    /// <summary>Whether your file has a row under this id.</summary>
+    public static bool HasCustomRow(string id) => id != null && Mine.ContainsKey(id);
 
     /// <summary>
     /// Reads both files. The shipped one first, so pruning can see what it says.
@@ -942,7 +1071,8 @@ internal static class Wrt
             moved = true;
         }
 
-        if (mine.Set != null && mine.Set == shipped.Set)
+        // Decided agrees with a shipped row's blank, which means decided too. See Row.Decided.
+        if (mine.Set != null && Row.Decided(mine.Set) == Row.Decided(shipped.Set))
             mine.Set = null;
 
         if (mine.Kind != null && string.Equals(mine.Kind, shipped.Kind, StringComparison.Ordinal))
@@ -1240,6 +1370,132 @@ internal static class Wrt
         return moved;
     }
 
+    /// <summary>
+    /// Moves each discovery row filed under a render name onto the id without one, merging rows that differed in
+    /// that field alone. See Unknowns.Key, which no longer puts the name in an id, and MergedRows.
+    /// </summary>
+    private static int MergedOnRenderName()
+    {
+        var moved = 0;
+
+        foreach (var (id, mine) in Mine.ToList())
+        {
+            if (!id.StartsWith("found:", StringComparison.Ordinal))
+                continue;
+
+            var parts = id["found:".Length..].Split('|');
+
+            if (parts.Length < 7 || parts[6].Length == 0)
+                continue;
+
+            parts[6] = "";
+            MovedOnto(id, "found:" + string.Join("|", parts), mine);
+            moved++;
+        }
+
+        return moved;
+    }
+
+    /// <summary>
+    /// Moves each discovery row filed before its art or its minimap icon had arrived onto the row of the same object
+    /// with them, yours or shipped, where exactly one such row exists. With none it stays as it is; with several it
+    /// cannot be told which it was, and stays as well. See Unknowns.Register, which now waits for both, and MergedRows.
+    /// </summary>
+    private static int MergedOnMissingArtOrIcon()
+    {
+        var moved = 0;
+
+        foreach (var (id, mine) in Mine.ToList())
+        {
+            if (!id.StartsWith("found:", StringComparison.Ordinal))
+                continue;
+
+            var parts = id["found:".Length..].Split('|');
+
+            if (parts.Length < 5 || (parts[2].Length > 0 && parts[3].Length > 0))
+                continue;
+
+            // The same object with what this row is missing: every field equal, except an empty art or icon here
+            // that the other row has.
+            bool Fuller(string x)
+            {
+                var other = x["found:".Length..].Split('|');
+
+                return other.Length == parts.Length &&
+                       Enumerable.Range(0, parts.Length).All(i =>
+                           other[i] == parts[i] || (i is 2 or 3 && parts[i].Length == 0 && other[i].Length > 0));
+            }
+
+            var fuller = Mine.Keys.Concat(Shipped.Keys).Distinct(StringComparer.Ordinal)
+                .Where(x => x != id && x.StartsWith("found:", StringComparison.Ordinal) && Fuller(x))
+                .ToList();
+
+            if (fuller.Count != 1)
+                continue;
+
+            MovedOnto(id, fuller[0], mine);
+            moved++;
+        }
+
+        return moved;
+    }
+
+    /// <summary>
+    /// Whether a discovery row of yours is only the seed filing writes - weight at the placeholder, not agreed, no
+    /// other answer in it - for an object the shipped file has a row for. Such a row shadows the shipped answer
+    /// with the placeholder: after the shipped ids stopped carrying the render name, four Vaal Zealots on a Frigid
+    /// Bluffs site (2026-10-04) were filed afresh at weight 1, unagreed, over shipped rows at 2. Dropped on load,
+    /// so the shipped row answers. Any edit to the row keeps it. See Unknowns.Found.
+    /// </summary>
+    private static bool SeedOverShipped(string id, Row row)
+    {
+        if (!id.StartsWith("found:", StringComparison.Ordinal) || !Shipped.ContainsKey(id) || row.Set != false)
+            return false;
+
+        // The kind as filed, which the thinning may have taken off a row that agreed with the shipped one. A weight
+        // thinned off the same way leaves none, which is as much a seed as the placeholder itself.
+        var seed = Enum.TryParse<TargetKind>(row.Kind ?? Shipped[id].Kind, out var kind)
+            ? Priors.Weight(kind) ?? Unknowns.Default
+            : Unknowns.Default;
+
+        return (row.Weight == null || MathF.Abs(row.Weight.Value - seed) < 0.0001f) &&
+               row.Tags == null && row.Stacks == null && row.Children == null && row.Effect == null &&
+               row.Matches == null && row.Share == null && row.NameInGame == null && row.Granter == null &&
+               row.Name == null && row.Type == null;
+    }
+
+    /// <summary>
+    /// Moves a row of yours to another id, merging it into the row there if there is one. See MergedRows.
+    /// </summary>
+    private static void MovedOnto(string from, string to, Row row)
+    {
+        Mine.Remove(from);
+
+        Mine[to] = Mine.TryGetValue(to, out var already) ? MergedRows(already, row) : row;
+    }
+
+    /// <summary>
+    /// Two rows of one object merged into one. The row somebody has agreed - Set, which the Status column shows -
+    /// wins every field it holds, the other filling only what it leaves empty; between two agreed or two unagreed
+    /// rows, the first. First is the earlier of the two and Seen the later. Every field of Row is carried, read off
+    /// the type, so a field added later is not dropped here.
+    /// </summary>
+    private static Row MergedRows(Row a, Row b)
+    {
+        var (winner, other) = b.Set == true && a.Set != true ? (b, a) : (a, b);
+
+        foreach (var field in typeof(Row).GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+        {
+            if (field.GetValue(winner) == null)
+                field.SetValue(winner, field.GetValue(other));
+        }
+
+        winner.First = new[] { a.First, b.First }.Where(x => x != null).Min();
+        winner.Seen = new[] { a.Seen, b.Seen }.Where(x => x != null).Max();
+
+        return winner;
+    }
+
     /// <summary>The file this table used to be called, so a rename does not read as an empty table.</summary>
     private const string WasCustom = "entity_reference_table_custom.json";
 
@@ -1311,7 +1567,7 @@ internal static class Wrt
         // rows are what the objective walks - so a row still sitting here is a number somebody could
         // edit to no effect, which is the whole fault this table is being rewritten to end.
         var retire = new List<string>();
-        var carried = Counted(retire) + Wisped() + Labelled();
+        var carried = Counted(retire) + Wisped() + Labelled() + MergedOnRenderName() + MergedOnMissingArtOrIcon();
 
         var gone = new List<string>(retire);
         var thinned = 0;
@@ -1347,7 +1603,7 @@ internal static class Wrt
             if (Thinned(id, row))
                 thinned++;
 
-            if (row.Empty || row.Same(Default(id)))
+            if (row.Empty || row.Same(Default(id)) || SeedOverShipped(id, row))
             {
                 gone.Add(id);
 

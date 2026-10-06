@@ -288,8 +288,101 @@ internal static class Catalogue
 
         Resets(shown);
 
+        RowAdding();
+
         ImGui.Separator();
     }
+
+    /// <summary>
+    /// A row added by hand: an id that binds to things in the world, and optionally a Kind.
+    ///
+    /// **Rows could only be edited, never added.** Every row came from the shipped file or from something the scan
+    /// had met, so a rule covering a family - path:Metadata/Monsters/VaalMonsters/Zealots/*, every Vaal Zealot - had
+    /// nowhere to be written. The id must start with one of AddableBindings, or it would bind to nothing and say
+    /// nothing about it; a star at either end opens that end. Ignored as the Kind of a path: row drops what it
+    /// matches from the scan. See Scan.IgnoredByTable.
+    ///
+    /// Stored with Set false when no Kind is given, since a row holding nothing is removed as empty; the Status
+    /// column then shows it as not yet agreed.
+    /// </summary>
+    private static void RowAdding()
+    {
+        ImGui.TextUnformatted("Add a row: ");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(380f);
+
+        var id = _addingId ?? "";
+
+        if (ImGui.InputTextWithHint("###aeAddId", "path:Metadata/Monsters/VaalMonsters/Zealots/*", ref id, 256))
+            _addingId = id;
+
+        ImGui.SameLine();
+        ImGui.TextUnformatted("Kind: ");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(90f);
+
+        var kind = _addingKind ?? "";
+
+        if (ImGui.InputTextWithHint("###aeAddKind", Scan.IgnoredKind, ref kind, 32))
+            _addingKind = kind;
+
+        ImGui.SameLine();
+
+        if (ImGui.SmallButton("Add row###aeAddRow"))
+            _addingSaid = RowAdded(_addingId?.Trim() ?? "", _addingKind?.Trim() ?? "");
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(
+                $"The id starts with {string.Join(", ", AddableBindings)} and matches the whole name, unless a\n" +
+                "star opens an end: path:Metadata/Monsters/VaalMonsters/Zealots/* matches every Vaal Zealot.\n" +
+                $"{Scan.IgnoredKind} as the Kind of a path: row drops everything it matches from the scan.");
+
+        if (_addingSaid.Length > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(_addingSaid);
+        }
+    }
+
+    /// <summary>Adds the row, or says why not. See RowAdding.</summary>
+    private static string RowAdded(string id, string kind)
+    {
+        if (id.Length == 0)
+            return "type an id first";
+
+        if (!AddableBindings.Any(x => id.StartsWith(x, StringComparison.OrdinalIgnoreCase)))
+            return $"an id must start with {string.Join(", ", AddableBindings)}";
+
+        if (Wrt.Of(id) != null)
+            return "there is a row with that id already";
+
+        Wrt.Set(id, r =>
+        {
+            r.Kind = kind.Length > 0 ? kind : null;
+            r.Set = kind.Length > 0 ? null : false;
+        });
+
+        // Shown at once rather than at the next rebuild, and found by the search. See Draw.
+        _search = id;
+        _built = DateTime.MinValue;
+        _addingId = "";
+        _addingKind = "";
+
+        return $"added {id}";
+    }
+
+    /// <summary>
+    /// The binding prefixes a row added by hand may start with: TableGrammar.Bindings without art:, since a row of
+    /// yours under art: is dropped on the next load. See Wrt.Load.
+    /// </summary>
+    private static readonly string[] AddableBindings =
+        TableGrammar.Bindings.Where(x => x != TableGrammar.Art).ToArray();
+
+    private static string _addingId = "";
+
+    private static string _addingKind = "";
+
+    private static string _addingSaid = "";
 
     /// <summary>
     /// Put everything back, or put back only what the search is showing.
@@ -322,6 +415,25 @@ internal static class Catalogue
 
         Held("Puts every row in this table back to its shipped value.\n" +
              "That is every tuned weight and every object you have priced. There is no undo.");
+
+        ImGui.SameLine();
+
+        // Rows where your file overrides a shipped answer. After an update that rewrites shipped rows, these are the
+        // ones still holding the old answer; rows only your file has, such as objects you priced, are left alone.
+        var overriding = _rows.Where(x => Wrt.HasShippedRow(x.Filed) && Wrt.HasCustomRow(x.Filed)).ToList();
+
+        ImGui.BeginDisabled(!armed);
+
+        if (ImGui.SmallButton($"Reset shipped rows ({overriding.Count})###aeResetShipped") && armed)
+        {
+            foreach (var row in overriding)
+                Reset(row);
+        }
+
+        ImGui.EndDisabled();
+
+        Held("Puts back every row the plugin ships an answer for that you have changed.\n" +
+             "Rows only you have, such as objects you priced, are kept. There is no undo.");
 
         ImGui.SameLine();
 
@@ -867,7 +979,11 @@ internal static class Catalogue
         var most = float.MinValue;
 
         foreach (var effect in effects)
-            most = MathF.Max(most, effect.Share);
+        {
+            // An 'own' effect reaches the holding remnant's waves only. See Weighing.OwnEffectsOfRunes.
+            if (!effect.Own)
+                most = MathF.Max(most, effect.Share);
+        }
 
         return most;
     }
@@ -1497,7 +1613,7 @@ internal static class Catalogue
     /// <summary>
     /// What else you get for blowing this up.
     ///
-    /// **The cell that takes composition out of code.** A remnant is three waves of so many monsters;
+    /// **The cell that takes composition out of code.** A remnant is one wave per rune of so many monsters;
     /// a monstermarker is 0.85 of a white one and 0.15 of a blue one; a strongbox's packs come off its
     /// modifiers. All three were a switch in Weighing, none of them is a preference, and every one is
     /// a fact about the game - which is what a reference table is for.
@@ -2242,6 +2358,47 @@ internal static class Catalogue
 
     // ------------------------------------------------------------------ building the rows
 
+    /// <summary>
+    /// Every cell a drawn row shows differently from the stored row it is filed under, among the columns drawn from the
+    /// table's own copy rather than read from the stored row each frame: Type, Weight, Size, Tags and Stacks. Only cells
+    /// the stored row sets are compared; an unset one is derived, and shows the derivation.
+    ///
+    /// **What CellSurfaces cannot see.** That check asks whether every stored field has a column. It passed while the
+    /// rune rows drew their Tags column blank - every rune row's builder left the copy empty - so the tags that decide
+    /// what Power lifts were stored, read by the scoring and shown nowhere. This asks the other half: whether the
+    /// column a field has shows what is stored. Seen and First seen are left out: the drawn Seen is a count of sightings
+    /// and the stored one a date, so they are not one value drawn twice. See Dump's weight table section.
+    /// </summary>
+    internal static string[] DrawnCellsAgainstStored(AutoExpeditionSettings settings, Scan scan)
+    {
+        var found = new List<string>();
+
+        static string Number(float? value) =>
+            value?.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+
+        foreach (var row in Build(settings, scan))
+        {
+            if (row.Filed.Length == 0 || Wrt.Of(row.Filed) is not { } stored)
+                continue;
+
+            void Compare(string column, string drawn, string held)
+            {
+                if (held == null || string.Equals((drawn ?? "").Trim(), held.Trim(), StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                found.Add($"{row.Filed}: the {column} column draws '{drawn ?? ""}' where the row holds '{held}'");
+            }
+
+            Compare("Type", row.Type, stored.Type);
+            Compare("Weight", Number(row.Weight), Number(stored.Weight));
+            Compare("Size", Number(row.Size), Number(stored.Size));
+            Compare("Tags", row.Marks, stored.Tags);
+            Compare("Stacks", row.Stacks?.ToString(), stored.Stacks?.ToString());
+        }
+
+        return found.ToArray();
+    }
+
     private static List<Row> Build(AutoExpeditionSettings settings, Scan scan)
     {
         var rows = new List<Row>();
@@ -2262,6 +2419,7 @@ internal static class Catalogue
         InSite(rows, settings, scan);
         Shipped(rows, settings);
         RuneTallyByRemnant(rows, settings);
+        RowsOnlyInYourFile(rows);
 
         return rows;
     }
@@ -2273,6 +2431,39 @@ internal static class Catalogue
     /// art because that is what the plugin distinguishes - twenty monster markers are one row with
     /// twenty against it, not twenty rows.
     /// </summary>
+    /// <summary>
+    /// Your rows that bind to things in the world and that nothing above listed: rows added by hand, mostly, which
+    /// are neither shipped nor met in a dig site. Without this a row added in the editor vanished from it. See
+    /// RowAdding.
+    /// </summary>
+    private static void RowsOnlyInYourFile(List<Row> rows)
+    {
+        var listed = rows.Select(x => x.Filed).Where(x => x.Length > 0).ToHashSet(StringComparer.Ordinal);
+
+        foreach (var (id, mine) in Wrt.Yours.ToList())
+        {
+            if (listed.Contains(id) ||
+                !TableGrammar.Bindings.Any(x => id.StartsWith(x, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            var now = Wrt.Of(id) ?? mine;
+
+            rows.Add(new Row
+            {
+                Name = now.Name ?? id,
+                Type = now.Kind ?? "",
+                Source = Priced,
+                Weight = now.Weight,
+                Stacks = now.Stacks,
+                Size = now.Size,
+                Marks = now.Tags ?? "",
+                First = now.First,
+                Filed = id,
+                Id = id,
+            });
+        }
+    }
+
     private static void InSite(List<Row> rows, AutoExpeditionSettings settings, Scan scan)
     {
         var targets = scan?.Targets;
@@ -2383,18 +2574,14 @@ internal static class Catalogue
                     // row's children and effects - so a row storing nothing showed a number, in a
                     // column whose other rows show what somebody typed. Two kinds of number under
                     // one heading, and no way to tell which a cell was.
-                    Weight = Safe.Read(() => Wrt.Of(target.Kind == TargetKind.Unknown
-                        ? Wrt.Id.Found(Unknowns.Key(target))
-                        : box ?? Wrt.Id.Kind(target.Kind, target.Tier))?.Weight, null),
+                    Weight = Safe.Read(() => Wrt.Of(Weighing.RowIdOfTarget(target))?.Weight, null),
                     // The stored cell here too, resolved by the same rule as the weight above it.
                     // This showed Extents.Of, the extent actually in force, which is never null - so
                     // a row storing no size showed a number under a heading whose other rows show
                     // what somebody typed, and clearing the cell put the worked-out figure back. What
                     // is in force is on the Size hover and in the dump's bounds table, both of which
                     // have room to say where it came from.
-                    Size = Safe.Read(() => Wrt.Of(target.Kind == TargetKind.Unknown
-                        ? Wrt.Id.Found(Unknowns.Key(target))
-                        : box ?? Wrt.Id.Kind(target.Kind, target.Tier))?.Size, null),
+                    Size = Safe.Read(() => Wrt.Of(Weighing.RowIdOfTarget(target))?.Size, null),
 
                     // **What is seen in the site is a view of something, and this is what.**
                     //
@@ -2744,6 +2931,12 @@ internal static class Catalogue
                 Weight = now?.Weight ?? 0f,
                 Shipped = shipped.Weight,
 
+                // **Drawn from these copies, so they have to be filled.** Left out, the Type and Size columns read blank
+                // on every shipped strongbox, relic, pack and modifier row while the stored values were used.
+                // See DrawnCellsAgainstStored.
+                Type = Typed(id, ""),
+                Size = now?.Size,
+
                 // The tags of whatever this prices, so a category row says what it reaches. The
                 // table file first here too, with the derivation as the fallback, so clearing the
                 // cell returns it to what the objective actually applies. See Weighing.DerivedTagsFor.
@@ -2801,9 +2994,11 @@ internal static class Catalogue
         // instead of sitting blank and implying nought.
         //
         // Read through Weighing.Waves rather than multiplied out here, so it cannot disagree with
-        // what the objective counts. A bare remnant, because sockets no longer change the waves.
+        // what the objective counts. One wave, because a remnant sends one per rune of its recipe and a rune
+        // in the last slot acts on the last wave alone - the smallest thing it can act on. See
+        // Weighing.WavesOfRemnant and Propagation.WaveShareOfSlot.
         var waves = Safe.Read(
-            () => Weighing.Waves(new Target { Kind = TargetKind.Remnant }), 0f);
+            () => Weighing.Waves(new Target { Kind = TargetKind.Remnant, Sockets = 1 }), 0f);
 
         // **Two runes can wear one name, so the name alone cannot identify a row.**
         //
@@ -2886,6 +3081,14 @@ internal static class Catalogue
                 // under. The search reads the drawn key rather than this, and "bait" still finds
                 // the Bait rune even though it draws as Power, because the key is "rune:bait".
                 Id = name,
+
+                // **The row's tags, which the scoring reads.** A tag an amplifier aims at - "rune" for
+                // Power - says its lift reaches this one (Weighing.EmpowerableRune), and the column was left
+                // blank for every rune - a stored value nobody could see. The shipped tags stand in
+                // as what is derived, so typing them back clears the override rather than freezing
+                // a copy of today's answer.
+                Marks = Wrt.Of(Wrt.Id.Rune(name))?.Tags ?? "",
+                Derived = Wrt.Default(Wrt.Id.Rune(name))?.Tags ?? "",
             });
         }
     }
@@ -2904,7 +3107,13 @@ internal static class Catalogue
             return 0f;
 
         foreach (var effect in TableGrammar.Effects(said, out _))
+        {
+            // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+            if (effect.Own)
+                continue;
+
             return effect.Share * 100f;
+        }
 
         return 0f;
     }

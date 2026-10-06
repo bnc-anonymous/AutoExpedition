@@ -296,6 +296,12 @@ internal static class Unknowns
         var already = Wrt.Of(id);
         var now = DateTime.UtcNow;
 
+        // Answered by the row of the same object with its art, icon and states, which this id lacks only because the
+        // entity was not loaded when it was read: nothing to file, and a row written here under the partial id would
+        // shadow that one. See Wrt.FoundWithUnreadFields.
+        if (already != null && !Wrt.HasExactly(id))
+            return;
+
         // **A row that exists is one that has been filed, whatever its cells say.**
         //
         // This asked whether the row had a WEIGHT, so a row whose weight had been cleared by hand
@@ -886,7 +892,7 @@ internal static class Unknowns
     /// - the mod that names an effect, which is what the recognised relics are matched on;
     /// - the state names it carries, sorted - be_free is an encased monster, sockets is a remnant;
     /// - the words on its ground label, which is the game saying in English what the thing is;
-    /// - the render name, which is occasionally a real description.
+    /// - not the render name any more, which split one monster into several rows. See the key below.
     ///
     /// Rarity is deliberately NOT here. It varies from one instance to the next rather than
     /// describing a kind, so including it would file a Magic strongbox and a Rare one as two
@@ -903,7 +909,7 @@ internal static class Unknowns
         if (target.Filed.Length > 0)
             return target.Filed;
 
-        return Key(target.Meta, target.Mods, target.Art, target.Icon,
+        return Key(target.Meta, target.Mods, target.ArtNow, target.IconNow,
             target.StateNames(), target.Words, target.Rendered, target.Blessing);
     }
 
@@ -921,6 +927,14 @@ internal static class Unknowns
             return key;
 
         if (!target.Settled || target.StateNames().Length == 0)
+            return key;
+
+        // **Not before the art and the minimap icon have arrived, unless they never do.** Filed without one, an
+        // object was filed again under a second key once it came: on a Frigid Bluffs site (2026-10-04) a Vaal
+        // Zealot had a row with its art and another without, and a relic and a sub-area entrance were filed
+        // without their icons and missed their shipped rows, each drawn as unknown. Many objects have no icon at
+        // all, so this waits ArtWait and then files what there is. See ArtWait.
+        if ((target.ArtNow.Length == 0 || target.IconNow.Length == 0) && DateTime.UtcNow - target.Born < ArtWait)
             return key;
 
         target.Filed = key;
@@ -1023,8 +1037,16 @@ internal static class Unknowns
         // only its identity it has stopped being.
         var said = "";
 
+        // **Nor the name the render component gives, which is read rather than known.** It arrives after
+        // everything else and is not always readable when it does: one Vaal Zealot on a Frigid Bluffs site
+        // (2026-10-04) was filed under no name, its right name, another Zealot's name and two strings of garbage
+        // read before the name was there - five rows for one monster, four of them unpriced and drawn as
+        // unknown. The field is kept empty so ids written before it was dropped still line up; Wrt merges
+        // those rows. See Wrt.MergedOnRenderName.
+        var rendered = "";
+
         return string.Join("|", metadata ?? "", upside, art ?? "", icon ?? "", states ?? "",
-            said, render ?? "", granted);
+            said, rendered, granted);
     }
 
     /// <summary>
@@ -1034,6 +1056,13 @@ internal static class Unknowns
     /// row. Every run of digits becomes a hash, whitespace collapses, and what is left is the
     /// sentence the game uses for that kind of thing.
     /// </summary>
+    /// <summary>
+    /// How long a new object's row waits for its art and minimap icon before it is filed without them. Chosen: both
+    /// arrive within a second or two of an object loading where they arrive at all, and an object without one is
+    /// filed after this. See Register.
+    /// </summary>
+    private static readonly TimeSpan ArtWait = TimeSpan.FromSeconds(10);
+
     public static string Plain(string words)
     {
         if (string.IsNullOrWhiteSpace(words))

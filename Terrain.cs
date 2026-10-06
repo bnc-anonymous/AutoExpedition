@@ -89,6 +89,9 @@ internal sealed class Terrain
     /// </summary>
     private readonly Wire _wire;
 
+    /// <summary>The router this snapshot answers reach from, or null without a routing grid. For offline checks.</summary>
+    internal Wire RouterOfTerrain => _wire;
+
     /// <summary>
     /// The authored rectangles the site forbids outright. Empty when none were read. See Volumes.
     /// </summary>

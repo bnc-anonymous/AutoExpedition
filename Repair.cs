@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Threading;
@@ -29,8 +30,8 @@ namespace AutoExpedition;
 /// <item>nothing is polished until something is accepted.</item>
 /// </list>
 ///
-/// **What it is NOT yet:** each trial insertion rescores the whole chain, where Planner's Push and
-/// Pop price one added link against a running tally. That is the next order of magnitude and it is
+/// **What it is NOT yet:** each trial insertion rescores the whole chain, where Planner's Fold,
+/// Price and Pop price one added link against a running tally. That is the next order of magnitude and it is
 /// deliberately not in the first version - a mode nobody has measured should be simple enough to be
 /// obviously correct before it is fast.
 /// </summary>
@@ -97,9 +98,6 @@ internal static class Repair
 
         return Math.Min(random.Next(least, ceiling + 1), Math.Max(1, links - 1));
     }
-
-    /// <summary>How long the band search gets to offer an opening. See Opening.</summary>
-    private static readonly TimeSpan BandTime = TimeSpan.FromMilliseconds(900);
 
     /// <summary>
     /// How many randomised constructions the opening is drawn from.
@@ -174,116 +172,6 @@ internal static class Repair
     private static double Slacking(PlanEnvironment env) =>
         env.AcceptSlack > 0d ? env.AcceptSlack : Slack;
 
-    /// <summary>
-    /// The band search's answer for this environment, worked out once and handed to everyone.
-    ///
-    /// **It is deterministic, and it was being paid for four times over.** Every stagnation restart
-    /// ran it again for the same answer, and with several workers each of those would run it again
-    /// as well - nine hundred milliseconds apiece, out of the window the tearing was supposed to
-    /// have. The environment is rebuilt per solve and never mutated during one, so reference
-    /// equality is exactly the right key.
-    /// </summary>
-    /// <summary>
-    /// The band seeding this worker asks for, which is not the same as its neighbour's.
-    ///
-    /// **Eight workers were exploring around one chain.** The band opening is deterministic, so it
-    /// was computed once and shared - and every worker then started from the same structure, shaken
-    /// by its own number of kicks. That is eight samples of one search rather than eight searches,
-    /// and it shows: six measurements on one site, every one landing between 4,050 and 4,120, with
-    /// runs routinely ending at exactly the figure they opened with.
-    ///
-    /// The bands are what decide that figure. They are drawn from families - how many spots per
-    /// pair, per rare, how much worth may separate a cell from the best in its band, whether to lean
-    /// on heavy content - and different answers to those give genuinely different chains rather than
-    /// different points near one chain.
-    ///
-    /// Worker nought keeps the configured seeding exactly, so whatever the sliders say is always one
-    /// of the eight and the settings still mean what they say. The rest vary around it.
-    /// </summary>
-    private static SeedFamilies Asking(PlanEnvironment env, int stream)
-    {
-        var seeding = env.Seeding;
-
-        if (seeding == null || stream <= 0)
-            return seeding;
-
-        // Small, deliberate steps rather than random ones: a worker's opening should be repeatable,
-        // and eight fixed variations spread further than eight draws from one distribution usually
-        // manage. The counts and the slack move on different cycles, so the set covers "few spots,
-        // tight" through "many spots, loose" rather than clustering in the middle.
-        var step = Varied(stream);
-
-        return seeding with
-        {
-            Pairs = Math.Max(1, seeding.Pairs + (step % 3) - 1),
-            Rares = Math.Max(1, seeding.Rares + step / 3 * 2 - 1),
-            Slack = Math.Max(0f, seeding.Slack * (step % 2 == 0 ? 0.5f : 2f)),
-            Heavy = step % 4 < 2 ? seeding.Heavy : !seeding.Heavy,
-        };
-    }
-
-    /// <returns>The band opening for this worker's own seeding, or null when there is none.</returns>
-    internal static List<Vector2> Banded(PlanEnvironment env, CancellationToken token, int stream)
-    {
-        // Every worker takes worker nought's seeding - the configured one. A seeding per worker was a setting
-        // and was removed: the opening shake undid the difference before anything read it, measured at 20,092
-        // against 23,517 with half the rounds.
-        var seeding = Asking(env, 0);
-
-        if (seeding == null)
-            return null;
-
-        var key = (env, Varied(0));
-
-        if (_bands.TryGetValue(key, out var had))
-            return had;
-
-        // **Claimed rather than locked, which is neither waiting nor duplicating.**
-        //
-        // Two workers asking the same question must not both answer it: with the variations off,
-        // all eight ask the same one, and computing it eight times cost every worker 3,170ms of a
-        // window it never recovered from - five of them managed under 500 rounds where the three
-        // that got through managed ten thousand. Locking instead would serialise those eight, which
-        // is the wait this was built to remove.
-        //
-        // So the first worker to arrive claims the key and the rest get on without the bands. They
-        // still have their seed and their greedy starts to open from, and whoever arrives after the
-        // answer is stored picks it up for nothing. Only one worker ever pays, and nobody queues.
-        if (!_building.TryAdd(key, true))
-            return null;
-
-        var asked = env with { Seeding = seeding };
-
-        // The band search is capped by wall clock too, and it decides the chain most workers open from. Let it
-        // run to completion when measuring, for the same reason. See SolverSettings.RoundsPerWorker.
-        var bandFor = env.RoundsPerWorker > 0 ? TimeSpan.FromHours(1) : BandTime;
-        var plan = Edges.Search(asked, bandFor, TimeSpan.Zero, token, null);
-        var found = plan.Points is { Count: > 0 } ? new List<Vector2>(plan.Points) : null;
-
-        _bands[key] = found;
-        _building.TryRemove(key, out _);
-
-        return found;
-    }
-
-    /// <summary>The keys somebody is already working on. See Banded.</summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
-        (PlanEnvironment Env, int Varied), bool> _building = new();
-
-    /// <summary>Which of the seeding variations a worker uses. See Asking.</summary>
-    private static int Varied(int stream) => stream <= 0 ? -1 : (stream - 1) % 6;
-
-    /// <summary>
-    /// The band opening per environment and per seeding variation.
-    ///
-    /// Keyed on both because the answer depends on both, and held across restarts because it is
-    /// deterministic - a worker that kicks and opens again asks the same question and should not pay
-    /// for it twice. The environment is rebuilt per solve and never mutated during one, so reference
-    /// equality is exactly the right key for that half.
-    /// </summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
-        (PlanEnvironment Env, int Varied), List<Vector2>> _bands = new();
-
 
 
     /// <param name="stream">
@@ -299,9 +187,17 @@ internal static class Repair
     /// forward and the search had to rediscover it by luck. Taken as one of the openings, the worst
     /// a second press can do is keep what the first found.
     /// </param>
+    /// <param name="own">
+    /// This worker's own chain from the end of the last continuous pass, or null. A worker given one starts from it
+    /// instead of drawing a fresh opening, so successive passes add up to one search per worker while the workers'
+    /// chains stay as different from each other as they were. Without it, every worker but the first restarted each
+    /// pass: measured offline on a Grand layout, six 24s passes seeded with a 39,179 chain stalled at 42,205, because a
+    /// worker starting afresh reached only 34-37k in one pass, never beat the plan in hand, and was restarted by the
+    /// next. See Planning.Start.
+    /// </param>
     public static Plan Search(PlanEnvironment env, TimeSpan budget, TimeSpan settle,
         CancellationToken token, Action<List<Vector2>> found, int stream = 0,
-        List<Vector2> seed = null)
+        List<Vector2> seed = null, List<Vector2> own = null)
     {
         if (env.Explosives <= 0 || env.Targets.Count == 0)
             return Plan.Empty;
@@ -440,6 +336,14 @@ internal static class Repair
             if (!constructed)
                 improved = DateTime.UtcNow;
 
+            // **Nor while the orders the order workers wait for are being built.** Nothing improves while six of eight
+            // workers wait, so the rest ran out of window as the orders arrived: on replays of a Frigid Bluffs site
+            // (2026-10-05) the refining worker's last spot search ended 8.2 s into the final pass, as its order search
+            // ended, and it never searched a chain built from the orders. Planning holds the solve open for the same
+            // search. See Planning.Expire.
+            if (env.RemnantOrdersFirst && RemnantOrder.SearchingAcrossThreads)
+                improved = DateTime.UtcNow;
+
             // **A round budget replaces both clocks, so the work per press is fixed and a draw reproduces.**
             // The deadline and the settle window are what make a press unrepeatable: the seeds are common
             // random numbers and the amount of work is not, so two batches over the same draws build different
@@ -472,15 +376,12 @@ internal static class Repair
         var asked = 0;
         var arrived = 0;
 
-        // **One counter called "opening" was hiding three different things.**
+        // **One counter called "opening" was hiding two different things.**
         //
-        // It held the first construction, the kick's rebuild, and - through Banded's lock
-        // - however long this worker sat waiting for another one to finish the band search. Read as
-        // a single number it says "setup is expensive", which is true and useless: the setup happens
-        // once, the kick happens every time the search gets stuck, and the wait is pure idling that
-        // no amount of tuning the opening would remove. Measured at 4,257ms on a fifteen link site,
-        // against 1,126ms of actual tearing, with no way to tell which third to attack.
-        var bandMs = 0d;
+        // It held the first construction and the kick's rebuild. Read as a single number it says "setup is
+        // expensive", which is true and useless: the setup happens once and the kick happens every time the
+        // search gets stuck. Measured at 4,257ms on a fifteen link site, against 1,126ms of actual tearing,
+        // with no way to tell which part to attack.
         var openingMs = 0d;
         var kickMs = 0d;
 
@@ -508,18 +409,19 @@ internal static class Repair
 
         // The part of mustTakeMs spent polishing the chosen route rather than building the candidates.
         var mustTakePolishMs = 0d;
+
+        // The part of mustTakeMs spent in Planner.MustTakeTour, building and choosing the route.
+        var mustTakeTourMs = 0d;
         var finishMs = 0d;
         var phase = System.Diagnostics.Stopwatch.StartNew();
         var watch = new System.Diagnostics.Stopwatch();
-        var band = new System.Diagnostics.Stopwatch();
 
         // Something worth tearing at, and not the same thing every worker is tearing at. See Starts.
         watch.Restart();
 
         // **The opening's own clock, on top of the window's.** It otherwise runs until it finishes,
         // which on a Grand site is four to eight seconds of an eight second window. Nought leaves
-        // that alone. The band search is not interrupted by it - that pass takes a token rather than
-        // a predicate - so a cap shorter than the band's cost lands immediately after it instead.
+        // that alone.
         // **No clock on the opening while a round budget is in force.** A cap in milliseconds decides how
         // much of the opening gets built, so two presses of the same draw start from different chains and the
         // pairing the draws exist for is lost before the loop begins. Measured: with the loop bounded by rounds
@@ -555,8 +457,7 @@ internal static class Repair
         }
         else
         {
-            best = Opening(env, candidates, shortlist, random, Early, token, stream, out keptOpening, seed,
-                band);
+            best = Opening(env, candidates, shortlist, random, Early, stream, out keptOpening, seed, own);
 
             // Kept so the tally can tell a worker that was never seeded from one that was seeded and lost its
             // opening before it could be kept. See KeepOpeningSaid.
@@ -595,6 +496,32 @@ internal static class Repair
                 keepOpeningUntil = DateTime.UtcNow + keepBase * keepShare;
             else
                 keptOpening = null;
+
+            // A given opening held for the whole search, for the offline harness alone. See LockedOpening.
+            //
+            // **Built from it, not merely kept if the worker happened to start there.** A worker opens on its own
+            // construction and only takes a seed that out-scores it, and a few links alone never do - so no worker
+            // started from the given links and none kept them. Each completes them greedily instead.
+            if (LockedOpening is { Count: > 0 } locked)
+            {
+                bool StartsWithLocked(List<Vector2> chain) =>
+                    chain is { Count: > 0 } && chain.Count >= locked.Count &&
+                    locked.Select((at, i) => chain[i] == at).All(x => x);
+
+                if (!StartsWithLocked(best) &&
+                    Planner.Greedy(env, candidates, null, 1, null, new List<Vector2>(locked)) is { } completed &&
+                    StartsWithLocked(completed))
+                {
+                    best = completed;
+                    found?.Invoke(new List<Vector2>(best));
+                }
+
+                if (StartsWithLocked(best))
+                {
+                    keptOpening = new List<Vector2>(locked);
+                    keepOpeningUntil = DateTime.MaxValue;
+                }
+            }
 
             if (seededWith != null)
                 Interlocked.Increment(ref _seededWorkers);
@@ -636,7 +563,6 @@ internal static class Repair
                     : $"{Destroys[told.At]}:{told.Share:0}";
 
         openingMs += watch.Elapsed.TotalMilliseconds;
-        bandMs = band.Elapsed.TotalMilliseconds;
         // **The opening as Opening returned it**, which for an exploring worker is now the shaken
         // chain before any descent and for worker nought is its polish. Eight workers finishing on one
         // number says nothing on its own about which half failed: the shakes may be producing one
@@ -660,8 +586,14 @@ internal static class Repair
         // every operator here moves a link and keeps the result only if it improves, and the ground
         // between is worse than where the chain stands. The charge for dropping one ranks the
         // answer afterwards; it does not build it. See Planner.MustTakeTour.
-        if (env.Musts > 0 &&
-            Planner.MustTakeTour(env, shortlist, best, stream, keptOpening?.Count ?? 0) is { Count: > 0 } demanded)
+        var touringForMustTake = System.Diagnostics.Stopwatch.StartNew();
+        var tourForMustTake = env.Musts > 0
+            ? Planner.MustTakeTour(env, shortlist, best, stream, keptOpening?.Count ?? 0)
+            : null;
+
+        mustTakeTourMs = touringForMustTake.Elapsed.TotalMilliseconds;
+
+        if (tourForMustTake is { Count: > 0 } demanded)
         {
             // **Not shaken afterwards.** The shake happens inside Opening, before this, and the
             // tour is what puts back what the shake tore off - so shaking the tour undoes the
@@ -684,8 +616,16 @@ internal static class Repair
         // through the n-th richest target that construction misses, n counted over the touring workers so no two
         // aim at the same one. Taken whether or not it scores better at once: the point is a different starting
         // region, and the loop that follows judges it. See Planner.TourThrough.
-        if (Role(env, stream) is { Opening: ThreadRoles.Opens.Tour } &&
-            Planner.RichestUnreached(env, best, TourSlot(env, stream), TourCount(env)) is var aim and >= 0 &&
+        //
+        // Two searches for a whole route through every must-take were tried here and removed: a best-path search over
+        // the candidate spots, and one built a link at a time like the openings. Measured on one Grand site
+        // (2026-09-30), the first cost 1.0 to 2.3 seconds a press and offered no route, and the second ran to its two
+        // second cap on every press and found none.
+        //
+        // Not for a worker continuing its own chain from the last pass: it was toured when it started, and touring it
+        // again every pass would undo the search it is continuing. See Search's own.
+        if (own is not { Count: > 0 } && Role(env, stream) is { Opening: ThreadRoles.Opens.Tour } &&
+            Planner.RichestUnreached(env, best, TourSlot(env, stream), Math.Max(1, TourCount(env))) is var aim and >= 0 &&
             Planner.TourThrough(env, shortlist, best, aim) is { Count: > 0 } toured)
         {
             best = Planner.Improve(env, shortlist, toured, Waiting);
@@ -707,7 +647,7 @@ internal static class Repair
         // only be inferred. It matters because everything else has come back flat: the answer did
         // not move for twice the rounds, nor for a candidate set swept from 291 spots to 1,063. If
         // the opening already scores within a per cent or two of the finish, the tearing is not what
-        // decides a press and the band search is the only thing left that does.
+        // decides a press and the opening does.
         var opened = top;
 
         // What the site pays out of that, which is what the acceptance slack is a share of. Kept
@@ -817,6 +757,9 @@ internal static class Repair
             ? TimeSpan.FromMilliseconds(kickWindow.TotalMilliseconds * env.StagnationKickPercent / 100d)
             : TimeSpan.MaxValue;
         var stuckSince = DateTime.UtcNow;
+
+        // When the refining worker next relinks the workers' records. See RelinkDuringSolveMs.
+        var nextRelink = DateTime.UtcNow + TimeSpan.FromMilliseconds(RelinkDuringSolveMs);
         var kickRounds = KickRounds(env);
 
         // How far towards the kick this worker is, nought to one, by whichever of rounds or the clock is further
@@ -847,9 +790,177 @@ internal static class Repair
 
 
 
+        // **Remnant orders published while this solve runs, taken when they arrive.** A worker opening on them reads
+        // them when the solve begins, and a solve begun before the order search finished had none: on a Frigid Bluffs
+        // site (2026-10-04) the first solve after a reset climbed to 68,020 over 25 s on its fallback openings, and
+        // the next, begun with the orders, passed 72,500 in under two seconds. A worker that began without orders
+        // starts its chain again from the first it is given, since everything before was a fallback; one that began
+        // with them only from a later order scoring above the chain it is working. Its record moves only if the order
+        // beats it. Asked every 64 rounds. See RemnantOrder.PublishedSince.
+        var takesOrders = Role(env, stream) is { Opening: ThreadRoles.Opens.RemnantOrder };
+        var hasOrders = env.RemnantOrderChains is { Count: > 0 };
+        var ordersTaken = 0;
+
+        // Whether the orders this worker works from are the search's last for the site state, which it takes whatever
+        // they score: one that began on orders published while the search went on climbs them meanwhile, and on a
+        // Frigid Bluffs site (2026-10-04) workers that began on 21,629 and 24,845 kept their climbed 64-68,000 chains
+        // over final orders scoring less, and the exhaustive search on those never found the 74,081 it found from the
+        // final orders themselves. What the climbing found is in the pool already. See RemnantOrder.PublishedSince.
+        var finalOrders = false;
+
+        if (takesOrders && hasOrders)
+            RemnantOrder.PublishedSince(env, ref ordersTaken, out finalOrders);
+
+        // **A worker opening on a remnant order searches its chain exhaustively first, with remnant orders first.** Its
+        // order is a chain no worker has climbed yet, and the windows take it further than the tears would: on a
+        // Frigid Bluffs site (2026-10-04) they took a 72,989 chain to 74,276 where the tears found nothing. Each gain is
+        // handed to the pool as it comes. See SpotSearchUntilStalled.
+        //
+        // **Once the order search has stalled, not as soon as the first orders arrive.** They are published while the
+        // search goes on, and searching them exhaustively then competed with it for the router; meanwhile the worker
+        // climbs its order with the usual moves, and the loop below starts this when the search ends.
+        var ownChainSearched = false;
+
+        // **The order this worker is searching, which its kicks start from.** A kick shakes the worker's record, so a
+        // worker given a new order went back to its old chain at its next kick. Null while the record is the line.
+        // See SpareOrderAfterKicks.
+        List<Vector2> lineBest = null;
+        var lineTop = double.NegativeInfinity;
+        var lineAtLastKick = double.NegativeInfinity;
+        var kicksWithoutLineGain = 0;
+
+        void SearchOwnChain()
+        {
+            if (!takesOrders || !env.RemnantOrdersFirst || !hasOrders || RemnantOrder.SearchingAcrossThreads)
+                return;
+
+            ownChainSearched = true;
+
+            var searchedFrom = Planner.Plainly(env, chain);
+
+            Solving.Happened(stream, $"spot search of its own chain begins, {searchedFrom:N0} plain" +
+                                     (stream >= 0 && stream < _orderOfWorker.Length && _orderOfWorker[stream] >= 0
+                                         ? $", order #{_orderOfWorker[stream] + 1}" : ""));
+
+            // Broken off when newer orders are published, which the loop below then offers this worker: started on the
+            // first part's orders, it would otherwise search them for seconds while better ones waited.
+            // **Windows of two and three only, not the sweep to six.** The sweep took an order worker 2 to 8 s of a
+            // cold press for small gains, and the refining worker sweeps the pool's best anyway. Over six Grand sites
+            // and three draws, cold 10 s presses ended at 98.3% of each site's best against 97.1% with the sweep, and
+            // 92.7% against 91.7% at 7 s. Measured offline, 2026-10-06. See OwnChainSweeps.
+            var searched = SpotSearchUntilStalled(env, chain, () => Waiting() && !RemnantOrder.PublishedAfter(env, ordersTaken), sweep: OwnChainSweeps, better: better =>
+            {
+                if (Planner.Score(env, better) is var worth && worth > top)
+                {
+                    top = worth;
+                    best = new List<Vector2>(better);
+                    improved = DateTime.UtcNow;
+                    bettered++;
+                    plainTop = Planner.Plainly(env, best);
+                    Solving.Scored(stream, plainTop, top, lean);
+                    found?.Invoke(new List<Vector2>(best));
+                }
+            });
+
+            if (searched != null)
+            {
+                chain = new List<Vector2>(searched);
+                score = Planner.Score(env, chain);
+                stuckSince = DateTime.UtcNow;
+            }
+
+            Solving.Happened(stream, $"spot search of its own chain ends, {searchedFrom:N0} -> {Planner.Plainly(env, chain):N0} plain");
+        }
+
+        SearchOwnChain();
+
+
         while (Waiting())
         {
             rounds++;
+
+            if (!ownChainSearched && (rounds & 255) == 0)
+                SearchOwnChain();
+
+            // **The exhaustive spot search as soon as the pool's best moves, not at the next kick.** A kick waits for the
+            // worker to stall, and in game the first press after a reset reached 72,652 at 6 s and ended at 14 s with
+            // nothing found by it; the next press found 74,081 at 18 s. Asked every 256 rounds; it does nothing when the
+            // pool's best has been searched already. See LeaderImprovedBySpotSearch.
+            if (refining && (rounds & 255) == 0 &&
+                LeaderImprovedBySpotSearch(env, stream, Waiting, deadline - budget) is { } searched)
+            {
+                chain = new List<Vector2>(searched);
+                score = Planner.Score(env, chain);
+                since = 0;
+                stuckSince = DateTime.UtcNow;
+
+                if (score > top)
+                {
+                    top = score;
+                    best = new List<Vector2>(chain);
+                    improved = DateTime.UtcNow;
+                    bettered++;
+                    plainTop = Planner.Plainly(env, best);
+                    Solving.Scored(stream, plainTop, top, lean);
+                    found?.Invoke(new List<Vector2>(best));
+                }
+            }
+
+            // **The workers' records relinked while they search, not only once they have stopped.** On a Grazed Prairie
+            // site (2026-10-06) relinking at the end of a solve made the last three gains, +20, +12 and +11, each after a
+            // continuous pass of 24 to 195 s that had published nothing: a good opening and a good ending sat in two
+            // workers' chains the whole time. Every RelinkDuringSolveMs; a few tens of milliseconds each. See
+            // LeaderRelinked.
+            if (refining && (rounds & 255) == 0 && RelinkDuringSolveMs > 0 && DateTime.UtcNow >= nextRelink)
+            {
+                nextRelink = DateTime.UtcNow + TimeSpan.FromMilliseconds(RelinkDuringSolveMs);
+
+                if (LeaderRelinked(env, stream) is { } relinked)
+                {
+                    chain = new List<Vector2>(relinked);
+                    score = Planner.Score(env, chain);
+                    since = 0;
+                    stuckSince = DateTime.UtcNow;
+
+                    if (score > top)
+                    {
+                        top = score;
+                        best = new List<Vector2>(chain);
+                        improved = DateTime.UtcNow;
+                        bettered++;
+                        plainTop = Planner.Plainly(env, best);
+                        Solving.Scored(stream, plainTop, top, lean);
+                        found?.Invoke(new List<Vector2>(best));
+                    }
+                }
+            }
+
+            if (takesOrders && (rounds & 63) == 0 &&
+                RemnantOrder.PublishedSince(env, ref ordersTaken, out var lastOrders) is { } published &&
+                published[RemnantOrderSlot(env, stream) % published.Count] is { } fresh && Sound(env, fresh) &&
+                (!hasOrders || lastOrders && !finalOrders || Planner.Score(env, fresh) > score))
+            {
+                finalOrders |= lastOrders;
+                hasOrders = true;
+                chain = new List<Vector2>(fresh);
+                score = Planner.Score(env, chain);
+                (lineBest, lineTop, lineAtLastKick, kicksWithoutLineGain) = (new List<Vector2>(chain), score, score, 0);
+                since = 0;
+                stuckSince = DateTime.UtcNow;
+                ownChainSearched = false;
+                SearchOwnChain();
+
+                if (score > top)
+                {
+                    top = score;
+                    best = new List<Vector2>(chain);
+                    improved = DateTime.UtcNow;
+                    bettered++;
+                    plainTop = Planner.Plainly(env, best);
+                    Solving.Scored(stream, plainTop, top, lean);
+                    found?.Invoke(new List<Vector2>(best));
+                }
+            }
 
             // Stuck. Kick the record hard and carry on from there. See KickRounds.
             //
@@ -866,6 +977,62 @@ internal static class Repair
                 restarts++;
 
                 watch.Restart();
+
+                var lineNow = lineBest != null ? lineTop : top;
+
+                if (lineNow > lineAtLastKick)
+                    (lineAtLastKick, kicksWithoutLineGain) = (lineNow, 0);
+                else
+                    kicksWithoutLineGain++;
+
+                // **A worker done with its order moves to one nobody has searched**, once the order search has ended,
+                // its own chain has been searched exhaustively, and SpareOrderAfterKicks kicks in a row have not
+                // improved the order it is on. The next order no worker opened on, if any is left; then searched
+                // exhaustively as its first was. See NextSpareOrder.
+
+                var wantsSpare = takesOrders && ownChainSearched && !RemnantOrder.SearchingAcrossThreads &&
+                                 kicksWithoutLineGain >= SpareOrderAfterKicks;
+                var spareIndex = -1;
+                var spare = wantsSpare ? NextSpareOrder(env, out spareIndex) : null;
+
+                if (spare != null && stream >= 0 && stream < _orderOfWorker.Length)
+                    _orderOfWorker[stream] = spareIndex;
+
+                if (spare != null)
+                    Solving.Happened(stream, $"moves to order #{spareIndex + 1}, its record {Planner.Plainly(env, best ?? chain):N0} plain");
+
+                // The first time this worker asks and none is left: what it had then, so the dump can say what the
+                // rest of its window added. See OrdersRanOutSaid.
+                if (wantsSpare && spare == null && stream >= 0 && stream < _ordersRanOutMs.Length &&
+                    _ordersRanOutMs[stream] < 0d)
+                {
+                    _ordersRanOutMs[stream] = marked.Elapsed.TotalMilliseconds;
+                    Solving.Happened(stream, $"no order left, its record {Planner.Plainly(env, best ?? chain):N0} plain");
+                    _topWhenOrdersRanOut[stream] = top;
+                    _bestsWhenOrdersRanOut[stream] = bettered;
+                }
+
+                if (spare != null && Sound(env, spare))
+                {
+                    chain = new List<Vector2>(spare);
+                    score = Planner.Score(env, chain);
+                    (lineBest, lineTop, lineAtLastKick, kicksWithoutLineGain) = (new List<Vector2>(chain), score, score, 0);
+                    progressedAt = DateTime.UtcNow;
+
+                    if (stream >= 0 && stream < _spareOrdersTaken.Length)
+                        Interlocked.Increment(ref _spareOrdersTaken[stream]);
+
+                    ownChainSearched = false;
+                    SearchOwnChain();
+
+                    if (lineBest != null && score > lineTop)
+                        (lineBest, lineTop) = (new List<Vector2>(chain), score);
+
+                    kickMs += watch.Elapsed.TotalMilliseconds;
+                    stuckSince = DateTime.UtcNow;
+
+                    continue;
+                }
 
                 // **Hopeless, so start again - from a chain of this worker's own making.**
                 //
@@ -965,14 +1132,15 @@ internal static class Repair
                     continue;
                 }
 
-                var start = best;
+                var start = lineBest ?? best;
 
                 var shake = 1 + restarts % 3;
 
                 // Before refine-after, a refining worker's kick is an ordinary one. Marked done even when there was
                 // nothing to rebuild from, or the trigger above would fire on every round.
                 var refineNow = refining && DateTime.UtcNow >= refineFrom;
-                var refined = refineNow ? RefinedStart(env, candidates, random, stream) : null;
+                var refined = (refining ? LeaderImprovedBySpotSearch(env, stream, Waiting, deadline - budget) : null) ??
+                              (refineNow ? RefinedStart(env, candidates, random, stream) : null);
 
                 if (refineNow && !refinedYet)
                 {
@@ -1215,6 +1383,9 @@ internal static class Repair
                 score = worth;
                 kept++;
 
+                if (lineBest != null && score > lineTop)
+                    (lineBest, lineTop) = (new List<Vector2>(chain), score);
+
                 // A restarted chain that is still climbing is not stuck, whether or not it has reached the record.
                 if (rescued > 0 && score > restartTop)
                 {
@@ -1235,8 +1406,12 @@ internal static class Repair
                 Reweigh(weight, used, paid, won, spent);
         }
 
+
         if (refinedYet && stream >= 0 && stream < _refinedFinal.Length)
             _refinedFinal[stream] = top;
+
+        if (takesOrders && stream >= 0 && stream < _ordersRanOutMs.Length)
+            (_endedMs[stream], _topAtEnd[stream], _bestsAtEnd[stream]) = (marked.Elapsed.TotalMilliseconds, top, bettered);
 
         // **Why the loop stopped, read at the moment it did.** Workers were seen running nought rounds with seconds
         // of their eight still to go, and Waiting has three ways to say no - the deadline, cancellation, and the
@@ -1281,9 +1456,9 @@ internal static class Repair
             $"{rounds:N0} rounds, {bettered:N0} bests, {restarts:N0} kicks " +
             $"({rescued:N0} restarted), " +
             $"reach {won[3]:N0} won of {used[3]:N0}, " +
-            $"open {openingMs:N0}ms band {bandMs:N0}ms kick {kickMs:N0}ms (restarts {restartMs:N0}ms) " +
+            $"open {openingMs:N0}ms kick {kickMs:N0}ms (restarts {restartMs:N0}ms) " +
             $"reach {reachMs:N0}ms tear {tearMs:N0}ms polish {polishMs:N0}ms ({polishesThatHelped:N0} of {polishes:N0} added {polishGain:N0}) " +
-            $"must-take {mustTakeMs:N0}ms (polish {mustTakePolishMs:N0}ms) tour {touringMs:N0}ms finish {finishMs:N0}ms; " +
+            $"must-take {mustTakeMs:N0}ms (building {mustTakeTourMs:N0}ms, polish {mustTakePolishMs:N0}ms) tour {touringMs:N0}ms finish {finishMs:N0}ms; " +
             $"stopped on {ended} with {leftMs:N0}ms to the deadline");
 
         var spread = new List<string>();
@@ -1301,8 +1476,7 @@ internal static class Repair
                   $"sized {(spread.Count > 0 ? string.Join(" ", spread) : "none")} " +
                   $"(of {env.TearLeast} to {env.TearMost}); " +
                   $"reach arrived {arrived:N0} of {asked:N0} asked; " +
-                  $"spent opening {openingMs:N0}ms (of which {bandMs:N0}ms on the shared band " +
-                  $"search), kicks {kickMs:N0}ms, tearing {tearMs:N0}ms, " +
+                  $"spent opening {openingMs:N0}ms, kicks {kickMs:N0}ms, tearing {tearMs:N0}ms, " +
                   $"reaching {reachMs:N0}ms, polishing {polishMs:N0}ms";
 
         // **Re-ordered once, here, where it cannot redirect anything.** Reversed was first applied at
@@ -1329,31 +1503,6 @@ internal static class Repair
     }
 
     /// <summary>
-    /// A chain worth tearing at: the best of the band search and several randomised greedy builds,
-    /// polished.
-    ///
-    /// **Greedy cannot find this site's answer and the band search can, in under a second.** The
-    /// second run of this mode opened at 4,345 from ten randomised constructions while the band
-    /// search alone reached 9,395.6 in 800ms on the same site - and Mixed, which is the band search
-    /// followed by a general one, finished at 12,984.2. A destroy-and-repair that starts a thousand
-    /// points behind the cheapest thing on the shelf is measuring its opening, not its operators.
-    ///
-    /// So the opening is whichever of the two is better, and the tearing starts from there. This is
-    /// what the literature means by constructing with a decent heuristic before improving: the
-    /// neighbourhood search is for polishing a good answer, not for discovering one.
-    ///
-    /// Only the leader is polished, because the polish is the expensive half by a wide margin and a
-    /// build that is behind before it starts is not going to pass by being tidied. See Starts.
-    /// </summary>
-    /// <param name="band">
-    /// Times the band search, which is shared between workers and therefore mostly WAITING.
-    ///
-    /// Banded computes once per environment behind a lock, so the first worker pays nine hundred
-    /// milliseconds of work and the other seven pay the same in idling - and both landed in the
-    /// opening's total, where they read as construction cost. They are not: one is work that could
-    /// be done before the workers start, the other is nothing at all.
-    /// </param>
-    /// <summary>
     /// Whether the seeded openings were actually kept, counted rather than reasoned about.
     ///
     /// **Because two explanations for the same dump were both wrong.** A press where no worker finished on one
@@ -1365,6 +1514,13 @@ internal static class Repair
     /// Keeping that refuses nothing had nothing to protect. A worker seeded and not keeping its opening lost it
     /// before the search began.
     /// </summary>
+    /// <summary>
+    /// Links every worker whose first chain starts with them keeps for its whole search, or null. Set only by the
+    /// offline harness, to ask whether the rest of a chain can be found once its opening is right; the game never
+    /// sets it. See tools/offline --lock-opening.
+    /// </summary>
+    internal static List<Vector2> LockedOpening;
+
     internal static string KeepOpeningSaid =>
         $"{Volatile.Read(ref _workersKeepingOpening)} of {Volatile.Read(ref _seededWorkers)} seeded worker(s) kept their opening, " +
         $"refusing {Volatile.Read(ref _refusedWhileKeepingOpening):N0} chain(s); " +
@@ -1395,8 +1551,108 @@ internal static class Repair
     /// Starts the per-solve opening tallies over - kept openings and touring targets - before any worker runs. See
     /// KeepOpeningSaid and TouringSaid.
     /// </summary>
+    /// <summary>
+    /// How many kicks in a row without improving the order it is on before a worker opening on remnant orders moves
+    /// to one nobody has searched. One, since a kick already means the worker has gone StagnationKickPercent of the
+    /// window without a better chain; three left none of the workers on a Frigid Bluffs site (2026-10-04) moving within
+    /// a 24 s solve. See NextSpareOrder.
+    /// </summary>
+    private const int SpareOrderAfterKicks = 1;
+
+    /// <summary>
+    /// The next published order no worker opened on and none has moved to, or null when none is left. The workers
+    /// opening on orders take the first of them, one each; the rest are handed out in turn this solve. See
+    /// ThreadRoles.Opens.RemnantOrder.
+    /// </summary>
+    private static List<Vector2> NextSpareOrder(PlanEnvironment env, out int index)
+    {
+        index = -1;
+
+        // The orders this worker was given, which are the finished search's when it waited for them; the published
+        // ones when it began without any.
+        if ((env.RemnantOrderChains is { Count: > 0 } given ? given : RemnantOrder.PublishedFor(env)) is not { } published)
+            return null;
+
+        var opening = env.Roles?.Count(x => x.Opening == ThreadRoles.Opens.RemnantOrder) ?? 0;
+        var next = opening + Interlocked.Increment(ref _sparesHandedOut) - 1;
+
+        index = next;
+
+        return next < published.Count ? published[next] : null;
+    }
+
+    /// <summary>How many spare orders this solve has handed out. See NextSpareOrder.</summary>
+    private static int _sparesHandedOut;
+
+    /// <summary>How many spare orders each worker moved to this solve, for the dump. See NextSpareOrder.</summary>
+    private static readonly int[] _spareOrdersTaken = new int[64];
+
+    /// <summary>What the workers opening on remnant orders moved to once done with their own, for the dump.</summary>
+    internal static string SpareOrdersSaid
+    {
+        get
+        {
+            var said = Enumerable.Range(0, _spareOrdersTaken.Length).Where(i => Volatile.Read(ref _spareOrdersTaken[i]) > 0)
+                .Select(i => $"worker {i} moved to {_spareOrdersTaken[i]}").ToList();
+
+            return said.Count == 0 ? "no worker moved to another order" : string.Join(", ", said);
+        }
+    }
+
+    /// <summary>
+    /// By worker: milliseconds into its search when it first asked for a spare order and none was left, or -1 while it
+    /// has not; its record and record count then; and the same at the end of its search. Only workers opening on
+    /// remnant orders. See OrdersRanOutSaid.
+    /// </summary>
+    private static readonly double[] _ordersRanOutMs = Enumerable.Repeat(-1d, 64).ToArray();
+
+    private static readonly double[] _topWhenOrdersRanOut = new double[64];
+    private static readonly int[] _bestsWhenOrdersRanOut = new int[64];
+    private static readonly double[] _endedMs = Enumerable.Repeat(-1d, 64).ToArray();
+    private static readonly double[] _topAtEnd = new double[64];
+    private static readonly int[] _bestsAtEnd = new int[64];
+
+    /// <summary>
+    /// For each worker opening on remnant orders, when it ran out of orders and what the rest of its search added:
+    /// "worker 2 out of orders at 9,820 of 24,100 ms on 7,359; after it 0 bests, ended on 7,359". For the dump.
+    /// </summary>
+    internal static string OrdersRanOutSaid
+    {
+        get
+        {
+            var said = new List<string>();
+
+            for (var i = 0; i < _endedMs.Length; i++)
+            {
+                if (_endedMs[i] < 0d)
+                    continue;
+
+                said.Add(_ordersRanOutMs[i] < 0d
+                    ? $"worker {i} never ran out ({_endedMs[i]:N0} ms, ended on {_topAtEnd[i]:N1})"
+                    : $"worker {i} out of orders at {_ordersRanOutMs[i]:N0} of {_endedMs[i]:N0} ms on " +
+                      $"{_topWhenOrdersRanOut[i]:N1}; after it {_bestsAtEnd[i] - _bestsWhenOrdersRanOut[i]:N0} bests, " +
+                      $"ended on {_topAtEnd[i]:N1}");
+            }
+
+            return said.Count == 0 ? "no worker opened on remnant orders" : string.Join("; ", said);
+        }
+    }
+
     internal static void ForgetOpeningTallies()
     {
+        Array.Fill(_orderOfWorker, -1);
+
+        lock (_spotWinsFrom)
+            _spotWinsFrom.Clear();
+
+        Volatile.Write(ref _sparesHandedOut, 0);
+        Array.Clear(_spareOrdersTaken);
+        Array.Fill(_ordersRanOutMs, -1d);
+        Array.Fill(_endedMs, -1d);
+        Array.Clear(_topWhenOrdersRanOut);
+        Array.Clear(_bestsWhenOrdersRanOut);
+        Array.Clear(_topAtEnd);
+        Array.Clear(_bestsAtEnd);
         Volatile.Write(ref _seededWorkers, 0);
         Volatile.Write(ref _workersKeepingOpening, 0);
         Volatile.Write(ref _refusedWhileKeepingOpening, 0);
@@ -1408,12 +1664,25 @@ internal static class Repair
         Array.Clear(_refineFromWorth);
         Array.Clear(_refinedFinal);
         Array.Clear(_refineFirstMs);
+        Array.Clear(_windowPasses);
+        Array.Clear(_windowWins);
+        Array.Clear(_windowGain);
+        Array.Clear(_windowMs);
+        Array.Clear(_windowLargest);
+        Array.Clear(_windowFirstMs);
+        Array.Clear(_windowLastMs);
+        Array.Clear(_windowRunningSinceMs);
+        Array.Clear(_windowWonMs);
     }
 
+    /// <summary>
+    /// A chain worth tearing at: last time's chain when the ground still allows it, a randomised or
+    /// enumerated construction of the worker's own for an exploring worker, and for worker nought the
+    /// best of several greedy builds, polished.
+    /// </summary>
     private static List<Vector2> Opening(PlanEnvironment env, List<Vector2> candidates,
-        List<Vector2> shortlist, Random random, Func<bool> waiting, CancellationToken token,
-        int shakes, out List<Vector2> seeded, List<Vector2> seed = null,
-        System.Diagnostics.Stopwatch band = null)
+        List<Vector2> shortlist, Random random, Func<bool> waiting,
+        int shakes, out List<Vector2> seeded, List<Vector2> seed = null, List<Vector2> own = null)
     {
         // Which enumerated opening this worker was given, for the caller to hold it in place for a while.
         // Null when the worker drew its own. See SolverSettings.ThreadRoles.
@@ -1440,66 +1709,13 @@ internal static class Repair
             top = Planner.Score(env, best);
         }
 
-        // The bands next, since it is the one that knows about the shape of the site. Worked out
-        // once for the whole solve however many workers and restarts ask for it. See Banded.
-        band?.Start();
-
-        // `shakes` IS the worker number - Search passes its stream in under that name, because the
-        // opening is shaken by it. See Opening's signature.
-        var bands = Banded(env, token, shakes);
-
-        band?.Stop();
-
-        if (bands is { Count: > 0 } banded)
-        {
-            // **Capped, and the cap is now a setting because what it was tuned against turned out
-            // not to matter.**
-            //
-            // Two was chosen when three looked like demolition - the fourth worker came back at
-            // 11,454 where the others reached 14,735 - and that reasoning treats a weak opening as a
-            // loss. It is not. Openings were measured at 1,159 to 1,297 against finishes above
-            // 4,100: the window is worth +217%, so the opening decides almost nothing about the
-            // score.
-            //
-            // What it does decide is whether the workers are different from each other, and at a cap
-            // of two every worker from the third onwards gets the same two shakes of the same band
-            // chain and is then polished onto the same local optimum. Measured on eight threads:
-            // three of them opened on the identical chain, twice running, and several finished on
-            // identical numbers. Those are not eight samples. See SolverSettings.OpeningShakes.
-            var opened = shakes > 0
-                ? Shaken(env, shortlist, banded, random, Math.Min(shakes, Math.Max(1, env.OpeningShakes)),
-                    Shakes)
-                : new List<Vector2>(banded);
-
-            var worth = Planner.Score(env, opened);
-
-            // **A shaken opening is taken because it is different, not because it is better.**
-            //
-            // This kept it only when it beat what was already in hand, and a shake is a
-            // perturbation - it makes the chain worse nearly every time, by design. So every
-            // worker fell back to the same unshaken band chain, and the pool explored one point
-            // with eight threads. Measured on Craggy Peninsula: all eight BUILT 106,088, before
-            // any polish, and finished there. The cap on shakes was blamed for this and was never
-            // the reason; raising it makes the shaken chain score worse still and be refused more
-            // surely.
-            //
-            // Worker nought is the exception and keeps the best construction, so the pool never
-            // loses the greedy answer while the others go looking. That is the ordinary division
-            // in a multi-start: one exploits, the rest explore.
-            if (stream > 0 || worth > top)
-            {
-                best = opened;
-                top = worth;
-            }
-        }
-
         // **An exploring worker opens on a randomised construction of its own, not on the chain
         // everybody else has.**
         //
         // This is the one thing measured to give the pool real variance, and it was found by accident:
-        // on a COLD press there is no seed, and Banded hands its answer to exactly one worker and null
-        // to whoever asks while it is building - so seven workers fell through to the greedy draw
-        // below. They built about 4,600 apiece against the band worker's 29,072, and finished at
+        // on a COLD press there is no seed, and the shared opening the solver then had reached one worker
+        // only - so seven workers fell through to the greedy draw below. They built about 4,600 apiece
+        // against that worker's 29,072, and finished at
         // 32,435, 32,538, 32,701, 32,765, 33,124, 33,273 and 36,056. The site scored 10,655.
         //
         // The next press on the same site with the same settings had a seed, so every worker opened
@@ -1519,8 +1735,33 @@ internal static class Repair
         // press proves it in the direction that matters, 4,600 to over 32,000 - so a weak start costs
         // little and a shared one costs the whole pool.
         //
-        // Worker nought keeps the seed, the bands and the polish, so the incumbent is never lost.
-        if (stream > 0)
+        // Worker nought keeps the seed, the greedy starts and the polish, so the incumbent is never lost.
+        //
+        // **A worker with its own chain from the last continuous pass continues it instead.** Still its own and
+        // still different from the others, so the variance above is kept; only the restart is dropped. See
+        // Search's own.
+        var continuing = stream > 0 && own is { Count: > 0 } && Sound(env, own);
+
+        if (continuing)
+        {
+            best = new List<Vector2>(own);
+            top = Planner.Score(env, best);
+
+            // **A worker opening on a remnant order takes it over the chain it carries when it scores more.** The
+            // orders are built again in the background when a reroll changes a remnant, and a carried chain shaped for the remnant as it
+            // was can be the wrong shape now; otherwise the carried chain, repaired from an order, beats the order it
+            // started from and the worker carries on. See RemnantOrder.Latest.
+            if (Role(env, stream) is { Opening: ThreadRoles.Opens.RemnantOrder } &&
+                env.RemnantOrderChains is { Count: > 0 } reordered &&
+                reordered[RemnantOrderSlot(env, stream) % reordered.Count] is { } fresh && Sound(env, fresh) &&
+                Planner.Score(env, fresh) > top)
+            {
+                best = new List<Vector2>(fresh);
+                top = Planner.Score(env, best);
+            }
+        }
+
+        if (stream > 0 && !continuing)
         {
             // **One worker in four ignores the enumeration and draws its own.** The same proportion this
             // file already reserves for a thread that never adopts, and for the same reason: if the
@@ -1534,7 +1775,19 @@ internal static class Repair
             var openings = env.Openings;
             var drawn = (List<Vector2>)null;
 
-            if (!hedging && openings is { Count: > 0 })
+            // A whole chain from an order of the remnants, a different one per worker with this role. See RemnantOrder.
+            if (Role(env, stream) is { Opening: ThreadRoles.Opens.RemnantOrder } &&
+                env.RemnantOrderChains is { Count: > 0 } ordered)
+            {
+                var index = RemnantOrderSlot(env, stream) % ordered.Count;
+
+                drawn = new List<Vector2>(ordered[index]);
+
+                if (stream >= 0 && stream < _orderOfWorker.Length)
+                    _orderOfWorker[stream] = index;
+            }
+
+            if (drawn == null && !hedging && openings is { Count: > 0 })
             {
                 // **Counted over the workers that take an enumerated opening**, so the ones that continue
                 // from the incumbent or draw their own do not leave gaps in the rotation.
@@ -1573,7 +1826,8 @@ internal static class Repair
             }
         }
 
-        // The greedy starts, which are what a worker opens on when the bands produced nothing.
+        // The greedy starts, which worker nought always runs and an exploring worker falls back to when it
+        // drew nothing of its own.
         //
         // **Skipped once an exploring worker has its own chain**, because the first of them is a
         // deterministic greedy - no random, one sample - and it is the same chain on every thread.
@@ -1688,8 +1942,12 @@ internal static class Repair
     /// The spots a repair is allowed to reach for: the richest, plus enough of the rest to keep the
     /// site connected. See Spread.
     /// </summary>
-    private static List<Vector2> Shortlist(PlanEnvironment env, List<Vector2> candidates)
+    internal static List<Vector2> Shortlist(PlanEnvironment env, List<Vector2> candidates)
     {
+        // Timed as a phase, because every worker builds this before its first round and none of it was counted
+        // anywhere but the worker's own time. See Planner.PhaseShortlist.
+        using var phase = new Planner.Phase(Planner.PhaseShortlist);
+        var shortlistClock = System.Diagnostics.Stopwatch.StartNew();
         var worth = new List<(Vector2 At, double Solo)>(candidates.Count);
         var one = new List<Vector2> { Vector2.Zero };
 
@@ -1771,7 +2029,56 @@ internal static class Repair
             steps++;
         }
 
-        var got = kept.Count - rich;
+        // **The edge points toward neighbours always, on top of the quota.** They are the places a link does a named
+        // job, and a quota filled by each spot's own score does not guarantee them: a spot on a remnant's edge facing
+        // the content scores less alone than one on its centre, and it is the edge the chain wants. Which edge points
+        // are offered is set under Solver > Advanced > Candidate spots. Worked out once per environment and shared by
+        // every worker. See Planner.EdgePointCellsOfEnvironment.
+        var edgePointClock = System.Diagnostics.Stopwatch.StartNew();
+        var edgePoints = 0;
+
+        if (env.Seeding is { HeavyEdgePoints: true } or { RareEdgePoints: true })
+        {
+            var present = new HashSet<Vector2>(kept);
+            List<Vector2> edgePointCells;
+
+            using (new Planner.Phase(Planner.PhaseShortlistEdgePoints))
+                edgePointCells = Planner.EdgePointCellsOfEnvironment(env);
+
+            foreach (var at in edgePointCells)
+            {
+                if (present.Add(at))
+                {
+                    kept.Add(at);
+                    edgePoints++;
+                }
+            }
+        }
+
+        edgePointClock.Stop();
+
+        // Spots a debug setting insists on, for testing whether the search finds a known chain once its spots are
+        // on offer. Refused ground is left out and named. See DebugSettings.ForcedShortlistSpots.
+        var forcedAdded = 0;
+        var forcedRefused = new List<Vector2>();
+
+        if (env.ForcedShortlistSpots is { Count: > 0 } forced)
+        {
+            var present = new HashSet<Vector2>(kept);
+
+            foreach (var at in forced)
+            {
+                if (!env.CanPlace(at))
+                    forcedRefused.Add(at);
+                else if (present.Add(at))
+                {
+                    kept.Add(at);
+                    forcedAdded++;
+                }
+            }
+        }
+
+        var got = kept.Count - rich - edgePoints - forcedAdded;
 
         Spreading = spread <= 0
             ? "no spread asked for - the shortlist is the richest spots and nothing else"
@@ -1787,8 +2094,17 @@ internal static class Repair
                       "them. Either the rich picks are blanketing the site - try fewer - or there is " +
                       "genuinely no open ground here.";
 
-        Listed = $"{rich:N0} richest asked {wanted:N0}, {kept.Count - rich:N0} spread asked " +
-                 $"{spread:N0}, {kept.Count:N0} of {candidates.Count:N0}" +
+        Listed = $"{rich:N0} richest asked {wanted:N0}, {got:N0} spread asked " +
+                 $"{spread:N0}, {edgePoints:N0} edge points added " +
+                 $"({edgePointClock.ElapsedMilliseconds:N0}ms of {shortlistClock.ElapsedMilliseconds:N0}ms building it), " +
+                 (env.ForcedShortlistSpots is { Count: > 0 } asked
+                     ? $"FORCED {forcedAdded:N0} of {asked.Count:N0} debug spots added" +
+                       (forcedRefused.Count > 0
+                           ? $", {forcedRefused.Count:N0} refused by the ground: " +
+                             string.Join(" ", forcedRefused.Select(p => $"({p.X:0},{p.Y:0})"))
+                           : "") + ", "
+                     : "") +
+                 $"{kept.Count:N0} of {candidates.Count:N0}" +
                  (steps == 0
                      ? $" - spacing {sparse:0.#} filled it first time"
                      : $" - spacing relaxed {sparse:0.#} to {relaxed:0.#} over {steps} step" +
@@ -2107,6 +2423,357 @@ internal static class Repair
     /// <summary>When each refining worker first rebuilt, in milliseconds from the start of its search. See _refines.</summary>
     private static readonly double[] _refineFirstMs = new double[16];
 
+    /// <summary>
+    /// The pool's best improved by ExhaustiveSpotSearch, when the first refining worker has not yet searched a chain
+    /// worth this much, or null when nothing betters it. A pass of windows of WindowStops stops, then when that finds
+    /// nothing a sweep of the larger windows up to MostWindowStops; it returns at the first pass that improves the
+    /// chain, and the next call starts on what is then the pool's best - with the sweep, when the sweep produced it.
+    /// See PassOfWindows and SweepsFirst. Asked every few hundred rounds and at each kick, before the refine share of
+    /// the window as well as after it, until the solve ends.
+    ///
+    /// **Why the refiner's kick.** The pool's best is where the moves that change one or two links at a time have
+    /// stopped, and an ending that only pays once four links move together is out of their reach: on a Frigid
+    /// Bluffs site (2026-10-04) windows of three stops took the solver's 72,989 to 74,276 in three passes, 1.4 s
+    /// offline, where a round of every other move found nothing. One worker, so the rest keep their rounds.
+    /// </summary>
+    /// <param name="began">When the solve began, for the times the dump gives. See SpotSearchSaid.</param>
+    private static List<Vector2> LeaderImprovedBySpotSearch(PlanEnvironment env, int stream, Func<bool> waiting, DateTime began)
+    {
+        if (RefineSlot(env, stream) != 0 || stream < 0 || stream >= _windowPasses.Length)
+            return null;
+
+        // **Not until the order search has stalled.** Until then the pool's best is a fallback chain or an order the
+        // search is about to better, and the search wants the router to itself: after a reload on a Frigid Bluffs site
+        // (2026-10-04) this search ran from 1.9 s into the solve beside an order search that ended at 10.7 s. See
+        // DestroyAndRepairSettings.RemnantOrdersFirst.
+        //
+        // **The search the workers wait for, not the background feed.** The feed builds new orders after a reroll on one
+        // low-priority thread while the workers search the old ones, and this waited for it too: 11.1 s offline on that
+        // site, unloaded, and longer in game beside the workers - a large part of a continuous reroll pass with no spot
+        // search and no worker moving to a spare order. See RemnantOrder.SearchingAcrossThreads.
+        if (env.RemnantOrdersFirst && RemnantOrder.SearchingAcrossThreads)
+            return null;
+
+        var (leader, leaderWorth) = Solving.Leader();
+        var leaderFrom = Solving.LeaderFrom();
+
+        if (leader is not { Count: > 2 } || SpotSearched(leader, leaderWorth))
+            return null;
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var chain = leader;
+        var worth = leaderWorth;
+        var sweeping = SweepsFirst(leader, leaderWorth);
+        var searchedAll = false;
+
+        if (_windowFirstMs[stream] <= 0d)
+            _windowFirstMs[stream] = (DateTime.UtcNow - began).TotalMilliseconds;
+
+        _windowRunningSinceMs[stream] = (DateTime.UtcNow - began).TotalMilliseconds;
+
+        while (waiting())
+        {
+            var relaid = PassOfWindows(env, chain, sweeping, waiting);
+
+            _windowPasses[stream]++;
+            _windowLargest[stream] = Math.Max(_windowLargest[stream], sweeping ? MostWindowStops : WindowStops);
+
+            // **A pass stopped part way is not a pass that found nothing.** RelayEachWindow answers null for both, and
+            // counting the stop as a pass moved the size on: stopped during the windows of six, the chain went past
+            // MostWindowStops and was marked searched, and no later call searched it. On a replay of a Frigid Bluffs
+            // site (2026-10-05) the refining worker's last call, with windows of six reached, ended 16.8 s into a 25.5 s
+            // pass that stayed on 73,083, a chain windows of six take to 74,511 in two passes offline.
+            if (relaid == null && !waiting())
+                break;
+
+            if (relaid == null && sweeping)
+            {
+                searchedAll = true;
+
+                break;
+            }
+
+            if (relaid == null)
+            {
+                sweeping = true;
+
+                continue;
+            }
+
+            // Handed over at once rather than at the end of the search, so the pool has it while the windows grow;
+            // the next call carries on from it, the pool's best then. Offline the 74,276 was held back for the 4 s the
+            // passes after it took.
+            chain = relaid;
+            worth = Planner.Score(env, chain);
+            GainedBySweep(chain, worth, sweeping);
+
+            break;
+        }
+
+        // Marked searched only when the sweep ran to its end; a search the solve's end cut short goes on from the
+        // same chain at the next kick.
+        if (searchedAll)
+            MarkSpotSearched(chain, worth);
+
+        _windowMs[stream] += clock.Elapsed.TotalMilliseconds;
+        _windowLastMs[stream] = (DateTime.UtcNow - began).TotalMilliseconds;
+        _windowRunningSinceMs[stream] = 0d;
+
+        if (worth <= leaderWorth + 0.0001d)
+            return null;
+
+        _windowWins[stream]++;
+        _windowGain[stream] += worth - leaderWorth;
+
+        // Whose chain the search started from, for the dump: the worker that published it, its role, and the remnant
+        // order it was working when it did. See SpotSearchSaid.
+        lock (_spotWinsFrom)
+            _spotWinsFrom.Add(
+                $"at {_windowLastMs[stream]:N0}ms {Planner.Plainly(env, leader):N0} -> {Planner.Plainly(env, chain):N0} plain, " +
+                $"from worker {leaderFrom}'s chain ({Role(env, leaderFrom)?.Opening.ToString() ?? "no role"}" +
+                (leaderFrom >= 0 && leaderFrom < _orderOfWorker.Length && _orderOfWorker[leaderFrom] >= 0
+                    ? $", on remnant order #{_orderOfWorker[leaderFrom] + 1} of {OrdersOffered(env)}" : "") + ")");
+
+        _windowWonMs[stream] = _windowLastMs[stream];
+
+        return chain;
+    }
+
+    /// <summary>
+    /// A chain improved by ExhaustiveSpotSearch until it stalls - a pass of windows of WindowStops stops, then the
+    /// sweep of the larger windows, each gain followed by the same kind of pass that found it - each gain handed to
+    /// <paramref name="better"/> as it comes; null when nothing betters it. Stops when the solve does. See PassOfWindows.
+    /// </summary>
+    /// <summary>
+    /// Whether an order worker's search of its own order goes on to the sweep of windows up to MostWindowStops. Off:
+    /// see SearchOwnChain.
+    /// </summary>
+    private const bool OwnChainSweeps = false;
+
+    private static List<Vector2> SpotSearchUntilStalled(PlanEnvironment env, List<Vector2> chain, Func<bool> waiting,
+        Action<List<Vector2>> better, bool sweep = true)
+    {
+        // With sweep off the search stops once the windows of WindowStops find nothing, and the chain is not marked
+        // searched, since the larger windows never ran on it.
+        if (SpotSearched(chain, Planner.Score(env, chain)))
+            return null;
+
+        var current = chain;
+        var gained = false;
+        var sweeping = false;
+        var searchedAll = false;
+
+        while (waiting())
+        {
+            var relaid = PassOfWindows(env, current, sweeping, waiting);
+
+            // A pass stopped part way is not one that found nothing. See LeaderImprovedBySpotSearch.
+            if (relaid == null && !waiting())
+                break;
+
+            if (relaid == null && sweeping)
+            {
+                searchedAll = true;
+
+                break;
+            }
+
+            if (relaid == null)
+            {
+                if (!sweep)
+                    break;
+
+                sweeping = true;
+
+                continue;
+            }
+
+            // Carried on as it was found, by the sweep or by the windows of WindowStops. See SweepsFirst.
+            current = relaid;
+            gained = true;
+            better(current);
+        }
+
+        if (searchedAll)
+            MarkSpotSearched(current, Planner.Score(env, current));
+
+        return gained ? current : null;
+    }
+
+    /// <summary>
+    /// How many consecutive stops the first windows hold. Three found the ending on that Frigid Bluffs site in 1.4 s
+    /// offline and four in 2.5 s, to the same chain. See ExhaustiveSpotSearch.
+    /// </summary>
+    private const int WindowStops = 3;
+
+    /// <summary>
+    /// How many stops the windows grow to before a chain counts as searched. Six, not five: relics count as stops, and
+    /// the ending of a 74,000 chain on a Frigid Bluffs site (2026-10-04) moves four remnants and two relics at once -
+    /// from the solver's 72,880, windows of five found nothing and windows of six reached 74,301. See
+    /// LeaderImprovedBySpotSearch.
+    /// </summary>
+    private const int MostWindowStops = 6;
+
+    /// <summary>
+    /// Per worker in the last solve: passes of the exhaustive spot search, how many searches bettered the pool's best
+    /// and by how much, the time they took, the largest window reached, and the worth of the chain last searched to
+    /// the end. See LeaderImprovedBySpotSearch.
+    /// </summary>
+    private static readonly int[] _windowPasses = new int[16];
+
+    /// <summary>See _windowPasses.</summary>
+    private static readonly int[] _windowWins = new int[16];
+
+    /// <summary>
+    /// The chains the exhaustive spot search has run to the largest windows without bettering, by their spots and
+    /// their score, kept across solves until a reset. The score is part of the key so a change to the site, which
+    /// changes it, has the chain searched again.
+    ///
+    /// **Kept across solves, not per solve.** It was a worth per worker cleared at every solve's start, so each pass of
+    /// continuous solving searched the chain the last pass had already searched to the end - seconds of the refining
+    /// worker's time a pass, and an order worker's on the chain it carried. See Caches.ForgetPlan.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int Spots, double Score), byte> _spotSearched = new();
+
+    private static (int Spots, double Score) SpotSearchedKey(List<Vector2> chain, double worth)
+    {
+        var hash = new HashCode();
+
+        foreach (var spot in chain)
+            hash.Add(spot);
+
+        return (hash.ToHashCode(), Math.Round(worth, 3));
+    }
+
+    /// <summary>Whether this chain, at this score, has been searched to the largest windows. See _spotSearched.</summary>
+    private static bool SpotSearched(List<Vector2> chain, double worth) =>
+        _spotSearched.ContainsKey(SpotSearchedKey(chain, worth));
+
+    private static void MarkSpotSearched(List<Vector2> chain, double worth) =>
+        _spotSearched.TryAdd(SpotSearchedKey(chain, worth), 0);
+
+    /// <summary>Forgets which chains have been searched, for a reset meant to start the search afresh. See Caches.</summary>
+    internal static void ForgetSpotSearched()
+    {
+        _spotSearched.Clear();
+        _gainedBySweep.Clear();
+    }
+
+    /// <summary>
+    /// One pass of the exhaustive spot search over a chain: every window of WindowStops stops, or with
+    /// <paramref name="sweeping"/> every window of one more up to MostWindowStops, taken by where they end from the end
+    /// of the chain back. The first that improves the chain, or null. See SweepsFirst.
+    ///
+    /// **Windows by where they end, every size at each end, rather than a pass of each size in turn.** On a Frigid
+    /// Bluffs site (2026-10-05), from a 73,083 chain, passes of three, four and five stops cost 0.85 s, 1.6 s and 3.9 s
+    /// finding nothing before one of six reached 74,047 in 3.0 s, its gain at the tail, and a second pass of six
+    /// reached 74,511: about 12 s offline. Taken by where they end, the same windows reached 74,511 in 3.7 s. A pass of
+    /// threes still comes first, since a small gain away from the tail costs it under a second and the sweep reaches it
+    /// only after every larger window behind it.
+    ///
+    /// In three 25 s solves from that site's whole-site orders, 74k came 5.7-6.1 s after the orders against 11.4-13.3 s
+    /// growing the windows a size at a time, and each solve ended on 74,494 where those ended on 74,503 or 74,511.
+    /// Starting every call with the threes, a sweep's gains included, did not recover it - two of three ended on 74,494
+    /// - and took 7.9-10.0 s to 74k.
+    /// </summary>
+    private static List<Vector2> PassOfWindows(PlanEnvironment env, List<Vector2> chain, bool sweeping, Func<bool> waiting) =>
+        sweeping
+            ? ExhaustiveSpotSearch.RelayEachWindowByEnd(env, chain, WindowStops + 1, MostWindowStops, 1, () => !waiting())
+            : ExhaustiveSpotSearch.RelayEachWindow(env, chain, SmallestWindowStops, 1, () => !waiting()) ??
+              (waiting() ? ExhaustiveSpotSearch.RelayEachWindow(env, chain, WindowStops, 1, () => !waiting()) : null);
+
+    /// <summary>
+    /// The windows a pass tries before those of WindowStops: two stops. A larger window does not stand in for a smaller
+    /// one - on a Craggy Peninsula site (2026-10-05) windows of two took the solver's 26,701 to 28,134 in 0.2 s by moving
+    /// two neighbouring links together, where windows of three and of four from the same chain found nothing. Neither
+    /// link improves the chain alone: the first moved alone leaves the next out of reach, the second alone scores 26,605.
+    /// See PassOfWindows.
+    /// </summary>
+    private const int SmallestWindowStops = 2;
+
+    /// <summary>
+    /// Whether a spot search of this chain starts with the sweep: when the sweep produced it, since the windows of
+    /// WindowStops were searched on the chain before that gain, which changed only the window it laid again. See
+    /// PassOfWindows.
+    /// </summary>
+    private static bool SweepsFirst(List<Vector2> chain, double worth) =>
+        _gainedBySweep.TryGetValue(SpotSearchedKey(chain, worth), out var swept) && swept;
+
+    private static void GainedBySweep(List<Vector2> chain, double worth, bool sweeping) =>
+        _gainedBySweep[SpotSearchedKey(chain, worth)] = sweeping;
+
+    /// <summary>The chains a spot search produced, by chain and score, and whether the sweep produced each. See SweepsFirst.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int Spots, double Score), bool> _gainedBySweep = new();
+
+    /// <summary>See _windowPasses.</summary>
+    private static readonly double[] _windowGain = new double[16];
+
+    /// <summary>See _windowPasses.</summary>
+    private static readonly double[] _windowMs = new double[16];
+
+    /// <summary>See _windowPasses.</summary>
+    private static readonly int[] _windowLargest = new int[16];
+
+    /// <summary>
+    /// When, in milliseconds from the start of the solve, each worker first began the search, last finished one, and
+    /// last bettered the pool's best with it. See _windowPasses.
+    /// </summary>
+    private static readonly double[] _windowFirstMs = new double[16];
+
+    /// <summary>See _windowFirstMs.</summary>
+    private static readonly double[] _windowLastMs = new double[16];
+
+    /// <summary>
+    /// When the call running now began, in milliseconds into the solve, or nought when none is. The time spent and the
+    /// end are written as a call returns, so without this a dump taken during one read as passes that took no time
+    /// and ended at the solve's start. See SpotSearchSaid.
+    /// </summary>
+    private static readonly double[] _windowRunningSinceMs = new double[16];
+
+    /// <summary>See _windowFirstMs.</summary>
+    private static readonly double[] _windowWonMs = new double[16];
+
+    /// <summary>See _windowPasses.</summary>
+
+    /// <summary>What the exhaustive spot search did in the last solve, for the dump. See LeaderImprovedBySpotSearch.</summary>
+    internal static string SpotSearchSaid
+    {
+        get
+        {
+            var said = new List<string>();
+
+            for (var i = 0; i < _windowPasses.Length; i++)
+            {
+                if (_windowPasses[i] > 0)
+                    said.Add($"worker {i} ran {_windowPasses[i]} pass(es) over the pool's best, windows up to {_windowLargest[i]} stops, " +
+                             $"in {_windowMs[i]:N0}ms over the calls ended, first begun at {_windowFirstMs[i]:N0}ms and " +
+                             (_windowLastMs[i] > 0d ? $"last ended at {_windowLastMs[i]:N0}ms into the solve, " : "none ended yet, ") +
+                             (_windowRunningSinceMs[i] > 0d ? $"one running since {_windowRunningSinceMs[i]:N0}ms into the solve, " : "") +
+                             $"{_windowWins[i]} search(es) bettering it by {_windowGain[i]:N0} in all" +
+                             (_windowWins[i] > 0 ? $", the last at {_windowWonMs[i]:N0}ms" : ""));
+            }
+
+            lock (_spotWinsFrom)
+                if (_spotWinsFrom.Count > 0)
+                    said.Add("its gains: " + string.Join("; ", _spotWinsFrom));
+
+            return said.Count == 0 ? "no worker ran it" : string.Join("; ", said);
+        }
+    }
+
+    /// <summary>
+    /// By worker, this solve: which of the published remnant orders it last took - its opening or a spare - counted from
+    /// nought in the order search's ranking, or -1. See SpotSearchSaid.
+    /// </summary>
+    private static readonly int[] _orderOfWorker = Enumerable.Repeat(-1, 64).ToArray();
+
+    /// <summary>Each gain of the exhaustive spot search this solve, with whose chain it started from. See SpotSearchSaid.</summary>
+    private static readonly List<string> _spotWinsFrom = new();
+
+    /// <summary>How many remnant orders the workers were given. See SpotSearchSaid.</summary>
+    private static int OrdersOffered(PlanEnvironment env) =>
+        env.RemnantOrderChains?.Count ?? RemnantOrder.PublishedFor(env)?.Count ?? 0;
+
     /// <summary>What each refining worker did in the last solve, for the dump.</summary>
     internal static string RefiningSaid
     {
@@ -2183,8 +2850,315 @@ internal static class Repair
     /// Whether this worker opens on the enumerated openings, and so has to wait for them. True for a worker no
     /// roles line describes, because Opening then draws on the enumeration for every worker but the hedges.
     /// </summary>
+    internal static bool OpensOnRemnantOrder(PlanEnvironment env, int stream) =>
+        stream > 0 && Role(env, stream) is { Opening: ThreadRoles.Opens.RemnantOrder };
+
+    /// <summary>
+    /// How many of the workers opening on remnant orders wait for the order search, with remnant orders first; the
+    /// search runs on their threads. The rest start at once on their roles' own openings and take orders as the search
+    /// publishes them.
+    ///
+    /// **Two, not all six.** With every order worker waiting, only the continuing and refining workers searched until
+    /// the orders arrived, and a site whose best chain lies outside every order was found late or not at all: on a
+    /// Craggy Peninsula site (2026-10-05) the order workers all climbed orders round 26,000 while the 28,914 chain was
+    /// found from a fallback opening, in one draw of three. Over seven Grand sites and five draws of cold 10 s presses
+    /// with every aim routed, the mean share of each site's best was 67/81/87/91/94/98% at 1/2/3/5/7/10 s with two
+    /// waiting, against 61/78/84/90/92/96% with all six; with one waiting the orders came too slowly (96% at 10 s),
+    /// and with none, built on one thread in the background, 96%. Measured offline, 2026-10-06. See WaitsForOrders.
+    /// </summary>
+    internal const int OrderWorkersWaiting = 2;
+
+    /// <summary>
+    /// How many threads the order search runs on for a solve with this many order workers: one per waiting worker. See
+    /// OrderWorkersWaiting.
+    /// </summary>
+    internal static int OrderSearchParts(int orderWorkers) => Math.Min(OrderWorkersWaiting, orderWorkers);
+
+    /// <summary>
+    /// Whether this worker waits for the order search before it starts: the first OrderWorkersWaiting of the workers
+    /// opening on remnant orders. See OrderWorkersWaiting.
+    /// </summary>
+    internal static bool WaitsForOrders(PlanEnvironment env, int stream) =>
+        OpensOnRemnantOrder(env, stream) && RemnantOrderSlot(env, stream) < OrderWorkersWaiting;
+
+    /// <summary>Which remnants this worker searches as though they were must take. See ThreadRoles.Role.HoldsRemnants.</summary>
+    internal static ThreadRoles.RemnantsHeld RemnantsHeldBy(PlanEnvironment env, int stream) =>
+        Role(env, stream)?.HoldsRemnants ?? ThreadRoles.RemnantsHeld.Free;
+
+    /// <summary>
+    /// Which remnants this worker holds in this search: its role's, except that with HoldEveryRemnantUnderTakeLast on
+    /// and a marker taken last, the order workers that do not wait for the orders hold every remnant. Off by default.
+    ///
+    /// **No measured effect since the held first solve.** It was added on a figure of 11,894 that the offline harness
+    /// reported by counting chains not ending on the marker, which the pool cannot keep. Measured again after that fix,
+    /// with the held first solve and edge points at step 0 (Grazed Prairie 12:00, 2026-10-06, a held then a real 10 s
+    /// press, 2 draws): 11,620 and 11,620 with it, 11,620 and 11,611 without it, and with a plain worker in place of the
+    /// descending one 11,609 and 11,622 with it, 11,609 and 11,564 without. So it is off (HoldEveryRemnantUnderTakeLast);
+    /// the held first solve (Planning.HeldFirstSolve) is what takes every remnant. Without a marker taken last the same workers holding every
+    /// remnant did slightly worse over eight Grand sites - 94.3% of each site's best at 10 s against 95.1% - so the roles
+    /// as written stand there. See WaitsForOrders.
+    /// </summary>
+    /// <summary>
+    /// Whether RemnantsHeldWith switches order workers to every remnant under a marker taken last. Off: it had no
+    /// measured effect once the held first solve took every remnant, and off was level with on. Settable for the offline
+    /// harness.
+    /// </summary>
+    internal static bool HoldEveryRemnantUnderTakeLast;
+
+    internal static ThreadRoles.RemnantsHeld RemnantsHeldWith(PlanEnvironment env, int stream)
+    {
+        var held = RemnantsHeldBy(env, stream);
+
+        if (HoldEveryRemnantUnderTakeLast && held == ThreadRoles.RemnantsHeld.Free && env.TakenLast >= 0 &&
+            OpensOnRemnantOrder(env, stream) &&
+            !WaitsForOrders(env, stream))
+            return ThreadRoles.RemnantsHeld.All;
+
+        return held;
+    }
+
+    /// <summary>
+    /// A worker's search with the remnants it holds as must take (see RemnantsHeldWith): Search itself for one holding none, on every
+    /// remnant for one holding all, and SearchDescendingRemnants for one descending. See ThreadRoles.Role.HoldsRemnants.
+    /// </summary>
+    internal static Plan SearchHoldingRemnants(PlanEnvironment env, TimeSpan budget, TimeSpan settle,
+        CancellationToken token, Action<List<Vector2>> found, int stream, List<Vector2> seed, List<Vector2> own) =>
+        RemnantsHeldWith(env, stream) switch
+        {
+            ThreadRoles.RemnantsHeld.All => Search(WithEveryRemnantMustTake(env), budget, settle, token, found, stream, seed, own),
+            ThreadRoles.RemnantsHeld.Descending => SearchDescendingRemnants(env, budget, settle, token, found, stream, seed, own),
+            _ => Search(env, budget, settle, token, found, stream, seed, own),
+        };
+
+    /// <summary>
+    /// Searches with every remnant must take, then every one but one, then but two, a slice each, and then as itself
+    /// for the rest of the window, each search seeded with the best chain so far, and answers the best by env's own
+    /// score. What it finds goes to the pool as it is found, judged there on env.
+    ///
+    /// **Why.** Holding every remnant first found 11,905 within 3 s on a Grazed Prairie site (2026-10-06), where the
+    /// plain search reached 11,847 in 10 s and, with a remnant taken last, 10,965. Where the best chain leaves a remnant
+    /// out, holding every one misleads, so the variants after it each free one - the least valuable first, since those
+    /// are likeliest to be worth leaving - and then two among the least valuable. More than two left out is not tried.
+    ///
+    /// Each worker with this role starts at a different variant, so between them they cover the list sooner. The
+    /// marks the player made stand in every variant.
+    /// </summary>
+    internal static Plan SearchDescendingRemnants(PlanEnvironment env, TimeSpan budget, TimeSpan settle,
+        CancellationToken token, Action<List<Vector2>> found, int stream, List<Vector2> seed, List<Vector2> own)
+    {
+        var began = DateTime.UtcNow;
+        var variants = RemnantVariantsDescending(env);
+        var offset = DescendingSlot(env, stream);
+        List<Vector2> best = null;
+        var bestScore = double.NegativeInfinity;
+        Plan bestPlan = null;
+
+        void Keep(Plan plan)
+        {
+            if (plan?.Points is not { Count: > 0 } points)
+                return;
+
+            var score = Planner.Score(env, points);
+
+            if (score <= bestScore)
+                return;
+
+            bestScore = score;
+            best = new List<Vector2>(points);
+            bestPlan = plan;
+        }
+
+        var slice = TimeSpan.FromMilliseconds(DescendingSliceMs);
+
+        for (var i = 0; i < variants.Count && !token.IsCancellationRequested &&
+                        DateTime.UtcNow - began < TimeSpan.FromMilliseconds(DescendingPhaseMs) &&
+                        DateTime.UtcNow - began + slice < budget; i++)
+        {
+            var held = variants[(offset + i) % variants.Count];
+
+            Solving.Happened(stream, $"holding {held.Count} remnant(s) as must take for {DescendingSliceMs} ms");
+            Keep(Search(WithMustTake(env, held), slice, slice, token, found, stream, best ?? seed, i == 0 ? own : null));
+        }
+
+        var left = budget - (DateTime.UtcNow - began);
+
+        if (!token.IsCancellationRequested && left > TimeSpan.Zero)
+            Keep(Search(env, left, settle, token, found, stream, best ?? seed, best == null ? own : null));
+
+        return bestPlan == null || best == null ? bestPlan : Planner.Describe(env, best);
+    }
+
+    /// <summary>How long each held set gets in SearchDescendingRemnants. Chosen, not measured.</summary>
+    private const int DescendingSliceMs = 1500;
+
+    /// <summary>How long SearchDescendingRemnants spends on held sets before searching as itself. Chosen, not measured.</summary>
+    private const int DescendingPhaseMs = 6000;
+
+    /// <summary>
+    /// The remnant sets SearchDescendingRemnants holds, in order: every remnant, then every one but one for each, the
+    /// least valuable left out first, then every one but two among the three least valuable. Remnants the plan avoids
+    /// are in none. Indices into env.Targets.
+    /// </summary>
+    private static List<List<int>> RemnantVariantsDescending(PlanEnvironment env)
+    {
+        var remnants = new List<int>();
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            if (env.Targets[i].Kind == TargetKind.Remnant && !env.Targets[i].Shunned)
+                remnants.Add(i);
+        }
+
+        var cheapest = remnants.OrderBy(i => Planner.WorthOfTarget(env.Targets[i])).ToList();
+        var variants = new List<List<int>> { remnants };
+
+        foreach (var left in cheapest)
+            variants.Add(remnants.Where(i => i != left).ToList());
+
+        var few = cheapest.Take(3).ToList();
+
+        for (var a = 0; a < few.Count; a++)
+        for (var b = a + 1; b < few.Count; b++)
+            variants.Add(remnants.Where(i => i != few[a] && i != few[b]).ToList());
+
+        return variants;
+    }
+
+    /// <summary>This worker's place among the workers descending, from nought, for where it starts in the variants.</summary>
+    private static int DescendingSlot(PlanEnvironment env, int stream)
+    {
+        var slot = 0;
+
+        for (var i = 0; i < stream && i < (env.Roles?.Count ?? 0); i++)
+        {
+            if (env.Roles[i].HoldsRemnants == ThreadRoles.RemnantsHeld.Descending)
+                slot++;
+        }
+
+        return slot;
+    }
+
+    /// <summary>
+    /// The environment with these targets must take as well as the player's, each credited far above anything a chain
+    /// scores where the site has no credit of its own. See WithEveryRemnantMustTake.
+    /// </summary>
+    internal static PlanEnvironment WithMustTake(PlanEnvironment env, IReadOnlyCollection<int> held)
+    {
+        if (env?.Targets == null || held is not { Count: > 0 })
+            return env;
+
+        var targets = new List<PlanTarget>(env.Targets);
+        var changed = false;
+
+        foreach (var i in held)
+        {
+            if (i < 0 || i >= targets.Count || targets[i].Must)
+                continue;
+
+            targets[i] = targets[i] with { Must = true };
+            changed = true;
+        }
+
+        if (!changed)
+            return env;
+
+        return HeldEnvironment(env, targets);
+    }
+
+    /// <summary>
+    /// The environment with every remnant must take, for a worker whose role holds every remnant: its search ranks a
+    /// chain holding more remnants above any holding fewer, and only then by score, as when the player marks them all.
+    /// The pool judges what it publishes by the real environment, so this can only add candidates.
+    ///
+    /// **Why a worker does it.** On a Grazed Prairie site (2026-10-06) the search left a remnant out where a chain with
+    /// all eight scored higher, and marking all eight must take by hand found 11,639 within seconds where the plain
+    /// search ended at 10,991. Holding every remnant first is a strong guide wherever the best chain does take them all,
+    /// and a worse one where it does not, which is why it is one worker's role and not the rule.
+    ///
+    /// Not a remnant the plan avoids - its weight is below nought - since holding it is what the player said not to do.
+    /// The credit for each is far above anything a chain scores, kept where the site already has one.
+    /// </summary>
+    internal static PlanEnvironment WithEveryRemnantMustTake(PlanEnvironment env)
+    {
+        if (env?.Targets == null)
+            return env;
+
+        var targets = new List<PlanTarget>(env.Targets.Count);
+        var changed = false;
+
+        foreach (var target in env.Targets)
+        {
+            if (target.Kind == TargetKind.Remnant && !target.Must && !target.Shunned)
+            {
+                targets.Add(target with { Must = true });
+                changed = true;
+            }
+            else
+            {
+                targets.Add(target);
+            }
+        }
+
+        if (!changed)
+            return env;
+
+        return HeldEnvironment(env, targets);
+    }
+
+    /// <summary>
+    /// The environment with these targets, which hold remnants as must take beyond the player's marks: each credited far
+    /// above anything a chain scores, and the marker taken last, if any, counted twice.
+    ///
+    /// **Why twice.** At one apiece a chain taking every remnant but not ending on the marker ties with one ending on it
+    /// that leaves a remnant out, and the first usually scores more, so it wins - and it is a chain the real objective
+    /// cannot use. On a Grazed Prairie site (2026-10-06) a pool holding every remnant published only such chains, 11,614
+    /// to 11,931, none ending on the marker. Twice breaks the tie the right way and no further: weighting the marker
+    /// above every added remnant together held the score at about 11,050 offline. See PlanTarget.MustWeight.
+    /// </summary>
+    /// <summary>How many must takes the marker taken last counts as in HeldEnvironment. Settable for the offline harness.</summary>
+    internal static int TakenLastWeightWhenHeld = 2;
+
+    private static PlanEnvironment HeldEnvironment(PlanEnvironment env, List<PlanTarget> targets)
+    {
+        if (env.TakenLast >= 0 && env.TakenLast < targets.Count && targets[env.TakenLast].Must)
+            targets[env.TakenLast] = targets[env.TakenLast] with { MustWeight = TakenLastWeightWhenHeld };
+
+        var musts = 0;
+
+        foreach (var target in targets)
+        {
+            if (target.Must)
+                musts += target.MustWeight;
+        }
+
+        return env with { Targets = targets, Musts = musts, Refused = Math.Max(env.Refused, EveryRemnantCredit) };
+    }
+
+    /// <summary>
+    /// The credit a must take holds in WithEveryRemnantMustTake where the site has none: above anything a chain scores,
+    /// as Planning's ceiling is, and small enough that the sum over every remnant keeps a score's precision.
+    /// </summary>
+    private const double EveryRemnantCredit = 1e9;
+
     internal static bool TakesEnumeratedOpening(PlanEnvironment env, int stream) =>
         stream > 0 && Role(env, stream) is null or { Opening: ThreadRoles.Opens.Enumerated };
+
+    /// <summary>
+    /// This worker's place among the workers whose opening is a remnant order, so each starts from a different one.
+    /// See ThreadRoles.Opens.RemnantOrder.
+    /// </summary>
+    private static int RemnantOrderSlot(PlanEnvironment env, int stream)
+    {
+        var slot = 0;
+
+        for (var i = 0; i < stream && i < (env.Roles?.Count ?? 0); i++)
+        {
+            if (env.Roles[i].Opening == ThreadRoles.Opens.RemnantOrder)
+                slot++;
+        }
+
+        return slot;
+    }
 
     private static (int At, double Share) Told(string mix, int stream)
     {
@@ -2303,7 +3277,53 @@ internal static class Repair
     /// <summary>Rebuild's scratch collections, one set per thread. See RebuildInner.</summary>
     [ThreadStatic] private static List<(int At, Vector2 Spot, double Worth)> _near;
 
-    [ThreadStatic] private static HashSet<int> _held;
+    /// <summary>
+    /// Which markers the chain already holds, as the stamp of the hole that marked them, by marker index. A new stamp
+    /// per hole clears it without touching the array. See RebuildInner.
+    /// </summary>
+    [ThreadStatic] private static int[] _heldMarks;
+
+    [ThreadStatic] private static int _heldStamp;
+
+    /// <summary>
+    /// What the rebuild ranks a shortlist on, worked out once per environment and shortlist on each thread: the
+    /// markers each spot catches, by the spot's index in the shortlist, and each marker's worth to the ranking - its
+    /// own worth plus what a remnant is worth where it stands - by marker index. Both are fixed for a solve. The caught
+    /// lists are the coverage index's own arrays. See RebuildInner.
+    /// </summary>
+    private static (int[][] CaughtBySpot, float[] WorthOfMarker) RankingPricesOf(PlanEnvironment env,
+        List<Vector2> shortlist)
+    {
+        if (ReferenceEquals(_rankingEnv, env) && ReferenceEquals(_rankingShortlist, shortlist) &&
+            _rankingPrices.CaughtBySpot.Length == shortlist.Count)
+            return _rankingPrices;
+
+        var caught = new int[shortlist.Count][];
+
+        for (var s = 0; s < shortlist.Count; s++)
+            caught[s] = Planner.CaughtIndicesAt(env, shortlist[s]);
+
+        var worth = new float[env.Targets.Count];
+
+        for (var i = 0; i < worth.Length; i++)
+        {
+            var target = env.Targets[i];
+
+            worth[i] = Planner.WorthOfTarget(target) + MathF.Max(0f, target.Rough(0f));
+        }
+
+        _rankingEnv = env;
+        _rankingShortlist = shortlist;
+        _rankingPrices = (caught, worth);
+
+        return _rankingPrices;
+    }
+
+    [ThreadStatic] private static PlanEnvironment _rankingEnv;
+
+    [ThreadStatic] private static List<Vector2> _rankingShortlist;
+
+    [ThreadStatic] private static (int[][] CaughtBySpot, float[] WorthOfMarker) _rankingPrices;
 
     [ThreadStatic] private static List<(int Spot, double Gain)> _ranked;
 
@@ -2441,11 +3461,9 @@ internal static class Repair
         // the nested reach queries is these four growing to the shortlist's size on every call and
         // being dropped. Clearing keeps the capacity they have already grown to.
         var near = _near ??= new List<(int At, Vector2 Spot, double Worth)>();
-        var held = _held ??= new HashSet<int>();
         var ranked = _ranked ??= new List<(int Spot, double Gain)>();
 
         near.Clear();
-        held.Clear();
         ranked.Clear();
 
         // One tally for every hole, wound back between them rather than allocated again. See the
@@ -2479,12 +3497,22 @@ internal static class Repair
             // Ranked on the marker's own worth plus what a remnant is worth where it stands, because
             // a remnant's reward lives in its combinations rather than its weight - the same measure
             // Remnants sorts on, and for the same reason.
-            held.Clear();
+            var ranking = new Planner.Phase(Planner.PhaseRebuildRank);
+
+            // **Read from arrays worked out once per shortlist, not looked up per spot per hole.** Which markers each
+            // spot catches and what each marker is worth to the ranking are both fixed for a solve, and looking them
+            // up again - a coverage lookup per spot, a set per hole - was most of what ranking cost. Same markers, same
+            // worths, summed in the same order, so the ranking comes out the same. See RankingPricesOf.
+            var (caughtBySpot, worthOfMarker) = RankingPricesOf(env, shortlist);
+            var marks = _heldMarks = _heldMarks is { } had && had.Length >= env.Targets.Count
+                ? had
+                : new int[env.Targets.Count];
+            var stamp = ++_heldStamp;
 
             foreach (var link in chain)
             {
                 foreach (var index in Planner.CaughtIndicesAt(env, link))
-                    held.Add(index);
+                    marks[index] = stamp;
             }
 
             ranked.Clear();
@@ -2498,14 +3526,12 @@ internal static class Repair
 
                 var gain = 0d;
 
-                foreach (var index in Planner.CaughtIndicesAt(env, spot))
+                foreach (var index in caughtBySpot[s])
                 {
-                    if (held.Contains(index))
+                    if (marks[index] == stamp)
                         continue;
 
-                    var target = env.Targets[index];
-
-                    gain += Planner.WorthOfTarget(target) + MathF.Max(0f, target.Rough(0f));
+                    gain += worthOfMarker[index];
                 }
 
                 ranked.Add((s, gain));
@@ -2524,6 +3550,8 @@ internal static class Repair
 
                 looked++;
             }
+
+            ranking.Dispose();
 
             // **Slot outside, candidate inside - which is the other way round from how this read.**
             //
@@ -2685,6 +3713,25 @@ internal static class Repair
         var span = (float)(spend * env.Reach) + env.Blast;
         var rich = new List<(int Index, double Worth)>();
 
+        // **What a remnant is worth reached from here, not on its own.** With Gaining Traction a remnant caught after
+        // the kept links carries their remnants' bonus, and a bridge's whole point is a payoff later in the chain:
+        // on one Grand site (2026-10-01) the best chain found, 30,053 against 21,7xx for nine presses of ten, ended on
+        // two remnants three empty links out, with eight remnants detonated before them. Ranked on its own worth, a
+        // far remnant looked no richer than a near one. See Planner.TractionScales.
+        var keptRemnants = env.RemnantsCompletedInArea;
+        var keptCaught = new HashSet<int>();
+
+        foreach (var link in work)
+        {
+            foreach (var index in Planner.CaughtIndicesAt(env, link))
+            {
+                if (keptCaught.Add(index) && env.Targets[index].Kind == TargetKind.Remnant)
+                    keptRemnants++;
+            }
+        }
+
+        var (magicLater, rareLater) = Planner.TractionScales(env, keptRemnants);
+
         for (var i = 0; i < env.Targets.Count; i++)
         {
             if (held.Contains(i))
@@ -2700,7 +3747,9 @@ internal static class Repair
             if (Vector2.Distance(work[^1], target.Grid) > span)
                 continue;
 
-            var worth = Planner.WorthOfTarget(target) + MathF.Max(0f, target.Rough(0f));
+            var waves = target.MagicAndRareWaves;
+            var worth = Planner.WorthOfTarget(target) + MathF.Max(0f, target.Rough(0f)) +
+                        (magicLater - 1f) * waves.Magic + (rareLater - 1f) * waves.Rare;
 
             if (worth > 0d)
                 rich.Add((i, worth));
@@ -2845,7 +3894,7 @@ internal static class Repair
     /// result is better - a kick rather than a move.
     ///
     /// **Independent workers starting from an identical chain are one worker.** Four of them opened
-    /// at the same deterministic band chain and every one returned it to the decimal: 9,402.8 four
+    /// at the same deterministic chain and every one returned it to the decimal: 9,402.8 four
     /// times over. Nothing separated them, because the opening was shared and the local search that
     /// follows it is deterministic too. The seeds reached the random stream and the random stream had
     /// nothing left to decide.
@@ -3027,6 +4076,10 @@ internal static class Repair
             if (_from.TryGetValue(key, out var already))
                 return already;
 
+            // Timed on its own: a row asks Says about every spot, and Says is not a phase, so this was counted as
+            // Rebuild's own time. See Planner.PhaseReachRow.
+            using var phase = new Planner.Phase(Planner.PhaseReachRow);
+
             var words = (_spots.Count + 63) / 64;
             var made = (new ulong[words], new ulong[words]);
 
@@ -3123,6 +4176,54 @@ internal static class Repair
     /// after every worker has finished, so it costs the search nothing.
     /// </summary>
     /// <returns>The best chain found on the paths, or null when none beat what it was given.</returns>
+    /// <summary>
+    /// How often, in milliseconds, the refining worker relinks the workers' records while the solve runs; nought turns
+    /// it off. See LeaderRelinked.
+    /// </summary>
+    internal static int RelinkDuringSolveMs = 2000;
+
+    /// <summary>
+    /// Relinks run while solves ran since the plugin loaded, how many bettered the pool's best, and by how much plain
+    /// in all, for the dump and the offline harness. See LeaderRelinked.
+    /// </summary>
+    internal static string RelinksDuringSolveSaid =>
+        $"{Interlocked.Read(ref _relinksDuringSolve):N0} run, {Interlocked.Read(ref _relinkWinsDuringSolve):N0} bettering the pool's best by {_relinkGainDuringSolve:N0} plain in all";
+
+    private static long _relinksDuringSolve;
+    private static long _relinkWinsDuringSolve;
+    private static double _relinkGainDuringSolve;
+
+    /// <summary>
+    /// The pool's best relinked with the workers' records, when that beats the pool's best, or null. Relinked ranks the
+    /// chains and walks from the best towards the next ones, so this only ever answers with a chain scoring above every
+    /// chain it was given.
+    /// </summary>
+    private static List<Vector2> LeaderRelinked(PlanEnvironment env, int stream)
+    {
+        var chains = Solving.WorkerBestChains();
+        var (leader, leaderWorth) = Solving.Leader();
+
+        if (leader is { Count: > 1 })
+            chains.Add(leader);
+
+        Interlocked.Increment(ref _relinksDuringSolve);
+
+        if (chains.Count < 2 || Relinked(env, chains, out _) is not { } relinked)
+            return null;
+
+        var worth = Planner.Score(env, relinked);
+
+        if (worth <= leaderWorth)
+            return null;
+
+        Interlocked.Increment(ref _relinkWinsDuringSolve);
+        _relinkGainDuringSolve += Planner.Plainly(env, relinked) - Planner.Plainly(env, leader);
+
+        Solving.Happened(stream, $"relinked the workers' records, {Planner.Plainly(env, relinked):N0} plain");
+
+        return relinked;
+    }
+
     internal static List<Vector2> Relinked(PlanEnvironment env, List<List<Vector2>> chains,
         out string said)
     {
@@ -3238,6 +4339,38 @@ internal static class Repair
     /// bound rather than a budget.
     /// </summary>
     private const int Guides = 3;
+
+    /// <summary>
+    /// The best press's chain, scored against the current environment, with how far its last link sits from each
+    /// must-take; for the dump. A chain recorded under other prices or markers scores differently from its press.
+    /// </summary>
+    internal static string BestPressChainSaid(PlanEnvironment env)
+    {
+        if (env == null)
+            return "  no environment";
+
+        if (PressHistory.BestPressChain is not { Length: > 0 } chain)
+            return "  no press has recorded a chain yet";
+
+        var musts = env.Targets.Where(t => t.Must).ToList();
+        var text = new System.Text.StringBuilder();
+
+        string Spelled(IEnumerable<Vector2> links) =>
+            string.Join(" ", links.Select(p => $"({p.X:0},{p.Y:0})"));
+
+        string Ends(List<Vector2> links) =>
+            musts.Count == 0 || links.Count == 0
+                ? ""
+                : ", last link " + string.Join("/", musts.Select(m =>
+                    $"{Vector2.Distance(links[^1], m.Grid):0.0} from must-take ({m.Grid.X:0},{m.Grid.Y:0})"));
+
+        var whole = chain.ToList();
+
+        text.AppendLine($"  the best press's chain, scored now: {Planner.Plainly(env, whole):N0} plain  " +
+                        $"{Spelled(whole)}{Ends(whole)}");
+
+        return text.ToString().TrimEnd();
+    }
 
     internal static List<Vector2> Reversed(PlanEnvironment env, List<Vector2> chain, int laid)
     {

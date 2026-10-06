@@ -153,10 +153,16 @@ internal static class Minimap
         var colour = settings.Display.UnscoutedGround.UnscoutedColour.Value;
         var surface = Surface(gc);
 
+        // The ground the layer is drawn level with: the dig site's, or the player's before there is one. See Wash.Ready.
+        var heightAt = Detonator.DetonatorGridPosition(gc);
+
+        if (heightAt == Vector2.Zero)
+            heightAt = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
         // **One image over four projected corners, which is how Radar draws the walkable map.**
         // See Wash for why the quads had to go: a translucent fill is feathered outward, so every
         // seam between two patches was painted twice and a field of them read as a hatch.
-        if (!Wash.Ready(graphics, scouted, colour))
+        if (!Wash.Ready(graphics, scouted, colour, heightAt))
         {
             Washed = (0, 0, "the texture could not be built", surface, Large(gc));
 
@@ -172,7 +178,10 @@ internal static class Minimap
             return;
         }
 
-        var (a, b, c, d) = Wash.Corners(graphics, scouted);
+        // About the player as Radar draws on the large map; through GridToMap otherwise. See Wash.CornersAboutPlayer.
+        var heightOffset = settings.Display.UnscoutedGround.UnscoutedHeightOffset.Value;
+        var (a, b, c, d) = Wash.CornersAboutPlayer(gc, scouted, Wash.Reference, heightOffset) ??
+                           Wash.Corners(graphics, scouted, heightAt);
 
         if (a == Vector2.Zero && c == Vector2.Zero)
         {
@@ -192,8 +201,35 @@ internal static class Minimap
         shapes.AddImageQuad(texture, a, b, c, d);
         shapes.PopClipRect();
 
+        // **Where the image puts a point against where the map does.** A grid point maps into the image's quad by its
+        // share of the width and height, after the move its tile's height gives it; GridToMap places it as the chain's
+        // circles are placed. The two should agree; the difference is the layer's offset there, in screen pixels.
+        var (wideGrid, highGrid) = (scouted.Wide * (float)Scouted.Tile, scouted.High * (float)Scouted.Tile);
+
+        string Agreement(string called, Vector2 grid)
+        {
+            if (grid == Vector2.Zero)
+                return "";
+
+            var lift = (scouted.HeightAt(grid) - Wash.Reference) / Detonator.GridToWorld / 2f;
+            var moved = grid - new Vector2(lift, lift);
+            var through = a + (b - a) * (moved.X / wideGrid) + (d - a) * (moved.Y / highGrid);
+            var itself = Safe.Read(() => graphics.GridToMap(grid, grid), Vector2.Zero);
+            var apart = through - itself;
+
+            return $"; {called} ({grid.X:0},{grid.Y:0}) at ({itself.X:0},{itself.Y:0}) on the map, ({through.X:0},{through.Y:0}) " +
+                   $"through the image, {apart.X:0},{apart.Y:0} px apart";
+        }
+
         Washed = (1, 1,
-            $"one image {scouted.Wide}x{scouted.High} over ({a.X:0},{a.Y:0})-({c.X:0},{c.Y:0})",
+            $"one image {scouted.Wide}x{scouted.High} placed {(Wash.CornersAboutPlayer(gc, scouted, Wash.Reference) != null ? $"about the player as Radar does, {heightOffset} world units above the ground" : "through GridToMap")} over ({a.X:0},{a.Y:0})-({c.X:0},{c.Y:0}), level with the ground at " +
+            $"({heightAt.X:0},{heightAt.Y:0}), height {scouted.HeightAt(heightAt):0}" +
+            Agreement("the site", heightAt) +
+            Agreement("the player", Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero)) +
+            (scouted.PaintedHeightExtremes() is { } extremes
+                ? Agreement($"the highest painted tile, height {scouted.HeightAt(extremes.Highest):0},", extremes.Highest) +
+                  Agreement($"the lowest painted tile, height {scouted.HeightAt(extremes.Lowest):0},", extremes.Lowest)
+                : ""),
             surface, Large(gc));
     }
 
@@ -316,8 +352,13 @@ internal static class Minimap
 
             var colour = said == Insisted.Said.Take ? green : red;
 
-            graphics.DrawCircleOnMap(target.Grid, false, 3.2f, colour, 1.5f, Segments);
-            graphics.DrawCircleOnMap(target.Grid, false, 4.4f, colour, 1.5f, Segments);
+            // Two and a half times the first size, which at 3.2 and 4.4 grid was hard to pick out on the corner map.
+            graphics.DrawCircleOnMap(target.Grid, false, 8f, colour, 1.5f, Segments);
+            graphics.DrawCircleOnMap(target.Grid, false, 11f, colour, 1.5f, Segments);
+
+            // A third ring for the marker the chain takes last, as in the world. See Insisted.IsTakenLast.
+            if (said == Insisted.Said.Take && Insisted.Here.IsTakenLast(target.Grid))
+                graphics.DrawCircleOnMap(target.Grid, false, 14f, colour, 1.5f, Segments);
         }
     }
 
@@ -330,7 +371,7 @@ internal static class Minimap
     /// </summary>
     public static void Rolls(Graphics graphics, GameController gc, AutoExpeditionSettings settings)
     {
-        if (!Rolling.Here.Fresh || Rolling.Here.Best is not { } best || best.Grid == Vector2.Zero ||
+        if (!Rolling.Here.Fresh || Rolling.Here.Advised is not { } best || best.Grid == Vector2.Zero ||
             !Showing(gc))
             return;
 

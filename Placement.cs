@@ -70,6 +70,12 @@ internal enum Step
 
     /// <summary>The option has been clicked; waiting for the window to go away.</summary>
     Chose,
+
+    /// <summary>
+    /// A reward has been taken and the explosive just placed covers another remnant with none chosen; waiting for the
+    /// game to put that remnant's window up. See Placement.AfterPick.
+    /// </summary>
+    AwaitingWindow,
 }
 
 /// <summary>
@@ -368,6 +374,9 @@ internal sealed class Placement
 
     public string Begin(GameController gc, AutoExpeditionSettings settings, Planning planning)
     {
+        // A press is a new attempt, so the last one's warning comes down. See CursorWarning.
+        CursorWarning.Clear();
+
         _game = gc;
         _planning = planning;
         _scrolls = 0;
@@ -395,7 +404,7 @@ internal sealed class Placement
 
         if (!_input.Available)
             {
-                Say("No input", "ExileInput2 is not installed, so nothing can be placed");
+                Say("ExileInput2 not installed", "ExileInput2 is not installed, so nothing can be placed");
 
                 return Status;
             }
@@ -409,7 +418,7 @@ internal sealed class Placement
 
         if (planning.Plan.Points.Count == 0 && !breaking)
             {
-                Say("No route", "there is no plan to place");
+                Say("No plan", "there is no plan to place");
 
                 return Status;
             }
@@ -430,6 +439,14 @@ internal sealed class Placement
         // Nothing is half-picked at the start of a run. See Took.
         _picking = "";
         _picked = null;
+
+        // Nor is a remnant being rewritten, or the reward it was rewritten for. Kept from an earlier run - on this
+        // map or a previous one - they answered for the next window that opened, which then looked for that
+        // remnant's reward among another remnant's options and stopped at "Choose". _wants is keyed by entity id,
+        // and ids are reused from one area to the next. See Options.Pick.
+        _change = null;
+        _wanted = null;
+        _wants.Clear();
         _clicked = DateTime.MinValue;
 
         // Unconditionally, before claiming. A stop is sticky until the holder hands the cursor
@@ -442,7 +459,7 @@ internal sealed class Placement
 
         if (!_input.Take())
             {
-                Say("Busy", "another plugin is using the cursor");
+                Say("ExileInput2 busy", "another plugin is using the cursor");
 
                 return Status;
             }
@@ -591,7 +608,7 @@ internal sealed class Placement
                     return;
                 }
 
-                Give("Not placed",
+                Give("Placement failure",
                     $"the click went out and the game placed nothing - it still reports {placed} " +
                     $"placed, was {_placedWhenStarted} before the click. " + Clicked(gc) +
                     " Now the circle " +
@@ -625,6 +642,11 @@ internal sealed class Placement
         if (_step != Step.Choosing && _step != Step.Chose && _step != Step.Scrolling &&
             Options.Open(gc))
         {
+            // How long the game took to put up the next remnant's window after a reward was taken. See AfterPick.
+            if (_step == Step.AwaitingWindow)
+                NextWindowSaid = $"the window for the next remnant came up {(DateTime.UtcNow - _awaitingSince).TotalMilliseconds:0}ms " +
+                                 $"after the last reward took ({DateTime.Now:HH:mm:ss})";
+
             Choose(gc, settings, valuation, scan);
 
             return;
@@ -672,7 +694,7 @@ internal sealed class Placement
                 // it back rather than spending its remaining pulls on the same mistake.
                 if (_input.DragMissed())
                 {
-                    Give("Scroll for it", "the scroll bar is not where it was read to be - nothing " +
+                    Give("Failed to scroll", "the scroll bar is not where it was read to be - nothing " +
                                           "was clicked; scroll to the reward and press again");
 
                     return;
@@ -732,7 +754,7 @@ internal sealed class Placement
 
                         Showing(settings);
 
-                        Give("Not a button", "the combinations button did not light up under the " +
+                        Give("Failed to click", "the combinations button did not light up under the " +
                                              "cursor - " + Panels.Describe(gc) +
                                              " is over it, or the element path is wrong; pick the " +
                                              "combination yourself and press again");
@@ -877,11 +899,20 @@ internal sealed class Placement
                 // spends a reward the player has already been given.
                 if (Took(gc) || DateTime.UtcNow - _clicked >= Answers)
                 {
+                    // Remembered as the run's own choice, so it is not taken for the player's. See SetByPlacement.
+                    if (Took(gc) && _picked != null)
+                        RecordSetByPlacement(Safe.Read(_picked, static e => e.GridPos, Vector2.Zero), _pickingRecipe);
+
                     Picked = (_picking, Took(gc),
                         (DateTime.UtcNow - _clicked).TotalMilliseconds, DateTime.UtcNow);
 
+                    // The rewrite this pick was for is done, so it must not answer for the next window, which an
+                    // explosive landing on another remnant opens. See Begin.
+                    _change = null;
+                    _wanted = null;
+
                     Settling();
-                    Advance(gc, settings);
+                    AfterPick(gc, settings);
                 }
                 else
                 {
@@ -892,10 +923,24 @@ internal sealed class Placement
 
                 return;
 
+            case Step.AwaitingWindow:
+                // The window opening is handled above, as every window is. What is left here is it not
+                // opening in time: move on, and say which remnant was left without a reward.
+                if (DateTime.UtcNow - _awaitingSince >= NextWindowWithin)
+                {
+                    NextWindowSaid = $"no window came up within {NextWindowWithin.TotalMilliseconds:0}ms for the " +
+                                     $"remnant at ({_awaitedAt.X:0},{_awaitedAt.Y:0}) - it was left without a reward " +
+                                     $"({DateTime.Now:HH:mm:ss})";
+                    Advance(gc, settings);
+                }
+
+                return;
+
             case Step.Confirming:
                 if (Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0) > _placedWhenStarted)
                 {
                     _landed++;
+                    _justPlaced = _expect;
                     _declined = 0;
                     _armed = false;
                     _unlit = Array.Empty<Vector2>();
@@ -1112,7 +1157,7 @@ internal sealed class Placement
 
         if (Panels.Covers(Panels.Covered(gc), at))
         {
-            Give("Hidden", "the next spot is behind a panel - move the camera and press again");
+            Give("Unclickable", "the next spot is behind a panel - move the camera and press again");
 
             return;
         }
@@ -1203,7 +1248,7 @@ internal sealed class Placement
 
         if (++_arms > 4)
         {
-            Give("No mode", $"the placement circle would not come up ({fromLast:0} grid from the last explosive)");
+            Give("Placement key not working", $"the placement circle would not come up ({fromLast:0} grid from the last explosive)");
 
             return;
         }
@@ -1270,7 +1315,7 @@ internal sealed class Placement
     {
         if (!settings.Automation.On(settings.Automation.PreExpedition.ChooseRewards))
         {
-            Give("Choose", "the combinations window is open - pick a reward and press again");
+            Give("Panel failure, choose manually", "the combinations window is open - pick a reward and press again");
 
             return;
         }
@@ -1286,7 +1331,7 @@ internal sealed class Placement
         // spend the remnant. So the run ends and says which of the two it was. See Options.Unknown.
         if (index == Options.Unknown)
         {
-            Give("Choose", Options.Whose(gc, scan) == null
+            Give("Panel failure, choose manually", Options.Whose(gc, scan) == null
                 ? "the combinations window is open and the plugin cannot tell which remnant it " +
                   "belongs to - pick a reward yourself, or close it and let the run open it"
                 : $"the combinations window does not offer {name}, which is what was decided for " +
@@ -1355,7 +1400,7 @@ internal sealed class Placement
                 return;
             }
 
-            Give("Scroll for it", $"the reward worth taking is {name}, and it is scrolled out of " +
+            Give("Failed to scroll", $"the reward worth taking is {name}, and it is scrolled out of " +
                                   "sight in the combinations window - " +
                                   (_input.CanDrag
                                       ? "scroll down to it and press again, or pick it yourself"
@@ -1368,7 +1413,7 @@ internal sealed class Placement
 
         if (rect.Width <= 0f)
         {
-            Give("Choose", "the combinations window is open, nothing in it is priced and none of it " +
+            Give("Panel failure, choose manually", "the combinations window is open, nothing in it is priced and none of it " +
                            "matches the preference list - pick a reward yourself and press again");
 
             return;
@@ -1763,6 +1808,59 @@ internal sealed class Placement
     /// </summary>
     private readonly Dictionary<uint, DateTime> _settling = new();
 
+    /// <summary>What the last placed explosive was chosen to catch, for AfterPick. Empty before the first lands.</summary>
+    private Vector2[] _justPlaced = [];
+
+    /// <summary>When AwaitingWindow began, and the remnant it waits on. See AfterPick.</summary>
+    private DateTime _awaitingSince;
+
+    private Vector2 _awaitedAt;
+
+    /// <summary>
+    /// How long to wait for the next remnant's window after a reward is taken. Chosen, not measured: the game puts
+    /// the windows up one at a time, and the first dump that caught it had the next one open after the run had
+    /// already moved on. NextWindowSaid records how long it actually takes.
+    /// </summary>
+    private static readonly TimeSpan NextWindowWithin = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>What the last wait for another remnant's window came to, for the dump.</summary>
+    public static string NextWindowSaid { get; private set; } = "no wait for a second window yet";
+
+    /// <summary>
+    /// After a reward is taken, waits for the next remnant's window if the explosive just placed covers another
+    /// remnant still without a reward; otherwise moves on.
+    ///
+    /// **The game puts the windows up one at a time.** An explosive covering three undecided remnants opens the
+    /// window for one, and the next only after its reward is taken. The run moved on as soon as a pick took, so
+    /// when the next link could not be placed it ended - "Walk closer" - and the third remnant's window came up
+    /// after, with nothing left to answer it. Seen on one Grand site (2026-09-30): the remnant at (369,1214) was left
+    /// with its window open and no reward.
+    /// </summary>
+    private void AfterPick(GameController gc, AutoExpeditionSettings settings)
+    {
+        var owed = _justPlaced.Length == 0 || _scan == null || _valuation == null
+            ? null
+            : _scan.Targets.FirstOrDefault(target =>
+                target.Kind == TargetKind.Remnant && target.Rewards.Count > 0 && !target.Rerolled &&
+                _justPlaced.Any(at => Vector2.Distance(target.Grid, at) < 1f) &&
+                !_settling.ContainsKey(Safe.Read(() => target.Entity.Id, 0u)) &&
+                Undecided(Safe.Read(() => _valuation.ChosenName(target.Entity), null)));
+
+        if (owed == null)
+        {
+            Advance(gc, settings);
+
+            return;
+        }
+
+        _awaitingSince = DateTime.UtcNow;
+        _awaitedAt = owed.Grid;
+
+        // A patience past NextWindowWithin, so the run's own deadline does not end it as a timeout first.
+        Wait(Step.AwaitingWindow, NextWindowWithin + TimeSpan.FromSeconds(2));
+        Say("Choosing", "waiting for the next remnant's window");
+    }
+
     /// <summary>How long to leave a remnant alone after clicking its reward.</summary>
     private static readonly TimeSpan Settles = TimeSpan.FromMilliseconds(300);
 
@@ -2028,6 +2126,80 @@ internal sealed class Placement
     /// name alone cannot tell a click that took from one that set the other.
     /// </summary>
     private string _pickingRecipe = "";
+
+    /// <summary>
+    /// The recipe the placement run set on each remnant in this area, by cell. A reward set on a remnant is the
+    /// player's choice unless it is the one recorded here: the run sets must takes to the reward the plan was pinned
+    /// to, and that is not a decision the player made. Written to sites/placement_choices_{area}.tsv as it changes and
+    /// read back on entering the area, so it survives a reload and a trip out and back. See Valuation.ChosenByPlayer.
+    /// </summary>
+    private static readonly Dictionary<(int X, int Y), string> _setByPlacement = new();
+
+    /// <summary>The area _setByPlacement belongs to, and so the file it is written to.</summary>
+    private static uint _setByPlacementArea;
+
+    private static void RecordSetByPlacement(Vector2 grid, string recipe)
+    {
+        if (grid == Vector2.Zero || string.IsNullOrEmpty(recipe))
+            return;
+
+        lock (_setByPlacement)
+        {
+            _setByPlacement[((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y))] = recipe;
+
+            Safe.Do(() => System.IO.File.WriteAllLines(SetByPlacementFile(_setByPlacementArea),
+                _setByPlacement.Select(x => $"{x.Key.X}\t{x.Key.Y}\t{x.Value}")));
+        }
+    }
+
+    private static string SetByPlacementFile(uint area)
+    {
+        var folder = System.IO.Path.Combine(Kept.Home, "sites");
+
+        System.IO.Directory.CreateDirectory(folder);
+
+        return System.IO.Path.Combine(folder, $"placement_choices_{area}.tsv");
+    }
+
+    /// <summary>Whether the placement run set this recipe on the remnant at this cell. See _setByPlacement.</summary>
+    internal static bool SetByPlacement(Vector2 grid, string recipe)
+    {
+        lock (_setByPlacement)
+            return _setByPlacement.TryGetValue(((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y)), out var set) &&
+                   string.Equals(set, recipe, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// What the run set in the area being entered: read from its file, or nothing for an area not seen before. See
+    /// _setByPlacement.
+    /// </summary>
+    internal static void LoadSetByPlacement(uint area)
+    {
+        lock (_setByPlacement)
+        {
+            _setByPlacement.Clear();
+            _setByPlacementArea = area;
+
+            if (area == 0 || Kept.Home.Length == 0)
+                return;
+
+            Safe.Do(() =>
+            {
+                var path = SetByPlacementFile(area);
+
+                if (!System.IO.File.Exists(path))
+                    return;
+
+                foreach (var line in System.IO.File.ReadLines(path))
+                {
+                    var parts = line.Split('\t');
+
+                    if (parts.Length == 3 && int.TryParse(parts[0], out var x) && int.TryParse(parts[1], out var y))
+                        _setByPlacement[(x, y)] = parts[2];
+                }
+            });
+        }
+    }
 
     private Entity _picked;
 
@@ -3037,7 +3209,7 @@ internal sealed class Placement
             _unlit = Array.Empty<Vector2>();
             Reason = "Refused";
 
-            Give("Refused", $"the game will not take an explosive at ({_target.X:0},{_target.Y:0})" +
+            Give("Placement refused", $"the game will not take an explosive at ({_target.X:0},{_target.Y:0})" +
                             (Cell(aimedAt) == Cell(_target)
                                 ? ""
                                 : $", aimed at from ({aimedAt.X:0},{aimedAt.Y:0})") +
@@ -3119,10 +3291,27 @@ internal sealed class Placement
             _unlit = beyond.ToArray();
             Reason = "Wrong spot";
 
-            Give("Wrong spot", $"spot {_landed + 1} was aimed at ({aimed.X:0},{aimed.Y:0}) to land " +
+            // Where the cursor was sent and where it is, and which cell the pick simulation makes of that pixel, so a
+            // landing off the spot says whether the cursor left its rect, the simulation disagrees with the game, or
+            // the routing model is wrong. See AimRect.
+            var cursorPixel = Safe.Read(gc, static g => new Vector2(g.IngameState.MousePosX, g.IngameState.MousePosY),
+                Vector2.Zero);
+            var cursorCell = Safe.Read(gc, static g =>
+            {
+                var at = g.IngameState.ServerData.GridMousePosition;
+
+                return new Vector2(at.X, at.Y);
+            }, Vector2.Zero);
+            var simulated = SimulatedCell(gc, Safe.Read(gc, static g => g.IngameState.Camera, null), cursorPixel, aimed);
+
+            Give("Placement lands wrong", $"spot {_landed + 1} was aimed at ({aimed.X:0},{aimed.Y:0}) to land " +
                                $"on ({_target.X:0},{_target.Y:0}), and the game puts the explosive " +
-                               $"on ({indicator.X:0},{indicator.Y:0}) instead - the routing model " +
-                               "disagrees with the client here, and the reading is in the F6 dump");
+                               $"on ({indicator.X:0},{indicator.Y:0}) instead - the cursor was sent into " +
+                               $"({_aimRect.Left:0.#}-{_aimRect.Right:0.#}, {_aimRect.Top:0.#}-{_aimRect.Bottom:0.#})px, " +
+                               $"and is at ({cursorPixel.X:0},{cursorPixel.Y:0})px over cell ({cursorCell.X:0},{cursorCell.Y:0}); " +
+                               (simulated == null
+                                   ? "the pick simulation could not read that pixel"
+                                   : $"the pick simulation reads that pixel as ({simulated.Value.X:0},{simulated.Value.Y:0})"));
 
             return;
         }
@@ -3207,7 +3396,7 @@ internal sealed class Placement
 
             Spoil(_target);
 
-            Give("Not lit", learnt
+            Give("Marker not lit", learnt
                 ? $"blast #{_landed + 1}: {missing} of the {_expect.Length} markers it was chosen " +
                   $"for are not highlighted, worth {lost:N0} of {wanted:N0} - they are ringed in " +
                   "red on the ground; working out a chain that reaches them"
@@ -3229,7 +3418,7 @@ internal sealed class Placement
         // nothing missing the rest follows. Zero lit with things unloaded proves nothing at all.
         if (lit == 0 && unknown > 0)
         {
-            Give("Unverified", $"{unknown} expected markers are not loaded, so the blast cannot be " +
+            Give("Marker load failure", $"{unknown} expected markers are not loaded, so the blast cannot be " +
                                "confirmed - walk closer and press again");
 
             return;
@@ -3364,7 +3553,7 @@ internal sealed class Placement
 
                 wanted += worth;
 
-                if (target.Live && !target.Glowing)
+                if (target.Live && target.GlowReadable && !target.Glowing && !target.InPlacedBlast)
                 {
                     lost += worth;
                     dark.Add(want);
@@ -3403,9 +3592,12 @@ internal sealed class Placement
                 }
             }
 
-            if (found is not { Live: true })
+            // Taken by an explosive already down counts as lit: the client does not light it again under
+            // the circle, and this blast losing it loses nothing. See Target.InPlacedBlast.
+            // A marker whose highlight cannot be read is not known to be dark. See Target.GlowReadable.
+            if (found is not { Live: true } || !found.GlowReadable)
                 unknown++;
-            else if (found.Glowing)
+            else if (found.Glowing || found.InPlacedBlast)
                 lit++;
             else
                 missing++;
@@ -3444,11 +3636,14 @@ internal sealed class Placement
             return;
         }
 
-        // Loose, because arrival is not the check that matters. What decides whether to click is
-        // where the GAME says the explosive would land, and a few pixels of slop in the cursor is
-        // exactly what the adjustment step is for.
+        // How near the game's reported cursor must be to the point sent before the move counts as arrived.
+        // ExileInput2 ends every journey exactly on the point it was given; this only gates Arrived, and a
+        // tolerance of a pixel or two risks a move that never reports arriving and times out.
+        // A rect rather than a point, so ExileInput2 picks where in it to land the way it does for any
+        // rect - wandering about the centre from one explosive to the next - and bounds its arrival
+        // tolerance by the rect. See AimRect.
         _input.SetTolerance(12);
-        _input.MoveTo(at);
+        _input.MoveTo(_aimRect);
         Wait(Step.Moving);
         Say($"Moving {_landed + 1}", $"moving to spot {_landed + 1}");
     }
@@ -3493,7 +3688,23 @@ internal sealed class Placement
         // recomputing it later would ask a model that has learnt from the failure in between.
         _aimedGridPosition = Pointed(gc, _target);
 
-        at = Screen(gc, camera, _aimedGridPosition);
+        var (aimRect, verdict) = AimRect(gc, camera, _aimedGridPosition);
+
+        _aimRect = aimRect;
+        at = verdict == AimVerdict.Aimed ? aimRect.Center : Vector2.Zero;
+
+        // **A cell the game cannot be made to read reliably from here is said before the circle comes up.** From
+        // a shallow angle the line of sight can run along the ground across the whole cell, and then no pixel is
+        // safe; coming closer steepens it. See AimRect.
+        if (verdict == AimVerdict.Unreliable)
+        {
+            word = "Bad camera angle";
+            why = $"no point of cell ({MathF.Floor(_aimedGridPosition.X):0},{MathF.Floor(_aimedGridPosition.Y):0}) " +
+                  "reads reliably as that cell from this camera angle - the ground there runs nearly along the line " +
+                  "of sight; move closer and press again";
+
+            return false;
+        }
 
         // Edge, like every other test about a spot on the ground. See OnScreen's margin.
         if (at == Vector2.Zero || !OnScreen(gc, at, Edge))
@@ -3509,7 +3720,7 @@ internal sealed class Placement
         // encounter. Refusing is the only safe answer.
         if (Panels.Covers(Panels.Covered(gc), at))
         {
-            word = "Hidden";
+            word = "Unclickable";
             why = "the next spot is behind a panel - move the camera and press again";
 
             return false;
@@ -3517,7 +3728,7 @@ internal sealed class Placement
 
         if (Panels.Covers(Buttons(gc), at))
         {
-            word = "Behind a button";
+            word = "Unclickable";
             why = "the next spot is under one of a remnant's buttons - move the camera so the " +
                   "spot is clear, and press again";
 
@@ -3542,7 +3753,7 @@ internal sealed class Placement
         if (Panels.Blocked(gc, at, true))
         {
             word = Obscured;
-            why = "a click at the next spot would hit " + Panels.Why(gc, at) + " - move the camera";
+            why = "the next spot is under " + Panels.Blocker(gc, at) + " - move the camera";
 
             return false;
         }
@@ -3710,11 +3921,16 @@ internal sealed class Placement
     /// and the same problem to the player: the place that needs clicking cannot be clicked, and the
     /// answer to both is to move. The sentence underneath still says which it was.
     /// </summary>
-    private const string Obscured = "Click location obscured";
+    private const string Obscured = "Unclickable";
 
     /// <summary>Says one thing two ways: a word for the HUD, a sentence for the debug line.</summary>
     private void Say(string status, string detail = null)
     {
+        // Not a word about moving on once this run has put an explosive down: the run stops at the edge of what it can
+        // reach, and the player already knows the next spot is further on.
+        if (!(_landed > 0 && MovingOn.Contains(status)))
+            CursorWarning.Show(status);
+
         _status = status;
         _lingers = DateTime.UtcNow + Linger;
         Detail = _landed > 0 ? $"placed {_landed}; {detail ?? status}" : detail ?? status;
@@ -3726,6 +3942,9 @@ internal sealed class Placement
             SaidAt = DateTime.UtcNow;
         }
     }
+
+    /// <summary>The warnings that only say the next spot is further away. See Say.</summary>
+    private static readonly HashSet<string> MovingOn = new(StringComparer.Ordinal) { "Bad camera angle", "Too far" };
 
     /// <summary>Hands the cursor back and says why. Every way out of the sequence goes through here.</summary>
     /// <summary>The grid cell a spot rounds to, which is the granularity Refused works in.</summary>
@@ -3782,7 +4001,7 @@ internal sealed class Placement
 
         var why = Safe.Read(() => _input.Stopped(), "") ?? "";
 
-        Give("Input refused",
+        Give("ExileInput2 input refused",
             $"{what} was not sent - " +
             (why.Length > 0
                 ? why
@@ -3918,6 +4137,317 @@ internal sealed class Placement
         _deadline = DateTime.UtcNow + patience;
     }
 
+    /// <summary>The screen rect the cursor is sent into for the spot in hand. See AimRect.</summary>
+    private RectangleF _aimRect;
+
+    /// <summary>Which of the safe points in a cell the cursor goes to. See AimRect.</summary>
+    private static readonly Random AimChoice = new();
+
+    /// <summary>What AimRect found. See AimRect.</summary>
+    private enum AimVerdict
+    {
+        /// <summary>A rect whose every point the game reads as the aimed cell.</summary>
+        Aimed,
+
+        /// <summary>The camera or the height map could not be read, or the cell does not project.</summary>
+        NotProjected,
+
+        /// <summary>The cell projects, but no point of it reads as the cell with margin from this camera.</summary>
+        Unreliable,
+    }
+
+    /// <summary>How far from its cell's centre a candidate aim point may be, as a fraction of a cell each way.</summary>
+    private const float AimSpread = 0.35f;
+
+    /// <summary>Candidate aim points per axis, spread evenly across AimSpread. See AimRect.</summary>
+    private const int AimSamples = 7;
+
+    /// <summary>How far off its pixel the cursor may land and still have to read as the cell, in pixels.</summary>
+    private const float AimPixelTolerance = 1.5f;
+
+    /// <summary>How far the game's ground may differ from BlendedHeight and the aim still hold, in world units.</summary>
+    private const float AimHeightTolerance = 0.5f;
+
+    /// <summary>Half the size of the rect handed to ExileInput2 around the chosen pixel. Inside AimPixelTolerance.</summary>
+    private const float AimRectHalfPx = 1f;
+
+    /// <summary>
+    /// A screen rect for the cursor that the game will read as the aimed cell, or why there is none.
+    ///
+    /// **Chosen by simulating the game's cursor pick, not by projecting the cell's centre.** Measured on
+    /// 2026-09-30: the game names the cursor's cell by rounding its grid position down, Camera.WorldToScreen of
+    /// its own cursor ground point lands on the cursor pixel to within 0.03 pixels, and the ground it picks
+    /// against is the height map blended between cell centres (see BlendedHeight). Projecting the centre at that
+    /// height was still not enough on a raised cell seen from a shallow angle: at (686,958) the line of sight
+    /// through the centre fell about 8.2 units a cell, the far slope of the bump 7.8, so the sight line grazed
+    /// the slope and the game read the pixel as (686,959) - a few tenths of a unit of height moved the pick most
+    /// of a cell.
+    ///
+    /// So each of AimSamples squared points across the cell is projected, and kept only if the game's pick for
+    /// its pixel - found by PickedGrid - lands in the cell, and still does with the pixel AimPixelTolerance off
+    /// each way and the ground AimHeightTolerance higher or lower. One of the kept points is chosen at random,
+    /// and ExileInput2 is given a small rect about it, so where the cursor lands varies inside the safe part.
+    /// None kept means the cell cannot be aimed at reliably from this camera, and the run says so before the
+    /// placement circle comes up.
+    /// </summary>
+    private static (RectangleF Rect, AimVerdict Verdict) AimRect(GameController gc, Camera camera, Vector2 grid)
+    {
+        var data = Safe.Read(gc, static g => g.IngameState.Data, null);
+        var view = camera == null ? null : Safe.Read(camera, static c => c.Snapshot, null);
+
+        if (view == null || data == null || grid == Vector2.Zero)
+            return (default, AimVerdict.NotProjected);
+
+        var heights = new Dictionary<(int X, int Y), float>();
+
+        float HeightOf(int x, int y)
+        {
+            if (!heights.TryGetValue((x, y), out var h))
+                heights[(x, y)] = h = HeightOfCell(data, x, y);
+
+            return h;
+        }
+
+        var cellX = (int)MathF.Floor(grid.X);
+        var cellY = (int)MathF.Floor(grid.Y);
+        var safe = new List<Vector2>();
+        var projected = false;
+
+        for (var i = 0; i < AimSamples; i++)
+        for (var j = 0; j < AimSamples; j++)
+        {
+            var point = new Vector2(
+                cellX + 0.5f - AimSpread + 2f * AimSpread * i / (AimSamples - 1),
+                cellY + 0.5f - AimSpread + 2f * AimSpread * j / (AimSamples - 1));
+            var height = BlendedHeight(HeightOf, point);
+
+            if (float.IsNaN(height))
+                continue;
+
+            var pixel = Safe.Read(() => view.WorldToScreen(new Vector3(point * Detonator.GridToWorld, height)),
+                Vector2.Zero);
+
+            if (pixel == Vector2.Zero)
+                continue;
+
+            projected = true;
+
+            if (ReadsAsCell(view, HeightOf, pixel, point, cellX, cellY))
+                safe.Add(pixel);
+        }
+
+        if (safe.Count == 0)
+            return (default, projected ? AimVerdict.Unreliable : AimVerdict.NotProjected);
+
+        var chosen = safe[AimChoice.Next(safe.Count)];
+
+        return (new RectangleF(chosen.X - AimRectHalfPx, chosen.Y - AimRectHalfPx, 2f * AimRectHalfPx,
+            2f * AimRectHalfPx), AimVerdict.Aimed);
+    }
+
+    /// <summary>
+    /// Whether the game reads a pixel as the cell, with the pixel off by AimPixelTolerance each way and, at the
+    /// pixel itself, the ground AimHeightTolerance higher and lower. See AimRect.
+    /// </summary>
+    private static bool ReadsAsCell(Camera.CameraSnapshot view, Func<int, int, float> heightOf, Vector2 pixel,
+        Vector2 near, int cellX, int cellY)
+    {
+        var t = AimPixelTolerance;
+        var trials = new (Vector2 Nudge, float Lift)[]
+        {
+            (Vector2.Zero, 0f), (new Vector2(t, 0f), 0f), (new Vector2(-t, 0f), 0f), (new Vector2(0f, t), 0f),
+            (new Vector2(0f, -t), 0f), (Vector2.Zero, AimHeightTolerance), (Vector2.Zero, -AimHeightTolerance),
+        };
+
+        foreach (var (nudge, lift) in trials)
+        {
+            var hit = PickedGrid(view, heightOf, pixel + nudge, near, lift);
+
+            if (hit == null || (int)MathF.Floor(hit.Value.X) != cellX || (int)MathF.Floor(hit.Value.Y) != cellY)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>How far above and below the local ground the line of sight is followed, in world units.</summary>
+    private const float PickSearchHeight = 12f;
+
+    /// <summary>The step down the line of sight while looking for the ground, in world units of height.</summary>
+    private const float PickStep = 0.25f;
+
+    /// <summary>
+    /// Where the game's cursor pick for a pixel meets the ground, in grid, or null when it cannot be worked out.
+    ///
+    /// The line of sight through a pixel is the set of world points that project onto it, and it is straight, so
+    /// it is fixed by two of them: the ground-plane point projecting onto the pixel is solved at a height above
+    /// the local ground and at one below, and the line between them is followed downwards until it meets
+    /// BlendedHeight (plus lift), then bisected to a fraction of a step. Uses the camera's projection only.
+    /// Up is negative in world height, so the line starts at the more negative end.
+    /// </summary>
+    private static Vector2? PickedGrid(Camera.CameraSnapshot view, Func<int, int, float> heightOf, Vector2 pixel,
+        Vector2 near, float lift)
+    {
+        var ground = BlendedHeight(heightOf, near);
+
+        if (float.IsNaN(ground))
+            return null;
+
+        var above = ground - PickSearchHeight;
+        var below = ground + PickSearchHeight;
+        var start = OnPixel(view, pixel, above, near * Detonator.GridToWorld);
+        var end = OnPixel(view, pixel, below, near * Detonator.GridToWorld);
+
+        if (start == null || end == null)
+            return null;
+
+        float Clearance(float z, out Vector2 grid)
+        {
+            var along = (z - above) / (below - above);
+
+            grid = Vector2.Lerp(start.Value, end.Value, along) / Detonator.GridToWorld;
+
+            var surface = BlendedHeight(heightOf, grid);
+
+            return float.IsNaN(surface) ? float.NaN : z - (surface + lift);
+        }
+
+        var was = above;
+
+        for (var z = above + PickStep; z <= below; z += PickStep)
+        {
+            var gap = Clearance(z, out _);
+
+            if (float.IsNaN(gap))
+                return null;
+
+            if (gap < 0f)
+            {
+                was = z;
+
+                continue;
+            }
+
+            // Between was (above the ground) and z (at or below it).
+            var high = was;
+            var low = z;
+
+            for (var k = 0; k < 8; k++)
+            {
+                var mid = (high + low) / 2f;
+
+                if (Clearance(mid, out _) < 0f)
+                    high = mid;
+                else
+                    low = mid;
+            }
+
+            Clearance(low, out var hit);
+
+            return hit;
+        }
+
+        return null;
+    }
+
+    /// <summary>The world ground-plane point at a height that projects onto a pixel, by Newton's method from a guess.</summary>
+    private static Vector2? OnPixel(Camera.CameraSnapshot view, Vector2 pixel, float height, Vector2 guess)
+    {
+        var at = guess;
+
+        for (var k = 0; k < 6; k++)
+        {
+            var here = view.WorldToScreen(new Vector3(at, height));
+            var alongX = view.WorldToScreen(new Vector3(at + Vector2.UnitX, height)) - here;
+            var alongY = view.WorldToScreen(new Vector3(at + Vector2.UnitY, height)) - here;
+            var det = alongX.X * alongY.Y - alongY.X * alongX.Y;
+
+            if (MathF.Abs(det) < 1e-9f)
+                return null;
+
+            var off = pixel - here;
+
+            at += new Vector2((off.X * alongY.Y - alongY.X * off.Y) / det, (alongX.X * off.Y - off.X * alongX.Y) / det);
+        }
+
+        return at;
+    }
+
+    /// <summary>
+    /// The height of the surface the game picks the cursor against, at a grid point: the height map's four
+    /// nearest cell centres blended bilinearly, a cell centre being its whole-number corner plus a half.
+    ///
+    /// Fitted on 2026-09-30 against 1,601 cursor readings, each the height at which the game's cursor ground
+    /// point projects onto the cursor pixel: within 0.25 of it on 99% of them, where the per-cell height was off
+    /// by up to 7.8. A neighbour more than BlendedHeightStep away from the point's own cell is taken as level
+    /// with it, so a wall or pillar beside placeable ground does not drag the blend up it; that made no
+    /// difference on the readings that fitted. The ones that did not - 16 of 1,601 - had the cursor over
+    /// ground the height map puts 23 to 219 above the level the game picked, which placeable ground is not.
+    /// </summary>
+    internal static float BlendedHeight(IngameData data, Vector2 grid) =>
+        BlendedHeight((x, y) => HeightOfCell(data, x, y), grid);
+
+    /// <summary>The same, over a height lookup the caller supplies. See BlendedHeight.</summary>
+    private static float BlendedHeight(Func<int, int, float> heightOf, Vector2 grid)
+    {
+        var own = heightOf((int)MathF.Floor(grid.X), (int)MathF.Floor(grid.Y));
+
+        if (float.IsNaN(own))
+            return float.NaN;
+
+        var x = grid.X - 0.5f;
+        var y = grid.Y - 0.5f;
+        var left = (int)MathF.Floor(x);
+        var top = (int)MathF.Floor(y);
+        var fx = x - left;
+        var fy = y - top;
+
+        float Level(int cx, int cy)
+        {
+            var h = heightOf(cx, cy);
+
+            return float.IsNaN(h) || MathF.Abs(h - own) > BlendedHeightStep ? own : h;
+        }
+
+        return Level(left, top) * (1f - fx) * (1f - fy) + Level(left + 1, top) * fx * (1f - fy) +
+               Level(left, top + 1) * (1f - fx) * fy + Level(left + 1, top + 1) * fx * fy;
+    }
+
+    /// <summary>How far a neighbour's height may differ and still be blended in. See BlendedHeight.</summary>
+    private const float BlendedHeightStep = 16f;
+
+    /// <summary>The height map's value for one cell, or NaN when unreadable.</summary>
+    private static float HeightOfCell(IngameData data, int x, int y) =>
+        Safe.Read(() => data.ToWorldWithTerrainHeight(new Vector2(x, y)).Z, float.NaN);
+
+    /// <summary>
+    /// Which cell the game would read a pixel as, by PickedGrid near a grid point, or null. For the Wrong spot
+    /// message, so a failure says whether the simulation agrees with the game.
+    /// </summary>
+    private static Vector2? SimulatedCell(GameController gc, Camera camera, Vector2 pixel, Vector2 near)
+    {
+        var data = Safe.Read(gc, static g => g.IngameState.Data, null);
+        var view = camera == null ? null : Safe.Read(camera, static c => c.Snapshot, null);
+
+        if (view == null || data == null)
+            return null;
+
+        var hit = PickedGrid(view, (x, y) => HeightOfCell(data, x, y), pixel, near, 0f);
+
+        return hit == null ? null : new Vector2(MathF.Floor(hit.Value.X), MathF.Floor(hit.Value.Y));
+    }
+
+    /// <summary>
+    /// Where a grid point shows on screen, through ToWorldWithTerrainHeight.
+    ///
+    /// **That call already lands half a cell along both axes from the point it is given**, so a whole-number
+    /// grid point comes out at its cell's centre. Measured on flat ground (2026-09-30, four dumps): the game's
+    /// cursor point projected at its own world position landed on the cursor pixel exactly, while the same
+    /// point through ToWorldWithTerrainHeight landed about half a cell up the screen every time, whatever the
+    /// cursor's position inside its cell. The game names the cell under the cursor by rounding down, so the
+    /// whole-number aims the run sends are aimed at cell centres already. Adding another half cell here was
+    /// tried and aims at the next cell's corner.
+    /// </summary>
     private static Vector2 Screen(GameController gc, Camera camera, Vector2 grid)
     {
         if (camera == null || grid == Vector2.Zero)

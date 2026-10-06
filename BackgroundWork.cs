@@ -127,9 +127,22 @@ internal static class BackgroundWork
     /// </summary>
     public static System.Threading.Tasks.Task<T> StartAtLowPriority<T>(Func<T> work,
         CancellationToken token = default) =>
+        StartOnOwnThread(work, ThreadPriority.BelowNormal, token);
+
+    /// <summary>
+    /// Starts a job on a thread of its own at normal priority: ahead of every job StartAtLowPriority started, which is
+    /// every solver worker, and level with the game's threads rather than above them. For the reroll advice, which the
+    /// player is waiting on. See Rolling.
+    /// </summary>
+    public static System.Threading.Tasks.Task<T> StartAtNormalPriority<T>(Func<T> work,
+        CancellationToken token = default) =>
+        StartOnOwnThread(work, ThreadPriority.Normal, token);
+
+    private static System.Threading.Tasks.Task<T> StartOnOwnThread<T>(Func<T> work, ThreadPriority priority,
+        CancellationToken token) =>
         System.Threading.Tasks.Task.Factory.StartNew(() =>
             {
-                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                Thread.CurrentThread.Priority = priority;
 
                 return work();
             }, token, System.Threading.Tasks.TaskCreationOptions.LongRunning,

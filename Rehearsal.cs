@@ -118,7 +118,7 @@ internal sealed class Rehearsal
     public string Describe() =>
         _passes == 0
             ? "has not rehearsed here"
-            : Recounted() + $"{_passes} passes over {_spent:N0}ms, best {_best:N1}, " +
+            : Recounted() + $"{_passes} passes over {PassesSpanMs():N0}ms, best {_best:N1}, " +
               $"last pass drew {_drew} improvements and " +
               $"{(_moved ? "moved" : "did NOT move")} the score" +
               (_done ? " (finished - nothing left to learn)" : "") +
@@ -195,7 +195,11 @@ internal sealed class Rehearsal
             // Not when the later run had no floor at all: a deleted plan or a cold press starts from nothing on
             // purpose, and it falling below what came before is what it was asked to risk.
             if (now.After < before.After - 0.0001d && now.Before > 0.0001d)
-                return now.Table != before.Table
+                return now.Cause == Planning.MustTakeChangedCause
+                    ? $"RE-AIMED - run {now.Number} published {now.After:N1} under run {before.Number}'s " +
+                      $"{before.After:N1} after a must take was marked or cleared, which changes what the solver " +
+                      "maximises - the chain before it may not hold what is now required. "
+                    : now.Table != before.Table
                     ? $"RE-SCORED - run {now.Number} fell to {now.After:N1} from {before.After:N1} " +
                       $"across a reference table edit (rev {before.Table} to {now.Table}), so the " +
                       "two numbers are not comparable. "
@@ -244,6 +248,21 @@ internal sealed class Rehearsal
     private bool _cut;
 
     /// <summary>
+    /// Whether markers that are not remnants or relics have arrived since the pass in flight began. They do not stop it
+    /// at once; the pass takes them in when it ends, or is stopped for them once it has run MarkersWaitMs. See Tick.
+    /// </summary>
+    private bool _markersWaiting;
+
+    /// <summary>Where the remnants and relics stood when last looked at, as one number. See Tick.</summary>
+    private int _stops;
+
+    /// <summary>
+    /// How long a pass runs before markers that arrived under it stop it. Chosen: longer than the remnant order search
+    /// takes in game on a Grand site, about 8 s, so a pass started while scouting can finish it. See MarkersWaiting.
+    /// </summary>
+    private const double MarkersWaitMs = 10000d;
+
+    /// <summary>
     /// When the pass in flight was dispatched, and how long the last finished one took.
     ///
     /// **Because "the presolve only ran for a second" could not be checked.** The line said how many
@@ -254,7 +273,21 @@ internal sealed class Rehearsal
     /// </summary>
     private DateTime _launched = DateTime.MinValue;
 
-    private double _spent;
+    /// <summary>
+    /// When this site's first pass began and when it settled, for the dump's span of the passes. The span used to be the
+    /// last pass alone and was set only when the site settled, so in the continuous reroll mode, which never settles,
+    /// it read "14 passes over 0ms". See PassesSpanMs.
+    /// </summary>
+    private DateTime _firstLaunched = DateTime.MinValue;
+
+    /// <summary>See _firstLaunched.</summary>
+    private DateTime _settledAt = DateTime.MinValue;
+
+    /// <summary>From the first pass to settling, or to now while the site has not settled.</summary>
+    private double PassesSpanMs() =>
+        _firstLaunched == DateTime.MinValue
+            ? 0d
+            : ((_done && _settledAt != DateTime.MinValue ? _settledAt : DateTime.UtcNow) - _firstLaunched).TotalMilliseconds;
 
     /// <summary>
     /// Whether the site has changed since the pass whose result the settle test is about to read.
@@ -272,6 +305,7 @@ internal sealed class Rehearsal
     /// </summary>
     private bool _reopened;
 
+
     /// <summary>A solve for a roll is under way, so this does not ask for a second. See Tick.</summary>
     private bool _solvingARoll;
 
@@ -286,23 +320,37 @@ internal sealed class Rehearsal
     /// **A roll also turns the continuous reroll mode back on after the action key stopped it.** The key
     /// means "that plan will do"; rolling another remnant afterwards changes the site that plan was
     /// for, so the reason to stop has gone. See StopContinuing.
+    ///
+    /// **And a roll's solve counts as asked for**, as the action key's does. Continuing needs a pass of the presolve's
+    /// own or an ask, and a roll's solve takes the place of the pass: after a reload on a Frigid Bluffs site
+    /// (2026-10-04) a roll 0.7 s after the site was first seen solved for 28 s, and nothing solved again until the
+    /// action key was pressed nearly two minutes later. See Continuing.
     /// </summary>
     public void RemnantWasRolled()
     {
         _solvingARoll = true;
         _stoppedByPlayer = false;
+        _continueAsked = true;
     }
 
     /// <summary>
-    /// Whether the continuous reroll mode is keeping the presolve going at this site, as of the last
-    /// tick with no search in flight.
+    /// Whether continuous solving is keeping the presolve going at this site, as of the last tick with no search in
+    /// flight.
     ///
-    /// True while the mode is Continuous, the site has had at least one pass, the last plan is not
-    /// proved optimal, a remnant here is still unrolled, and the action key has not stopped it. Needs
-    /// the presolve switched on, since this is the presolve continuing rather than a solver of its own.
+    /// True while the site has had at least one pass, or the action key has asked for a solve here, the last plan is not
+    /// proved optimal, no explosive is down, and the action key has not stopped it. The action key over the placement
+    /// button starts it again. Needs the presolve switched on, since this is the presolve continuing rather than a
+    /// solver of its own.
     ///
-    /// **Unrolled remnants, not Liquid Verisium.** The plugin does not read how many the player holds,
-    /// so running out of them does not end this; the action key does. See RerollsLeft.
+    /// **Asked for counts as a pass.** A roll's own solve takes the place of the presolve's pass, and outside the last
+    /// roll of the continuous reroll mode it settles the site - so after a reload on a site whose remnants were rolled,
+    /// the presolve had no pass of its own, and the action key over the placement button ran one press and stopped.
+    ///
+    /// **Not tied to rerolling any more.** It used to run only in the Continuous reroll mode and only while a remnant
+    /// was still unrolled, so once the rolls were done nothing could search further except single presses. Each pass
+    /// carries every worker's chain on to the next, so passes add up to one search. See WorkerChains.
+    ///
+    /// **Not once an explosive is down**, because a solve then interrupts placing. See todo section 0.
     /// </summary>
     public bool Continuing { get; private set; }
 
@@ -319,6 +367,7 @@ internal sealed class Rehearsal
     {
         _stoppedByPlayer = true;
         _stoppedBy = by;
+        _continueAsked = false;
         Continuing = false;
     }
 
@@ -330,10 +379,20 @@ internal sealed class Rehearsal
     /// fresh press, so the solve the press started ended, the reroll advice ran, and nothing searched while the
     /// remnants were rolled.
     /// </summary>
-    public void ResumeContinuing() => _stoppedByPlayer = false;
+    public void ResumeContinuing()
+    {
+        _stoppedByPlayer = false;
+        _continueAsked = true;
+    }
 
     /// <summary>Whether the action key has stopped the continuous reroll mode here. See StopContinuing.</summary>
     private bool _stoppedByPlayer;
+
+    /// <summary>
+    /// Whether the action key has asked for a solve at this site since it was last stopped, which lets continuous
+    /// solving run although the presolve has had no pass of its own here. See Continuing.
+    /// </summary>
+    private bool _continueAsked;
 
     /// <summary>What stopped it, for the presolve readout: the action key or a delete button.</summary>
     private string _stoppedBy = "the action key";
@@ -356,7 +415,9 @@ internal sealed class Rehearsal
     private void KeepGoing()
     {
         if (!_keptGoing)
-            Reopening($"continuous reroll mode, {_rerollsLeft} remnant(s) still to roll");
+            Reopening(_rerollsLeft > 0
+                ? $"continuous solving, {_rerollsLeft} remnant(s) still to roll"
+                : "continuous solving");
 
         _keptGoing = true;
     }
@@ -443,6 +504,7 @@ internal sealed class Rehearsal
         _whys = 0;
         _ran = null;
         _stoppedByPlayer = false;
+        _continueAsked = false;
         _keptGoing = false;
         _finalPass = false;
         Continuing = false;
@@ -489,6 +551,7 @@ internal sealed class Rehearsal
             _whys = 0;
             _ran = null;
             _stoppedByPlayer = false;
+            _continueAsked = false;
             _keptGoing = false;
             _finalPass = false;
             Continuing = false;
@@ -643,9 +706,21 @@ internal sealed class Rehearsal
         // The rewards are folded in for the same reason the score line folds them into its cache
         // key: a reading that is stale rather than wrong is the worse kind, because it looks like
         // the choice made no difference.
+        // Where the remnants and relics stand, which is what a chain is built round. See MarkersWaiting.
+        var stops = 0;
+
+        foreach (var target in content)
+        {
+            if (target.Kind is TargetKind.Remnant or TargetKind.Relic)
+                stops = unchecked(stops * 31 + target.Grid.GetHashCode());
+        }
+
         if (here != _markers || shape != _shape)
         {
             var markersArrived = here != _markers;
+            var stopsChanged = stops != _stops || shape != _shape && here == _markers;
+
+            _stops = stops;
 
             Reopening(markersArrived
                 ? $"markers {here}, were {_markers}"
@@ -678,13 +753,40 @@ internal sealed class Rehearsal
             //
             // Only our own. A player who has pressed the key is having their search stopped by
             // nobody.
-            if (planning.Searching && Planning.Rehearsing && HadItsTurn(settings) &&
-                planning.Stop("the presolve, because the site changed under it"))
+            //
+            // **Except for markers alone.** While a site is scouted they arrive every second or two, and each one cut the
+            // pass: on a Frigid Bluffs site (2026-10-04) sixteen passes in a row were stopped after 1.2 to 4.5 s, the
+            // workers starting over every time and the remnant order search, which needs about 8 s, never finishing
+            // until the scouting did - the score stood at 52,000 for twenty seconds and then jumped to 72,000. A marker
+            // that is not a remnant or a relic moves the score but not the chain's shape, so it waits for the pass to
+            // end, or for it to have run MarkersWaitMs. See MarkersWaiting.
+            if (!stopsChanged && markersArrived)
+                _markersWaiting = true;
+            else if (planning.Searching && Planning.Rehearsing && HadItsTurn(settings) &&
+                     planning.Stop("the presolve, because the site changed under it"))
                 _cut = true;
+        }
+
+        // Markers waiting on a pass that has run long enough for them. See MarkersWaiting.
+        if (_markersWaiting && planning.Searching && Planning.Rehearsing &&
+            (DateTime.UtcNow - _launched).TotalMilliseconds >= MarkersWaitMs &&
+            planning.Stop("the presolve, because markers arrived while it ran"))
+        {
+            _cut = true;
+            _markersWaiting = false;
         }
 
         // Ours is stopping, or theirs is running. Either way this frame does not start one.
         if (planning.Searching)
+            return;
+
+        // Nor after a cold start, until the player asks: Start would refuse, and the pass would be counted as run.
+        // See Planning.HeldAfterColdStart.
+        if (Planning.HeldAfterColdStart)
+            return;
+
+        // Nor on a Grand site already set off, where Start would refuse. See Detonator.GrandSiteSetOff.
+        if (Detonator.GrandSiteSetOff(gc))
             return;
 
         // **The continuous reroll mode keeps solving until the player stops it or nothing is left to
@@ -692,8 +794,8 @@ internal sealed class Rehearsal
         // change to the site - a marker, a price, a roll - opens it again. Between rolls the player is
         // walking to the next remnant, and that time was spent solving nothing. See Continuing.
         _rerollsLeft = RerollsLeft(content);
-        Continuing = Rolling.Mode(settings) == RerollSettings.Continuous && !_stoppedByPlayer &&
-                     _passes > 0 && !planning.ProvenBest && _rerollsLeft > 0;
+        Continuing = !_stoppedByPlayer && (_passes > 0 || _continueAsked) && !planning.ProvenBest &&
+                     Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0) == 0;
 
         if (_done && Continuing)
         {
@@ -770,7 +872,12 @@ internal sealed class Rehearsal
         // the clock, and a remnant that had just appeared was unpriced until the next sweep - so the
         // grace period never expired and the rehearsal did not start until the site stopped
         // revealing itself, which is when you had arrived.
-        if (!Priced(content) && DateTime.UtcNow - _first < TimeSpan.FromMilliseconds(Patience))
+        var priced = Priced(content);
+
+        if (priced)
+            SiteArrival.Note(SiteArrival.Step.RemnantsPriced);
+
+        if (!priced && DateTime.UtcNow - _first < TimeSpan.FromMilliseconds(Patience))
             return;
 
         // **Solve on what there is, from wherever you are, and say what it rests on.**
@@ -889,7 +996,7 @@ internal sealed class Rehearsal
             DateTime.UtcNow - _revealed > TimeSpan.FromMilliseconds(Quiet)))
         {
             _drew = drew;
-            _spent = _launched == DateTime.MinValue ? 0d : (DateTime.UtcNow - _launched).TotalMilliseconds;
+            _settledAt = DateTime.UtcNow;
             _done = true;
             Settled = true;
             ContentSettled = true;
@@ -940,7 +1047,13 @@ internal sealed class Rehearsal
         _why = null;
         _whys = 0;
         _launched = DateTime.UtcNow;
+        _markersWaiting = false;
+
+        if (_passes == 0)
+            _firstLaunched = _launched;
+
         _passes++;
+        SiteArrival.Note(SiteArrival.Step.FirstPresolvePass);
         Passes = _passes;
         Settled = false;
         _next = DateTime.UtcNow + TimeSpan.FromMilliseconds(Between);

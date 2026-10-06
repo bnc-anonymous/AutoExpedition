@@ -63,7 +63,8 @@ internal static class Propagation
     /// a remnant carries one or two propagating slots and no more, so the cap could only ever hide
     /// something and never shorten anything - which makes it a setting whose best value is "off".
     /// </summary>
-    public static string Waves(Planner.RuneTally runes) => Waves(runes, runes.FirstSourced);
+    public static string RunesOnWaves(Planner.RuneTally runes) =>
+        RunesOnWaves(runes.Sockets, runes.Inherited, runes.Wasted, runes.FirstSourced, runes.Empowered, runes.PerWave);
 
     /// <summary>
     /// The same line with the names supplied, for a combination that has not been chosen yet.
@@ -74,8 +75,8 @@ internal static class Propagation
     /// answer on every row. So the numbers come from the objective and the names from the row being
     /// looked at. See Options and Ids.
     /// </summary>
-    public static string Waves(Planner.RuneTally runes, IReadOnlyList<string> sources) =>
-        Waves(runes.Sockets, runes.Inherited, runes.Wasted, sources);
+    public static string RunesOnWaves(Planner.RuneTally runes, IReadOnlyList<string> sources) =>
+        RunesOnWaves(runes.Sockets, runes.Inherited, runes.Wasted, sources, null, runes.PerWave);
 
     /// <summary>
     /// The same line from figures worked out elsewhere, for a combination not yet taken.
@@ -87,10 +88,21 @@ internal static class Propagation
     /// remnant's. Reading the chosen combination's three numbers for every row printed one sentence
     /// six times and called it per row. See Options.
     /// </summary>
-    public static string Waves(int sockets, int inherited, int wasted, IReadOnlyList<string> sources)
+    /// <param name="empowered">Of the sources, those sent empowered, written with a "+". See Planner.RuneTally.Empowered.</param>
+    /// <param name="perWave">
+    /// How many distinct runes each wave's monsters carry, wave 1 first, or null when the recipe's slots are not known -
+    /// then the one total stands in for them. See RunesPerWave.
+    /// </param>
+    public static string RunesOnWaves(int sockets, int inherited, int wasted, IReadOnlyList<string> sources,
+        IReadOnlyList<string> empowered = null, IReadOnlyList<int> perWave = null)
     {
-        var total = Math.Max(0, sockets + inherited - wasted);
-        var said = $"{total} ({sockets}+{inherited}-{wasted})";
+        // **One figure per wave, then how the last is made up**: its own runes, those arriving from earlier links, less
+        // those arriving twice - "2 2 3 4 5 (5+0-0)". A single total beside the word "waves" read as a wave count:
+        // "waves 10 (5+7-2)" on a five-wave remnant. Five figures for five waves cannot be read that way.
+        var said = (perWave is { Count: > 0 }
+                       ? string.Join(" ", perWave)
+                       : Math.Max(0, sockets + inherited - wasted).ToString()) +
+                   $" ({sockets}+{inherited}-{wasted})";
 
         if (sources is not { Count: > 0 })
             return said;
@@ -98,7 +110,8 @@ internal static class Propagation
         var names = new List<string>(sources.Count);
 
         foreach (var id in sources)
-            names.Add(RuneInfo.Called(id));
+            names.Add(RuneInfo.Called(id) +
+                      (empowered != null && empowered.Contains(id, StringComparer.OrdinalIgnoreCase) ? "+" : ""));
 
         return said + " " + string.Join(", ", names);
     }
@@ -227,27 +240,23 @@ internal static class Propagation
             // Its percentage travels as its worth so the scoring loop can find it; Planner.Owned takes
             // it out of the groups and applies it as a factor on everything landing on these waves.
             // See Weighing.Empowering.
-            if (string.Equals(Weighing.GroupKeyOfEffect(id), Weighing.Empowering,
-                    StringComparison.OrdinalIgnoreCase))
+            if (Weighing.Lift(id) > 0f)
             {
-                // **From the row's effect, not from its scope cell.** That cell is where an empowering
-                // rate lived while it had nowhere honest to go - a bare number pointing at nothing -
-                // and Runes.Scope now correctly answers empty for a rune aimed at runes, so reading it
-                // here returned nought and dropped the one rune whose nought was never its share. The
-                // identical fault this comment already describes, one store later. See Weighing.Lift.
-                var lift = Weighing.Lift(id);
-
-                if (lift > 0f)
-                    found.Add((id, lift));
+                // **Under its lift key, worth the share of these waves its slot reaches**, in per cent; the lift itself
+                // is read off the rune where it is paid, per class. Its own key so a rune that also adds - Rebirth's
+                // monster weight beside its lift - is both. See Weighing.LiftKeyOf and Planner.LocalSharesOfMarker.
+                found.Add((Weighing.LiftKeyOf(id), 100f * WaveShareOfSlot(slot, runes.Count)));
 
                 // Deliberately NOT added to the total. That is what the ordinary slots are worth on
-                // these waves, and an empowering rune is worth none of it on its own - it multiplies
+                // these waves, and an amplifier's lift is worth none of it on its own - it multiplies
                 // what the others bring. Adding it here would pay for it twice and pay for it on a
-                // remnant with nothing to empower.
-                continue;
+                // remnant with nothing to lift. A share it also has goes through below as any rune's.
+                if (!Weighing.HasShareEffect(id))
+                    continue;
             }
 
-            var worth = Locally(id);
+            // Only on the waves it is in force for. See WaveShareOfSlot.
+            var worth = Locally(id) * WaveShareOfSlot(slot, runes.Count);
 
             // Counted only when it is worth something on these waves. A rune scoped entirely to
             // chests sits in an ordinary slot and reaches none of the monsters there, so it is not
@@ -260,6 +269,41 @@ internal static class Propagation
         }
 
         return (total, found.ToArray());
+    }
+
+    /// <summary>
+    /// What share of a remnant's waves the rune in one slot acts on: all of them for the first two slots, and from
+    /// the slot's own wave onward for the rest - slot k of n reaches n - k + 1 of n waves, counting from one.
+    ///
+    /// **A remnant adds a rune slot per wave, left to right.** The monsters of its first two waves carry the runes of
+    /// its first two slots, and each wave after carries one slot more. Matched on 720 wave monsters over five sites
+    /// (2026-09-30), each carrying exactly the runes propagated to its remnant and its first k slots. So a rune in the
+    /// last slot of five acts on one wave in five. Runes arriving from earlier in the chain act on every wave and are
+    /// not weighed here.
+    /// </summary>
+    public static float WaveShareOfSlot(int slot, int runes)
+    {
+        if (runes <= 0 || slot < 2)
+            return 1f;
+
+        return Math.Clamp((runes - slot) / (float)runes, 0f, 1f);
+    }
+
+    /// <summary>
+    /// The average of WaveShareOfSlot over every slot of a recipe with this many runes, for a slot whose position is
+    /// not known. See Rolling, which prices the ordinary slots of an imagined remnant.
+    /// </summary>
+    public static float AverageWaveShare(int runes)
+    {
+        if (runes <= 0)
+            return 1f;
+
+        var total = 0f;
+
+        for (var slot = 0; slot < runes; slot++)
+            total += WaveShareOfSlot(slot, runes);
+
+        return total / runes;
     }
 
     /// <summary>What share of a scope reaches monsters, which is all a local slot can reach.</summary>
@@ -276,14 +320,154 @@ internal static class Propagation
     private static float Monsterly(string scope)
     {
         var total = 0f;
+        WaveTierShares? shares = null;
 
         foreach (var (tag, percent) in Tags.Scope(scope, out _))
         {
-            if (tag == Tags.Monsters && percent > 0f)
+            if (percent <= 0f)
+                continue;
+
+            if (tag == Tags.Monsters)
+            {
                 total += percent;
+
+                continue;
+            }
+
+            // **A scope on one rarity reaches that rarity's part of the waves**, not none of them. Only the monster tag
+            // counted, so a rune scoped to rare monsters - Bond, Oath and Time, once their rows said so - read nought in
+            // an ordinary slot and was dropped from the combination, its local worth and its own effects with it.
+            // Measured at (415,833) on Frigid Bluffs (2026-10-01): a Bond holder planned as Opulent alone, which ran no
+            // magic at all.
+            shares ??= WaveTierSharesOfRemnant();
+
+            if (tag == Tags.Rares)
+                total += percent * shares.Value.Rare;
+            else if (tag == Tags.Magics)
+                total += percent * shares.Value.Magic;
+            else if (tag == Tags.Normals)
+                total += percent * shares.Value.Normal;
         }
 
         return total;
+    }
+
+    /// <summary>A remnant wave's worth split by tier, as shares of the whole. See WaveTierSharesOfRemnant.</summary>
+    private readonly record struct WaveTierShares(float Rare, float Magic, float Normal);
+
+    /// <summary>
+    /// What share of a remnant's wave worth is rare, magic and normal monsters, for a five-wave remnant on the map
+    /// remnant waves are built for. All nought where it adds up to nothing. See Monsterly and Weighing.PartsOfWaves.
+    /// </summary>
+    private static WaveTierShares WaveTierSharesOfRemnant()
+    {
+        var (rare, magic, normal) = Safe.Read(() => Weighing.TierWorthOfParts(Weighing.PartsOfWaves(5)), (0f, 0f, 0f));
+        var whole = rare + magic + normal;
+
+        return whole > 0f ? new WaveTierShares(rare / whole, magic / whole, normal / whole) : default;
+    }
+
+    /// <summary>The rune in each slot of a recipe, by id, in slot order, empty slots as null. See RunesPerWave.</summary>
+    public static string[] SlotRunes(Expedition2Recipe recipe)
+    {
+        var runes = Safe.Read(() => recipe?.Runes, null);
+
+        if (runes == null)
+            return [];
+
+        var slots = new string[runes.Count];
+
+        for (var slot = 0; slot < runes.Count; slot++)
+            slots[slot] = Safe.Read(() => runes.ElementAtOrDefault(slot)?.Id, null);
+
+        return slots;
+    }
+
+    /// <summary>
+    /// How many distinct runes the monsters of each wave carry, wave 1 first: the remnant's own slots in force on that
+    /// wave, and every rune arriving from earlier links, a rune in both counted once. A remnant adds a slot per wave
+    /// from the second on, so slots AB, AB, ABC, ABCD for four - see WaveShareOfSlot. Null with no slots known.
+    /// </summary>
+    public static int[] RunesPerWave(IReadOnlyList<string> slots, IReadOnlyList<string> arriving)
+    {
+        if (slots is not { Count: > 0 })
+            return null;
+
+        var perWave = new int[slots.Count];
+        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var id in arriving ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(id))
+                present.Add(id);
+        }
+
+        var inForce = 0;
+
+        for (var wave = 0; wave < slots.Count; wave++)
+        {
+            for (var last = Math.Min(slots.Count, Math.Max(2, wave + 1)); inForce < last; inForce++)
+            {
+                if (!string.IsNullOrWhiteSpace(slots[inForce]))
+                    present.Add(slots[inForce]);
+            }
+
+            perWave[wave] = present.Count;
+        }
+
+        return perWave;
+    }
+
+    /// <summary>
+    /// Every rune a recipe puts in a slot, by id, each once, in slot order - priced or not. What its own effects are read
+    /// from: a rune worth nothing on these waves can still change what they spawn. See Weighing.OwnEffectsOfChoices.
+    /// </summary>
+    public static string[] HeldRunes(Expedition2Recipe recipe)
+    {
+        var runes = Safe.Read(() => recipe?.Runes, null);
+
+        if (runes == null)
+            return [];
+
+        var held = new List<string>();
+
+        for (var slot = 0; slot < runes.Count; slot++)
+        {
+            var id = Safe.Read(() => runes.ElementAtOrDefault(slot)?.Id, null);
+
+            if (!string.IsNullOrWhiteSpace(id) && !held.Contains(id, StringComparer.OrdinalIgnoreCase))
+                held.Add(id);
+        }
+
+        return held.ToArray();
+    }
+
+    /// <summary>
+    /// The share of the remnant's waves each rune of HeldRunes acts on, in the same order: its first slot's share. See
+    /// WaveShareOfSlot and Weighing.OwnEffectsOfRunes.
+    /// </summary>
+    public static float[] HeldRuneWaveShares(Expedition2Recipe recipe)
+    {
+        var runes = Safe.Read(() => recipe?.Runes, null);
+
+        if (runes == null)
+            return [];
+
+        var held = new List<string>();
+        var shares = new List<float>();
+
+        for (var slot = 0; slot < runes.Count; slot++)
+        {
+            var id = Safe.Read(() => runes.ElementAtOrDefault(slot)?.Id, null);
+
+            if (string.IsNullOrWhiteSpace(id) || held.Contains(id, StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            held.Add(id);
+            shares.Add(WaveShareOfSlot(slot, runes.Count));
+        }
+
+        return shares.ToArray();
     }
 
     /// <summary>
@@ -310,6 +494,38 @@ internal static class Propagation
         }
 
         return found.ToArray();
+    }
+
+    /// <summary>
+    /// The share of its own remnant's waves each rune Ids returns is on, in the same order: WaveShareOfSlot of the
+    /// first passing slot holding it. A propagating rune reaches every wave of the remnants after its own, but only its
+    /// own remnant's waves from its slot onward. See Planner.Settle, which takes the rest of those waves out of the
+    /// rune's reach.
+    /// </summary>
+    public static float[] WaveSharesOfIds(Expedition2Recipe recipe, List<Passes> passing)
+    {
+        if (recipe == null || passing == null)
+            return [];
+
+        var count = Safe.Read(() => recipe.Runes?.Count ?? 0, 0);
+        var found = new List<string>();
+        var shares = new List<float>();
+
+        foreach (var slot in passing.OrderBy(x => x.Slot))
+        {
+            var id = Safe.Read(() => recipe.Runes.ElementAtOrDefault(slot.Slot)?.Id, null);
+
+            if (string.IsNullOrWhiteSpace(id) || found.Contains(id, StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            found.Add(id);
+            shares.Add(WaveShareOfSlot(slot.Slot, count));
+        }
+
+        // Back into Ids' order, which follows the passing list as given.
+        return Ids(recipe, passing)
+            .Select(id => shares[found.FindIndex(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))])
+            .ToArray();
     }
 
 }

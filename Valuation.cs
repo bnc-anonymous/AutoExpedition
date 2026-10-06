@@ -33,9 +33,18 @@ namespace AutoExpedition;
 /// needs the NAMES, so it can strike out any the chain is already propagating into those same
 /// waves. A summed percentage answers neither. See Propagation.Locally.
 /// </param>
+/// <param name="Held">
+/// Every rune the recipe puts in a slot, priced or not, which is what its own effects are read from. See
+/// Propagation.HeldRunes and Weighing.OwnEffectsOfChoices.
+/// </param>
+/// <param name="CarryingWaveShares">
+/// The share of this remnant's own waves each rune in Carrying is on, same order. See Propagation.WaveSharesOfIds.
+/// </param>
+/// <param name="SlotRunes">The rune in each slot of the recipe, by id, in slot order. See Propagation.RunesPerWave.</param>
 internal sealed record Reward(string Name, double Value, int RuneCount, float Carries = 0f,
     string[] Carrying = null, float Local = 0f, (string Id, float Worth)[] Locals = null,
-    string Recipe = "");
+    string Recipe = "", string[] Held = null, float[] CarryingWaveShares = null, float[] HeldWaveShares = null,
+    string[] SlotRunes = null);
 
 /// <summary>
 /// One rune slot that carries forward, and which runes could end up in it.
@@ -265,13 +274,20 @@ internal sealed class Valuation
         {
             _heldIn = here;
             _held = null;
+            _stored = null;
         }
 
-        if (frozen && _held == null)
-            _held = Thawed();
+        // The stored prices, read once an area: what the freeze holds, and what stands in for live prices that are
+        // missing or incomplete. See StoredPrices.
+        _stored ??= StoredPrices();
 
-        if (_held != null && frozen)
-            return _held;
+        if (frozen && _stored != null)
+        {
+            // Whatever answered before still answers, or nothing downstream would believe the table.
+            Priced = true;
+
+            return _held = _stored;
+        }
 
         var prices = new Dictionary<Expedition2Recipe, double>();
 
@@ -302,18 +318,45 @@ internal sealed class Valuation
                     : Safe.Read(() => value(reward), 0d) * Math.Max(1, count);
         }
 
-        // Kept so the freeze has something to hand back. Only when it says something - a build that
-        // found no pricer at all is not an answer worth holding on to.
+        // **Live prices when they are whole, the stored ones when they are not, and the store kept up to date.**
+        //
+        // Prices came only from NinjaPricer, so until it answered every reward was worth nothing, and the store was
+        // written only for the freeze. Now the store holds the last prices read: written whenever live prices change
+        // and the freeze is off, read whenever live prices are missing - no pricer, or one still loading that prices
+        // fewer than WholeShareOfStored of the rewards the store does. A table of noughts never overwrites one that
+        // says something. See StoredPrices and StorePrices.
+        var positive = prices.Values.Count(x => x > 0d);
+        var storedPositive = _stored?.Values.Count(x => x > 0d) ?? 0;
+
+        if (_stored != null && (!Priced || positive < storedPositive * WholeShareOfStored))
+        {
+            Priced = true;
+            PricesFileSaid = $"live prices {(positive == 0 ? "not read yet" : $"price {positive:N0} rewards against {storedPositive:N0} stored")} - " +
+                             "the stored prices used";
+
+            return _held = _stored;
+        }
+
         if (Priced)
         {
             _held = prices;
 
-            if (frozen)
-                Freezing(prices, recipes);
+            if (!frozen || _stored == null)
+                StorePrices(prices, recipes);
         }
 
         return prices;
     }
+
+    /// <summary>
+    /// The share of the rewards the stored prices price that live prices must price before they are used and stored.
+    /// Chosen: high enough that a pricer still loading, answering nought for most rewards, is not taken for a market
+    /// that moved. See BuildPrices.
+    /// </summary>
+    private const double WholeShareOfStored = 0.8;
+
+    /// <summary>The stored prices as read this area, or null when there are none that fit. See StoredPrices.</summary>
+    private Dictionary<Expedition2Recipe, double> _stored;
 
     /// <summary>The last prices that were actually read. See BuildPrices and FreezePrices.</summary>
     private Dictionary<Expedition2Recipe, double> _held;
@@ -321,14 +364,22 @@ internal sealed class Valuation
     /// <summary>Which area the held table was built in. See BuildPrices.</summary>
     private uint _heldIn;
 
-    /// <summary>Where the frozen table lives. See Thawed.</summary>
-    private static string Frozen => Path.Combine(Kept.Home, "frozen_prices.tsv");
-
-    /// <summary>What the freeze last did, for the dump. See Thawed.</summary>
-    public static string Freezer { get; private set; } = "not frozen";
+    /// <summary>Where the last prices read are stored. See StoredPrices.</summary>
+    private static string PricesFile => Path.Combine(Kept.Home, "last_prices.tsv");
 
     /// <summary>
-    /// Writes the frozen table down, so the freeze outlives the plugin.
+    /// Where they were stored when they were written only for the freeze, moved to PricesFile the first time it is
+    /// read. See StoredPrices.
+    /// </summary>
+    private static string FrozenPricesFile => Path.Combine(Kept.Home, "frozen_prices.tsv");
+
+    /// <summary>What the stored prices last did, for the dump. See StoredPrices.</summary>
+    public static string PricesFileSaid { get; private set; } = "not read yet";
+
+    /// <summary>
+    /// Writes the prices read to PricesFile when they differ from what is stored there, so the last prices read
+    /// outlive the plugin: they stand in for live ones while NinjaPricer is still loading, and the freeze holds them.
+    /// Not while the freeze is on and something is stored. See BuildPrices.
     ///
     /// **The freeze was held in a field and the field is rebuilt on every reload.** Valuation is
     /// constructed once in Initialise, so a reset could not shake it loose - but reloading the
@@ -345,36 +396,24 @@ internal sealed class Valuation
     /// written with it so a game patch that changes the list is noticed rather than silently
     /// mismatched.
     /// </summary>
-    private static void Freezing(Dictionary<Expedition2Recipe, double> prices,
+    private void StorePrices(Dictionary<Expedition2Recipe, double> prices,
         List<Expedition2Recipe> recipes)
     {
         if (recipes == null || recipes.Count == 0 || Kept.Home.Length == 0)
             return;
 
-        // **A capture, not a running copy.** This used to write on every build while the setting
-        // was on, which turns a failed thaw into a fresh snapshot: the home is set as the plugin
-        // loads, so a reload whose first build lands before it reads nothing, prices fresh, and
-        // overwrites the file with what it just read. The setting then holds prices for as long as
-        // nobody reloads, which is the opposite of what it is for.
-        //
-        // So an existing file that still matches this game build is left exactly alone. To take a
-        // new snapshot, delete it - which is the one action that cannot happen by accident.
-        try
-        {
-            if (File.Exists(Frozen))
-            {
-                var had = File.ReadAllLines(Frozen);
+        // Unchanged since last written: nothing to do. Most builds, since the market moves far more slowly than every
+        // five seconds.
+        if (_stored != null && _stored.Count == recipes.Count &&
+            recipes.All(r => prices.TryGetValue(r, out var now) && _stored.TryGetValue(r, out var was) && now == was))
+            return;
 
-                if (had.Length == recipes.Count + 1 &&
-                    int.TryParse(had[0], NumberStyles.Integer, CultureInfo.InvariantCulture,
-                        out var many) && many == recipes.Count)
-                    return;
-            }
-        }
-        catch (Exception ex)
-        {
-            Freezer = $"could not check the frozen prices before writing: {ex.Message}";
-        }
+        // **Never under the freeze when something is stored.** The caller asks this only with the freeze off, or with
+        // nothing stored yet - and a file that exists but did not fit (a reload's first build landing before the config
+        // folder is known reads nothing) is checked again here, so a failed read does not become a fresh snapshot
+        // under a ticked box. See DebugSettings.FreezePrices.
+        if (Safe.Read(() => _settings.Debug.FreezePrices.Value, false) && File.Exists(PricesFile))
+            return;
 
         try
         {
@@ -387,20 +426,21 @@ internal sealed class Valuation
                     : "0");
             }
 
-            File.WriteAllLines(Frozen, lines);
+            File.WriteAllLines(PricesFile, lines);
 
-            Freezer = $"froze {recipes.Count:N0} recipes to disk";
+            _stored = new Dictionary<Expedition2Recipe, double>(prices);
+            PricesFileSaid = $"stored {recipes.Count:N0} recipes' prices, {DateTime.Now:HH:mm:ss}";
         }
         catch (Exception ex)
         {
-            Freezer = $"could not write the frozen prices: {ex.Message}";
+            PricesFileSaid = $"could not store the prices: {ex.Message}";
         }
     }
 
     /// <summary>
-    /// Reads the frozen table back, or null when there is not one that fits. See Freezing.
+    /// Reads the stored prices back, or null when there are none that fit this game build. See StorePrices.
     /// </summary>
-    private Dictionary<Expedition2Recipe, double> Thawed()
+    private Dictionary<Expedition2Recipe, double> StoredPrices()
     {
         var recipes = Safe.Read(() => _gc.Files.Expedition2Recipes.EntriesList, null);
 
@@ -410,28 +450,39 @@ internal sealed class Valuation
         // it loads, so the first build of a reload can arrive before it.
         if (recipes == null || recipes.Count == 0)
         {
-            Freezer = "the game's recipe list has not loaded yet - not frozen";
+            PricesFileSaid = "the game's recipe list has not loaded yet - no stored prices";
 
             return null;
         }
 
         if (Kept.Home.Length == 0)
         {
-            Freezer = "no config folder yet, so the frozen prices could not be read - not frozen";
+            PricesFileSaid = "no config folder yet, so the stored prices could not be read";
 
             return null;
         }
 
-        if (!File.Exists(Frozen))
+        // The file the freeze wrote, moved to its new name once. See FrozenPricesFile.
+        try
         {
-            Freezer = "nothing frozen on disk yet - this build will be captured";
+            if (!File.Exists(PricesFile) && File.Exists(FrozenPricesFile))
+                File.Move(FrozenPricesFile, PricesFile);
+        }
+        catch (Exception ex)
+        {
+            PricesFileSaid = $"could not move {Path.GetFileName(FrozenPricesFile)}: {ex.Message}";
+        }
+
+        if (!File.Exists(PricesFile))
+        {
+            PricesFileSaid = "no prices stored yet - the first prices read will be";
 
             return null;
         }
 
         try
         {
-            var lines = File.ReadAllLines(Frozen);
+            var lines = File.ReadAllLines(PricesFile);
 
             // The first line is how many recipes the game had when this was written. A different
             // number means a different game build and the indices no longer line up, so the file is
@@ -441,7 +492,7 @@ internal sealed class Valuation
                 !int.TryParse(lines[0], NumberStyles.Integer, CultureInfo.InvariantCulture,
                     out var many) || many != recipes.Count)
             {
-                Freezer = "the frozen prices are from a different game build - ignored";
+                PricesFileSaid = "the stored prices are from a different game build - ignored";
 
                 return null;
             }
@@ -456,15 +507,13 @@ internal sealed class Valuation
                     : 0d;
             }
 
-            // Whatever answered before still answers, or nothing downstream would believe the table.
-            Priced = true;
-            Freezer = $"thawed {recipes.Count:N0} recipes from disk - prices held across the reload";
+            PricesFileSaid = $"read {recipes.Count:N0} recipes' prices from disk";
 
             return held;
         }
         catch (Exception ex)
         {
-            Freezer = $"could not read the frozen prices: {ex.Message}";
+            PricesFileSaid = $"could not read the stored prices: {ex.Message}";
 
             return null;
         }
@@ -538,7 +587,9 @@ internal sealed class Valuation
                 var local = Propagation.Locally(recipe, passing);
 
                 best[id] = new Reward(name, value, needs, carries,
-                    Propagation.Ids(recipe, passing), local.Total, local.Runes, id);
+                    Propagation.Ids(recipe, passing), local.Total, local.Runes, id, Propagation.HeldRunes(recipe),
+                    Propagation.WaveSharesOfIds(recipe, passing), Propagation.HeldRuneWaveShares(recipe),
+                    Propagation.SlotRunes(recipe));
             }
         }
 
@@ -737,7 +788,7 @@ internal sealed class Valuation
     /// </param>
     private List<KeyValuePair<Expedition2Recipe, double>> Reachable(Expedition2EncounterData data,
         Entity entity) =>
-        Pinned(Everything(data, entity), entity);
+        Pinned(Everything(data, entity), entity, data);
 
     /// <summary>
     /// The same list before a must take collapses it. What the remnant IS, rather than what to click.
@@ -965,6 +1016,8 @@ internal sealed class Valuation
         var whole = (_prices.Value?.Count ?? 0);
         var byLevel = 0;
         var byFixed = 0;
+        var byLeague = 0;
+        var league = Safe.Read(() => _gc.IngameState.ServerData.League, "") ?? "";
 
         var prices = _prices.Value ?? new Dictionary<Expedition2Recipe, double>();
         var buckets = _recipesByRuneCount.Value;
@@ -991,6 +1044,13 @@ internal sealed class Valuation
                 continue;
             }
 
+            if (WithheldInLeague(recipe, league))
+            {
+                byLeague++;
+
+                continue;
+            }
+
             // The rune already in the ground has to be the one this recipe wants in that slot.
             if (pinned &&
                 !Safe.Read(() => recipe.Runes.ElementAtOrDefault(fixedAt)?.Equals(fixedRune) == true, false))
@@ -1013,11 +1073,25 @@ internal sealed class Valuation
         FilterAccounting = $"of {whole} recipes in the game, {found.Count} fit this remnant - " +
                  $"{whole - enumerated} ruled out by sockets/slot " +
                  $"({sockets} sockets, rune counts [{(allowed == null ? "any" : string.Join(",", allowed))}]), " +
-                 $"{byLevel} by level {level}, {byFixed} by the fixed rune " +
+                 $"{byLevel} by level {level}, {byLeague} withheld in league \"{league}\", {byFixed} by the fixed rune " +
                  $"({(pinned ? Safe.Read(() => fixedRune.Id, "?") + "@" + fixedAt : "none in the ground")})";
 
         return found;
     }
+
+    /// <summary>
+    /// Whether the game keeps this recipe's reward out of the combinations window in this league. The 0.5.5 patch notes
+    /// (forum thread 4000864): "The Aldur's Saga cannot be obtained outside of the Runes of Aldur League". The recipe is
+    /// still in the game's recipe table and on a remnant's own list, so a remnant read it as an option - priced at a
+    /// hand-set 200,001 on 2026-10-01 - and the window then had no row for it. Matched on the reward's metadata
+    /// rather than its name.
+    /// </summary>
+    private static bool WithheldInLeague(Expedition2Recipe recipe, string league) =>
+        league.IndexOf("Aldur", StringComparison.OrdinalIgnoreCase) < 0 &&
+        string.Equals(Safe.Read(() => recipe.Reward?.Metadata, "") ?? "", AldursSaga, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Aldur's Saga's base item. See WithheldInLeague.</summary>
+    private const string AldursSaga = "Metadata/Items/Expedition/Expedition2LogbookSpecial";
 
     /// <summary>
     /// Why the last option list came out the size it did, term by term. See Everything.
@@ -1064,14 +1138,25 @@ internal sealed class Valuation
     /// everywhere else.
     /// </summary>
     private List<KeyValuePair<Expedition2Recipe, double>> Pinned(
-        List<KeyValuePair<Expedition2Recipe, double>> found, Entity entity)
+        List<KeyValuePair<Expedition2Recipe, double>> found, Entity entity, Expedition2EncounterData data = null)
     {
+        // **Not once the player has chosen a reward on it.** A must take with a reward the player chose is fixed to that
+        // reward (see Planning.Pinned), and the whole list is kept so the chosen one is in it and a richer one can be
+        // shown beside it. One the placement run set is not the player's. See ChosenByPlayer.
+        if (data != null && Safe.Read(() => ChosenByPlayer(entity), null) != null)
+            return found;
+
         // **Asked of the marker, not of the threshold.** Collapsing the list is the consequence of a
         // remnant being must take, so it has to follow the marker: un-mark one and its other
         // combinations come back, which is the whole reason somebody would un-mark it. Reading the
         // threshold here instead made the collapse outlive the decision that caused it.
+        //
+        // **And only a must take the threshold earned.** A must take set by hand says "take this remnant", not "take its
+        // richest reward": asked with Wants, every remnant marked by hand lost all but one combination, and a remnant
+        // offering five on a Grazed Prairie site (2026-10-06) was planned on Uhtred's Saga alone, its Power-bearing 10x
+        // Chaos Orb gone. See Insisted.MarkedForRewardValue.
         if (found.Count <= 1 ||
-            !Insisted.Here.Wants(Safe.Read(() => entity.GridPos, System.Numerics.Vector2.Zero)))
+            !Insisted.Here.MarkedForRewardValue(Safe.Read(() => entity.GridPos, System.Numerics.Vector2.Zero)))
             return found;
 
         var best = -1;
@@ -1226,6 +1311,22 @@ internal sealed class Valuation
     /// "Skill: Leylines" are both named "Leylines" - and the wrong one cannot be recovered from,
     /// because there is no alternative for the search to fall back on.
     /// </summary>
+    /// <summary>
+    /// The recipe set on this remnant when the player set it, or null: nothing set, or set by the placement run. See
+    /// Placement.SetByPlacement.
+    /// </summary>
+    public string ChosenByPlayer(Entity entity)
+    {
+        var recipe = ChosenRecipeId(entity);
+
+        if (string.IsNullOrEmpty(recipe))
+            return null;
+
+        var grid = Safe.Read(entity, static e => e.GridPos, System.Numerics.Vector2.Zero);
+
+        return Placement.SetByPlacement(grid, recipe) ? null : recipe;
+    }
+
     public string ChosenRecipeId(Entity entity)
     {
         var data = Data(entity);
@@ -1276,6 +1377,37 @@ internal sealed class Valuation
         var recipe = data == null ? null : Chosen(data);
 
         return recipe == null ? 0 : Safe.Read(() => recipe.RuneCountRequired, 0);
+    }
+
+    /// <summary>
+    /// The chosen combination's runes in slot order, space separated, a propagating slot marked with a trailing
+    /// *, or empty when nothing is chosen or it cannot be read. For the spawn census, which asks whether
+    /// particular runes - Oath summoning allies, Time respawning the slain - change how many monsters come.
+    /// </summary>
+    public string ChosenRuneNames(Entity entity)
+    {
+        var data = Data(entity);
+        var recipe = data == null ? null : Chosen(data);
+
+        if (recipe == null)
+            return "";
+
+        var passing = Safe.Read(() => data.PassedOnRunePositions, null);
+        var count = Safe.Read(() => recipe.Runes?.Count ?? 0, 0);
+        var names = new List<string>();
+
+        for (var slot = 0; slot < count; slot++)
+        {
+            var at = slot;
+            var rune = Safe.Read(() => recipe.Runes.ElementAtOrDefault(at)?.Id, null);
+
+            if (string.IsNullOrEmpty(rune))
+                continue;
+
+            names.Add(rune + (passing != null && passing.Contains(at) ? "*" : ""));
+        }
+
+        return string.Join(" ", names);
     }
 
     /// <summary>The rune already placed in this remnant, by id, or null when unreadable.</summary>
@@ -1447,7 +1579,8 @@ internal sealed class Valuation
         var best = -1d;
         var longest = 0;
 
-        foreach (var entry in text.Split(','))
+        // One a line, or comma separated as they were saved before. See RewardSettings.Overrides.
+        foreach (var entry in text.Split(new[] { ',', '\n' }))
         {
             var parts = entry.Split('=');
 

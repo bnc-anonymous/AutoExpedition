@@ -84,17 +84,7 @@ internal static class Detonator
     {
         var found = new List<(Vector2 At, int Placed, int Total)>();
 
-        // Cleared here rather than anywhere else, because this is where it is written - a latch
-        // whose reset lives in another method is one that resets late the day that method stops
-        // being called. See Worked.
-        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
-
-        if (area != _workedFor)
-        {
-            _workedFor = area;
-            _worked.Clear();
-            _setOff.Clear();
-        }
+        SwapSiteRecordsOnAreaChange(gc);
 
         var encounters = Safe.Read(Info(gc), static i => i.Encounters, null);
 
@@ -168,6 +158,71 @@ internal static class Detonator
     private static readonly Dictionary<(int X, int Y), int> _worked = new();
 
     private static uint _workedFor;
+
+    /// <summary>
+    /// The set-off latch and the placed high-water mark of each area left recently, so coming back through a portal
+    /// restores them. Neither can be read again from across the map: a detonated site's panel reads 0 of 0 on return
+    /// and its detonator is only readable once loaded, so a finished Grand site whose records were dropped with the
+    /// area read as never started, and the presolve planned and drew a chain on it. Keyed by area hash, which a map
+    /// instance keeps across a portal and a new instance does not share. See Insisted.AreaChange, which keeps the
+    /// must-take marks the same way.
+    /// </summary>
+    private static readonly Dictionary<uint, (Dictionary<(int X, int Y), int> Worked, HashSet<(int X, int Y)> SetOff)>
+        _siteRecordsByArea = new();
+
+    /// <summary>The areas in _siteRecordsByArea, oldest first, so the oldest goes once there are too many.</summary>
+    private static readonly List<uint> _areasWithSiteRecords = new();
+
+    /// <summary>How many areas' site records are kept. The same as the must-take marks keep.</summary>
+    private const int AreasWithSiteRecordsKept = 8;
+
+    /// <summary>
+    /// Swaps the site records over when the area has changed since they were last touched. Called by everything that
+    /// writes or reads them with the game in hand, so no one caller being skipped leaves another area's records in
+    /// place. See _siteRecordsByArea.
+    /// </summary>
+    private static void SwapSiteRecordsOnAreaChange(GameController gc)
+    {
+        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
+        if (area == _workedFor)
+            return;
+
+        SwapSiteRecordsForArea(_workedFor, area);
+        _workedFor = area;
+        SetOffEvidence.Clear();
+    }
+
+    /// <summary>
+    /// Files the site records of the area being left and puts back those of the area entered, or empties them for an
+    /// area not seen recently. See _siteRecordsByArea.
+    /// </summary>
+    private static void SwapSiteRecordsForArea(uint left, uint entered)
+    {
+        if (left != 0 && (_worked.Count > 0 || _setOff.Count > 0))
+        {
+            _siteRecordsByArea[left] = (new Dictionary<(int X, int Y), int>(_worked), new HashSet<(int X, int Y)>(_setOff));
+            _areasWithSiteRecords.Remove(left);
+            _areasWithSiteRecords.Add(left);
+
+            while (_areasWithSiteRecords.Count > AreasWithSiteRecordsKept)
+            {
+                _siteRecordsByArea.Remove(_areasWithSiteRecords[0]);
+                _areasWithSiteRecords.RemoveAt(0);
+            }
+        }
+
+        _worked.Clear();
+        _setOff.Clear();
+
+        if (entered != 0 && _siteRecordsByArea.TryGetValue(entered, out var kept))
+        {
+            foreach (var (cell, most) in kept.Worked)
+                _worked[cell] = most;
+
+            _setOff.UnionWith(kept.SetOff);
+        }
+    }
 
     /// <summary>
     /// Whether the cursor is sitting on the game's own "toggle explosive placement" button.
@@ -571,6 +626,8 @@ internal static class Detonator
 
     private static int Detonating(GameController gc)
     {
+        SwapSiteRecordsOnAreaChange(gc);
+
         // **The whole list, because the type bucket does not hold it.**
         //
         // This asked ValidEntitiesByType for the IngameIcon bucket, which is the cheap way to find
@@ -624,8 +681,13 @@ internal static class Detonator
             // entity list either way, so recording the others costs nothing - and "has that
             // expedition been set off" is a question asked later, about a detonator that will not be
             // loaded by then. See SetOff.
-            if (said >= 1)
-                _setOff.Add(((int)MathF.Round(at.X), (int)MathF.Round(at.Y)));
+            if (said >= 1 && _setOff.Add(((int)MathF.Round(at.X), (int)MathF.Round(at.Y))))
+            {
+                var placedNow = Safe.Read(() => Info(gc)?.PlacedExplosiveCount ?? -1, -1);
+
+                SetOffEvidence.Add($"{DateTime.Now:HH:mm:ss} ({at.X:0},{at.Y:0}) {metadata} read activated {said} " +
+                                   $"with {placedNow} explosive(s) placed on the panel");
+            }
 
             // The one belonging to this dig site is the answer. A map holds two.
             if (site == Vector2.Zero || Vector2.Distance(at, site) <= 3f)
@@ -665,12 +727,22 @@ internal static class Detonator
     /// SetOff is the same question answered and remembered while the walk had the entity in hand, so
     /// it survives walking away, and it knows nothing about a site first seen after the fact.
     ///
-    /// The live read stays in front as the fast path for the site being stood on.
+    /// The live read stays in front as the fast path for the site being stood on, and it overrules the latch whenever
+    /// the detonator is loaded: a detonator read at 0 is not set off, whatever was latched. Seen 2026-10-02: a site
+    /// with 0 of 19 explosives placed and its detonator reading activated 0 was latched as set off, so no link of
+    /// its plan was drawn. What wrote the latch was not caught.
     /// </summary>
     public static bool SetOffHere(GameController gc)
     {
-        if (ExplosivesDetonated(gc) >= 1)
+        SwapSiteRecordsOnAreaChange(gc);
+
+        var live = ExplosivesDetonated(gc);
+
+        if (live >= 1)
             return true;
+
+        if (live == 0)
+            return false;
 
         var site = DetonatorGridPosition(gc);
 
@@ -678,6 +750,19 @@ internal static class Detonator
     }
 
     private static readonly HashSet<(int X, int Y)> _setOff = new();
+
+    /// <summary>
+    /// Whether this is a Grand site and it has been set off, so there is nothing left to plan or draw on it. Grand
+    /// only: a Grand map has one detonator, while an ordinary map can hold several expeditions, and the latch was not
+    /// trusted to tell one of those from another when the site in front of the player changes. See SetOffHere.
+    /// </summary>
+    public static bool GrandSiteSetOff(GameController gc) => Grand(gc) && SetOffHere(gc);
+
+    /// <summary>
+    /// When each site was latched as set off and what was read, for the dump. Cleared with the latch. A latch written
+    /// while nothing was placed is the case to look at; see SetOffHere.
+    /// </summary>
+    public static readonly List<string> SetOffEvidence = new();
 
     public static Vector2 DetonatorGridPosition(GameController gc)
     {
@@ -803,7 +888,7 @@ internal static class Detonator
         {
             _countedFor = area;
             _countedAt = cell;
-            _counted = 0;
+            _counted = _countsOfSites.TryGetValue((area, cell), out var before) ? before : 0;
         }
 
         // **This site's own entry, not the panel's single figure.** Info.TotalExplosiveCount is one
@@ -834,13 +919,30 @@ internal static class Detonator
         // fooled by a late reading and cannot lag behind an early one - within one site, which is
         // the qualification the reset above exists to enforce.
         if (known > _counted)
+        {
             _counted = known;
+
+            if (_countsOfSites.Count >= CountsOfSitesKept && !_countsOfSites.ContainsKey((area, cell)))
+                _countsOfSites.Clear();
+
+            _countsOfSites[(area, cell)] = known;
+        }
 
         return _counted > 0 ? _counted : Assumed;
     }
 
     /// <summary>The highest explosive count this SITE has reported. See Expected.</summary>
     private static int _counted;
+
+    /// <summary>
+    /// The highest count each site has reported, by area and detonator cell, so a site left and come back to keeps
+    /// it. A detonated site's panel reads 0 of 0 on return, so without this a Grand site came back as the assumed
+    /// five explosives and stopped reading as Grand. See GrandSiteSetOff.
+    /// </summary>
+    private static readonly Dictionary<(uint Area, (int X, int Y) Cell), int> _countsOfSites = new();
+
+    /// <summary>How many sites' counts are kept before they are all dropped and gathered again.</summary>
+    private const int CountsOfSitesKept = 32;
 
     /// <summary>Which area that was, so a new map cannot inherit it.</summary>
     private static uint _countedFor;

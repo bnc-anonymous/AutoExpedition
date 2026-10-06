@@ -24,11 +24,38 @@ namespace AutoExpedition;
 /// WorldToScreen and terrain lookup, which is where its frame time goes.
 ///
 /// Whether the blast circles follow that terrain or lie flat is a display setting - see
-/// PlanDisplaySettings.FlatBlastCircles, which has the argument about which of the two is truthful.
+/// PlanDisplaySettings.FlatCircles, which has the argument about which of the two is truthful.
 /// </summary>
 internal static class Overlay
 {
+    /// <summary>
+    /// Everything the overlay draws: the world, the plan and the debug layers clipped to clearOfPanels, then the score
+    /// area unclipped and on top. The score area sits low enough on the screen that no panel reaches it. See
+    /// DisplaySettings.HideBehindPanels.
+    /// </summary>
     public static void Draw(Graphics graphics, GameController gc, AutoExpeditionSettings settings, Scan scan,
+        Snap snap, Valuation valuation, Boundary boundary,
+        Planning planning, Placement placement, Blast blast, Scoring scoring, Spawns spawns,
+        Cleared cleared, Scouted scouted, List<RectangleF> covered, RectangleF clearOfPanels)
+    {
+        using (graphics.BeginRectClip(clearOfPanels, true))
+        {
+            DrawUnderPanels(graphics, gc, settings, scan, snap, valuation, boundary, planning, placement, blast,
+                scoring, spawns, cleared, scouted, covered);
+        }
+
+        // **The score area is drawn last, so it sits on top** of the explosive labels and the remnant text, which can
+        // land on it in the world. Drawn on every way out of DrawUnderPanels, because "nothing found yet" is one of
+        // the things it has to say, and a status line that vanishes exactly when there is a problem is worse than none.
+        if (settings.Display.DrawScore)
+            using (Spent.On("Status"))
+            {
+                Status(graphics, gc, settings, scan, planning, placement, scoring, valuation, scouted);
+            }
+    }
+
+    /// <summary>The overlay's drawing below the score area. See Draw.</summary>
+    private static void DrawUnderPanels(Graphics graphics, GameController gc, AutoExpeditionSettings settings, Scan scan,
         Snap snap, Valuation valuation, Boundary boundary,
         Planning planning, Placement placement, Blast blast, Scoring scoring, Spawns spawns,
         Cleared cleared, Scouted scouted, List<RectangleF> covered)
@@ -53,15 +80,6 @@ internal static class Overlay
 
         using (Spent.On("Including"))
             targets = site == Vector2.Zero ? scan.Targets : Including(scan, site, gc);
-
-        // Before the test below, because "nothing found yet" is one of the things it has to say and
-        // a status line that vanishes exactly when there is a problem is worse than none.
-        if (settings.Display.DrawScore)
-            using (Spent.On("Status"))
-            {
-                Status(graphics, gc, settings, scan, planning, placement, scoring, valuation,
-                    scouted);
-            }
 
         // Outside that test on purpose, whatever the indentation used to suggest. The invitation is
         // how you get a plan in the first place, so hiding it with the plan would leave the key
@@ -99,7 +117,9 @@ internal static class Overlay
             }
 
         if (targets.Count == 0)
+        {
             return;
+        }
 
         // Which chain is on show, worked out once for everything that draws it.
         //
@@ -117,7 +137,9 @@ internal static class Overlay
         // Planning.ShownAt.
         // Asked for, or offered up front because the presolve was switched on and told to show its
         // working. See SolverSettings.ShowPresolve.
-        var here = Vector2.Distance(planning.Site, site) < 1f &&
+        // And not on a Grand site already set off, where a plan left from before the detonation is out of date. See
+        // Detonator.GrandSiteSetOff.
+        var here = Vector2.Distance(planning.Site, site) < 1f && !Detonator.GrandSiteSetOff(gc) &&
                    (Planning.Showing(site) ||
                     (settings.Solver.Presolve.Enable.Value && settings.Solver.Presolve.ShowPresolve.Value));
         var live = here && settings.Display.ThePlan.ShowProgress && planning.Searching ? planning.Live : null;
@@ -160,7 +182,7 @@ internal static class Overlay
             //
             // The pass runs for either; only the per-link figures are withheld when spot worth is
             // off, which is what that setting actually means. See Planning.Breakdown.
-            List<(double Content, double Carried)> worth;
+            List<(double Added, double ToLaterBlasts)> worth;
 
             using (Spent.On("Breakdown"))
             {
@@ -203,7 +225,16 @@ internal static class Overlay
                 Minimap.Draw(graphics, gc, settings, shown, blast, cleared, lit,
                     settings.Display.ThePlan.ColourInRangeAsNext);
             }
+
         }
+
+        // The remnant orders, when the chain window's switch asks for them - not tied to a plan being shown here, which
+        // the plan's own drawing is, since the orders are looked at before there is one. See RemnantOrderPanel.
+        if (settings.Display.DrawOnMinimap)
+            using (Spent.On("RemnantOrderPanel.Draw"))
+            {
+                RemnantOrderPanel.Draw(graphics, gc);
+            }
 
         // The barrels, whether or not there is a plan yet: they are the site's own blasts and knowing
         // where they are is what shapes a chain. See Minimap.Barrels, and the world pass above for
@@ -377,7 +408,9 @@ internal static class Overlay
         var debugging = settings.Debug.ShowOverlay;
 
         if (!debugging && !settings.Debug.ShowUnpriced && !settings.Debug.ShowUnexpected)
+        {
             return;
+        }
 
         var placing = Detonator.Placing(gc);
 
@@ -466,9 +499,9 @@ internal static class Overlay
         }
 
         if (Planner.Drawn > 0)
-            using (Spent.On("Spots"))
+            using (Spent.On("Edge points"))
             {
-                Spots(graphics, gc, settings, blast, covered);
+                Shapes(graphics, gc, covered);
             }
 
         // **Not behind debug mode, like the unpriced flag beside it.** Both are about an object in
@@ -480,6 +513,9 @@ internal static class Overlay
             {
                 Unknown(graphics, gc, settings, scan, site, covered);
             }
+
+        using (Spent.On("MaybeLone"))
+            MaybeLone(graphics, gc, settings, scan, planning, site, covered);
 
         if (debugging && placing && settings.Debug.ShowBlastRadius)
             using (Spent.On("Blast"))
@@ -950,21 +986,13 @@ internal static class Overlay
     /// splitting content one could take. The score card answers that in a file; this answers it on
     /// the ground, where the decision is actually made.
     ///
-    /// Two figures, because they are two different claims. The first is what this blast TAKES - the
-    /// content credited to it, which is a fact about this circle. The bracketed one is what it
-    /// PASSES ON: a remnant's carried rune, or a relic's, applied to everything the rest of the
-    /// chain unearths. That second number belongs to the link in the sense that moving the link
-    /// changes it, and belongs to the chain in the sense that it is paid out elsewhere - so it is
-    /// shown beside the first rather than added to it.
+    /// Two figures. The first is what the blast adds to the score when it goes off: the content of everything it is
+    /// first to catch, and the propagation paid on what it unearths. Summed over the blasts before one, it is the score
+    /// of the chain stopped there. The bracketed one is what the objects it catches add at the blasts after it - their
+    /// runes, held lifts and Traction - which is part of those blasts' first figures, not extra to them. Either can be
+    /// negative: Bond's penalty on its own remnant is content lost.
     ///
-    /// Both come from the plan's own scoring rather than from the geometry, so they agree with the
-    /// score card instead of being a second opinion about the same blast.
-    ///
-    /// **The bracket is what dropping this blast would cost, not its share of the propagation.**
-    /// A rune booked here pays out over every link that follows, so no single blast owns that
-    /// number - and the question being asked of a figure drawn inside a blast circle is whether to
-    /// put a bomb there. The brackets therefore add up to more than the chain's propagation, which
-    /// is what superadditive means and is not an error. See Planning.Breakdown.
+    /// Both come from the plan's own scoring rather than a second estimate of it. See Planner.ScoreOfEachBlast.
     /// </summary>
     /// <param name="before">
     /// How many explosives were already on the ground when this plan was made.
@@ -975,21 +1003,21 @@ internal static class Overlay
     /// same blast #4. Two things counting the same chain and disagreeing by three.
     /// </param>
     private static string Numbered(bool worthy,
-        List<(double Content, double Carried)> worth, int index, int before)
+        List<(double Added, double ToLaterBlasts)> worth, int index, int before)
     {
         var number = (index + 1 + before).ToString();
 
         if (!worthy || worth == null || index >= worth.Count)
             return number;
 
-        var (content, carried) = worth[index];
+        var (added, toLater) = worth[index];
 
-        if (content <= 0d && carried <= 0d)
+        if (added == 0d && toLater == 0d)
             return number;
 
-        return carried > 0d
-            ? $"#{number} +{content:N0} ({carried:N0})"
-            : $"#{number} +{content:N0}";
+        return toLater != 0d
+            ? $"#{number} {added:+#,##0;-#,##0;0} ({toLater:+#,##0;-#,##0;0})"
+            : $"#{number} {added:+#,##0;-#,##0;0}";
     }
 
     /// <summary>
@@ -1048,7 +1076,7 @@ internal static class Overlay
 
         if (centre != Vector3.Zero && !Under(gc, covered, centre))
             graphics.DrawCircleInWorld(centre, radius.Value * Detonator.GridToWorld,
-                settings.Debug.BlastCircleColour, 2f, 48, !settings.Display.ThePlan.FlatBlastCircles);
+                settings.Debug.BlastCircleColour, 2f, 48, !settings.Display.ThePlan.FlatCircles);
     }
 
     // -------------------------------------------------------------------- the plan
@@ -1070,7 +1098,7 @@ internal static class Overlay
     private static void Chain(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         Plan plan, List<Target> targets, Blast blast, Cleared cleared, List<RectangleF> covered,
         Placement placement, bool[] lit,
-        List<(double Content, double Carried)> worth = null, int before = 0)
+        List<(double Added, double ToLaterBlasts)> worth = null, int before = 0)
     {
         if (plan.Points.Count == 0)
             return;
@@ -1176,7 +1204,7 @@ internal static class Overlay
                     (ready || next || settings.Display.ThePlan.ShowLater))
                 {
                     graphics.DrawCircleInWorld(world, radius.Value * Detonator.GridToWorld, colour,
-                        thickness, 32, !settings.Display.ThePlan.FlatBlastCircles);
+                        thickness, 32, !settings.Display.ThePlan.FlatCircles);
                 }
 
                 // Ring what that circle is for. Only the next one, and only outside debug mode,
@@ -1394,6 +1422,18 @@ internal static class Overlay
             return -1;
         }
 
+        // **A must take with a reward the player chose on it is fixed to that reward**, so the green is that reward
+        // whether or not the chain reaches it. See Planning.Pinned.
+        if (Safe.Read(() => Insisted.Here.Wants(target.Grid), false) &&
+            Safe.Read(() => valuation.ChosenByPlayer(target.Entity), null) is { Length: > 0 } byPlayer)
+        {
+            for (var i = 0; i < target.Rewards.Count; i++)
+            {
+                if (string.Equals(target.Rewards[i].Recipe, byPlayer, StringComparison.Ordinal))
+                    return i;
+            }
+        }
+
         // The objective's own choice where it has one, so the green text names what the plan was
         // scored with rather than a second answer to the same question. See Options.Solved.
         var solved = Options.Solved(target);
@@ -1555,8 +1595,8 @@ internal static class Overlay
     /// - the two differ by the lattice snap and by the range clamp, and the number has to belong to
     /// the spot the game would use rather than to the pixel the mouse is over.
     ///
-    /// Same two figures a planned circle carries, in the same order and the same words: what it
-    /// takes, and in brackets what it passes on. See Numbered.
+    /// The first figure a planned circle carries: what the blast adds, content and propagation together. There is no
+    /// bracket, since a blast scored alone has none after it. See Numbered and Planning.Spot.
     /// </summary>
     private static void Worth(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         Planning planning, List<RectangleF> covered)
@@ -1578,12 +1618,12 @@ internal static class Overlay
         if (on == Vector2.Zero || Panels.Covers(covered, on))
             return;
 
-        var (content, carried) = planning.Spot(at);
+        var added = planning.Spot(at);
 
-        if (content <= 0d && carried <= 0d)
+        if (added == 0d)
             return;
 
-        var text = carried > 0d ? $"+{content:N0} ({carried:N0})" : $"+{content:N0}";
+        var text = $"{added:+#,##0;-#,##0;0}";
         var size = graphics.MeasureText(text);
 
         graphics.DrawTextWithBackground(text,
@@ -1775,23 +1815,11 @@ internal static class Overlay
     /// which way to walk rather than disappearing at the moment it is most wanted.
     /// </summary>
     /// <summary>
-    /// Rings the richest spots the search found, best first, with what each is worth.
+    /// The edge points toward neighbours, one labelled ring per point, with each marker's short name on the marker.
+    /// See Planner.Shapes and Planner.EdgePointsTowardNeighbours.
     ///
-    /// The same numbers the anchor seeds are built from - see Planner.Spots - so this is the site as
-    /// the search understands it rather than a second opinion about it. Ranked one to n, because
-    /// the ORDER is the interesting part: a spot ringed second that you would have used first is a
-    /// disagreement worth chasing.
-    /// </summary>
-    /// <summary>
-    /// The bands themselves, drawn as the shapes they are.
-    ///
-    /// A band is every place that catches the same content for the same score, so on the ground it
-    /// is a blob - and its shape is the thing worth seeing. A long thin one means the chain has a
-    /// real choice about how far to lean; a round one a grid across means it has none, and no amount
-    /// of searching will find reach that is not there.
-    ///
-    /// The corners the search actually uses are ringed, the rest of the band is dotted, so it is
-    /// obvious whether the eight directions caught the useful extremes or cut a lobe off.
+    /// Each entry's second list is ringed and its third is dotted cell by cell; the edge points leave the third
+    /// empty, so only their rings show.
     /// </summary>
     private static void Shapes(Graphics graphics, GameController gc, List<RectangleF> covered)
     {
@@ -1805,9 +1833,39 @@ internal static class Overlay
         if (camera == null)
             return;
 
+        var seeds = Planner.EdgePointColourSeeds;
+
+        // Each marker's short name on the marker, so a label like "E1+L2 > R5" can be read against the ground.
+        if (Planner.TowardNeighbours)
+        {
+            foreach (var (grid, name) in Planner.EdgePointMarkerNames)
+            {
+                var world = Where(gc, grid);
+
+                if (world == Vector3.Zero)
+                    continue;
+
+                var on = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
+
+                if (on != Vector2.Zero && !Panels.Covers(covered, on))
+                    graphics.DrawTextWithBackground(name, on, Color.White, Color.Black);
+            }
+        }
+
         for (var i = 0; i < bands.Count; i++)
         {
-            var colour = Band(i);
+            // The edge points are coloured by what they catch rather than by their place in the list. See
+            // Planner.EdgePointColourSeeds.
+            var colour = Planner.TowardNeighbours && i < seeds.Count ? Band(seeds[i]) : Band(i);
+
+            // Dimmed by how much of its origin's richest spot it catches. See Planner.EdgePointBrightness.
+            if (Planner.TowardNeighbours && i < Planner.EdgePointBrightness.Count)
+            {
+                var bright = Planner.EdgePointBrightness[i];
+
+                colour = Color.FromArgb(colour.A, (int)(colour.R * bright), (int)(colour.G * bright),
+                    (int)(colour.B * bright));
+            }
             var (name, corners, all) = bands[i];
 
             foreach (var cell in all)
@@ -1843,16 +1901,16 @@ internal static class Overlay
                 static x => x.camera.WorldToScreen(x.Item2), Vector2.Zero);
 
             if (at != Vector2.Zero && !Panels.Covers(covered, at))
-                graphics.DrawTextWithBackground($"{name} ({all.Count})", at, colour, Color.Black);
+                graphics.DrawTextWithBackground(all.Count > 0 ? $"{name} ({all.Count})" : name, at, colour, Color.Black);
         }
     }
 
     /// <summary>
-    /// A colour per band, from a fixed wheel.
+    /// A colour from a fixed wheel, for a number that picks it.
     ///
-    /// Bands overlap on the ground - two families can want much the same place - so they have to be
-    /// told apart by colour rather than by position. Spaced round the wheel and kept light, so they
-    /// read against the dig site's browns and against each other where they cross.
+    /// Edge points overlap on the ground, so they have to be told apart by colour rather than by position. Spaced
+    /// round the wheel and kept light, so they read against the dig site's browns and against each other where they
+    /// cross.
     /// </summary>
     private static Color Band(int which)
     {
@@ -1872,75 +1930,6 @@ internal static class Overlay
         };
     }
 
-    private static void Spots(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
-        Blast blast, List<RectangleF> covered)
-    {
-        if (Planner.Shaped)
-        {
-            Shapes(graphics, gc, covered);
-
-            return;
-        }
-
-        var spots = Planner.Spots;
-
-        if (spots.Count == 0)
-            return;
-
-        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
-        var radius = blast.Radius(gc, settings);
-
-        if (camera == null)
-            return;
-
-        // Every spot on the list, not the first few.
-        //
-        // The count means "per thing" in the per-kind views - three best spots per rare over eight
-        // rares is twenty four rings, all of them wanted - and the list is already cut to that when
-        // it is built. Truncating again here drew three rings in total and made the per-kind buttons
-        // look broken.
-
-        // One colour for the whole set, and never the chain's: these answer a question about the
-        // site rather than about the plan, so they must not read as part of the route drawn in green
-        // and yellow.
-        //
-        // Which colour says which question. The overall ranking is light blue, its own thing; the
-        // per-remnant ranking borrows the remnant colour, because every ring in it belongs to a
-        // remnant and matching the mark already on that remnant is what joins the two up by eye.
-        var colour = Planner.Family
-            ? Color.FromArgb(255, 140, 255, 170)
-            : Planner.Paired
-                ? Color.FromArgb(255, 255, 170, 80)
-                : Planner.PerKind switch
-        {
-            TargetKind.Remnant => (Color)settings.Debug.RemnantColour,
-            TargetKind.Elite => (Color)settings.Debug.EliteColour,
-            _ => Color.FromArgb(255, 120, 200, 255),
-        };
-
-        for (var i = 0; i < spots.Count; i++)
-        {
-            var world = Where(gc, spots[i].At);
-
-            if (world == Vector3.Zero)
-                continue;
-
-            var at = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
-
-            if (at == Vector2.Zero || Panels.Covers(covered, at))
-                continue;
-
-            if (radius != null)
-            {
-                graphics.DrawCircleInWorld(world, radius.Value * Detonator.GridToWorld, colour,
-                    1f, 24, true);
-            }
-
-            graphics.DrawTextWithBackground($"{spots[i].Note}: {spots[i].Worth:N0}", at, colour,
-                Color.Black);
-        }
-    }
-
     /// <summary>
     /// A red line to anything the game would set off that the scan does not know about.
     ///
@@ -1951,6 +1940,113 @@ internal static class Overlay
     ///
     /// See <see cref="Unexpected"/> for why this is worth having at all.
     /// </summary>
+    /// <summary>
+    /// A label on each remnant of this site that may belong to no dig site and that the chain on screen catches, asking
+    /// for a recipe to be picked on it - which is what settles it. Such a remnant stays in the plan until it is
+    /// settled, because leaving out one that does belong costs more than keeping one that does not. One the chain does
+    /// not reach is not asked about. See Scan.MaybeLone and Scan.SettleLoneRemnants.
+    /// </summary>
+    private static void MaybeLone(Graphics graphics, GameController gc, AutoExpeditionSettings settings, Scan scan,
+        Planning planning, Vector2 site, List<RectangleF> covered)
+    {
+        if (scan == null || site == Vector2.Zero)
+            return;
+
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+
+        if (camera == null)
+            return;
+
+        foreach (var remnant in scan.At(site))
+        {
+            // Only where the chain on screen catches it; otherwise the answer changes nothing. See ChainCatches.
+            if (!scan.MaybeLone(remnant) || !ChainCatches(planning, remnant.Grid))
+                continue;
+
+            var world = Where(gc, remnant.Grid);
+
+            if (world == Vector3.Zero)
+                continue;
+
+            var at = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
+
+            if (at != Vector2.Zero && !Panels.Covers(covered, at))
+                graphics.DrawTextWithBackground("Pick a recipe here: this remnant may not belong to the dig site",
+                    at + new Vector2(0f, 20f),
+                    settings.Display.ThePlan.LaterColour, Color.Black);
+        }
+    }
+
+    /// <summary>
+    /// Whether some link of the current chain catches the target standing on this grid position, by the planner's own
+    /// reach test. False with no chain or no environment. See Planner.Catches.
+    /// </summary>
+    private static bool ChainCatches(Planning planning, Vector2 grid)
+    {
+        var env = planning?.Env;
+        var chain = planning?.Chain;
+
+        if (env == null || chain is not { Count: > 0 })
+            return false;
+
+        foreach (var target in env.Targets)
+        {
+            if (Vector2.Distance(target.Grid, grid) >= 1f)
+                continue;
+
+            foreach (var spot in chain)
+            {
+                if (Planner.Catches(env, spot, target))
+                    return true;
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Where a grid position is from the player, in words: its distance in grid and its direction on screen, such as
+    /// "60 grid up-left of you". Screen directions because grid axes run diagonally across the screen, so a compass
+    /// read off the grid points the wrong way. Distance alone where the camera cannot be read.
+    /// </summary>
+    private static string WhereFromPlayer(GameController gc, Vector2 grid)
+    {
+        var standing = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var distance = standing == Vector2.Zero ? 0f : Vector2.Distance(standing, grid);
+        var away = $"{distance:0} grid";
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+        var from = Where(gc, standing);
+        var to = Where(gc, grid);
+
+        if (camera == null || from == Vector3.Zero || to == Vector3.Zero)
+            return $"{away} from you";
+
+        var a = Safe.Read((camera, from), static x => x.camera.WorldToScreen(x.from), Vector2.Zero);
+        var b = Safe.Read((camera, to), static x => x.camera.WorldToScreen(x.to), Vector2.Zero);
+        var step = b - a;
+
+        if (a == Vector2.Zero || b == Vector2.Zero || step.Length() < 1f)
+            return $"{away} from you";
+
+        // Eight sectors of 45 degrees, measured from screen right, with screen y running down.
+        var sector = (int)MathF.Round(MathF.Atan2(-step.Y, step.X) / (MathF.PI / 4f));
+        var direction = (((sector % 8) + 8) % 8) switch
+        {
+            0 => "right",
+            1 => "up-right",
+            2 => "up",
+            3 => "up-left",
+            4 => "left",
+            5 => "down-left",
+            6 => "down",
+            _ => "down-right",
+        };
+
+        return $"{away} {direction} of you";
+    }
+
     private static void Unknown(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         Scan scan, Vector2 site,
         List<RectangleF> covered)
@@ -1992,7 +2088,9 @@ internal static class Overlay
             if (toward != Vector2.Zero && Vector2.Dot(toward, Normal(to - from)) <= 0.5f)
                 continue;
 
-            graphics.DrawLine(from, to, one.Lit ? 2f : 1f, Color.Red);
+            if (settings.Debug.ShowUnexpectedLines)
+                graphics.DrawLine(from, to, one.Lit ? 2f : 1f, Color.Red);
+
             // **The name the settings tab gives it, and no grid reference.**
             //
             // The coordinates were here to be read off the screen and typed into a search of the
@@ -2027,7 +2125,7 @@ internal static class Overlay
         // verdict below argues against one solved chain, and a solve in flight means that chain is
         // being replaced - so the line would point at a remnant chosen for a plan that no longer
         // exists. See Rolling.Fresh.
-        if (!Rolling.Here.Fresh || Rolling.Here.Best is not { } best || best.Grid == Vector2.Zero)
+        if (!Rolling.Here.Fresh || Rolling.Here.Advised is not { } best || best.Grid == Vector2.Zero)
             return;
 
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
@@ -2095,13 +2193,9 @@ internal static class Overlay
         // plane swings about, so the endpoint jitters along the window edge; and the dot test only has
         // to be wrong once - a bearing read at 0.51 against a mirrored projection hands the clip a
         // point on the opposite side, and the line reverses. The bearing cannot mirror, so out here it
-        // is the only input. On screen the projection is the answer and is used unchanged.
-        var end = !off
-            ? to
-            : Clip(window, from,
-                toward != Vector2.Zero
-                    ? from + toward * (window.Width + window.Height)
-                    : to);
+        // is the only input. On screen the projection is the answer and is used unchanged, and just past the
+        // edge it is too, since that is where the bearing's perspective error shows. See EdgeEnd.
+        var end = !off ? to : EdgeEnd(window, from, ground, toward, trusted);
 
         if (end != Vector2.Zero && !Panels.Covers(covered, end))
             graphics.DrawLine(from, end, settings.Display.Remnants.Rerolls.RollLineThicknessInWorld.Value,
@@ -2217,6 +2311,9 @@ internal static class Overlay
                 ? of
                 : null, null);
 
+        // The explosives down belong to the site as much as the detonator does. See FromSite.
+        var placed = Detonator.PlacedExplosiveGridPositions(gc);
+
         foreach (var chest in chests ?? new List<Entity>())
         {
             var metadata = Safe.Read(chest, static e => e.Metadata, "") ?? "";
@@ -2239,16 +2336,18 @@ internal static class Overlay
 
             var grid = Safe.Read(chest, static e => e.GridPos, Vector2.Zero);
 
+            // A chest the player cannot walk to - penned behind an explosive gate that is still shut - is not loot
+            // to walk towards. See WalkableFromPlayer.
+            if (grid != Vector2.Zero && !WalkableFromPlayer.CanWalkTo(gc, at, grid))
+                continue;
+
             // **A finite bound, because SiteReach is infinite on a Grand site.** That infinity is
             // right for deciding which markers belong to a site - a Grand one has no radius - and
             // wrong as a search radius: it made every targetable chest in the map a candidate, and
             // this loop deliberately does not filter on metadata, so an ordinary chest anywhere would
             // qualify. Never observed, because the loot within the site is almost always nearer.
-            if (grid == Vector2.Zero ||
-                Vector2.Distance(grid, site) > MathF.Min(Detonator.SiteReach(gc), Belongs))
-            {
+            if (grid == Vector2.Zero || FromSite(grid, site, placed) > MathF.Min(Detonator.SiteReach(gc), Belongs))
                 continue;
-            }
 
             var world = Safe.Read(chest, static e => e.Pos, Vector3.Zero);
 
@@ -2282,6 +2381,24 @@ internal static class Overlay
     /// How far from the site a chest may be and still be this site's, when the site has no radius.
     /// </summary>
     private const float Belongs = 300f;
+
+    /// <summary>
+    /// How far a chest is from the dig site, taking the explosives down as part of it: the nearest of the
+    /// detonator and every placed explosive.
+    ///
+    /// **From the detonator alone, a Grand site's far end was not the site.** A Grand chain walks well past
+    /// Belongs from its detonator - nineteen explosives on Grazed Prairie reached 440 grid from it - so an
+    /// Excavated Chest 39 grid from the chain's own explosives got no loot line.
+    /// </summary>
+    private static float FromSite(Vector2 at, Vector2 site, Vector2[] placed)
+    {
+        var nearest = Vector2.Distance(at, site);
+
+        foreach (var down in placed ?? [])
+            nearest = MathF.Min(nearest, Vector2.Distance(at, down));
+
+        return nearest;
+    }
 
     /// <summary>
     /// Whether a spot is actually on screen and not behind a panel.
@@ -2633,14 +2750,18 @@ internal static class Overlay
         var whole = walkable > 0 && unmet == 0;
         var presolving = planning.Searching && Planning.Rehearsing;
         var solving = planning.Searching && !Planning.Rehearsing;
-        var left = planning.Left > 0.05f ? $"{planning.Left:0.0}s" : "finishing";
+        // A window that has run out while the solve waits on the remnant orders is waiting, not finishing. See
+        // Planning.WaitingForOrders.
+        var left = planning.Left > 0.05f ? $"{planning.Left:0.0}s"
+            : planning.WaitingForOrders ? "waiting for remnant orders"
+            : "finishing";
         var along = Math.Clamp(planning.Left / MathF.Max(0.05f, planning.Window), 0f, 1f);
 
         var presolve = whole ? "Presolve" : "Partial presolve";
 
         if (presolving && settings.Display.ScoreArea.DrawPresolve)
         {
-            readout.Line(($"{presolve}: {planning.Left:0.0}s", later));
+            readout.Line(($"{presolve}: {left}", later));
             readout.Bar(along, later);
         }
         else if (Rehearsal.Passes > 0 && settings.Display.ScoreArea.DrawPresolve)
@@ -2650,7 +2771,7 @@ internal static class Overlay
                 whole && Rehearsal.Settled ? step : later));
         }
 
-        // **A continuous reroll pass has no end to count down to.** It runs until a roll restarts it or the key
+        // **A continuous pass has no end to count down to.** It runs until something restarts it or the key
         // stops it, and a countdown that ran out and refilled every pass read as a solve finishing. The figure in
         // brackets is how many seconds ago the plan last improved, which is what says whether it is still finding
         // anything. See Planning.RunningContinuous.
@@ -2660,13 +2781,42 @@ internal static class Overlay
                 ? ""
                 : $" ({(DateTime.UtcNow - Planning.LastGainAt).TotalSeconds:0})";
 
-            readout.Line(($"Solving: until reroll{gain}", later));
+            readout.Line(($"Solving: continuous{gain}", later));
         }
         else if (solving)
         {
             readout.Line(($"Solving: {left}", later));
             readout.Bar(along, later);
         }
+
+        // **The remnant order search, while it runs**: how long, how many orders, the best so far, and how many of its
+        // units have begun. It can run past the solve's window, and nothing else said it was running. See
+        // RemnantOrder.Progress.
+        if ((presolving || solving) && RemnantOrder.Progress is { } ordering)
+        {
+            readout.Line((string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"Remnant orders{(ordering.Share < 0f ? " (background)" : "")}: {ordering.Seconds:0}s, {ordering.Orders:N0} grown, best {ordering.Best:N0}"), later));
+
+            // No bar for a search on one thread, which has no units to count. See RemnantOrder.Progress.
+            if (ordering.Share >= 0f)
+                readout.Bar(ordering.Share, later);
+        }
+
+        // Remnants that may belong to no dig site, which picking a recipe settles. See Scan.MaybeLone.
+        var here = Detonator.DetonatorGridPosition(gc);
+        // Only those the chain on screen catches: one it never reaches changes nothing whichever it turns out to be,
+        // and asking about it sent the player to a remnant 300 grid from anything (2026-10-01).
+        var unsettled = here == Vector2.Zero
+            ? null
+            : scan?.At(here).Where(r => scan.MaybeLone(r) && ChainCatches(planning, r.Grid)).ToList();
+
+        // Said as where it is from the player, on screen, rather than as grid coordinates nobody can find.
+        if (unsettled is { Count: > 0 })
+            readout.Line(((unsettled.Count == 1
+                              ? "A remnant may not belong to this dig site - pick a recipe on it to check: "
+                              : $"{unsettled.Count} remnants may not belong to this dig site - pick a recipe on each " +
+                                "to check: ") +
+                          string.Join(", ", unsettled.Select(r => WhereFromPlayer(gc, r.Grid))), later));
 
         // Last in the column because it is last in the work: the rerolls are advice about the chain
         // that has just been solved, so there is nothing for them to say until there is one.
@@ -2763,8 +2913,12 @@ internal static class Overlay
                 ? $" ({Rolling.Here.RoundsWalked * 100 / Rolling.Here.RoundsNeeded}%)"
                 : "";
 
+            // Yellow while the walk is short of 100%, because the advice can still change; the roll colour once
+            // it cannot.
+            var settling = roll && Rolling.Here.RoundsNeeded > 1 && Rolling.Here.RoundsWalked < Rolling.Here.RoundsNeeded;
+
             readout.Line(($"Reroll: {(roll ? "true" : "false")}{rounds}",
-                roll ? settings.Display.Remnants.Rerolls.RollColour : step));
+                settling ? later : roll ? settings.Display.Remnants.Rerolls.RollColour : step));
         }
 
         // **No room kept for the bar.**
@@ -2873,6 +3027,9 @@ internal static class Overlay
         var green = (Color)settings.Display.ThePlan.StepColour;
         var red = (Color)settings.Display.Remnants.Rewards.OverruledColour;
 
+        // The plan's final blast, for saying whether the marker taken last is caught by it. See Insisted.IsTakenLast.
+        var finalBlast = plan?.Points?.Count ?? 0;
+
         foreach (var target in targets)
         {
             var said = Insisted.Here.Of(target.Grid);
@@ -2901,8 +3058,18 @@ internal static class Overlay
             if (world == Vector3.Zero)
                 continue;
 
-            graphics.DrawCircleInWorld(world, 3.2f * Detonator.GridToWorld, colour, 2f, 24, true);
-            graphics.DrawCircleInWorld(world, 4.4f * Detonator.GridToWorld, colour, 2f, 24, true);
+            // Flat or following the ground as the blast circles are, so the marks sit with them. See
+            // PlanDisplaySettings.FlatCircles.
+            var followGround = !settings.Display.ThePlan.FlatCircles;
+
+            graphics.DrawCircleInWorld(world, 3.2f * Detonator.GridToWorld, colour, 2f, 24, followGround);
+            graphics.DrawCircleInWorld(world, 4.4f * Detonator.GridToWorld, colour, 2f, 24, followGround);
+
+            // A third ring for the marker the chain takes last. See Insisted.IsTakenLast.
+            var last = said == Insisted.Said.Take && Insisted.Here.IsTakenLast(target.Grid);
+
+            if (last)
+                graphics.DrawCircleInWorld(world, 5.6f * Detonator.GridToWorld, colour, 2f, 24, followGround);
 
             var at = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world),
                 Vector2.Zero);
@@ -2936,7 +3103,16 @@ internal static class Overlay
             // it. A must take the chain cannot reach and an avoided marker it cannot help catching
             // are the same kind of news - the ground would not allow what was asked - and both are
             // worth saying, because neither shows up in any number.
-            var note = banned.Length > 0
+            var note = last
+                ? by switch
+                {
+                    > 0 when by == finalBlast => $"take last - blast #{by}, the final one",
+                    > 0 => $"take last - NOT LAST: blast #{by} of {finalBlast}",
+                    -2 => "take last - already taken",
+                    0 => "take last - NOT REACHED",
+                    _ => "take last",
+                }
+                : banned.Length > 0
                 ? by > 0
                     ? $"MUST AVOID ({banned}) - TAKEN ANYWAY by blast #{by}"
                     : $"must avoid ({banned}) - avoided"
@@ -2959,9 +3135,15 @@ internal static class Overlay
             // Red when the answer is not the one asked for, whichever way it was asked.
             // An explosive already down counts as taken, so it satisfies a must take and breaks a
             // must avoid - the same way a planned blast would. See Planning.Taken.
-            var failed = said == Insisted.Said.Take ? by == 0 : by > 0 || by == -2;
+            var failed = said == Insisted.Said.Take
+                ? by == 0 || last && by > 0 && by != finalBlast
+                : by > 0 || by == -2;
 
-            graphics.DrawTextWithBackground(note, at, failed ? red : colour, Color.Black);
+            // Centred under the marker.
+            var noteSize = graphics.MeasureText(note);
+
+            graphics.DrawTextWithBackground(note, new Vector2(at.X - noteSize.X / 2f, at.Y), failed ? red : colour,
+                Color.Black);
         }
     }
 
@@ -2978,14 +3160,15 @@ internal static class Overlay
     private static string Word(GameController gc, AutoExpeditionSettings settings, Planning planning,
         Placement placement)
     {
-        if (placement.Status.Length > 0)
+        // A warning is written under the cursor instead, and the line goes on showing the count. See CursorWarning.
+        if (placement.Status.Length > 0 && !CursorWarning.IsUnshown(placement.Status) &&
+            !(settings.Display.ScoreArea.CursorWarnings && CursorWarning.IsWarning(placement.Status)))
             return placement.Status;
 
         // **"Solving 0.0s" sat there for the best part of a second and read as a hang.** The
         // countdown is the improvement window, and the search stops checking it only between
         // operators - one pass of the polish over a three hundred marker site is hundreds of
-        // milliseconds on its own, and the mixed strategy spends a fixed slice on the band search
-        // before the main one starts. So the window can run out while the current piece of work is
+        // milliseconds on its own. So the window can run out while the current piece of work is
         // still in flight, and a frozen number is the worst way to say that.
         // **The countdown is not said here any more.** It belongs in the column with the preflood
         // and the presolve, in the order the work happens, because reading it against those two is
@@ -3368,13 +3551,8 @@ internal static class Overlay
             // that is the one that is unstable out there: a point approaching the camera plane
             // projects to a figure that swings about, so the endpoint jittered along the edge while
             // the bearing beside it sat still. On screen the projection is the answer and is used
-            // unchanged.
-            var end = !off
-                ? to
-                : Clip(window, from,
-                    toward != Vector2.Zero
-                        ? from + toward * (window.Width + window.Height)
-                        : to);
+            // unchanged, and just past the edge it is too. See EdgeEnd.
+            var end = !off ? to : EdgeEnd(window, from, to, toward, trusted);
 
             if (end == Vector2.Zero || Panels.Covers(covered, end) || Panels.Covers(covered, from))
                 continue;
@@ -3524,6 +3702,27 @@ internal static class Overlay
     /// handful of remnants a frame. Halving the interval twenty times puts the answer inside a
     /// thousandth of a pixel, which is further than anybody is going to look.
     /// </summary>
+    /// <summary>
+    /// Where a line to something off screen meets the window edge.
+    ///
+    /// **Along the projection just past the edge, along the ground bearing further out.** The bearing is a step
+    /// of ground turned into screen space, and perspective bends it: a remnant barely off the edge, or just
+    /// inside the margin, got a line clipped a few degrees away from where it actually stood. The projection
+    /// is exact there. It is the far projection that cannot be trusted - near the camera plane it swings about
+    /// and behind the camera it mirrors - so the bearing is kept for anything more than a window's size out,
+    /// and for any projection the bearing disagrees with.
+    /// </summary>
+    private static Vector2 EdgeEnd(RectangleF window, Vector2 from, Vector2 to, Vector2 toward, bool trusted)
+    {
+        var near = to.X > -window.Width && to.X < 2f * window.Width &&
+                   to.Y > -window.Height && to.Y < 2f * window.Height;
+
+        if (trusted && near)
+            return Clip(window, from, to);
+
+        return Clip(window, from, toward != Vector2.Zero ? from + toward * (window.Width + window.Height) : to);
+    }
+
     private static Vector2 Clip(RectangleF window, Vector2 from, Vector2 to)
     {
         if (!Inside(window, from, Edge))
@@ -3748,24 +3947,41 @@ internal static class Overlay
             // Nothing is drawn when they agree, which is the ordinary case.
             var picked = take >= 0 && take < target.Rewards.Count ? target.Rewards[take].Name : null;
 
-            // **The reward a remnant is set to is no longer drawn in red beside the plan's, because
-            // the comparison it claimed to make cannot be made.**
-            //
-            // The line said "this is what will happen and the plan would rather have that". It only
-            // ever appeared with overruling off - with it on the plan changes the choice, so there
-            // is nothing to disagree about - and with it off Planning.Pinned collapses the remnant's
-            // option list to the one recipe it is set to. The planner is then given a single choice
-            // and picks it, so the two sides of the comparison are the same value by construction
-            // and nothing drew.
-            //
-            // What could still draw was the case where the plan had not published yet: Taking falls
-            // back to the pricing heuristic, and a heuristic preference is not the planner's, so the
-            // line named an alternative the plan had never weighed. A readout that is silent when it
-            // is right and wrong when it speaks is worth less than no readout.
-            //
-            // The honest version needs the planner to rank every option while still scoring with the
-            // pinned one, which is a change to Weighing.Choices rather than to a colour. Until that
-            // exists there is nothing true to draw here.
+            // **The combination the player set, when Overrule already chosen rewards is off.** The plan is pinned to
+            // it then (see Planning.Pinned), so the solver's current pick is the choice itself and cannot say whether
+            // the player agreed with it. What can is the solver's pick from before anything was chosen, kept in
+            // Target.SolverPickBeforeChoice: green when the choice matches it or there was none, the warning colour
+            // when it differs, with that earlier pick in green underneath. With Overrule on nothing here is drawn red,
+            // since the run changes a choice that differs.
+            var chosen = -1;
+            var wanted = -1;
+
+            var mustTake = Safe.Read(() => Insisted.Here.Wants(target.Grid), false);
+
+            if (Reroll.HoldsPlayerChosenCombination(target, settings))
+            {
+                for (var i = 0; i < target.Rewards.Count; i++)
+                {
+                    if (Safe.Read(() => valuation.AlreadySetTo(target.Entity, target.Rewards[i]), false))
+                    {
+                        chosen = i;
+
+                        break;
+                    }
+                }
+
+                // A must take is always green: the chain is built around taking it, whatever it is set to.
+                for (var i = 0; chosen >= 0 && !mustTake && i < target.Rewards.Count; i++)
+                {
+                    if (i != chosen && target.SolverPickBeforeChoice.Length > 0 &&
+                        string.Equals(target.Rewards[i].Recipe, target.SolverPickBeforeChoice, StringComparison.Ordinal))
+                    {
+                        wanted = i;
+
+                        break;
+                    }
+                }
+            }
 
             // Behind the same switch as the list it sits above. It was drawn unconditionally,
             // so turning rewards off left the green pick and the red overruled line on screen -
@@ -3783,10 +3999,28 @@ internal static class Overlay
             // where every remnant carries a full list.
             using (Spent.On("Remnants/Rewards"))
             {
-                if (take > 0 && take < target.Rewards.Count && rewards)
-                    at.Y += Line(graphics, settings, valuation, target.Rewards[take], at, true);
-
                 var drawn = 0;
+
+                if (chosen >= 0 && rewards)
+                {
+                    at.Y += Line(graphics, settings, valuation, target.Rewards[chosen], at,
+                        wanted >= 0
+                            ? (Color)settings.Display.Remnants.Rewards.OverruledColour
+                            : (Color)settings.Display.ThePlan.StepColour);
+                    drawn++;
+
+                    if (wanted >= 0)
+                        at.Y += Line(graphics, settings, valuation, target.Rewards[wanted], at, true);
+
+                    // A must take fixed to a reward that is not its richest shows the richest in purple, as the
+                    // reward list does when the plan's pick is not the money. The list is ordered by price.
+                    if (mustTake && chosen > 0)
+                        at.Y += Line(graphics, settings, valuation, target.Rewards[0], at, false);
+                }
+                else if (take > 0 && take < target.Rewards.Count && rewards)
+                {
+                    at.Y += Line(graphics, settings, valuation, target.Rewards[take], at, true);
+                }
 
                 for (var i = 0; i < target.Rewards.Count && drawn < lines; i++)
                 {
@@ -3794,7 +4028,7 @@ internal static class Overlay
                     // alone dropped the richest reward whenever the pick WAS the richest, because then
                     // take is zero and zero is the richest - so the usual case, one line long, showed
                     // the second best reward and nothing else.
-                    if (take > 0 && i == take)
+                    if (chosen >= 0 || take > 0 && i == take)
                         continue;
 
                     // Green is the pick, wherever it lands. When nothing was hoisted the pick IS the
@@ -3837,17 +4071,71 @@ internal static class Overlay
             //
             // Suppressed here rather than by emptying the table, because the test above uses it to
             // decide whether a remnant is drawn at all. See Planner.RuneTallyOutOfDate.
-            var line = settings.Display.Remnants.Propagation.ShowWaves &&
-                       !Planner.RuneTallyOutOfDate &&
-                       Planner.RuneTallyByRemnant.TryGetValue(cell, out var runes)
-                ? Propagation.Waves(runes)
-                : null;
+            if (settings.Display.Remnants.Propagation.ShowWaves && !Planner.RuneTallyOutOfDate &&
+                Planner.RuneTallyByRemnant.TryGetValue(cell, out var runes))
+                RuneLine(graphics, settings, runes, at);
+        }
+    }
 
-            if (line != null)
-            {
-                graphics.DrawTextWithBackground(line, at, settings.Display.Remnants.Propagation.PassColour,
-                    RewardBackground);
-            }
+    /// <summary>
+    /// The line under a remnant: how many runes land on each of its waves, then every rune it propagates, each in its own colour -
+    /// the propagation colour for one it is the first and last source of, the upstream duplicate colour for one an
+    /// earlier remnant already sends, the downstream duplicate colour for one a later remnant sends as well. Drawn piece
+    /// by piece on one background. A rune the game sends empowered, because the remnant holds Power, has a "+" after its name. See
+    /// Planner.RuneTally.
+    /// </summary>
+    private static void RuneLine(Graphics graphics, AutoExpeditionSettings settings, Planner.RuneTally runes,
+        Vector2 at)
+    {
+        var colours = settings.Display.Remnants.Propagation;
+        var pieces = new List<(string Text, Color Colour)>
+        {
+            (Propagation.RunesOnWaves(runes, sources: null), colours.PassColour),
+        };
+
+        var arriving = runes.Arriving ?? [];
+        var downstream = runes.Downstream ?? [];
+        var empowered = runes.Empowered ?? [];
+        var named = runes.Propagating is { Length: > 0 } propagating ? propagating : runes.FirstSourced ?? [];
+
+        for (var i = 0; i < named.Length; i++)
+        {
+            var id = named[i];
+
+            if (id == null)
+                continue;
+
+            var colour = arriving.Contains(id, StringComparer.OrdinalIgnoreCase)
+                ? (Color)colours.UpstreamDuplicateColour
+                : downstream.Contains(id, StringComparer.OrdinalIgnoreCase)
+                    ? (Color)colours.DownstreamDuplicateColour
+                    : (Color)colours.PassColour;
+
+            pieces.Add((pieces.Count == 1 ? " " : ", ", colours.PassColour));
+            // A "+" for a rune this remnant sends empowered, because it holds Power. See Planner.RuneTally.Empowered.
+            pieces.Add((RuneInfo.Called(id) + (empowered.Contains(id, StringComparer.OrdinalIgnoreCase) ? "+" : ""),
+                colour));
+        }
+
+        var width = 0f;
+        var height = 0f;
+
+        foreach (var (text, _) in pieces)
+        {
+            var size = graphics.MeasureText(text);
+
+            width += size.X;
+            height = MathF.Max(height, size.Y);
+        }
+
+        graphics.DrawBox(new RectangleF(at.X, at.Y, width, height), RewardBackground);
+
+        var x = at.X;
+
+        foreach (var (text, colour) in pieces)
+        {
+            graphics.DrawText(text, new Vector2(x, at.Y), colour);
+            x += graphics.MeasureText(text).X;
         }
     }
 
@@ -3933,7 +4221,7 @@ internal static class Overlay
     /// What a roll here is worth, as one figure beside the Verisium button.
     ///
     /// **In the propagating yellow, because runes are all it measures.** The reroll comparison
-    /// scores both sides with the reward set aside - see Rolling.Enumerated - so the number is what
+    /// scores both sides with the reward set aside - see Rolling.ScoreRollOutcomes - so the number is what
     /// the roll does to the runes the chain carries, and the yellow the game borders a propagating
     /// slot in is the colour it is already about.
     ///
@@ -3967,7 +4255,7 @@ internal static class Overlay
         if (!Rolling.Here.Fresh)
             return false;
 
-        var planned = Rolling.Here.Best is { } best &&
+        var planned = Rolling.Here.Advised is { } best &&
                       Vector2.Distance(best.Grid, target.Grid) < 1f;
 
         return planned
@@ -4016,7 +4304,7 @@ internal static class Overlay
     /// The Liquid Verisium button on the remnant standing at this cell, or an empty rect.
     ///
     /// Matched on the label's own entity position rather than on an entity handed in, because the
-    /// advice carries a cell and nothing else - see Rolling.Verdict, which is keyed that way so a
+    /// advice carries a cell and nothing else - see Rolling.RollAdvice, which is keyed that way so a
     /// verdict outlives the entity it was computed from.
     /// </summary>
     private static RectangleF ButtonFor(GameController gc, Vector2 grid)
@@ -4249,9 +4537,8 @@ internal static class Overlay
         // green score read 12,096 for the same chain, and one of them looked wrong. Neither was: they
         // are different quantities, and only one of them is loot.
         //
-        // The objective follows in brackets where the two differ, so the number the search is actually
-        // maximising stays visible without being mistaken for what the chain is worth. See
-        // Solving.Watching and Verdict.Plain.
+        // Where the two differ the chain holds must takes, and a bracket says so rather than printing the
+        // objective, whose credit dwarfs the score. See Solving.Watching and Verdict.Plain.
         foreach (var (plain, best, lean) in Solving.Watching())
         {
             line.Y += 16f;
@@ -4260,7 +4547,9 @@ internal static class Overlay
                 ? "-"
                 : Math.Abs(best - plain) < 0.5d
                     ? $"{plain:N0}"
-                    : $"{plain:N0} [{best:N0} held]";
+                    // The difference is Verdict.Held * PlanEnvironment.Refused and nothing else, and Refused is above
+                    // anything a chain can score - so as a figure it read as a score in the billions.
+                    : $"{plain:N0} [+ must takes held]";
 
             graphics.DrawText(
                 said.PadRight(said.Length > 16 ? said.Length + 2 : 16) +
@@ -4351,6 +4640,13 @@ internal static class Overlay
             $"reaching from {(placed > 0 ? $"explosive {placed}" : "the detonator")} " +
             $"({origin.X:0},{origin.Y:0}), now {Vector2.Distance(origin, at):0.#} out" +
             (Detonator.PlacementIndicatorIsRed(gc) ? "  BLOCKED" : ""), line, grey);
+
+        // The grid cell under the cursor, read every frame whether or not an explosive is being placed - the placement
+        // request below only follows the mouse while one is. What a grid position in the dump or the plan refers to.
+        var cursor = Safe.Read(() => gc.IngameState.ServerData.GridMousePosition, default);
+
+        line.Y += 16f;
+        graphics.DrawText($"cursor at ({cursor.X},{cursor.Y})", line, grey);
 
         // The two positions side by side. They agree wherever an explosive can go and part company
         // past the limit, which is why the entity is the one read.

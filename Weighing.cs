@@ -58,7 +58,8 @@ internal static class Weighing
     {
         var rate = Safe.Read(() => settings.Rewards.PointWorth.Value, 0f);
 
-        if (rate <= 0f || exalts <= 0d)
+        // Small rewards count for nothing, so the choice is made on runes. See RewardSettings.IgnoreRewardsBelow.
+        if (rate <= 0f || exalts <= 0d || exalts < Safe.Read(() => settings.Rewards.IgnoreRewardsBelow.Value, 0f))
             return 0f;
 
         var worth = (float)exalts / rate;
@@ -112,7 +113,7 @@ internal static class Weighing
 
                 return new[]
                 {
-                    (Money(reward.Value, settings), reward.Carries, reward.Local,
+                    (Money(reward.Value, settings) + WavesOfRecipe(target, reward), reward.Carries, reward.Local,
                         reward.Locals ?? [], reward.Carrying ?? [], ScopedEffectsOfReward(reward, settings)),
                 };
             }
@@ -129,12 +130,605 @@ internal static class Weighing
         {
             var reward = target.Rewards[i];
 
-            found[i] = (Money(reward.Value, settings), reward.Carries, reward.Local,
+            found[i] = (Money(reward.Value, settings) + WavesOfRecipe(target, reward), reward.Carries, reward.Local,
                 reward.Locals ?? [], reward.Carrying ?? [], ScopedEffectsOfReward(reward, settings));
         }
 
         return found;
     }
+
+    /// <summary>
+    /// The rare and magic wave worth each combination adds over the remnant's own recipe, or takes away, walked exactly as
+    /// Choices is. What Gaining Traction scales in a combination's extra waves; the combination's reward term already
+    /// counts them at face value. See WavesOfRecipe and Planner.Settle.
+    /// </summary>
+    public static (float Rare, float Magic)[] MagicAndRareWavesOfChoices(Target target, AutoExpeditionSettings settings,
+        string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        (float Rare, float Magic) Change(Reward reward)
+        {
+            if (reward.RuneCount <= 0)
+                return (0f, 0f);
+
+            var now = TierWorthOfParts(PartsOfWaves(WavesOfRemnant(target)));
+            var then = TierWorthOfParts(PartsOfWaves(reward.RuneCount));
+
+            return (then.Rare - now.Rare, then.Magic - now.Magic);
+        }
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return new[] { Change(reward) };
+            }
+        }
+
+        var found = new (float Rare, float Magic)[target.Rewards.Count];
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+            found[i] = Change(target.Rewards[i]);
+
+        return found;
+    }
+
+    /// <summary>
+    /// The Gaining Traction row's rates, magic and rare, as fractions per remnant completed before: its effects on
+    /// magic_monster and rare_monster. Nought for a rarity the row does not name. Fitted to recorded waves, not the
+    /// node's text: rares grow about 25% per remnant, magic about 5%. Read only while DebugSettings.GainingTraction
+    /// says the node is allocated. See Planner.TractionScales.
+    /// </summary>
+    public static (float Magic, float Rare) GainingTractionRates()
+    {
+        var (magic, rare) = (0f, 0f);
+
+        foreach (var effect in TableGrammar.EffectsOfRow(GainingTractionRow, out _))
+        {
+            if (effect.Own || !effect.Multiplies)
+                continue;
+
+            if (string.Equals(effect.Target, Tags.Known[Tags.Magics], StringComparison.OrdinalIgnoreCase))
+                magic = effect.Share;
+            else if (string.Equals(effect.Target, Tags.Known[Tags.Rares], StringComparison.OrdinalIgnoreCase))
+                rare = effect.Share;
+        }
+
+        return (magic, rare);
+    }
+
+    /// <summary>The row holding Gaining Traction's rates. See GainingTractionRates.</summary>
+    public const string GainingTractionRow = "atlas:gaining_traction";
+
+    /// <summary>
+    /// The map's figures a remnant's waves are built from: increased rare and magic packs from the map and atlas
+    /// (AtlasStats.MapMonsterIncreases, the biome's atlas bonus already in the map's figure), "more magic and rare
+    /// monsters" and pack size. See PacksOfRemnant.
+    /// </summary>
+    public static TableGrammar.RemnantWaveMap MapForRemnantWaves(ExileCore2.GameController gc)
+    {
+        var (rare, magic) = AtlasStats.MapMonsterIncreases(gc);
+
+        return new TableGrammar.RemnantWaveMap(rare / 100f, magic / 100f, AtlasStats.MapMoreMagicAndRareMonsters(gc) / 100f,
+            AtlasStats.MapPackSize(gc) / 100f);
+    }
+
+    /// <summary>
+    /// What one extra modifier adds to a rare monster's worth, as a fraction of it: the rare modifier row's weight over
+    /// the rare monster row's. 5 of 20 as shipped, the figure Bond's row is derived from. Nought where either is unset.
+    /// See Planner.TractionScales.
+    /// </summary>
+    public static float RareModifierShareOfRare()
+    {
+        var modifier = Wrt.Of(RareModifierRow)?.Weight ?? 0f;
+        var rare = Wrt.Of(RareMonsterRow)?.Weight ?? 0f;
+
+        return modifier > 0f && rare > 0f ? modifier / rare : 0f;
+    }
+
+    /// <summary>The row saying what one extra modifier is worth on a rare. See RareModifierShareOfRare.</summary>
+    public const string RareModifierRow = "monster/rare_modifier";
+
+    /// <summary>The rare monster's row. See RareModifierShareOfRare.</summary>
+    public const string RareMonsterRow = "monster/rare";
+
+    /// <summary>
+    /// What each combination's runes do to the waves of the remnant holding them - the effects written "own" - walked
+    /// exactly as Choices is, so entry c belongs to combination c. Null when no combination holds such a rune. See
+    /// OwnEffectsOfRunes and PlanTarget.OwnOfChoice.
+    /// </summary>
+    public static (int Tag, bool Count, float Factor, float WaveShare)[][] OwnEffectsOfChoices(Target target,
+        AutoExpeditionSettings settings, string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        // **Every rune the recipe holds**, priced or not: a rune worth nothing on these waves can still change what they
+        // spawn. The priced lists stand in only where the recipe's own is missing. See Propagation.HeldRunes.
+        static (int Tag, bool Count, float Factor, float WaveShare)[] Of(Reward reward)
+        {
+            if (reward.Held is { Length: > 0 } all)
+                return OwnEffectsOfRunes(all, reward.HeldWaveShares);
+
+            var held = new List<string>();
+
+            foreach (var (id, _) in reward.Locals ?? [])
+                held.Add(id);
+
+            held.AddRange(reward.Carrying ?? []);
+
+            return OwnEffectsOfRunes(held);
+        }
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return Of(reward) is { } only ? new[] { only } : null;
+            }
+        }
+
+        var found = new (int Tag, bool Count, float Factor, float WaveShare)[target.Rewards.Count][];
+        var any = false;
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+        {
+            found[i] = Of(target.Rewards[i]);
+            any |= found[i] != null;
+        }
+
+        return any ? found : null;
+    }
+
+    /// <summary>
+    /// The share of this remnant's own waves each propagated rune of each combination is on, walked exactly as Choices
+    /// is, so entry c belongs to combination c. Null when every rune of every combination is on all of them, which is
+    /// what a missing entry means too. See Propagation.WaveSharesOfIds and PlanTarget.WaveShareOfCarried.
+    /// </summary>
+    /// <summary>
+    /// The rune in each slot of each combination's recipe, in slot order, walked exactly as Choices is, so entry c belongs
+    /// to combination c. Null when none is known. See Propagation.RunesPerWave and PlanTarget.SlotRunesOfChoice.
+    /// </summary>
+    public static string[][] SlotRunesOfChoices(Target target, string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return [reward.SlotRunes];
+            }
+        }
+
+        var found = new string[target.Rewards.Count][];
+        var any = false;
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+        {
+            found[i] = target.Rewards[i].SlotRunes;
+            any |= found[i] is { Length: > 0 };
+        }
+
+        return any ? found : null;
+    }
+
+    public static (string Id, float Share)[][] CarriedWaveSharesOfChoices(Target target, string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        static (string Id, float Share)[] Of(Reward reward)
+        {
+            var ids = reward.Carrying;
+            var shares = reward.CarryingWaveShares;
+
+            if (ids == null || shares == null || ids.Length == 0 || shares.Length != ids.Length)
+                return null;
+
+            var made = new (string Id, float Share)[ids.Length];
+            var partial = false;
+
+            for (var k = 0; k < ids.Length; k++)
+            {
+                made[k] = (ids[k], shares[k]);
+                partial |= shares[k] < 1f;
+            }
+
+            return partial ? made : null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return Of(reward) is { } only ? new[] { only } : null;
+            }
+        }
+
+        var found = new (string Id, float Share)[target.Rewards.Count][];
+        var any = false;
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+        {
+            found[i] = Of(target.Rewards[i]);
+            any |= found[i] != null;
+        }
+
+        return any ? found : null;
+    }
+
+    /// <summary>
+    /// The lifts each combination's recipe holds, per amplifier class as fractions - 1 on the rune class for
+    /// a Power rune - walked exactly as Choices is, so entry c belongs to combination c. Null when none holds an
+    /// amplifier. Read from every rune the recipe holds, whichever slot. See PlanTarget.HeldLiftsOfChoice.
+    /// </summary>
+    public static float[][] HeldLiftOfChoices(Target target, AutoExpeditionSettings settings, string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        static float[] Of(Reward reward)
+        {
+            var held = new List<string>(reward.Held ?? []);
+
+            if (held.Count == 0)
+            {
+                foreach (var (id, _) in reward.Locals ?? [])
+                    held.Add(BaseOfLiftKey(id));
+
+                held.AddRange(reward.Carrying ?? []);
+            }
+
+            return HeldLiftsOfRunes(held);
+        }
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return Of(reward) is { } only ? new[] { only } : null;
+            }
+        }
+
+        var found = new float[target.Rewards.Count][];
+        var any = false;
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+        {
+            found[i] = Of(target.Rewards[i]);
+            any |= found[i] != null;
+        }
+
+        return any ? found : null;
+    }
+
+    /// <summary>
+    /// The lift these runes hold per amplifier class, as fractions indexed as AmplifierTags: the largest of each class,
+    /// amplifiers not stacking, each multiplied by the held lifts of the classes lifting the rune it came from - a held
+    /// Power doubles a held Rebirth. Null where none lifts anything. See LiftsOfRune.
+    ///
+    /// A negative lift is a cut: Time's "merging_rune.effect *= -72% own", a held Time leaving fewer bodies for a held
+    /// Death to merge. Cuts are kept apart from lifts - the strongest per class, not stacking - and applied to the lifted
+    /// figure as a factor, (1 + lift) x (1 + cut) - 1, without being lifted themselves: the cut is a fitted ratio over
+    /// plain and empowered runes together, so Power doubling it would count Power twice and could invert the effect.
+    /// </summary>
+    /// <param name="withOwnLifts">
+    /// Whether lifts written "own" count too: they reach the own effects of runes on the same remnant, and nothing it
+    /// propagates, so only the readers of own effects ask for them. See OwnLiftsOfRune.
+    /// </param>
+    public static float[] HeldLiftsOfRunes(IEnumerable<string> ids, bool withOwnLifts = false)
+    {
+        var classes = AmplifierTags().Length;
+
+        if (classes == 0)
+            return null;
+
+        var raw = new double[classes];
+        var cuts = new double[classes];
+        var by = new long[classes];
+        var any = false;
+
+        foreach (var id in ids ?? [])
+        {
+            var rune = BaseOfLiftKey(id);
+            var lifts = LiftsOfRune(rune);
+
+            if (withOwnLifts && OwnLiftsOfRune(rune) is { } ownLifts)
+            {
+                lifts = lifts == null ? ownLifts : (float[])lifts.Clone();
+
+                for (var a = 0; a < lifts.Length && a < ownLifts.Length && !ReferenceEquals(lifts, ownLifts); a++)
+                    lifts[a] += ownLifts[a];
+            }
+
+            if (lifts == null)
+                continue;
+
+            var mask = AmplifiedClassesOfRune(rune);
+
+            for (var a = 0; a < classes; a++)
+            {
+                if (lifts[a] < cuts[a])
+                {
+                    cuts[a] = lifts[a];
+                    any = true;
+                }
+
+                if (lifts[a] <= raw[a])
+                    continue;
+
+                raw[a] = lifts[a];
+                by[a] = mask & ~(1L << a);
+                any = true;
+            }
+        }
+
+        if (!any)
+            return null;
+
+        var effective = new double[classes];
+
+        for (var a = 0; a < classes; a++)
+            effective[a] = raw[a];
+
+        for (var pass = 0; pass < classes; pass++)
+        {
+            for (var a = 0; a < classes; a++)
+            {
+                var lift = raw[a];
+
+                for (var b = 0; b < classes; b++)
+                {
+                    if ((by[a] & (1L << b)) != 0L)
+                        lift *= 1d + effective[b];
+                }
+
+                effective[a] = lift;
+            }
+        }
+
+        var made = new float[classes];
+
+        for (var a = 0; a < classes; a++)
+            made[a] = (float)((1d + effective[a]) * (1d + cuts[a]) - 1d);
+
+        return made;
+    }
+    /// <summary>
+    /// The "own" effects of the runes a remnant holds, local and propagating slots alike: the tag each reaches, whether
+    /// it scales count (a part's worth and number) or weight (worth only), and its factor. Null when none has one.
+    ///
+    /// Each distinct rune once, as the booking counts it, and two runes scaling one tag multiply. Only "*=" is read;
+    /// TableGrammar's checks say so of anything else.
+    ///
+    /// **Lifted by the amplifiers held beside it.** A held Power empowers the remnant's own runes on every wave, so a
+    /// held Time beside it is Time+, and its effect is scaled as a propagated share is: the part above one times one
+    /// plus the lift of each class the rune belongs to. Rare and magic counts x1.5 become x2.0 under Power's +100%.
+    /// Measured on 2 remnants (2026-10-02), held Time with a held Power upgraded rarity after 19% of deaths against
+    /// 2% without it, so this is the conservative reading. See HeldLiftsOfRunes.
+    ///
+    /// **Bonuses only.** Power doubles a rune's bonuses and not its penalties (user, 2026-10-05): Bond's -75% magic
+    /// monsters stays -75%. Lifted as a bonus is, a factor of 0.25 under +100% came out at -0.5.
+    /// </summary>
+    /// <param name="shares">
+    /// The share of the remnant's waves each rune acts on, in the order of <paramref name="ids"/>, or null for all of
+    /// them. Not applied to the factor, which is remnant-wide; kept on each effect as WaveShare, which says how much of
+    /// a passed-in Power reaches it. See Propagation.HeldRuneWaveShares and PlanTarget.OwnFactorsOfPart.
+    /// </param>
+    public static (int Tag, bool Count, float Factor, float WaveShare)[] OwnEffectsOfRunes(IEnumerable<string> ids,
+        IReadOnlyList<float> shares = null)
+    {
+        List<(int, bool, float, float)> found = null;
+        HashSet<string> seen = null;
+        var all = new List<string>(ids ?? []);
+        var held = HeldLiftsOfRunes(all, withOwnLifts: true);
+
+        for (var k = 0; k < all.Count; k++)
+        {
+            var id = all[k];
+
+            if (string.IsNullOrWhiteSpace(id))
+                continue;
+
+            seen ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (!seen.Add(id))
+                continue;
+
+            var waveShare = shares != null && k < shares.Count ? Math.Clamp(shares[k], 0f, 1f) : 1f;
+
+            foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _))
+            {
+                // Monsters added per monster are not a factor on a part, and their target is a row, which asked for as a
+                // tag would mint one. See CreatedOfRunes. An own lift is a lift, not a factor. See OwnLiftsOfRune.
+                if (!effect.Own || effect.Per != null || IsOwnLiftEffect(effect))
+                    continue;
+
+                var tag = Tags.Bit(effect.Target);
+
+                if (tag < 0)
+                    continue;
+
+                if (!effect.Multiplies)
+                    continue;
+
+                var factor = effect.Factor;
+
+                // **Remnant-wide, bonus and penalty alike.** An own count factor scales every wave of the holding
+                // remnant whatever slot the rune sits in. Bond, the one row with own factors (2026-10-05), was measured
+                // that way: its normal, magic and rare changes reach the waves before its slot too (x1.29 / x0.31 /
+                // x0.60 there, x1.49 / x0.15 / x0.25 from it), and the row holds the remnant-wide figures. Scaling a
+                // bonus by the slot's wave share would pay Bond's extra normals on its own waves only. Effects that add
+                // monsters per monster are created entries, which do follow the slot - see CreatedOfRunes.
+                if (held != null && factor > 1f)
+                {
+                    var classes = AmplifiedClassesOfRune(BaseOfLiftKey(id));
+
+                    for (var a = 0; a < held.Length; a++)
+                    {
+                        if (held[a] != 0f && (classes & (1L << a)) != 0L)
+                            factor = 1f + (factor - 1f) * (1f + held[a]);
+                    }
+                }
+
+                found ??= new List<(int, bool, float, float)>(2);
+                found.Add((tag, string.Equals(effect.Attribute, TableGrammar.Count, StringComparison.Ordinal),
+                    factor, waveShare));
+            }
+        }
+
+        return found?.ToArray();
+    }
+
+    /// <summary>
+    /// The monsters a set of held runes adds to its own remnant's waves, from their "per" effects: the tag counted, so
+    /// many of the target row for each, the rune's slot's share of the waves, and the row's tag mask and worth apiece.
+    /// The rate is scaled by the slot's share and lifted by a held Power as a bonus is. Null when none. See
+    /// TableGrammar.Effect.Per and PlanTarget.CreatedByOwnEffects.
+    ///
+    /// **An effect marked plain or empowered is never lifted.** Where the runes hold a Power, the empowered ones apply
+    /// and the plain ones do not; where they hold none, both are kept, marked, for a Power passed in from earlier
+    /// links to weigh between. Empowerment is 0 for an effect that applies as it stands, 1 for plain, 2 for empowered.
+    ///
+    /// **A row, not the remnant's own monsters, prices what is added.** The Death rune's merge makes Runemarked rares,
+    /// which carry no runes and fewer modifiers than the waves' rares, so they are their own row with their own worth
+    /// and the unaffected_by_runes tag. See NOTES, "Death merges".
+    /// </summary>
+    public static (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[] CreatedOfRunes(IEnumerable<string> ids,
+        IReadOnlyList<float> shares = null)
+    {
+        List<(int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)> found = null;
+        HashSet<string> seen = null;
+        var all = new List<string>(ids ?? []);
+        var held = HeldLiftsOfRunes(all, withOwnLifts: true);
+
+        for (var k = 0; k < all.Count; k++)
+        {
+            var id = all[k];
+
+            if (string.IsNullOrWhiteSpace(id))
+                continue;
+
+            seen ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (!seen.Add(id))
+                continue;
+
+            var waveShare = shares != null && k < shares.Count ? Math.Clamp(shares[k], 0f, 1f) : 1f;
+
+            foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _, withEmpowered: true))
+            {
+                if (!effect.Own || effect.Per == null || effect.Multiplies || effect.Rate <= 0f ||
+                    Wrt.Of(effect.Target) == null || !Tags.Carried(effect.Per))
+                    continue;
+
+                var rate = effect.Rate * waveShare;
+                var lifting = AmplifiedClassesOfRune(BaseOfLiftKey(id));
+
+                // **Power decides plain or empowered; any other lift multiplies.** A marked effect states what Power
+                // does, so Power's class - the rune class - picks the clause and does not also multiply it; another
+                // class's lift, Oath's on the spawners, multiplies either. An unmarked effect takes every lift.
+                var runeClass = Array.FindIndex(AmplifierTags(),
+                    x => string.Equals(x, Tags.Known[Tags.Runes], StringComparison.OrdinalIgnoreCase));
+                var powerHeld = held != null && runeClass >= 0 && runeClass < held.Length && held[runeClass] > 0f &&
+                                (lifting & (1L << runeClass)) != 0L;
+                var empowerment = 0;
+
+                if (effect.Empowered is { } empowered)
+                {
+                    if (powerHeld && !empowered)
+                        continue;
+
+                    empowerment = powerHeld ? 0 : empowered ? 2 : 1;
+                }
+
+                for (var a = 0; held != null && a < held.Length; a++)
+                {
+                    if (held[a] != 0f && (lifting & (1L << a)) != 0L && (effect.Empowered == null || a != runeClass))
+                        rate *= 1f + held[a];
+                }
+
+                found ??= new List<(int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)>(2);
+                // Whether rune shares reach the row, read off its tag names here: a mask saved in a layout keeps the
+                // bits of the session that saved it, and a tag minted later can take another bit elsewhere.
+                var unaffected = false;
+
+                foreach (var name in Tags.Read(Wrt.Of(effect.Target)?.Tags ?? ""))
+                    unaffected |= string.Equals(name, Tags.UnaffectedByRunes, StringComparison.OrdinalIgnoreCase);
+
+                found.Add((Tags.Bit(effect.Per), rate, waveShare, TableGrammar.TagMaskOfRow(effect.Target),
+                    TableGrammar.Total(effect.Target).Fixed, unaffected, empowerment));
+            }
+        }
+
+        return found?.ToArray();
+    }
+
+    /// <summary>
+    /// CreatedOfRunes for each combination, walked exactly as Choices is, so entry c belongs to combination c. Null when
+    /// no combination adds anything. See OwnEffectsOfChoices, which reads the same runes.
+    /// </summary>
+    public static (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[][] CreatedOfChoices(Target target, string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        static (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[] Of(Reward reward)
+        {
+            if (reward.Held is { Length: > 0 } all)
+                return CreatedOfRunes(all, reward.HeldWaveShares);
+
+            var held = new List<string>();
+
+            foreach (var (id, _) in reward.Locals ?? [])
+                held.Add(id);
+
+            held.AddRange(reward.Carrying ?? []);
+
+            return CreatedOfRunes(held);
+        }
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return Of(reward) is { } only ? new[] { only } : null;
+            }
+        }
+
+        var found = new (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[target.Rewards.Count][];
+        var any = false;
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+        {
+            found[i] = Of(target.Rewards[i]);
+            any |= found[i] != null;
+        }
+
+        return any ? found : null;
+    }
+
+    /// <summary>
+    /// What a recipe's waves are worth beyond or short of the ones the remnant's own weight already counts: the
+    /// difference in rune count, times one wave. Added to the combination's reward term, so a recipe using two runes
+    /// on a remnant weighed at five is five waves' worth of monsters down on one using five. Nought where the recipe's
+    /// rune count is unread. The waves' propagation and scoped effects stay at the remnant's count. See
+    /// WavesOfRemnant.
+    /// </summary>
+    private static float WavesOfRecipe(Target target, Reward reward) =>
+        reward.RuneCount > 0
+            ? WorthOfWaves(reward.RuneCount) - WorthOfWaves(WavesOfRemnant(target))
+            : 0f;
 
     /// <summary>
     /// The stat a row's effect names with "as", or empty where it names none.
@@ -158,6 +752,11 @@ internal static class Weighing
 
         foreach (var effect in TableGrammar.Effects(said, out _) ?? [])
         {
+            // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+            // An empowered clause restates a plain one. See TableGrammar.EffectsOfRow.
+            if (effect.Own || effect.Empowered == true)
+                continue;
+
             if (string.IsNullOrWhiteSpace(effect.Stat))
                 continue;
 
@@ -233,11 +832,14 @@ internal static class Weighing
         // term pays only the increment: content plus propagation is weight * mult, which is what the
         // game states - the runes in a remnant's sockets multiply the monsters it unearths.
         //
-        // The magnitude comes from the remnant row's children and can be corrected there. The
-        // shipped recipe - three waves of one rare, three magic and ten normal - carries no
-        // measurement behind it; dumps/spawns.csv is the instrument that would settle it.
+        // The magnitude comes from the remnant pack rows: one wave per rune of the recipe, each wave a number of rare,
+        // magic and normal packs as the map weighs them, with nothing completed before it - Gaining Traction shifts
+        // the packs by the remnant's place in the chain (Planner.TractionScalesOfTarget). See PacksOfRemnant.
+        //
+        // **One wave per rune the recipe uses, not a fixed three.** This supplies the recipe: the best priced one,
+        // which each combination then corrects to its own rune count in Choices. See WavesOfRemnant.
         TargetKind.Remnant => MathF.Max(0f,
-            TableGrammar.Total(Wrt.RowOfKind(TargetKind.Remnant)).Fixed),
+            TableGrammar.Total(Wrt.RowOfKind(TargetKind.Remnant)).Fixed + WorthOfWaves(WavesOfRemnant(target))),
         // **The marker, not the monster.** Both of these used to answer with the price of the creature
         // the marker stands for, which is how the two came to be one row: elitemarker.ao WAS
         // kind:MonsterRare as far as the table could tell, so nothing in it could say that the marker
@@ -436,6 +1038,10 @@ internal static class Weighing
         if (target.Kind == TargetKind.Strongbox)
             return UnearthedPartsOfTarget(target);
 
+        // A remnant's parts are its waves, counted from its recipe. See WavesOfRemnant.
+        if (target.Kind == TargetKind.Remnant)
+            return WavePartsOfRemnant(target);
+
         var row = RowOfTarget(target);
 
         if (row == null)
@@ -514,18 +1120,283 @@ internal static class Weighing
         if (target.Kind != TargetKind.Remnant)
             return null;
 
-        var spread = TableGrammar.ContributionsOfRow(Wrt.RowOfKind(TargetKind.Remnant));
+        return WavePartsOfRemnant(target);
+    }
 
-        if (spread.Length == 0)
+    /// <summary>
+    /// How many waves a remnant sends up: the number of runes in the recipe it takes, taken as the best priced
+    /// recipe it offers, or its socket count where it offers none that could be read.
+    ///
+    /// **Runes used, not sockets.** A remnant sends up one wave per rune, the rune in slot k joining from wave k
+    /// (slots one and two both from the first). Measured on 39 completed remnants over five sites (2026-09-30):
+    /// about 14 monsters a wave, where the table carried a fixed three waves for every remnant.
+    /// Whether a recipe using fewer runes than the remnant has sockets sends fewer waves is not yet settled - two
+    /// of three such remnants were not watched to the end - and runes used is the choice made until it is.
+    ///
+    /// The best priced recipe because that is what Rewards holds first; a combination using a different number
+    /// of runes is corrected to its own in Choices, so the planner still sees what each recipe sends up.
+    /// </summary>
+    public static int WavesOfRemnant(Target target)
+    {
+        if (target == null || target.Kind != TargetKind.Remnant)
+            return 0;
+
+        if (target.Rewards is { Count: > 0 } rewards && rewards[0].RuneCount > 0)
+            return rewards[0].RuneCount;
+
+        return Math.Max(0, target.Sockets);
+    }
+
+    // ---------------------------------------------------------------- remnant waves as packs
+
+    /// <summary>Packs in wave 3 of a five-wave remnant. See PacksOfRemnant.</summary>
+    public const string PacksRow = "remnant/packs";
+
+    /// <summary>What each later wave multiplies the pack count by. See PacksOfRemnant.</summary>
+    public const string PacksPerLaterWaveRow = "remnant/packs-per-later-wave";
+
+    /// <summary>What each wave a remnant has beyond five multiplies the pack count by. See PacksOfRemnant.</summary>
+    public const string PacksPerRemnantWaveRow = "remnant/packs-per-remnant-wave";
+
+    /// <summary>A rare pack's weight against a normal pack's one, in wave 3 before modifiers. See PacksOfRemnant.</summary>
+    public const string RarePackWeightRow = "remnant/rare-pack-weight";
+
+    /// <summary>What each later wave multiplies the rare pack weight by. See PacksOfRemnant.</summary>
+    public const string RarePackWeightPerLaterWaveRow = "remnant/rare-pack-weight-per-later-wave";
+
+    /// <summary>A magic pack's weight against a normal pack's one, before modifiers. See PacksOfRemnant.</summary>
+    public const string MagicPackWeightRow = "remnant/magic-pack-weight";
+
+    /// <summary>What a rare pack holds: its rare and the normal monsters escorting it. See PartsOfPacks.</summary>
+    public const string RarePackRow = "remnant/rare-pack";
+
+    /// <summary>What a magic pack holds. See PartsOfPacks.</summary>
+    public const string MagicPackRow = "remnant/magic-pack";
+
+    /// <summary>What a normal pack holds. See PartsOfPacks.</summary>
+    public const string NormalPackRow = "remnant/normal-pack";
+
+    /// <summary>How much the map's pack size enlarges every pack's monsters but a rare pack's rares. See PartsOfPacks.</summary>
+    public const string PackSizeOnContentsRow = "remnant/pack-size-on-contents";
+
+    /// <summary>How many rares the map's pack size adds to a rare pack. See PartsOfPacks.</summary>
+    public const string PackSizeExtraRaresRow = "remnant/pack-size-extra-rares";
+
+    /// <summary>A row's weight cell as a number, or the default where the row or its cell is missing.</summary>
+    private static float NumberOfRow(string id, float otherwise) =>
+        Wrt.Of(id)?.Weight is { } weight && weight >= 0f ? weight : otherwise;
+
+    /// <summary>
+    /// How many rare, magic and normal packs a remnant's waves hold in all: each wave a number of packs, each pack rare,
+    /// magic or normal in proportion to its weight - normal one, magic and rare as their rows give them, times the map's
+    /// "more magic and rare" and (1 + increase), the rare increase raised by Gaining Traction's rate for each remnant
+    /// completed before. Packs grow with the wave's number and the remnant's wave count; rare weight grows with the wave's.
+    ///
+    /// **A pack is turned rare or magic, not added.** Fitted on 168 waves in 34 runs (2026-10-05): a wave holds about the
+    /// same number of packs on every map, and its rarity modifiers and Gaining Traction turn normal packs into magic and
+    /// rare ones. 36% of waves had no magic monster at all, which a per-monster roll could not give, and every wave with
+    /// a rare had normal monsters, most of them its escorts (RareMonsterPack). Traction on magic packs fitted worse and is
+    /// left to the table, nought as shipped. Increases add: Gaining Traction's +50% joins the map's rare increase. See
+    /// NOTES, "Remnant waves are packs".
+    /// </summary>
+    public static (float Rare, float Magic, float Normal) PacksOfRemnant(int waves, TableGrammar.RemnantWaveMap map,
+        int before = 0, float rareRate = 0f, float magicRate = 0f)
+    {
+        var (rare, magic, normal) = (0f, 0f, 0f);
+
+        foreach (var wave in PacksOfEachWave(waves, map, before, rareRate, magicRate))
+        {
+            rare += wave.Rare;
+            magic += wave.Magic;
+            normal += wave.Normal;
+        }
+
+        return (rare, magic, normal);
+    }
+
+    /// <summary>
+    /// PacksOfRemnant wave by wave, wave 1 first: the packs each wave holds by tier, which PacksOfRemnant sums. Empty for
+    /// none. See Planner.PredictedWavesOf, which records them for the census to compare.
+    /// </summary>
+    public static (float Rare, float Magic, float Normal)[] PacksOfEachWave(int waves, TableGrammar.RemnantWaveMap map,
+        int before = 0, float rareRate = 0f, float magicRate = 0f)
+    {
+        if (waves <= 0)
+            return [];
+
+        var packs = NumberOfRow(PacksRow, 0f);
+        var later = NumberOfRow(PacksPerLaterWaveRow, 1f);
+        var bigger = NumberOfRow(PacksPerRemnantWaveRow, 1f);
+        var rareWeight = NumberOfRow(RarePackWeightRow, 0f);
+        var rareLater = NumberOfRow(RarePackWeightPerLaterWaveRow, 1f);
+        var magicWeight = NumberOfRow(MagicPackWeightRow, 0f);
+        var more = 1f + MathF.Max(0f, map.More);
+        var each = new (float Rare, float Magic, float Normal)[waves];
+
+        for (var wave = 1; wave <= waves; wave++)
+        {
+            var count = packs * MathF.Pow(later, wave - 3) * MathF.Pow(bigger, waves - 5);
+            var rareOdds = rareWeight * MathF.Pow(rareLater, wave - 3) * more *
+                           (1f + map.RareIncrease + rareRate * before);
+            var magicOdds = magicWeight * more * (1f + map.MagicIncrease + magicRate * before);
+            var total = 1f + rareOdds + magicOdds;
+
+            each[wave - 1] = (count * rareOdds / total, count * magicOdds / total, count / total);
+        }
+
+        return each;
+    }
+
+    /// <summary>
+    /// A remnant of this many waves as parts, wave by wave, with nothing completed before it. The parts are linear in the
+    /// packs, so the waves add up to PartsOfWaves. See PacksOfEachWave.
+    /// </summary>
+    public static (long Mask, float Worth, float Many)[][] PartsOfEachWave(int waves)
+    {
+        var map = TableGrammar.MapForRemnantWaves;
+
+        var packsOfWaves = PacksOfEachWave(waves, map);
+        var parts = new (long Mask, float Worth, float Many)[packsOfWaves.Length][];
+
+        for (var w = 0; w < packsOfWaves.Length; w++)
+            parts[w] = PartsOfPacks(packsOfWaves[w], map.PackSize) ?? [];
+
+        return parts;
+    }
+
+    /// <summary>
+    /// What so many rare, magic and normal packs hold, as parts by the tags of the monster rows the pack rows name: every
+    /// monster but a rare pack's rares enlarged by the map's pack size, and a rare pack's rares raised by it. Fitted:
+    /// contents x (1 + 1.6 x pack size), rares per rare pack + 1.5 x pack size. Null for none. See PacksOfRemnant.
+    /// </summary>
+    public static (long Mask, float Worth, float Many)[] PartsOfPacks((float Rare, float Magic, float Normal) packs,
+        float packSize)
+    {
+        var size = 1f + NumberOfRow(PackSizeOnContentsRow, 0f) * packSize;
+        var extraRares = NumberOfRow(PackSizeExtraRaresRow, 0f) * packSize;
+        var merged = new List<(long Mask, float Worth, float Many)>();
+
+        void Add(string row, float count)
+        {
+            if (count <= 0f)
+                return;
+
+            var parts = TableGrammar.ContributionsOfRow(row);
+            var raresInPack = 0f;
+
+            foreach (var part in parts)
+            {
+                if ((part.Mask & (1L << Tags.Rares)) != 0L)
+                    raresInPack += part.Many;
+            }
+
+            foreach (var part in parts)
+            {
+                var factor = (part.Mask & (1L << Tags.Rares)) != 0L
+                    ? (raresInPack > 0f ? (raresInPack + extraRares) / raresInPack : 1f)
+                    : size;
+                var at = merged.FindIndex(x => x.Mask == part.Mask);
+                var added = (part.Mask, count * part.Worth * factor, count * part.Many * factor);
+
+                if (at < 0)
+                    merged.Add(added);
+                else
+                    merged[at] = (part.Mask, merged[at].Worth + added.Item2, merged[at].Many + added.Item3);
+            }
+        }
+
+        Add(RarePackRow, packs.Rare);
+        Add(MagicPackRow, packs.Magic);
+        Add(NormalPackRow, packs.Normal);
+
+        return merged.Count == 0 ? null : merged.ToArray();
+    }
+
+    /// <summary>
+    /// A remnant of this many waves as parts, on the map remnant waves are built for, with so many remnants completed
+    /// before it at Gaining Traction's rates. Null for none. See PacksOfRemnant.
+    /// </summary>
+    public static (long Mask, float Worth, float Many)[] PartsOfWaves(int waves, int before = 0, float rareRate = 0f,
+        float magicRate = 0f)
+    {
+        if (waves <= 0)
             return null;
 
-        var made = new (long, float, float)[spread.Length];
+        var map = TableGrammar.MapForRemnantWaves;
 
-        for (var i = 0; i < spread.Length; i++)
-            made[i] = (spread[i].Mask, spread[i].Worth, spread[i].Many);
-
-        return made;
+        return PartsOfPacks(PacksOfRemnant(waves, map, before, rareRate, magicRate), map.PackSize);
     }
+
+    /// <summary>Parts' worth by monster tier: rare, magic, and the rest as normal.</summary>
+    public static (float Rare, float Magic, float Normal) TierWorthOfParts((long Mask, float Worth, float Many)[] parts)
+    {
+        var (rare, magic, normal) = (0f, 0f, 0f);
+
+        foreach (var (mask, worth, _) in parts ?? [])
+        {
+            if ((mask & (1L << Tags.Rares)) != 0L)
+                rare += worth;
+            else if ((mask & (1L << Tags.Magics)) != 0L)
+                magic += worth;
+            else
+                normal += worth;
+        }
+
+        return (rare, magic, normal);
+    }
+
+    /// <summary>What a remnant of this many waves sends up, worth in all, with nothing completed before it.</summary>
+    public static float WorthOfWaves(int waves)
+    {
+        var (rare, magic, normal) = TierWorthOfParts(PartsOfWaves(waves));
+
+        return rare + magic + normal;
+    }
+
+    /// <summary>
+    /// What Gaining Traction multiplies a remnant's normal, magic and rare waves by, for each count of remnants completed
+    /// before it from nought to most: the same remnant's packs shifted by the table's rates, against none - rares up
+    /// with their escorts, magic and plain normal packs down - and rares also by the modifiers the rare half's modifier
+    /// chance buys (see Planner.TractionScales). Null where the remnant has no waves or traction is off. Worked out once
+    /// per remnant, since the shift depends on its wave count. See Planner.TractionScalesOfTarget.
+    /// </summary>
+    public static (float Normal, float Magic, float Rare)[] TractionByBeforeOfTarget(Target target, bool tractionOn, int most = 64)
+    {
+        var waves = WavesOfRemnant(target);
+
+        if (!tractionOn || waves <= 0)
+            return null;
+
+        var (magicRate, rareRate) = GainingTractionRates();
+
+        if (magicRate <= 0f && rareRate <= 0f)
+            return null;
+
+        var share = RareModifierShareOfRare();
+        var start = TierWorthOfParts(PartsOfWaves(waves));
+        var found = new (float Normal, float Magic, float Rare)[most + 1];
+
+        static float Ratio(float now, float was) => was > 0f ? now / was : 1f;
+
+        for (var before = 0; before <= most; before++)
+        {
+            var shifted = TierWorthOfParts(PartsOfWaves(waves, before, rareRate, magicRate));
+            var modifiers = 1f + share * MathF.Log2(1f + rareRate * before);
+
+            found[before] = (Ratio(shifted.Normal, start.Normal), Ratio(shifted.Magic, start.Magic),
+                Ratio(shifted.Rare, start.Rare) * modifiers);
+        }
+
+        return found;
+    }
+
+    /// <summary>A remnant's waves split by tier, for its waves count. See WavesOfRemnant.</summary>
+    private static (float Rare, float Magic, float Normal) WaveTierSplitOfRemnant(Target target) =>
+        TierWorthOfParts(PartsOfWaves(WavesOfRemnant(target)));
+
+    /// <summary>A remnant's waves as parts, for its waves count, or null for none. See WavesOfRemnant.</summary>
+    private static (long Mask, float Worth, float Many)[] WavePartsOfRemnant(Target target) =>
+        PartsOfWaves(WavesOfRemnant(target));
 
     /// <summary>
     /// How an effect combines with the others, as the key the objective groups it by.
@@ -551,6 +1422,10 @@ internal static class Weighing
         if (string.IsNullOrWhiteSpace(id))
             return "";
 
+        // A local slot's lift travels under its own key so a rune can add and lift at once. See LiftKeyOf.
+        if (IsLiftKey(id))
+            return Empowering;
+
         var rune = Wrt.Of(Wrt.Id.Rune(id));
 
         // **The effect says it now, where a reserved word in another column used to.** A rune that
@@ -558,7 +1433,9 @@ internal static class Weighing
         // which is the fact itself rather than a flag beside it. Combines was cleared off rune rows
         // when their magnitudes moved into effects; keying on it here would have silently switched
         // Power off. See Wrt.Runed and Lift.
-        if (Lift(id) > 0f)
+        // A rune that only lifts holds no share, so its group is the amplifiers'. One that also adds - Rebirth's
+        // monster weight beside its lift - is grouped by its share, and its lift is read off its effect number.
+        if (Lift(id) > 0f && !HasShareEffect(id))
             return Empowering;
 
         // **The effect's own "as" clause answers first, because it is the cell anybody can see.**
@@ -600,34 +1477,276 @@ internal static class Weighing
     }
 
     /// <summary>
-    /// How much this scales other effects by, or nought where it scales nothing.
+    /// How much this scales other effects by, in per cent - the sum over every amplifier class it lifts - or nought
+    /// where it scales nothing. Which classes and by how much each is LiftsOfRune's answer; this is the yes or no.
     ///
-    /// **One reading, from the row's own effect.** The rate used to sit in the propagation cell as a
-    /// bare number with no target, which is why that cell needed a special parse - there was nothing
-    /// honest to write in it, since an effect that scales effects points at no creature. It points at
-    /// the rune tag now and the number is its share, read the same way every other magnitude is.
+    /// **One reading, from the row's own effect.** A rune that scales others says so with an effect aimed at the tag
+    /// the runes it scales carry - "spawner_rune.effect *= +60%" - or at the rune tag for all of them, as Power's
+    /// "rune.effect *= +100%" is, and the
+    /// number is its share, read the same way every other magnitude is. See AmplifierTags.
     /// </summary>
     public static float Lift(string id)
     {
-        // **The STORED effect, never the translated one.** TableGrammar.Of falls back to translating the old
-        // three columns, and that translation asks Combining which group a row is in - so reading it
-        // here would be Combining calling Lift calling Of calling Translated calling Combining, which
-        // is a stack overflow on any rune row that has no effect written yet. A row still speaking v1
-        // is recognised by the reserved word below, which is what it has.
-        var said = Wrt.Of(Wrt.Id.Rune(id))?.Effect;
+        var lifts = LiftsOfRune(id);
+        var total = 0f;
 
-        if (said == null)
-            return 0f;
+        foreach (var lift in lifts ?? [])
+            total += lift;
 
-        foreach (var effect in TableGrammar.Effects(said, out _))
+        return total * 100f;
+    }
+
+    /// <summary>
+    /// The tags an effect scales other runes through, one amplifier class each, in a fixed order: every tag some rune
+    /// row's stored effect aims a magnitude at - "rune" for Power, "spawner_rune" for a rune that lifts the
+    /// spawners - and the rune tag where an effect aims at every rune. A rune's lifts and the classes lifting it are
+    /// indexed by position in this list, so it is ordinal-sorted and rebuilt only when the table moves. See
+    /// LiftsOfRune and AmplifiedClassesOfRune.
+    /// </summary>
+    public static string[] AmplifierTags()
+    {
+        var had = _amplifierTags;
+
+        if (had.Revision == Wrt.Revision && had.Tags != null)
+            return had.Tags;
+
+        var found = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (id, _) in Wrt.Standing)
+            AddAmplifierTagsOfRow(id, found);
+
+        foreach (var (id, _) in Wrt.Yours)
+            AddAmplifierTagsOfRow(id, found);
+
+        var tags = new string[found.Count];
+        found.CopyTo(tags);
+        _amplifierTags = (Wrt.Revision, tags);
+
+        return tags;
+    }
+
+    /// <summary>The last AmplifierTags, against the table revision it was read at. Replaced whole, never mutated.</summary>
+    private static (int Revision, string[] Tags) _amplifierTags = (-1, null);
+
+    private static void AddAmplifierTagsOfRow(string id, SortedSet<string> into)
+    {
+        if (id == null || !id.StartsWith("rune:", StringComparison.Ordinal))
+            return;
+
+        foreach (var effect in StoredEffectsOfRune(id[5..]))
         {
-            if (string.Equals(effect.Target, Tags.Known[Tags.Runes],
-                    StringComparison.OrdinalIgnoreCase))
-                return effect.Share * 100f;
+            if (IsLiftEffect(effect) || IsOwnLiftEffect(effect))
+                into.Add(effect.Target.Trim());
+        }
+    }
+
+    /// <summary>
+    /// A rune row's stored effects, never the translated ones. TableGrammar.Of falls back to translating the old three
+    /// columns, and that translation asks GroupKeyOfEffect which group a row is in - so reading it here would be
+    /// GroupKeyOfEffect calling Lift calling Of calling Translated calling GroupKeyOfEffect, a stack overflow on any rune
+    /// row with no effect written yet.
+    /// </summary>
+    private static TableGrammar.Effect[] StoredEffectsOfRune(string id)
+    {
+        var revision = Wrt.Revision;
+
+        if (_storedEffectsOfRune.TryGetValue(id, out var kept) && kept.Revision == revision)
+            return kept.Effects;
+
+        var said = Wrt.Of(Wrt.Id.Rune(id))?.Effect;
+        var effects = string.IsNullOrWhiteSpace(said) ? [] : TableGrammar.Effects(said, out _);
+
+        _storedEffectsOfRune[id] = (revision, effects);
+
+        return effects;
+    }
+
+    /// <summary>
+    /// Each rune's parsed effects, kept until the table's revision moves. **The scorer asks for these per rune, per
+    /// reward option, per score** - through HasShareEffect in Planner.AmplifierWorthAt - and parsing the row each time
+    /// was about 70 KB of every Planner.Score, measured offline on a Grazed Prairie site (2026-10-06). Callers only read
+    /// the array. See Wrt.Revision, which every change to the table and every load bumps.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Revision, TableGrammar.Effect[] Effects)>
+        _storedEffectsOfRune = new();
+
+    /// <summary>
+    /// Whether an effect lifts the own effects of runes held on the same remnant and nothing else: a magnitude written
+    /// "own" - Oath's "spawner_rune.effect *= +37% own", its summons dying and respawning under a held Time. A lift that
+    /// propagates is IsLiftEffect. See OwnLiftsOfRune.
+    /// </summary>
+    internal static bool IsOwnLiftEffect(TableGrammar.Effect effect) =>
+        effect.Own && effect.Multiplies && string.Equals(effect.Attribute, TableGrammar.Magnitude, StringComparison.Ordinal);
+
+    /// <summary>
+    /// What this rune lifts the own effects of each amplifier class by on its own remnant, as fractions indexed as
+    /// AmplifierTags, or null where it has no own lift. Read with the propagating lifts by HeldLiftsOfRunes when asked;
+    /// never booked, so a propagated copy lifts nothing. See IsOwnLiftEffect.
+    /// </summary>
+    public static float[] OwnLiftsOfRune(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+
+        var tags = AmplifierTags();
+        float[] lifts = null;
+
+        foreach (var effect in StoredEffectsOfRune(id))
+        {
+            if (!IsOwnLiftEffect(effect))
+                continue;
+
+            var at = Array.FindIndex(tags,
+                x => string.Equals(x, effect.Target.Trim(), StringComparison.OrdinalIgnoreCase));
+
+            if (at < 0)
+                continue;
+
+            lifts ??= new float[tags.Length];
+            lifts[at] += effect.Share;
         }
 
-        return 0f;
+        return lifts;
     }
+
+    /// <summary>Whether an effect scales other runes rather than landing on things: a magnitude, or aimed at runes.</summary>
+    internal static bool IsLiftEffect(TableGrammar.Effect effect) =>
+        !effect.Own &&
+        (string.Equals(effect.Attribute, TableGrammar.Magnitude, StringComparison.Ordinal) ||
+         string.Equals(effect.Target, Tags.Known[Tags.Runes], StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// What this rune lifts each amplifier class by, as fractions indexed as AmplifierTags, or null where it lifts
+    /// none. Power's "rune.effect *= +100%" is 1 on the rune class. A rune can lift and add at
+    /// once: its other effects are its share, booked as any rune's are. See HasShareEffect.
+    /// </summary>
+    public static float[] LiftsOfRune(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+
+        var tags = AmplifierTags();
+        float[] lifts = null;
+
+        foreach (var effect in StoredEffectsOfRune(id))
+        {
+            if (!IsLiftEffect(effect))
+                continue;
+
+            var at = Array.FindIndex(tags,
+                x => string.Equals(x, effect.Target.Trim(), StringComparison.OrdinalIgnoreCase));
+
+            if (at < 0)
+                continue;
+
+            lifts ??= new float[tags.Length];
+            lifts[at] += effect.Share;
+        }
+
+        return lifts;
+    }
+
+    /// <summary>
+    /// What a Power reaching this rune multiplies its chain-wide value share by, where its row writes that share twice -
+    /// "plain" and "empowered" - as empowered over plain: Bond's "rare_monster.weight *= +15% plain,
+    /// rare_monster.weight *= +18% empowered" gives 1.2. Nought where the row writes it once, and Power's lift applies
+    /// as to any rune it reaches. Read when a site's groups are built, into Amplification.ReachOfGroup. The table's check
+    /// keeps such a share out of any stat pool, so the factor reaches this rune's group alone. See
+    /// TableGrammar.Effect.Empowered.
+    /// </summary>
+    public static float PowerFactorOfRune(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return 0f;
+
+        var (plain, empowered) = (0f, 0f);
+
+        foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _, withEmpowered: true))
+        {
+            if (effect.Own || effect.Per != null || effect.Empowered is not { } marked || IsLiftEffect(effect))
+                continue;
+
+            if (marked && empowered == 0f)
+                empowered = effect.Share;
+            else if (!marked && plain == 0f)
+                plain = effect.Share;
+        }
+
+        return plain > 0f && empowered > 0f ? empowered / plain : 0f;
+    }
+
+    /// <summary>Whether this rune has an effect that lands on things - a share - besides any lift. See LiftsOfRune.</summary>
+    public static bool HasShareEffect(string id)
+    {
+        foreach (var effect in StoredEffectsOfRune(id))
+        {
+            if (!effect.Own && !IsLiftEffect(effect))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Which amplifier classes lift this rune, as a mask over AmplifierTags: those whose tag its row carries, less any
+    /// class it lifts itself, so Power, tagged rune and lifting the rune class, does not lift itself. Rebirth is lifted by
+    /// Power while lifting the spawners. Nought where none does.
+    ///
+    /// **Every rune, Power and Bait aside.** Power was aimed at a rewarding_rune tag on Bond, Death, Oath, Opulent and
+    /// Time, on the reading that doubling a combat rune's damage pays nothing. It also doubles the 1% item quantity each
+    /// runic modifier gives under Calculated Investment (user, 2026-10-05), which every rune has, so it aims at all.
+    /// </summary>
+    public static long AmplifiedClassesOfRune(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return 0L;
+
+        var tags = AmplifierTags();
+
+        if (tags.Length == 0)
+            return 0L;
+
+        var said = Wrt.Of(Wrt.Id.Rune(id))?.Tags;
+
+        if (string.IsNullOrWhiteSpace(said))
+            return 0L;
+
+        var own = LiftsOfRune(id);
+        var ownLifts = OwnLiftsOfRune(id);
+        var mask = 0L;
+
+        foreach (var piece in said.Split(','))
+        {
+            var at = Array.FindIndex(tags, x => string.Equals(x, piece.Trim(), StringComparison.OrdinalIgnoreCase));
+
+            if (at >= 0 && at < 62 && (own == null || own[at] <= 0f) && (ownLifts == null || ownLifts[at] <= 0f))
+                mask |= 1L << at;
+        }
+
+        return mask;
+    }
+
+    /// <summary>
+    /// Whether any amplifier lifts this rune. The planner files such a share in a twin of its group for the classes
+    /// lifting it, so each lift reaches it alone. See Planning's band numbering and Planner.Multiplied.
+    /// </summary>
+    public static bool EmpowerableRune(string id) => AmplifiedClassesOfRune(id) != 0L;
+
+    /// <summary>
+    /// The key a rune's lift travels under in a combination's local slots, apart from its share under the rune's own
+    /// id, so a rune that adds and lifts - Rebirth - is both. Its worth there is the share of the remnant's waves the
+    /// slot reaches, in per cent; the lift itself is read from the rune. See Propagation.Locally and
+    /// Planner.LocalSharesOfMarker.
+    /// </summary>
+    public static string LiftKeyOf(string id) => id + LiftKeySuffix;
+
+    /// <summary>Whether an effect id is a rune's lift key. See LiftKeyOf.</summary>
+    public static bool IsLiftKey(string id) => id != null && id.EndsWith(LiftKeySuffix, StringComparison.Ordinal);
+
+    /// <summary>The rune a lift key belongs to, or the id unchanged. See LiftKeyOf.</summary>
+    public static string BaseOfLiftKey(string id) => IsLiftKey(id) ? id[..^LiftKeySuffix.Length] : id;
+
+    private const string LiftKeySuffix = "\u0001lift";
 
     /// <summary>
     /// What to type in Multiplicative behaviour for a rune that scales the others. See GroupKeyOfEffect.
@@ -737,7 +1856,7 @@ internal static class Weighing
     /// **This was the switch the reference table existed to replace.** It decided that a remnant is
     /// three waves of one rare, three magics and ten normals, and that a strongbox's guarding packs
     /// hold so many monsters of each rarity - facts about the game, in code, where nobody could see or
-    /// change them. They are now child edges: kind:Remnant has remnant/wave x3, and remnant/wave has
+    /// change them. They are now child edges: the remnant row has remnant/wave x recipe.Runes, and remnant/wave has
     /// the three tiers with their counts. See TableGrammar.Spread.
     ///
     /// What is left here is the part that genuinely belongs in code: which ROW a live entity answers
@@ -754,7 +1873,7 @@ internal static class Weighing
         // saying "your parts come off your modifiers", so that rule was true of exactly one kind of
         // thing and had to be written again for the next. It is the rule now.
         var own = target.Kind == TargetKind.Remnant
-            ? TableGrammar.TierSplitOfRow(Wrt.RowOfKind(TargetKind.Remnant))
+            ? WaveTierSplitOfRemnant(target)
             : default;
 
         var (rare, magic, normal) = TierSplitFromModifiers(target);
@@ -929,6 +2048,16 @@ internal static class Weighing
         var box = target.Kind == TargetKind.Strongbox && target.Tier == ChestTier.Unknown
             ? RowOfStrongbox(target)
             : null;
+
+        // **The row the weighing reads, for the kinds it reads by their kind cell.** WeightOfTarget prices a remnant,
+        // sentry, hatch, monolith or scenery from the row whose Kind cell names it (Wrt.RowOfKind), and this filed them
+        // under kind:Remnant and the like - a remnant had a kind:Remnant row the scoring never read for weight or tags,
+        // and the others a kind: id with no row at all. The table files a site row here and edits what it shows, so an
+        // edit there changed nothing. See Catalogue.DrawnCellsAgainstStored, which caught it.
+        if (target.Kind is TargetKind.Remnant or TargetKind.Sentry or TargetKind.Hatch or TargetKind.Monolith
+                or TargetKind.Scenery &&
+            Wrt.RowOfKind(target.Kind) is { Length: > 0 } ofKind)
+            return ofKind;
 
         return box ?? Wrt.Id.Kind(target.Kind, target.Tier);
     }
@@ -1301,6 +2430,10 @@ internal static class Weighing
             // behind. See TableGrammar.Translated, which dies with the scope column in stage 5.
             foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Found(id), out _))
             {
+                // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+                if (effect.Own)
+                    continue;
+
                 // **A flat effect keeps its own number.** A share is a percentage of what it
                 // reaches and is carried as one; "+= 3" is three of whatever weight is, per thing
                 // it reaches, and multiplying it by a hundred would make it three hundred. The two
@@ -1367,6 +2500,10 @@ internal static class Weighing
     {
         foreach (var effect in TableGrammar.EffectsOfRow(filed, out _))
         {
+            // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+            if (effect.Own)
+                continue;
+
             var flat = !effect.Multiplies;
             var percent = flat ? effect.Share : effect.Share * 100f;
             var tag = Tags.Bit(effect.Target);
@@ -1424,6 +2561,10 @@ internal static class Weighing
 
             foreach (var said in TableGrammar.EffectsOfRow(Wrt.Id.Found(effect), out _))
             {
+                // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
+                if (said.Own)
+                    continue;
+
                 var bit = Tags.Bit(said.Target);
 
                 if (said.Share <= 0f || bit < 0)
@@ -1665,7 +2806,7 @@ internal static class Weighing
         {
             foreach (var rune in slot.Runes)
             {
-                var weight = Runes.Weight(rune);
+                var weight = Runes.UnscopedWeight(rune);
 
                 if (weight > best)
                     best = weight;
@@ -1746,7 +2887,7 @@ internal static class Weighing
                 }
 
                 if (!known)
-                    found.Add((rune, Runes.Weight(rune)));
+                    found.Add((rune, Runes.UnscopedWeight(rune)));
             }
         }
 
@@ -1767,7 +2908,7 @@ internal static class Weighing
 
             foreach (var rune in slot.Runes)
             {
-                var weight = Runes.Weight(rune);
+                var weight = Runes.UnscopedWeight(rune);
 
                 if (weight > most)
                 {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace AutoExpedition;
 
@@ -35,6 +36,20 @@ internal sealed class RepeatedPresses
     /// <summary>Whether the first press of this batch is still to start. See Begin.</summary>
     private bool _fresh;
 
+    /// <summary>The plain score a press stops at, or nought. See DebugSettings.RepeatStopAtScore.</summary>
+    private double _target;
+
+    /// <summary>When the press in flight started, and how long each press that reached the target took.</summary>
+    private DateTime _pressStarted;
+
+    private readonly List<double> _reachedAfter = new();
+
+    /// <summary>The plain score a press of this batch stops at, or nought for none.</summary>
+    public double Target => _target;
+
+    /// <summary>When the press in flight started. A chain published before then is not this press's own.</summary>
+    public DateTime PressStarted => _pressStarted;
+
     /// <summary>Whether anything is being measured right now.</summary>
     public bool Running => _left > 0 || _inFlight;
 
@@ -51,12 +66,14 @@ internal sealed class RepeatedPresses
     /// dropped by emptying one moment later instead. Presses made by hand afterwards join the batch and
     /// are told apart by their draw and their timestamp.
     /// </summary>
-    public void Begin(int howMany, int from = 0)
+    public void Begin(int howMany, int from = 0, double target = 0d)
     {
         _asked = Math.Max(1, howMany);
         _left = _asked;
         _inFlight = false;
         _fresh = true;
+        _target = Math.Max(0d, target);
+        _reachedAfter.Clear();
 
         // **Every batch walks the same draws, so two batches are a matched pair.**
         //
@@ -94,7 +111,7 @@ internal sealed class RepeatedPresses
 
             if (_left <= 0)
             {
-                Said = $"finished {_asked} press(es) - see the distribution in the dump";
+                Said = $"finished {_asked} press(es){Reaching()} - see the distribution in the dump";
 
                 return;
             }
@@ -114,7 +131,8 @@ internal sealed class RepeatedPresses
             PressHistory.Forget();
         }
 
-        Said = $"press {_asked - _left} of {_asked}";
+        Said = $"press {_asked - _left} of {_asked}{Reaching()}";
+        _pressStarted = DateTime.UtcNow;
 
         if (press())
             return;
@@ -123,6 +141,19 @@ internal sealed class RepeatedPresses
         _inFlight = false;
         Said = $"stopped at press {_asked - _left} of {_asked} - the solve was refused";
     }
+
+    /// <summary>Notes that the press in flight reached the target, which the caller then stops.</summary>
+    public void Reached() =>
+        _reachedAfter.Add((DateTime.UtcNow - _pressStarted).TotalSeconds);
+
+    /// <summary>How the presses so far did against the target, or nothing without one.</summary>
+    private string Reaching() =>
+        _target <= 0d
+            ? ""
+            : $"; {_reachedAfter.Count} reached {_target:N0}" +
+              (_reachedAfter.Count == 0
+                  ? ""
+                  : $", after {string.Join(", ", _reachedAfter.ConvertAll(x => x.ToString("0.0") + "s"))}");
 
     /// <summary>Stops a batch without finishing it, for an area change or a placement run.</summary>
     public void Abandon(string why)

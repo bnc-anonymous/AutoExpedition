@@ -119,10 +119,17 @@ internal sealed class Census
         // Nought where no such modifier is present, which is the ordinary case, and nought is also
         // what an unreadable stat gives - a distinction that does not matter here, since both mean
         // "no floor stated".
-        var floor = Safe.Read(() => gc.IngameState.Data.MapStatsVisible
-            .TryGetValue(GameStat.MapExpedition2RemnantsHaveAtLeastXSlots, out var said)
-            ? said
-            : 0, 0);
+        var floor = Rolls.MapSlotFloor(gc);
+
+        // **The other modifiers that change how remnants are made, as the map states them.** "+# Verisium Remnant with
+        // at least # Rune slots" adds a remnant of seven, eight or nine slots on purpose, which no socket count in this
+        // file should be read as a draw of; the Power rune one does the same for a rune; the lucky rolls change the draw
+        // itself in a way nothing here has measured. Written as the raw values, since what each number means is not
+        // settled, so a reader can filter on any of them.
+        var remnantWithAtLeastSlots = Rolls.MapStat(gc, GameStat.MapLogbookHasAtLeast1Expedition2RemnantWithAtLeastXSlots);
+        var remnantWithPowerRune = Rolls.MapStat(gc, GameStat.MapLogbookHasAtLeast1Expedition2RemnantWithAPowerRune);
+        var luckyRolls = Rolls.MapStat(gc, GameStat.MapExpedition2RemnantGenerationHasXLuckyRolls);
+        var luckyRollChance = Rolls.MapStat(gc, GameStat.MapExpedition2RemnantGenerationHasAdditionalLuckyRollChancePct);
 
         // **Read the file back BEFORE deciding what is new, which is the whole of the dedupe bug.**
         //
@@ -233,7 +240,13 @@ internal sealed class Census
                 // The map's floor on rune slots, last because columns are only ever appended. See
                 // where it is read: a row from a map with a floor is not a sample of the natural
                 // socket distribution and has to be filtered out before counting.
-                floor.ToString(CultureInfo.InvariantCulture)));
+                floor.ToString(CultureInfo.InvariantCulture),
+
+                // The other generation modifiers, appended after it. See where they are read.
+                remnantWithAtLeastSlots.ToString(CultureInfo.InvariantCulture),
+                remnantWithPowerRune.ToString(CultureInfo.InvariantCulture),
+                luckyRolls.ToString(CultureInfo.InvariantCulture),
+                luckyRollChance.ToString(CultureInfo.InvariantCulture)));
         }
 
         if (rows.Count > 0)
@@ -334,7 +347,8 @@ internal sealed class Census
         // Appended, never inserted, so Upgrade can bring an existing file forward and its old rows
         // stay valid while simply stopping short. See Upgrade.
         "dedupe,activated,selected,reachable,admittedPins," +
-        "mapSlotFloor";
+        "mapSlotFloor," +
+        "mapRemnantWithAtLeastSlots,mapRemnantWithPowerRune,mapLuckyRolls,mapLuckyRollChancePct";
 
     /// <summary>
     /// Brings an existing file up to the current header, once, leaving its rows alone.

@@ -38,8 +38,13 @@ internal static class ChainPanel
     }
 
     /// <summary>Draws the window, if it is switched on. Called from Render, beside the reference table.</summary>
-    public static void Draw(GameController gc, AutoExpeditionSettings settings, Planning planning)
+    /// <summary>The scan, for the marker sightings a layout snapshot keeps. See Layout.SeenMagic.</summary>
+    private static Scan _scan;
+
+    public static void Draw(GameController gc, AutoExpeditionSettings settings, Planning planning, Scan scan = null)
     {
+        _scan = scan;
+
         _settings = settings;
 
         if (settings?.Debug?.ShowChains == null || !settings.Debug.ShowChains.Value)
@@ -47,7 +52,7 @@ internal static class ChainPanel
 
         var open = settings.Debug.ShowChains.Value;
 
-        ImGui.SetNextWindowSize(new Vector2(900f, 420f), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new Vector2(1000f, 640f), ImGuiCond.FirstUseEver);
 
         if (!ImGui.Begin("Worker chains###aeChains", ref open))
         {
@@ -62,7 +67,7 @@ internal static class ChainPanel
 
         try
         {
-            Body(planning);
+            Body(gc, planning);
         }
         finally
         {
@@ -70,19 +75,236 @@ internal static class ChainPanel
         }
     }
 
-    private static void Body(Planning planning)
+    /// <summary>
+    /// Four sections, each folding away: the best chains every solve at this site has finished with, kept past a
+    /// deleted plan; the chains of the last press or batch; the enumerated openings; and the remnant orders.
+    /// </summary>
+    private static void Body(GameController gc, Planning planning)
     {
-        Generated(planning);
+        if (ImGui.CollapsingHeader("Best chains at this site###aeBestHeader", ImGuiTreeNodeFlags.DefaultOpen))
+            SiteBestTable(planning);
 
-        ImGui.Separator();
+        if (ImGui.CollapsingHeader("Chains of the last press###aePoolHeader", ImGuiTreeNodeFlags.DefaultOpen))
+            PressPoolTable(planning);
 
+        if (ImGui.CollapsingHeader("Openings###aeOpeningsHeader"))
+            Generated(gc, planning);
+
+        if (ImGui.CollapsingHeader("Remnant order###aeRemnantOrderHeader"))
+            RemnantOrderPanel.Body(planning);
+    }
+
+    /// <summary>
+    /// The best chains every solve at this site finished with, scored then and scored on the site as it stands, with
+    /// the filed best chain and the plan on screen for comparison.
+    ///
+    /// **Kept past a deleted plan, which is the point.** Whether a fresh solve can get back to a route a solve held a
+    /// minute ago - or finds a better one it could not reach from where it was - can only be read with the earlier
+    /// route still in hand. "Now" is scored on the current environment, so a reroll, a table edit or an explosive
+    /// down since shows as a change between the two columns rather than as a mystery. See SiteBestChains.
+    /// </summary>
+    /// <summary>The text in the chain box, as "x,y; x,y". See PastedChain.</summary>
+    private static string _pastedChain = "";
+
+    /// <summary>
+    /// The spots read from the chain box, and the text they were read from. Read again only when the text changes,
+    /// because ScoreNow caches by the list it is given and a list parsed every frame would be scored every frame.
+    /// </summary>
+    private static (string Text, List<Vector2> Spots) _pastedSpots = ("", null);
+
+    /// <summary>
+    /// A box for a chain as coordinates, from the detonator in order - "x,y; x,y", as dumps, layouts and the offline
+    /// harness print them - with what it scores on the site as it stands, and a button that makes it the plan.
+    ///
+    /// **For a route the list no longer holds**: one written down before a table edit, or found in another session,
+    /// can be scored under the weights in force now and solved on from there.
+    /// </summary>
+    private static void PastedChain(Planning planning, PlanEnvironment env)
+    {
+        ImGui.InputText("Chain to load###aeChainText", ref _pastedChain, 8192);
+
+        if (!string.Equals(_pastedSpots.Text, _pastedChain, StringComparison.Ordinal))
+            _pastedSpots = (_pastedChain, Planning.SpotsOfText(_pastedChain));
+
+        var spots = _pastedSpots.Spots;
+        var now = spots is { Count: > 0 } ? ScoreNow(env, spots) : double.NaN;
+
+        ImGui.SameLine();
+        ImGui.BeginDisabled(env == null || double.IsNaN(now));
+
+        if (ImGui.Button("Load chain###aeLoadChainText"))
+            planning.Adopt(Planner.Describe(env, spots), SiteBestChains.Site);
+
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.Text(spots is not { Count: > 0 }
+            ? "no spots read"
+            : double.IsNaN(now)
+                ? $"{spots.Count} links, not scorable here"
+                : $"{spots.Count} links, {now:N0} now");
+    }
+
+    private static void SiteBestTable(Planning planning)
+    {
+        var env = planning?.Env;
+        var entries = SiteBestChains.Entries;
+        var current = planning?.Plan?.Points;
+        var currentNow = current is { Count: > 0 } ? ScoreNow(env, current) : double.NaN;
+
+        ImGui.TextWrapped($"{entries.Count} chain(s) kept from solves at ({SiteBestChains.Site.X:0},{SiteBestChains.Site.Y:0}), " +
+                          "best first by what they scored when found. Deleting the plan does not clear them; moving to " +
+                          "another site or area does. Now is the same chain scored on the site as it stands.");
+        ImGui.Text("Plan on screen: " +
+                   (double.IsNaN(currentNow) ? "none" : $"{currentNow:N0} now, {current.Count} links"));
+
+        // The filed best chain is what a new solve starts from as its floor. See Planning.Filed and Kept.
+        if (Kept.Chain is { Count: > 0 } filed)
+        {
+            var filedNow = ScoreNow(env, filed);
+
+            ImGui.Text($"Filed best for this site: {Kept.Worth:N0} when filed, " +
+                       (double.IsNaN(filedNow) ? "not scorable here" : $"{filedNow:N0} now") +
+                       (Kept.Stale ? ", STALE" : ""));
+            ImGui.SameLine();
+
+            ImGui.BeginDisabled(env == null || double.IsNaN(filedNow));
+
+            if (ImGui.Button("Load filed###aeLoadFiled"))
+                planning.Adopt(Planner.Describe(env, filed), SiteBestChains.Site);
+
+            ImGui.EndDisabled();
+        }
+
+        ImGui.TextDisabled("Last solve: " + Planning.Filed);
+
+        if (ImGui.Button("Clear this list###aeBestClear"))
+            SiteBestChains.Clear();
+
+        ImGui.SameLine();
+        ImGui.TextDisabled("Load makes a chain the plan; the next solve then starts from it as its floor.");
+
+        PastedChain(planning, env);
+
+        if (entries.Count == 0)
+            return;
+
+        if (!ImGui.BeginTable("###aeBestRows", 10,
+                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit))
+            return;
+
+        try
+        {
+            ImGui.TableSetupColumn("#", ImGuiTableColumnFlags.WidthFixed, 30f);
+            ImGui.TableSetupColumn("Found", ImGuiTableColumnFlags.WidthFixed, 65f);
+            ImGui.TableSetupColumn("Run.draw", ImGuiTableColumnFlags.WidthFixed, 65f);
+            ImGui.TableSetupColumn("Then", ImGuiTableColumnFlags.WidthFixed, 70f);
+            ImGui.TableSetupColumn("Now", ImGuiTableColumnFlags.WidthFixed, 70f);
+            ImGui.TableSetupColumn("Vs plan", ImGuiTableColumnFlags.WidthFixed, 60f);
+            ImGui.TableSetupColumn("Links", ImGuiTableColumnFlags.WidthFixed, 45f);
+            ImGui.TableSetupColumn("Shared", ImGuiTableColumnFlags.WidthFixed, 55f);
+            ImGui.TableSetupColumn("Opening", ImGuiTableColumnFlags.WidthFixed, 230f);
+            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 60f);
+            ImGui.TableHeadersRow();
+
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                var startsHere = env != null && Vector2.Distance(entry.Origin, env.Origin) < 1f;
+                var now = startsHere ? ScoreNow(env, entry.Route) : double.NaN;
+
+                ImGui.TableNextRow();
+
+                ImGui.TableNextColumn();
+                ImGui.Text($"{i + 1}");
+
+                ImGui.TableNextColumn();
+                ImGui.Text($"{entry.When:HH:mm:ss}");
+
+                ImGui.TableNextColumn();
+                ImGui.Text($"{entry.Run}.{entry.Draw}");
+
+                ImGui.TableNextColumn();
+                ImGui.Text($"{entry.PlainThen:N0}" + (entry.Revision != Wrt.Revision ? "*" : ""));
+
+                if (entry.Revision != Wrt.Revision && ImGui.IsItemHovered())
+                    ImGui.SetTooltip($"scored under reference table revision {entry.Revision}; it is {Wrt.Revision} now");
+
+                ImGui.TableNextColumn();
+                ImGui.Text(startsHere ? $"{now:N0}" : "start moved");
+
+                if (!startsHere && ImGui.IsItemHovered())
+                    ImGui.SetTooltip($"its first link was planned from ({entry.Origin.X:0},{entry.Origin.Y:0}); the next " +
+                                     "link now starts from somewhere else, so it cannot be scored or loaded as it stands");
+
+                ImGui.TableNextColumn();
+                ImGui.Text(startsHere && !double.IsNaN(currentNow) && currentNow > 0d
+                    ? $"{100d * (now - currentNow) / currentNow:+0.0;-0.0;0}%"
+                    : "-");
+
+                ImGui.TableNextColumn();
+                ImGui.Text($"{entry.Route.Count}");
+
+                ImGui.TableNextColumn();
+                ImGui.Text(current is { Count: > 0 } ? $"{Shared(entry.Route, current)}/{entry.Route.Count}" : "-");
+
+                ImGui.TableNextColumn();
+                ImGui.Text(Opening(entry.Route));
+
+                ImGui.TableNextColumn();
+
+                ImGui.BeginDisabled(!startsHere);
+
+                if (ImGui.Button($"Load###aeBestLoad{i}"))
+                    planning.Adopt(Planner.Describe(env, entry.Route), SiteBestChains.Site);
+
+                ImGui.EndDisabled();
+            }
+        }
+        finally
+        {
+            ImGui.EndTable();
+        }
+    }
+
+    /// <summary>
+    /// A chain's plain score on this environment, kept until the environment changes: the window draws every frame and
+    /// scoring twenty chains each time is a frame's worth of work. NaN without an environment.
+    /// </summary>
+    private static double ScoreNow(PlanEnvironment env, List<Vector2> route)
+    {
+        if (env == null || route is not { Count: > 0 })
+            return double.NaN;
+
+        if (!ReferenceEquals(env, _scoredUnder))
+        {
+            _scoredNow.Clear();
+            _scoredUnder = env;
+        }
+
+        if (_scoredNow.TryGetValue(route, out var known))
+            return known;
+
+        var worth = Safe.Read(() => Planner.Plainly(env, route), double.NaN);
+
+        _scoredNow[route] = worth;
+
+        return worth;
+    }
+
+    private static PlanEnvironment _scoredUnder;
+
+    private static readonly Dictionary<List<Vector2>, double> _scoredNow = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>The chains of the last press, or of every press of the last batch. See PressHistory.Every.</summary>
+    private static void PressPoolTable(Planning planning)
+    {
         // **Every press of the batch, not just the last one.** A batch walks ten draws and the last press is
         // the one nobody is asking about; the question is which draw found the good route. Falls back to the
         // live pool when no batch has been taken, which is the single-press case. See PressHistory.Every.
         var batch = PressHistory.Every();
-        var pool = batch.Count > 0
+        var (pool, found) = Distinct(batch.Count > 0
             ? batch
-            : Flat(Solving.Pool);
+            : Flat(Solving.Pool));
 
         if (pool.Count == 0)
         {
@@ -93,14 +315,13 @@ internal static class ChainPanel
 
         var best = pool[0].Plan.Points;
 
-        ImGui.TextWrapped($"{pool.Count} chain(s) from {Draws(pool)} press(es), best first. " +
-                          "Load makes one the plan, so it draws in the world; the next solve replaces it.");
+        ImGui.TextWrapped($"{pool.Count} distinct chain(s) from {Draws(pool)} press(es), best first; Found says how many " +
+                          "times each was reached. Load makes one the plan, so it draws in the world; the next solve replaces it.");
 
         ImGui.Separator();
 
-        if (!ImGui.BeginTable("###aeChainRows", 7,
-                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY |
-                ImGuiTableFlags.SizingFixedFit))
+        if (!ImGui.BeginTable("###aeChainRows", 8,
+                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit))
             return;
 
         try
@@ -111,6 +332,7 @@ internal static class ChainPanel
             // Which press it came from, so a good chain can be traced back to a draw and re-run.
             ImGui.TableSetupColumn("Draw", ImGuiTableColumnFlags.WidthFixed, 40f);
             ImGui.TableSetupColumn("Site pays", ImGuiTableColumnFlags.WidthFixed, 80f);
+            ImGui.TableSetupColumn("Found", ImGuiTableColumnFlags.WidthFixed, 45f);
             ImGui.TableSetupColumn("Links", ImGuiTableColumnFlags.WidthFixed, 45f);
 
             // **How much of this chain is the best one's, which is the question the scores cannot answer.**
@@ -137,6 +359,9 @@ internal static class ChainPanel
 
                 ImGui.TableNextColumn();
                 ImGui.Text($"{worth:N0}");
+
+                ImGui.TableNextColumn();
+                ImGui.Text($"{found[i]}");
 
                 ImGui.TableNextColumn();
                 ImGui.Text($"{links.Count}");
@@ -167,7 +392,49 @@ internal static class ChainPanel
     /// anything - particularly this one, whose whole claim is that it beats the greedy opening that most of
     /// the pool currently takes. See Openings.
     /// </summary>
-    private static void Generated(Planning planning)
+    /// <summary>
+    /// The chains a layout snapshot keeps as targets: the site's best chains (SiteBestChains) and the plan in hand when
+    /// it is not already among them, each with the score it had, best first.
+    /// </summary>
+    /// <summary>Whether a layout snapshot is being written on a background thread.</summary>
+    private static volatile bool _saving;
+
+    /// <summary>
+    /// The plugin's version and build time and the scoring settings, for a layout snapshot to keep as text. See
+    /// Layout.Answers.Notes.
+    /// </summary>
+    private static string NotesForLayout()
+    {
+        var assembly = typeof(ChainPanel).Assembly;
+        var built = Safe.Read(() => System.IO.File.GetLastWriteTime(assembly.Location).ToString("yyyy-MM-dd HH:mm"), "?");
+        var settings = _settings;
+
+        return $"plugin {assembly.GetName().Version} built {built}; " +
+               (settings == null
+                   ? "settings not read"
+                   : $"PointWorth={settings.Rewards.PointWorth.Value}; IgnoreRewardsBelow={settings.Rewards.IgnoreRewardsBelow.Value}; " +
+                     $"MustTakeAbove={settings.Rewards.MustTakeAbove.Value}; MapMonsterIncreases={settings.Debug.MapMonsterIncreases.Value}");
+    }
+
+    private static List<(double Scored, List<Vector2> Route)> KnownChainsOfSite(Planning planning)
+    {
+        var known = new List<(double Scored, List<Vector2> Route)>();
+
+        foreach (var entry in SiteBestChains.Entries)
+            known.Add((entry.PlainThen, new List<Vector2>(entry.Route)));
+
+        var inHand = Safe.Read(() => planning.Chain, null);
+
+        if (inHand is { Count: > 0 } && !known.Exists(k => SiteBestChains.SameRoute(k.Route, inHand)) &&
+            Safe.Read(() => planning.Env, null) is { } env)
+            known.Add((Safe.Read(() => Planner.Plainly(env, new List<Vector2>(inHand)), 0d), new List<Vector2>(inHand)));
+
+        known.Sort((a, b) => b.Scored.CompareTo(a.Scored));
+
+        return known;
+    }
+
+    private static void Generated(GameController gc, Planning planning)
     {
         var env = planning?.Env;
 
@@ -217,8 +484,44 @@ internal static class ChainPanel
         // **Saves the site, not the plan.** What comes out is a file an offline run can load to work the
         // openings out again as many times as it likes, with the solver's knobs set by the experiment rather
         // than by whatever they happened to be here. See Layout.
-        if (ImGui.Button("Save layout snapshot###aeSnap"))
-            Layout.SaveWithOpenings(env, _levels, _want, _horizon);
+        // **Off the frame**, because it asks the terrain millions of questions: every routed pair the solver has
+        // kept and every cell of the site. What is read from the game - the name, the modifiers, the chains, the
+        // settings - is read here, on the frame, and handed over. See Layout.SaveWithOpenings.
+        if (ImGui.Button("Save layout snapshot###aeSnap") && !_saving)
+        {
+            var area = Safe.Read(() => gc.Area.CurrentArea.Name, "") ?? "";
+            var mapStats = Safe.Read(() => string.Join(" ", System.Linq.Enumerable.Select(gc.IngameState.Data.MapStatsVisible,
+                x => $"{x.Key}={x.Value}")), "") ?? "";
+            var known = KnownChainsOfSite(planning);
+            var notes = NotesForLayout();
+
+            // When the scan first saw each marker, after the site was first seen, read here on the frame. See
+            // Layout.SeenMagic.
+            var sighted = Rehearsal.Sighted;
+            var seenAtMs = new Dictionary<System.Numerics.Vector2, double>();
+
+            if (_scan is { } scanned && sighted != DateTime.MinValue)
+            {
+                foreach (var target in scanned.Targets)
+                    seenAtMs[target.Grid] = Math.Max(0d, (target.Born - sighted).TotalMilliseconds);
+            }
+            var (levels, want, horizon) = (_levels, _want, _horizon);
+
+            _saving = true;
+            Layout.Saving();
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    Layout.SaveWithOpenings(env, levels, want, horizon, area, mapStats, known, notes, seenAtMs);
+                }
+                finally
+                {
+                    _saving = false;
+                }
+            });
+        }
 
         ImGui.EndDisabled();
 
@@ -516,6 +819,41 @@ internal static class ChainPanel
             all.Add((0, worth, plan));
 
         return all;
+    }
+
+    /// <summary>
+    /// The chains with each route listed once, at its best score and earliest press, and how many times it was found.
+    ///
+    /// **The same route is recorded again by every press that ends on it.** Each worker carries its chain from one
+    /// pass to the next and workers can converge, so one route filled several rows with nothing to tell them apart.
+    /// Same route as SiteBestChains means it: every link within a grid unit, in order.
+    /// </summary>
+    private static (List<(int Draw, double Worth, Plan Plan)> Chains, List<int> Found) Distinct(
+        List<(int Draw, double Worth, Plan Plan)> pool)
+    {
+        var chains = new List<(int Draw, double Worth, Plan Plan)>();
+        var found = new List<int>();
+
+        foreach (var row in pool)
+        {
+            var at = chains.FindIndex(x => SiteBestChains.SameRoute(x.Plan.Points, row.Plan.Points));
+
+            if (at < 0)
+            {
+                chains.Add(row);
+                found.Add(1);
+
+                continue;
+            }
+
+            found[at]++;
+
+            // Best first already, so the earlier entry holds the better score; keep the earlier press as well.
+            if (row.Draw > 0 && (chains[at].Draw <= 0 || row.Draw < chains[at].Draw))
+                chains[at] = chains[at] with { Draw = row.Draw };
+        }
+
+        return (chains, found);
     }
 
     /// <summary>How many presses the list spans, for the line above it.</summary>

@@ -18,9 +18,9 @@ namespace AutoExpedition;
 ///
 /// Two cells carry it:
 ///
-/// - **Children** - "monster.rare x1", "remnant.wave x3", "pack.rare xValues[-1]". What else you get
-///   for blowing this up. A count is a float, so a fraction is a probability; a count may name a
-///   value the game states on a modifier instead of a number.
+/// - **Children** - "monster.rare x1", "remnant.wave x recipe.Runes", "pack.rare xValues[-1]". What else you
+///   get for blowing this up. A count is a float, so a fraction is a probability; a count may name a
+///   value the game states on a modifier, or the rune count of the recipe a remnant takes, instead of a number.
 /// - **Effect** - "monster *= 1.04", "rare_monster *= 1.5 as rare_monster_count". What this does to
 ///   everything it reaches. One cell where Propagation %, Multiplicative behaviour and the carry
 ///   number used to be three.
@@ -150,6 +150,14 @@ internal static class TableGrammar
 
         var said = text.Trim();
 
+        // The number of runes in the recipe a remnant takes, which is how many waves it sends up. See RecipeRunes.
+        if (string.Equals(said, RecipeRunes, StringComparison.OrdinalIgnoreCase))
+        {
+            slot = RecipeRunes;
+
+            return true;
+        }
+
         // **"matched." is the whole of what this prefix buys, and it is worth a word.** The count used
         // to read "Values[-1]" and nothing on the row said whose values those were: the connection to
         // the matches cell above it was real and implicit, which is the shape of fault this table
@@ -181,6 +189,13 @@ internal static class TableGrammar
     /// </summary>
     public const string Matching = "matched.";
 
+    /// <summary>
+    /// A count read from the recipe a remnant takes: how many runes it holds. A remnant sends up one wave per rune
+    /// used, so "remnant/wave x recipe.Runes" is its waves. Resolved by Weighing.WavesOfRemnant, which knows the
+    /// recipe; nothing in the table can, so it sits with the other per-instance counts. See Slot.
+    /// </summary>
+    public const string RecipeRunes = "recipe.Runes";
+
     /// <summary>Which entry of a mod's Values a slot names, negative counting from the end.</summary>
     public static int Index(string slot)
     {
@@ -198,7 +213,9 @@ internal static class TableGrammar
     /// <summary>The value a mod states at a slot, or null where it does not state one.</summary>
     public static float? Valued(IReadOnlyList<int> values, string slot)
     {
-        if (values == null || values.Count == 0 || slot == null)
+        // A recipe's rune count is not on any modifier. See RecipeRunes.
+        if (values == null || values.Count == 0 || slot == null ||
+            string.Equals(slot, RecipeRunes, StringComparison.Ordinal))
             return null;
 
         var at = Index(slot);
@@ -220,12 +237,26 @@ internal static class TableGrammar
     /// Multiplicative behaviour's "+name" and "*name" sigils, where the same distinction was carried
     /// by punctuation in a different column from the number it applied to.
     ///
-    /// <paramref name="Here"/> means the effect reaches this row's own children and nothing the chain
-    /// unearths later - a remnant's own socketed rune over its own waves. Where an effect reaches
-    /// otherwise is the planner's business and not the table's.
+    /// <paramref name="Own"/>, written "own" at the end of the effect, means it reaches the waves of the remnant
+    /// holding the rune and nothing else: not later links, not other remnants the same explosive catches. It
+    /// applies whichever slot the rune sits in. Read on rune rows only; the planner applies it per combination,
+    /// to the combination holding the rune. See Weighing.OwnEffectsOfRunes. Without it, where an effect reaches
+    /// is the planner's business and not the table's.
+    ///
+    /// <paramref name="Per"/>, written "per tag" after the amount, makes a += add that many of the target row for each
+    /// monster of the tag named: "monster/runemarked_rare.count += 1.5% per normal_monster own" is 0.015 Runemarked
+    /// rares for every normal monster on the holding remnant's waves. Own, count and a row target only. See Rate and
+    /// Weighing.CreatedOfRunes.
+    ///
+    /// <paramref name="Empowered"/>, written "plain" or "empowered" at the end, limits an effect to a rune Power does
+    /// not reach, or does, in place of Power doubling it. Read on two kinds of effect: a "per" effect, where empowered
+    /// Time respawns more often and at higher rarity than any factor on the plain rate says (see
+    /// Weighing.CreatedOfRunes), and a rune's chain-wide value share, where the pair sets how far Power lifts that
+    /// share - Bond's +15% plain against +18% empowered (see Weighing.PowerFactorOfRune). Null for an effect that
+    /// applies either way.
     /// </summary>
     internal readonly record struct Effect(string Target, string Attribute, bool Multiplies,
-        float Amount, string Stat, bool Here, bool Percent = false)
+        float Amount, string Stat, bool Own, bool Percent = false, string Per = null, bool? Empowered = null)
     {
         public override string ToString()
         {
@@ -249,11 +280,17 @@ internal static class TableGrammar
             if (Percent)
                 text.Append('%');
 
+            if (!string.IsNullOrEmpty(Per))
+                text.Append(" per ").Append(Per);
+
             if (!string.IsNullOrEmpty(Stat))
                 text.Append(" as ").Append(Stat);
 
-            if (Here)
-                text.Append(" here");
+            if (Own)
+                text.Append(" own");
+
+            if (Empowered is { } empowered)
+                text.Append(empowered ? " empowered" : " plain");
 
             return text.ToString();
         }
@@ -277,10 +314,20 @@ internal static class TableGrammar
         /// not 1.5 x 1.5 = 2.25. The share is what adds; the stat total is what multiplies.
         /// </summary>
         public float Share => Multiplies ? Factor - 1f : Amount;
+
+        /// <summary>How many of the target a "per" effect adds for each monster it is per, the percentage read as a
+        /// fraction. See Per.</summary>
+        public float Rate => Percent ? Amount / 100f : Amount;
     }
 
     /// <summary>What a thing is worth. The attribute every target has unless it is an effect.</summary>
     public const string Weight = "weight";
+
+    /// <summary>
+    /// How many of a thing there are. Scales a part's worth and its number together, where weight scales the worth
+    /// alone; the number is what flat effects pay on. See Planner.Settle's payout and Counts.
+    /// </summary>
+    public const string Count = "count";
 
     /// <summary>
     /// How strong an effect is, which is what Power scales.
@@ -300,17 +347,18 @@ internal static class TableGrammar
     /// exists to stop. Two entries is enough to be worth the check: the pair is exactly the ambiguity
     /// that used to be resolved by guessing from the target.
     ///
-    /// **Count is deliberately absent.** It cannot differ from weight: both multiply the same currency,
-    /// so "twice as many rares" and "rares are worth twice as much" are the same number by
-    /// construction - 100 x 2 x 2 is 400 whichever way round it is read. Size is absent because nothing
-    /// scales it. Append if the game turns out to have something that genuinely is neither.
+    /// **Count and weight multiply the same worth**, so for a share "twice as many rares" and "rares are worth twice
+    /// as much" come to the same number. Count is here anyway because it says what was measured - spawn counts per
+    /// wave - and because it differs where a flat effect pays per monster. Where count is read, it scales a part's
+    /// worth and its number; weight scales the worth. Effects read as chain-wide shares do not tell the two apart.
+    /// Size is absent because nothing scales it.
     ///
     /// Nothing outside the table reads the attribute: which of the two a row means is decided by what
     /// its effect AIMS at, since only an effect can be aimed at the rune tag. The word is here so a
     /// row can be read as a sentence and so a target with no weight is refused rather than scored as
     /// nought. See Checked and Weighing.Lift.
     /// </summary>
-    public static readonly string[] Attributes = { Weight, Magnitude };
+    public static readonly string[] Attributes = { Weight, Count, Magnitude };
 
     /// <summary>
     /// Reads an Effect cell. Empty list and no complaint when the cell is blank.
@@ -406,12 +454,25 @@ internal static class TableGrammar
                 }
             }
 
-            var here = false;
+            bool? empowered = null;
 
-            if (rest.EndsWith(" here", StringComparison.OrdinalIgnoreCase))
+            if (rest.EndsWith(" empowered", StringComparison.OrdinalIgnoreCase))
             {
-                here = true;
-                rest = rest[..^5].TrimEnd();
+                empowered = true;
+                rest = rest[..^10].TrimEnd();
+            }
+            else if (rest.EndsWith(" plain", StringComparison.OrdinalIgnoreCase))
+            {
+                empowered = false;
+                rest = rest[..^6].TrimEnd();
+            }
+
+            var own = false;
+
+            if (rest.EndsWith(" own", StringComparison.OrdinalIgnoreCase))
+            {
+                own = true;
+                rest = rest[..^4].TrimEnd();
             }
 
             var stat = "";
@@ -442,12 +503,29 @@ internal static class TableGrammar
             // modifier.
             //
             // A flat addition takes no percentage: "+= 3%" would mean three per cent of a weight
-            // nobody named, which is not a thing the table can say.
+            // nobody named, which is not a thing the table can say. With "per" it can: so many per cent of each
+            // monster named. See Effect.Per.
+            string per = null;
+            var perAt = rest.LastIndexOf(" per ", StringComparison.OrdinalIgnoreCase);
+
+            if (perAt >= 0)
+            {
+                per = rest[(perAt + 5)..].Trim();
+                rest = rest[..perAt].TrimEnd();
+
+                if (per.Length == 0)
+                {
+                    wrong = $"'{part}' says 'per' and then nothing to count";
+
+                    return [.. found];
+                }
+            }
+
             var percent = false;
 
             if (rest.EndsWith("%", StringComparison.Ordinal))
             {
-                if (!multiplies)
+                if (!multiplies && per == null)
                 {
                     wrong = $"'{part}' adds a percentage of nothing - use *= for a percentage, " +
                             "or += with a flat number";
@@ -472,7 +550,7 @@ internal static class TableGrammar
 
 
 
-            var effect = new Effect(target, attribute, multiplies, amount, stat, here, percent);
+            var effect = new Effect(target, attribute, multiplies, amount, stat, own, percent, per, empowered);
 
             // **A multiplier below nought would invert what it reaches**, which nothing in the game
             // does and which would silently make covered content worth less than not covering it. A
@@ -502,7 +580,12 @@ internal static class TableGrammar
     ///
     /// See Translated for the mapping, which is mechanical.
     /// </summary>
-    public static Effect[] EffectsOfRow(string id, out string wrong)
+    /// <param name="withEmpowered">
+    /// Whether effects written "empowered" are returned. Off by default: an empowered clause restates a plain one for a
+    /// rune Power reaches, and a reader that does not tell the two apart would count the value twice. The readers that
+    /// do - created monsters, Power's factor on a value share, the table's checks - ask for them.
+    /// </param>
+    public static Effect[] EffectsOfRow(string id, out string wrong, bool withEmpowered = false)
     {
         var row = Wrt.Of(id);
 
@@ -516,7 +599,12 @@ internal static class TableGrammar
         // **The effect cell, and nothing else.** A row used to be translatable from a scope, a
         // combines and a carries when it had no effect of its own. Those cells are gone and
         // nothing reads them, so an effect is the only place a magnitude can be.
-        return Effects(row.Effect ?? "", out wrong);
+        var effects = Effects(row.Effect ?? "", out wrong);
+
+        if (withEmpowered || Array.TrueForAll(effects, x => x.Empowered != true))
+            return effects;
+
+        return Array.FindAll(effects, x => x.Empowered != true);
     }
 
     /// <summary>
@@ -652,7 +740,7 @@ internal static class TableGrammar
         if (childWrong.Length > 0)
             wrongs.Add(childWrong);
 
-        var effects = EffectsOfRow(id, out var effectWrong);
+        var effects = EffectsOfRow(id, out var effectWrong, withEmpowered: true);
 
         foreach (var effect in effects)
         {
@@ -672,12 +760,72 @@ internal static class TableGrammar
             // this column was rewritten to end, and it is exactly the mistake the old syntax invited:
             // with no attribute to write, "rune *= +50%" had to be guessed at, and guessing right was
             // the only thing standing between a working Power rune and a dead one.
-            if (string.Equals(effect.Attribute, Weight, StringComparison.Ordinal) &&
+            if ((string.Equals(effect.Attribute, Weight, StringComparison.Ordinal) ||
+                 string.Equals(effect.Attribute, Count, StringComparison.Ordinal)) &&
                 Weightless(effect.Target))
             {
-                wrongs.Add($"'{effect.Target}' has no weight to scale - did you mean " +
+                wrongs.Add($"'{effect.Target}' has no {effect.Attribute} to scale - did you mean " +
                            $"{effect.Target}.{Magnitude}?");
             }
+
+            // **Own is read in one place, so said where it would be ignored.** The planner applies it to the waves
+            // of a remnant holding a rune, per combination, and to nothing else. See Weighing.OwnEffectsOfRunes.
+            if (effect.Own && !Runic(id))
+                wrongs.Add($"'own' is read on rune rows only, and this is not one - it does nothing here");
+
+            if (effect.Own && !effect.Multiplies && effect.Per == null)
+                wrongs.Add($"'own' takes *= only - a flat '+=' on a remnant's own waves is not read, unless it is " +
+                           "'per' a monster tag");
+
+            // **'plain' and 'empowered' are read on 'per' effects and on a rune's chain-wide value share.** On a value
+            // share the pair sets Power's factor for that rune alone, so the share keeps a group of its own: pooled under
+            // a stat, it would share a lift with runes that have none. See Weighing.PowerFactorOfRune.
+            if (effect.Empowered is { } marked && effect.Per == null)
+            {
+                var marker = marked ? "empowered" : "plain";
+
+                if (!Runic(id))
+                    wrongs.Add($"'{marker}' is read on rune rows only - it does nothing here");
+                else if (effect.Own)
+                    wrongs.Add($"'{marker}' is read on 'per' effects and chain-wide value shares, not on own factors - " +
+                               "Power doubles an own bonus");
+                else if (string.Equals(effect.Attribute, Magnitude, StringComparison.Ordinal))
+                    wrongs.Add($"'{marker}' is not read on a lift");
+                else if (!string.IsNullOrWhiteSpace(effect.Stat))
+                    wrongs.Add($"'{marker}' on a value share needs a group of its own - drop 'as {effect.Stat}'");
+                else if (!Array.Exists(effects, x => x.Empowered == !marked && x.Per == null && !x.Own &&
+                                                     x.Multiplies == effect.Multiplies &&
+                                                     string.Equals(x.Attribute, effect.Attribute, StringComparison.Ordinal) &&
+                                                     string.Equals(x.Target, effect.Target, StringComparison.OrdinalIgnoreCase)))
+                    wrongs.Add($"'{marker}' needs a matching '{(marked ? "plain" : "empowered")}' effect on " +
+                               $"{effect.Target}.{effect.Attribute}");
+            }
+
+            // **'per' adds monsters of one kind for each of another, on the holding remnant's waves.** Read there only,
+            // as an addition to a count. See Effect.Per and PlanTarget.OwnOfChoice.
+            if (effect.Per != null)
+            {
+                if (!effect.Own)
+                    wrongs.Add($"'per' is read on own effects only - add 'own'");
+
+                if (effect.Multiplies)
+                    wrongs.Add($"'per' takes += only - it adds so many for each one counted");
+
+                if (!string.Equals(effect.Attribute, Count, StringComparison.Ordinal))
+                    wrongs.Add($"'per' adds monsters, so it is written on '{effect.Target}.{Count}'");
+
+                if (Wrt.Of(effect.Target) == null)
+                    wrongs.Add($"'per' adds things of a row, and '{effect.Target}' is not one - write a row id such as " +
+                               "monster/runemarked_rare");
+
+                if (!Tags.Carried(effect.Per))
+                    wrongs.Add($"'{effect.Per}' is a tag nothing carries - write a monster tag such as normal_monster");
+            }
+
+            // An own lift reaches the effects of runes held on the same remnant and nothing propagated. It lifts, so it
+            // multiplies. See Weighing.OwnLiftsOfRune.
+            if (effect.Own && string.Equals(effect.Attribute, Magnitude, StringComparison.Ordinal) && !effect.Multiplies)
+                wrongs.Add($"an own lift on '{Magnitude}' takes *= only");
         }
 
         if (effectWrong.Length > 0)
@@ -882,10 +1030,12 @@ internal static class TableGrammar
                     continue;
                 }
 
-                fixt += kid.Count * inner.Fixed;
+                var count = kid.Count;
+
+                fixt += count * inner.Fixed;
 
                 foreach (var (from, each) in inner.PerValue ?? [])
-                    per.Add((from, kid.Count * each));
+                    per.Add((from, count * each));
             }
         }
         finally
@@ -968,11 +1118,13 @@ internal static class TableGrammar
 
         foreach (var kid in kids)
         {
-            text.Append(pad).Append("  x").Append(kid.From ?? Printed(kid.Count)).Append(' ')
+            var count = kid.Count;
+
+            text.Append(pad).Append("  x").Append(kid.From ?? Printed(count)).Append(' ')
                 .AppendLine(kid.Pool ? kid.Id + " (pool)" : "");
 
             Explaining(kid.Id, text, depth + 1,
-                kid.From != null ? times : times * kid.Count, walking);
+                kid.From != null ? times : times * count, walking);
         }
 
         walking.RemoveAt(walking.Count - 1);
@@ -1382,13 +1534,15 @@ internal static class TableGrammar
             var inner = Wrt.Of(kid.Id);
             var own = inner == null ? 0f : Content(kid.Id, inner);
 
+            var count = kid.Count;
+
             if (own != 0f)
             {
-                into[kid.Id] = into.GetValueOrDefault(kid.Id) + times * kid.Count * own;
-                many[kid.Id] = many.GetValueOrDefault(kid.Id) + times * kid.Count;
+                into[kid.Id] = into.GetValueOrDefault(kid.Id) + times * count * own;
+                many[kid.Id] = many.GetValueOrDefault(kid.Id) + times * count;
             }
 
-            Spreading(kid.Id, times * kid.Count, into, many, walking, depth + 1);
+            Spreading(kid.Id, times * count, into, many, walking, depth + 1);
         }
 
         walking.RemoveAt(walking.Count - 1);
@@ -1446,6 +1600,34 @@ internal static class TableGrammar
         }
 
         return (rare, magic, normal);
+    }
+
+    // ---------------------------------------------------------------- remnant waves and the map
+
+    /// <summary>
+    /// The map's figures a remnant's waves are built from, as fractions: its increased number of rare and of magic packs
+    /// (map and atlas), its "more magic and rare monsters", and its pack size. See Weighing.PacksOfRemnant.
+    /// </summary>
+    internal readonly record struct RemnantWaveMap(float RareIncrease, float MagicIncrease, float More, float PackSize);
+
+    /// <summary>The map remnant waves are built for now: none until set. See SetMapForRemnantWaves.</summary>
+    public static RemnantWaveMap MapForRemnantWaves { get; private set; }
+
+    /// <summary>
+    /// Sets MapForRemnantWaves, and when it moves, bumps the table's revision so everything priced from remnant waves is
+    /// priced again. Called once a frame; a map changes it, an unchanged map does not.
+    /// </summary>
+    public static void SetMapForRemnantWaves(RemnantWaveMap map)
+    {
+        var was = MapForRemnantWaves;
+
+        if (Math.Abs(map.RareIncrease - was.RareIncrease) < 0.001f && Math.Abs(map.MagicIncrease - was.MagicIncrease) < 0.001f &&
+            Math.Abs(map.More - was.More) < 0.001f && Math.Abs(map.PackSize - was.PackSize) < 0.001f)
+            return;
+
+        MapForRemnantWaves = map;
+        Wrt.Repriced($"the map changes remnant waves: rare packs +{map.RareIncrease:P0}, magic +{map.MagicIncrease:P0}, " +
+                     $"more {map.More:P0}, pack size {map.PackSize:P0}");
     }
 
     // ---------------------------------------------------------------- shared

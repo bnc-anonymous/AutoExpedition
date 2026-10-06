@@ -196,8 +196,14 @@ internal sealed class Readout
 
         // The background goes down once for the whole row. Painted per piece, a line in three
         // colours shows as three boxes with three seams down it.
-        _graphics.DrawBox(new Vector2(at, top), new Vector2(at + row.Width, top + row.Height),
-            Color.Black);
+        //
+        // **As a text background, not as a box**: the whole row's text drawn invisible with a black
+        // background, then the pieces over it. An explosive's label in the world draws its background
+        // with DrawTextWithBackground, and a row drawn later with DrawBox still showed that label
+        // through its box while its own text sat on top, so the two lines muddled together. Drawn
+        // the way the label is drawn, the later one covers the earlier one, background and all.
+        _graphics.DrawTextWithBackground(string.Concat(row.Pieces.ConvertAll(x => x.Text)), new Vector2(at, top),
+            Color.Transparent, Color.Black);
 
         foreach (var piece in row.Pieces)
         {
