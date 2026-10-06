@@ -3988,7 +3988,7 @@ internal static class Dump
                      "screen sized - a cull that never fires is one whose rects cover everything");
         var clearOfPanels = Panels.LastClearOfPanels;
 
-        b.AppendLine($"  panels at the last draw (read only while Hide behind panels is on): {Panels.SidePanels} side " +
+        b.AppendLine($"  panels at the last draw (read only while Hide behind panels is on): {Panels.SidePanels} side{Panels.SidePanelsSaid} " +
                      $"panels, Escape menu {(Panels.EscapeMenuOpen ? $"open with {Panels.EscapeMenuRects} rects found" : "closed")}; " +
                      $"drawing clipped to ({clearOfPanels.X:0},{clearOfPanels.Y:0} {clearOfPanels.Width:0}x{clearOfPanels.Height:0}); kept clear: " +
                      string.Join(", ", Panels.LastPanelsToClear.Select(r => $"({r.X:0},{r.Y:0} {r.Width:0}x{r.Height:0})")));
@@ -4982,7 +4982,7 @@ internal static class Dump
         {
             var sizes = new List<string>();
 
-            foreach (var (sockets, _) in Rolls.Sockets)
+            foreach (var (sockets, _) in Rolls.SocketsOnGrandSites)
             {
                 var pairs = Safe.Read(() => Valuation.FixedRunesPossibleAt(sockets).Count, -1);
 
@@ -5003,7 +5003,7 @@ internal static class Dump
             // Listed so the observed fixed runes in remnants.csv can be tested against the set the
             // game actually admits, which is the one question the table answers and the odds are
             // separate from. See Valuation.FixedRunesPossibleAt.
-            foreach (var (sockets, _) in Rolls.Sockets)
+            foreach (var (sockets, _) in Rolls.SocketsOnGrandSites)
             {
                 var pairs = Safe.Read(() => Valuation.FixedRunesPossibleAt(sockets), null);
 

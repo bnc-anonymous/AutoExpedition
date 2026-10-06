@@ -49,57 +49,71 @@ namespace AutoExpedition;
 internal static class Rolls
 {
     /// <summary>
-    /// How many sockets a roll comes up with. Shares, summing to one.
+    /// How many sockets a roll comes up with, on a Grand Expedition site or on any other. See SocketsOnGrandSites and
+    /// SocketsOnRegularSites; Rolling picks between them with Detonator.Grand.
+    /// </summary>
+    public static (int Sockets, float Share)[] SocketsFor(bool grand) => grand ? SocketsOnGrandSites : SocketsOnRegularSites;
+
+    /// <summary>
+    /// How many sockets a roll comes up with on a Grand Expedition site. Shares, summing to one.
     ///
-    /// **Counted from rolled remnants, 976 of them**, recorded by Census from 2026-09-26 to 2026-10-05 at area levels
-    /// 78 to 82, each remnant once, leaving out 2 readings of no sockets as misreads. A roll's own outcomes rather than
-    /// the fresh population standing in for them.
+    /// **Counted from rolled remnants on Grand sites, 901 of them**, recorded by Census up to 2026-10-06 at area levels
+    /// 78 to 82, each remnant once, leaving out readings of fewer than three sockets as misreads. A roll's own outcomes
+    /// rather than the fresh population standing in for them. Grand and regular sites were told apart by map name,
+    /// since Census did not record it until 2026-10-06.
     ///
     /// **Rows from a map with a floor on rune slots count only above the floor.** Such a map holds no remnant below its
-    /// floor, so its rows say nothing about how common the smaller counts are. The 948 rows from maps with no floor give
+    /// floor, so its rows say nothing about how common the smaller counts are. The 873 rows from maps with no floor give
     /// three, four, and five or more; the five-or-more share is split between five and nine by those rows and the 28
-    /// from maps with a floor of five together: 234, 337 and 377 of 948, then 241, 119, 28, 15 and 2 of 405. On a map
-    /// with a floor the counts below it are left out of the draw. See MapSlotFloor and Rolling.ShapesARollCouldProduce.
+    /// from maps with a floor of five together. On a map with a floor the counts below it are left out of the draw. See
+    /// MapSlotFloor and Rolling.ShapesARollCouldProduce.
     ///
-    /// Fresh remnants over the same days, 1,007 from maps with no floor, came out close: 20.3%, 33.3%, 25.6%, 14.5%,
-    /// 3.5%, 2.5%, 0.4% from three sockets to nine.
+    /// Fresh remnants on Grand sites, 869 from maps with no floor, came out at 19.8%, 32.7%, 24.1%, 15.4%, 4.8%, 2.6%
+    /// and 0.6% from three sockets to nine.
     ///
-    /// Before this the table was 476 fresh remnants of 2026-09-18, with seven, eight and nine sockets at 0.63% each from
-    /// three sightings apiece; the larger sample puts seven and eight at about four and two times that.
-    ///
-    /// **Seven, eight and nine are listed rather than folded into six, which is a change.** They are
-    /// three observations each out of the 476 and were collapsed on the reasoning that a
-    /// distribution built to be sampled from should not carry a tail nobody has seen enough of to
-    /// believe. That reasoning is sound about confidence and wrong about consequence: folding them
-    /// into six does not make the tail uncertain, it makes it absent, and everything downstream
-    /// then behaves as though remnants larger than six do not exist.
-    ///
-    /// They are where the largest rewards are. Mirror of Kalandra and Hinekora's Lock are nine rune
-    /// recipes and so need nine sockets; Krillson's Bay Key needs ten. A reroll advisor that cannot
-    /// produce a nine socket remnant cannot price the possibility of one, and that is the tail that
-    /// matters rather than a rounding detail.
-    ///
-    /// Each is 3/476 = 0.0063, and six gives up the 9/476 it was carrying for them: 0.177 - 0.019.
-    /// Ten is still absent because none has been seen at all, which is a different statement from
-    /// seen rarely - see the Krillson's Bay Key note in NOTES 8z.
-    ///
-    /// **Three observations is three observations.** These shares are the least reliable numbers in
-    /// this file and should be read as "rare, and how rare is not settled".
+    /// **Seven, eight and nine are listed rather than folded into six.** They are where the largest rewards are: Mirror
+    /// of Kalandra and Hinekora's Lock are nine rune recipes. A reroll advisor that cannot produce a nine socket remnant
+    /// cannot price the possibility of one. Ten is absent because none has been seen at all.
     /// </summary>
-    public static readonly (int Sockets, float Share)[] Sockets =
+    public static readonly (int Sockets, float Share)[] SocketsOnGrandSites =
     {
-        (3, 0.2468f),
-        (4, 0.3555f),
-        (5, 0.2367f),
-        (6, 0.1168f),
-        (7, 0.0275f),
-        (8, 0.0147f),
-        (9, 0.0020f),
+        (3, 0.2451f),
+        (4, 0.3528f),
+        (5, 0.2302f),
+        (6, 0.1220f),
+        (7, 0.0297f),
+        (8, 0.0180f),
+        (9, 0.0021f),
+    };
+
+    /// <summary>
+    /// How many sockets a roll comes up with on any site that is not a Grand Expedition. Shares, summing to one.
+    ///
+    /// **Seven sockets almost never come up here, while eight and nine do.** Players report it and take it for a bug;
+    /// Census agrees. Over 15 maps with no Grand Expedition (recorded up to 2026-10-06, area levels 78 and 79), 352
+    /// remnants, each once - 195 fresh and 157 rolled, pooled, since 157 rolls alone cannot show the tail - gave 86, 122,
+    /// 98 and 41 at three to six sockets, none at seven, four at eight and one at nine. At the Grand sites' 4.8%, none in
+    /// 195 fresh would happen about once in 15,000. Nothing in the client's tables separates the two kinds of site, so
+    /// the difference is the server's.
+    ///
+    /// Seven is listed at half an observation, 0.5 of 352.5, which is chosen rather than measured: never seen is not
+    /// impossible, and a share of nought would make one sighting read as a misread. Eight and nine are four observations
+    /// and one, and should be read as "rare, and how rare is not settled".
+    /// </summary>
+    public static readonly (int Sockets, float Share)[] SocketsOnRegularSites =
+    {
+        (3, 0.2440f),
+        (4, 0.3461f),
+        (5, 0.2780f),
+        (6, 0.1163f),
+        (7, 0.0014f),
+        (8, 0.0113f),
+        (9, 0.0028f),
     };
 
     /// <summary>
     /// The fewest rune slots any remnant in this map has, from its "All Verisium Remnants have at least X rune slots"
-    /// modifier, or nought when it has none or the stat cannot be read. See Sockets and Census.
+    /// modifier, or nought when it has none or the stat cannot be read. See SocketsFor and Census.
     /// </summary>
     public static int MapSlotFloor(ExileCore2.GameController gc) =>
         MapStat(gc, ExileCore2.Shared.Enums.GameStat.MapExpedition2RemnantsHaveAtLeastXSlots);

@@ -58,7 +58,7 @@ internal static class Spent
     /// </summary>
     private static readonly HashSet<string> Outside = new(StringComparer.Ordinal)
     {
-        "Catalogue.Draw", "Options.Draw", "Landed.Observe", "Panels.Covered", "Cleared.Observe",
+        "Catalogue.Draw", "Options.Draw", "Landed.Observe", "Panels.Covered", "Cleared.Observe", "Panels.ClearOfPanels",
 
         // Inside Reachable, which is itself inside the whole - so counting them again would take
         // them off the total twice. A stage with a slash in it is a part of the stage before it.

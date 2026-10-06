@@ -1013,11 +1013,10 @@ internal static class Panels
     /// The largest band of the screen that no open side panel and no part of the Escape menu covers: the whole window
     /// when nothing is open, empty when nothing is clear. See DisplaySettings.HideBehindPanels.
     ///
-    /// A side panel - the inventory, the character sheet, the stash - is a visible top level child of the interface
-    /// that runs at least nine tenths of the window's height, touches its left or right edge, and is narrower than half
-    /// of it. Read off the tree rather than through OpenLeftPanel and OpenRightPanel; see Hidden for why those are not
-    /// read. On a 2560x1440 window (2026-10-06) the character sheet was child 33 at (0,0 887x1440) and the inventory
-    /// child 34, its title at x 1673.
+    /// A side panel - the inventory, the character sheet, the stash - is the top level child of the interface that holds
+    /// IngameUi.OpenLeftPanel or OpenRightPanel, while it is visible and shows at least one child. On a 2560x1440 window
+    /// (2026-10-06) the character sheet was child 33 at (0,0 887x1440) and the inventory child 34. A test on shape alone
+    /// was tried first and took elements that are not panels; see the comment where they are resolved.
     ///
     /// The Escape menu is not under IngameUi. It is looked for under EscapeState.UIRoot while TheGame.IsEscapeState,
     /// taking the first elements down from that root smaller than three fifths of the window. In this client that root
@@ -1030,10 +1029,15 @@ internal static class Panels
     /// </summary>
     public static RectangleF ClearOfPanels(GameController gc)
     {
-        if (_clearOfPanelsAt == Frame.Number)
+        // **Worked out every 100 ms, the whole answer at once** - which panels, whether they show, and the band they
+        // leave clear. The left panel is a different element for each panel (the character sheet 33, the market 38, in
+        // dumps of 2026-10-06), so finding it and checking it are one question and are asked together. A panel just
+        // opened or closed is clipped wrongly for at most this long; the length is the player's choice. Every frame it
+        // cost about 0.11 ms and 220 KB a frame (2026-10-06), so at 100 ms about a twentieth of a millisecond a frame.
+        if (Clock.ElapsedMilliseconds - _clearOfPanelsAt < ClearOfPanelsMs)
             return _clearOfPanels;
 
-        _clearOfPanelsAt = Frame.Number;
+        _clearOfPanelsAt = Clock.ElapsedMilliseconds;
         SidePanels = 0;
         EscapeMenuOpen = false;
         _panelsToClear.Clear();
@@ -1050,27 +1054,49 @@ internal static class Panels
 
         var ui = Safe.Read(gc, static g => (Element)g.IngameState.IngameUi, null);
         var kids = ui == null ? null : Safe.Kids(ui);
-        var edge = 4f;
+        // **The game's own two side panels, by name, not anything shaped like one.** A test on size alone - full height,
+        // at an edge, under half the window - took the chat's column, and then an element at index 98 that is always
+        // visible at 0,0 887x1440 whatever is open (2026-10-06), and cut the left of the screen off with nothing open.
+        // OpenLeftPanel was the character sheet's element, index 33, in the same dumps. An index that does not resolve
+        // leaves nothing clipped rather than the wrong thing.
+        //
+        // These two names resolve in this client - 19 "not found" log lines that whole day, none at the lookup's
+        // rhythm - so asking every 100 ms writes nothing to the log. See Hidden.
+        var leftPanelTop = TopLevelOf(ui, Safe.Read(gc, static g => (Element)g.IngameState.IngameUi.OpenLeftPanel, null));
+        var rightPanelTop = TopLevelOf(ui, Safe.Read(gc, static g => (Element)g.IngameState.IngameUi.OpenRightPanel, null));
+
+        SidePanelsSaid = "";
 
         if (kids != null)
         {
-            foreach (var kid in kids)
+            for (var i = 0; i < kids.Count; i++)
             {
-                if (kid == null || !Safe.Read(kid, static e => e.IsVisible, false))
+                var kid = kids[i];
+                var address = kid == null ? 0L : Safe.Read(kid, static e => (long)e.Address, 0L);
+                var side = address != 0L && address == leftPanelTop ? "left" : address != 0L && address == rightPanelTop ? "right" : null;
+
+                if (side == null)
                     continue;
 
+                var visible = Safe.Read(kid, static e => e.IsVisible, false);
                 var rect = Safe.Read(kid, static e => e.GetClientRectCache, default(RectangleF));
 
-                if (rect.Height < window.Height * 0.9f || rect.Width <= 0f || rect.Width >= window.Width * 0.5f)
+                // Showing something, not only there: a panel that is open shows at least one child.
+                var showing = visible ? VisibleChildrenOf(kid) : 0;
+
+                SidePanelsSaid += $" {side} [{i}] ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}) " +
+                                  (visible ? $"showing {showing}" : "closed");
+
+                if (!visible || showing == 0 || rect.Width <= 0f || rect.Height <= 0f)
                     continue;
 
-                if (rect.Left <= edge || rect.Right >= window.Width - edge)
-                {
-                    _panelsToClear.Add(rect);
-                    SidePanels++;
-                }
+                _panelsToClear.Add(rect);
+                SidePanels++;
             }
         }
+
+        if (leftPanelTop == 0L && rightPanelTop == 0L)
+            SidePanelsSaid = " (OpenLeftPanel and OpenRightPanel did not resolve, so nothing is clipped for them)";
 
         if (Safe.Read(gc, static g => g.Game.IsEscapeState, false))
         {
@@ -1121,6 +1147,51 @@ internal static class Panels
         }
     }
 
+    /// <summary>How many of an element's children are visible with a size of their own. See ClearOfPanels.</summary>
+    private static int VisibleChildrenOf(Element element)
+    {
+        var showing = 0;
+
+        foreach (var child in Safe.Kids(element) ?? [])
+        {
+            if (child == null || !Safe.Read(child, static e => e.IsVisible, false))
+                continue;
+
+            var rect = Safe.Read(child, static e => e.GetClientRectCache, default(RectangleF));
+
+            if (rect.Width > 0f && rect.Height > 0f)
+                showing++;
+        }
+
+        return showing;
+    }
+
+    /// <summary>The address of the top level child of the interface that holds this element, or nought. See ClearOfPanels.</summary>
+    private static long TopLevelOf(Element ui, Element inside)
+    {
+        var root = Safe.Read(ui, static e => (long)e.Address, 0L);
+
+        for (var at = inside; at != null; at = Safe.Read(at, static e => e.Parent, null))
+        {
+            var parent = Safe.Read(at, static e => e.Parent, null);
+
+            if (parent == null)
+                return 0L;
+
+            if (Safe.Read(parent, static e => (long)e.Address, 0L) == root)
+                return Safe.Read(at, static e => (long)e.Address, 0L);
+        }
+
+        return 0L;
+    }
+
+    /// <summary>How often ClearOfPanels works its answer out again. The player's choice, not measured.</summary>
+    private const int ClearOfPanelsMs = 100;
+
+
+    /// <summary>Which top level children ClearOfPanels last took for side panels, by index and rectangle, for the dump.</summary>
+    public static string SidePanelsSaid { get; private set; } = "";
+
     /// <summary>How many side panels ClearOfPanels last found, for the dump.</summary>
     public static int SidePanels { get; private set; }
 
@@ -1140,7 +1211,7 @@ internal static class Panels
 
     private static RectangleF _clearOfPanels;
 
-    private static int _clearOfPanelsAt = -1;
+    private static long _clearOfPanelsAt = -10000;
 
     /// <summary>Whether a point falls in any of these. See Snapshot.</summary>
     private static bool Inside(List<RectangleF> rects, Vector2 at)

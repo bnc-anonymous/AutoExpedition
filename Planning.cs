@@ -230,7 +230,12 @@ internal sealed class Planning
         if (RemnantOrder.FinishedFor(env) is { } finished)
             return (finished, null);
 
-        if (reuseGround && RemnantOrder.PublishedForGround(env) is { } rerolled)
+        // **Only orders that still hold every must take.** The ground leaves the marks out, so after a mark the orders
+        // of the same ground were handed out though none of them went near the new must take, and the order workers did
+        // not wait for new ones: on an Exhumed Ruins site (2026-10-06) the orders came from a search over 9 stops, 144 s
+        // old, while the marks asked for a tenth. A cold start built them over 10 and held all seven must takes.
+        if (reuseGround && RemnantOrder.PublishedForGround(env) is { } rerolled &&
+            (env.Musts <= 0 || rerolled.Any(order => Planner.Rate(env, order).Held >= env.Musts)))
         {
             RemnantOrder.Latest(env);
 
@@ -344,7 +349,27 @@ internal sealed class Planning
     /// </summary>
     internal static volatile bool HeldAfterColdStart;
 
-    private static (Vector2 Site, int Laid, int Explosives, int Threads) _chainsOfWorkersFor;
+    private static (Vector2 Site, int Laid, int Explosives, int Threads, long Marks) _chainsOfWorkersFor;
+
+    /// <summary>
+    /// A digest of the marks: which markers are must take, which must avoid, and which is taken last. For the key the
+    /// workers' carried chains are kept under, since a chain built before a mark searches the wrong question. See
+    /// WorkerChains.
+    /// </summary>
+    private static long MarksKeyOf(PlanEnvironment env)
+    {
+        var marks = 0L;
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            var target = env.Targets[i];
+
+            if (target.Must || target.Shunned)
+                marks = unchecked(marks + HashCode.Combine(target.Grid, target.Must, target.Shunned, i == env.TakenLast));
+        }
+
+        return marks;
+    }
 
     /// <summary>
     /// The site, laid count, explosives and marker taken last that a held first solve last ran its window out for, so
@@ -3139,9 +3164,12 @@ internal sealed class Planning
         // Its own thread at low priority, not a pool thread: it waits on the workers for the whole window. See
         // BackgroundWork.StartAtLowPriority.
         // **Each worker's chain from the last solve, for it to carry on from.** Kept while solves follow one another on
-        // the same site with the same explosives in hand and the same number laid; anything else is a different search
+        // the same site with the same explosives in hand, the same number laid and the same marks; anything else is a different search
         // and every worker starts afresh. See WorkerChains.
-        var workerKey = (Site, _laid, explosives, threads);
+        // **The marks as well.** Workers carried their chains across a mark, and each went on improving a chain built
+        // without the new must take: on an Exhumed Ruins site (2026-10-06) a chest marked during play was never taken
+        // in solve after solve, while a cold start, which drops the carried chains, took it.
+        var workerKey = (Site, _laid, explosives, threads, MarksKeyOf(env));
 
         if (workerKey != _chainsOfWorkersFor || ChainsOfWorkers.Workers != threads)
         {

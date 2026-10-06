@@ -2972,7 +2972,7 @@ internal static class Planner
             found.Sort((a, b) => Vector2.DistanceSquared(env.Origin, env.Targets[a].Grid)
                 .CompareTo(Vector2.DistanceSquared(env.Origin, env.Targets[b].Grid)));
 
-            orders = new List<List<int>> { found };
+            orders = OrdersBeyondFour(env, found);
         }
 
         // The marker taken last is fetched last, since a tour that takes it earlier does not hold it. See
@@ -9210,6 +9210,59 @@ internal static class Planner
     /// </summary>
     internal static double Plainly(PlanEnvironment env, List<Vector2> chain) =>
         Evaluate(env, chain).Plain;
+
+    /// <summary>
+    /// The orders tried for more must takes than every order can be: nearest the detonator first, nearest neighbour
+    /// from the detonator, and nearest neighbour starting at each must take in turn, with repeats dropped. Distances
+    /// are straight lines, which is enough to rank an order; the tour built from it routes properly.
+    ///
+    /// **Why more than one.** Nearest the detonator first was the only order, and it cannot leave for a far marker and
+    /// come back: on an Exhumed Ruins site (2026-10-06) with seven must takes, a chest 250 grid south of the detonator
+    /// was held only by a chain that went west, south to the chest and back north east, and offline no worker held all
+    /// seven from that one order. See Demanded.
+    /// </summary>
+    private static List<List<int>> OrdersBeyondFour(PlanEnvironment env, List<int> nearestFirst)
+    {
+        var made = new List<List<int>> { new(nearestFirst) };
+
+        List<int> Chained(Vector2 from, int? start)
+        {
+            var left = new List<int>(nearestFirst);
+            var order = new List<int>();
+
+            if (start is { } first)
+            {
+                order.Add(first);
+                left.Remove(first);
+                from = env.Targets[first].Grid;
+            }
+
+            while (left.Count > 0)
+            {
+                var at = from;
+                var next = left.OrderBy(i => Vector2.DistanceSquared(at, env.Targets[i].Grid)).First();
+
+                order.Add(next);
+                left.Remove(next);
+                from = env.Targets[next].Grid;
+            }
+
+            return order;
+        }
+
+        void Add(List<int> order)
+        {
+            if (!made.Any(o => o.SequenceEqual(order)))
+                made.Add(order);
+        }
+
+        Add(Chained(env.Origin, null));
+
+        foreach (var start in nearestFirst)
+            Add(Chained(env.Origin, start));
+
+        return made;
+    }
 
     /// <summary>Every order a handful of things could be taken in.</summary>
     private static IEnumerable<List<int>> Orders(List<int> of)

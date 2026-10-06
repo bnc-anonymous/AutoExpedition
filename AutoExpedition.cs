@@ -1805,9 +1805,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // The world drawing is cut off at the edge of an open side panel and around the Escape menu, so the plan and the
         // debug drawing stop painting over them. The score area is not; see Overlay.Draw and
         // DisplaySettings.HideBehindPanels.
-        var clearOfPanels = Settings.Display.HideBehindPanels
-            ? Panels.ClearOfPanels(GameController)
-            : new RectangleF(-1e5f, -1e5f, 2e5f, 2e5f);
+        RectangleF clearOfPanels;
+
+        using (Spent.On("Panels.ClearOfPanels"))
+            clearOfPanels = Settings.Display.HideBehindPanels
+                ? Panels.ClearOfPanels(GameController)
+                : new RectangleF(-1e5f, -1e5f, 2e5f, 2e5f);
 
         // **Nothing clear, so nothing drawn.** Clipping to an empty rectangle did not stop the drawing: with the Escape
         // menu open and the clip at 0x0 (2026-10-06), the overlay still painted over the menu. So an empty answer

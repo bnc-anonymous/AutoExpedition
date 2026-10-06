@@ -802,7 +802,7 @@ internal sealed class Rolling
         // **Read here, on the thread that owns the reads.** Valuation goes to game memory and two
         // TimeCaches, and the advice runs on a task; gathering the shapes up front means the task
         // walks an immutable list instead. See ShapesARollCouldProduce.
-        var shapes = ShapesARollCouldProduce(valuation, Rolls.MapSlotFloor(gc));
+        var shapes = ShapesARollCouldProduce(valuation, Rolls.MapSlotFloor(gc), Detonator.Grand(gc));
 
         // **Its own thread, at normal priority - ahead of the solver's workers.** A pass is usually asked for when the
         // chain has reached a strong point and the player is deciding what to roll, so it is what they are waiting on.
@@ -1044,14 +1044,20 @@ internal sealed class Rolling
     /// The map's floor on rune slots: no roll lands below it, so socket counts under it are left out, and ScoreRollOutcomes's
     /// division by the weight it gathers scales the rest up. See Rolls.MapSlotFloor.
     /// </param>
-    private static List<RolledShape> ShapesARollCouldProduce(Valuation valuation, int floor = 0)
+    /// <param name="grand">
+    /// Whether the site is a Grand Expedition, whose rolls come up seven sockets far more often than any other site's.
+    /// See Rolls.SocketsFor.
+    /// </param>
+    private static List<RolledShape> ShapesARollCouldProduce(Valuation valuation, int floor = 0, bool grand = true)
     {
         var shapes = new List<RolledShape>();
 
         if (valuation == null)
             return shapes;
 
-        foreach (var (sockets, socketShare) in Rolls.Sockets)
+        var socketShares = Rolls.SocketsFor(grand);
+
+        foreach (var (sockets, socketShare) in socketShares)
         {
             if (socketShare <= 0f || sockets < floor)
                 continue;
@@ -1100,14 +1106,14 @@ internal sealed class Rolling
         // shapes are its pins with recipes, each at the count's share times the pin's; pins without recipes drop out
         // and duplicate or unmatched pins can push a count's total above or below its share. On a Craggy Peninsula site
         // (2026-10-05) the outcomes came to 7 sockets 23.3% and 8 13.5% of a roll, against 2.75% and 1.47% in
-        // Rolls.Sockets, and those two counts carried most of every remnant's expected gain. So the shapes of each count
+        // Rolls.SocketsFor, and those two counts carried most of every remnant's expected gain. So the shapes of each count
         // are rescaled to its share, keeping the pins' proportions within it; what they summed to before is kept for
         // the dump. See ShapeSharesSaid.
         var said = new StringBuilder();
 
         foreach (var bySockets in shapes.GroupBy(x => x.Sockets).OrderBy(g => g.Key))
         {
-            var socketShare = Rolls.Sockets.FirstOrDefault(x => x.Sockets == bySockets.Key).Share;
+            var socketShare = socketShares.FirstOrDefault(x => x.Sockets == bySockets.Key).Share;
             var summed = bySockets.Sum(x => x.Share);
 
             said.Append(string.Create(CultureInfo.InvariantCulture,

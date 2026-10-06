@@ -37,6 +37,10 @@ internal static class RemnantOrder
         List<(int From, List<int> Leg)> Legs = null, double Ranked = 0d);
 
 
+    /// <summary>Where the marker taken last stands, or zero when there is none, for the order keys. See KeyOf.</summary>
+    private static System.Numerics.Vector2 TakenLastGridOf(PlanEnvironment env) =>
+        env.TakenLast >= 0 && env.TakenLast < env.Targets.Count ? env.Targets[env.TakenLast].Grid : default;
+
     /// <summary>
     /// A digest of everything Search reads, for Latest to tell one site state from the next: the detonator, reach, blast, explosives and those already down, and per
     /// target its place, kind, weight, carry, waves and what it sets off, with every reward a remnant offers - its value,
@@ -50,7 +54,11 @@ internal static class RemnantOrder
     /// </summary>
     private static long KeyOf(PlanEnvironment env)
     {
-        var site = HashCode.Combine(env.Origin, env.Reach, env.Blast, env.Explosives, env.Placed?.Count ?? 0);
+        // **The marks too**: a must take is a stop of its own and the marker taken last ends every order, so orders
+        // finished before a mark are not this site state's. They were taken as current: on an Exhumed Ruins site
+        // (2026-10-06) the orders came from a search over 9 stops while the marks asked for a tenth.
+        var site = HashCode.Combine(env.Origin, env.Reach, env.Blast, env.Explosives, env.Placed?.Count ?? 0,
+            TakenLastGridOf(env));
         var targets = 0L;
 
         foreach (var target in env.Targets)
@@ -59,6 +67,7 @@ internal static class RemnantOrder
 
             hash.Add(target.Grid);
             hash.Add(target.Kind);
+            hash.Add(target.Must);
             hash.Add(target.Weight);
             hash.Add(target.Carries);
             hash.Add(target.Waves);
@@ -1173,12 +1182,14 @@ internal static class RemnantOrder
     /// </summary>
     internal static long StopsKeyOf(PlanEnvironment env)
     {
-        var site = HashCode.Combine(env.Origin, env.Reach, env.Blast, env.Explosives, env.Placed?.Count ?? 0);
+        var site = HashCode.Combine(env.Origin, env.Reach, env.Blast, env.Explosives, env.Placed?.Count ?? 0,
+            TakenLastGridOf(env));
         var stops = 0L;
 
         foreach (var target in env.Targets)
         {
-            if (target.Kind != TargetKind.Remnant && !Multiplies(target))
+            // A must take of any kind is a stop of the search, so it is one of the key's too.
+            if (target.Kind != TargetKind.Remnant && !Multiplies(target) && !target.Must)
                 continue;
 
             var hash = new HashCode();

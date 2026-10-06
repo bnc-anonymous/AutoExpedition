@@ -131,6 +131,11 @@ internal sealed class Census
         var luckyRolls = Rolls.MapStat(gc, GameStat.MapExpedition2RemnantGenerationHasXLuckyRolls);
         var luckyRollChance = Rolls.MapStat(gc, GameStat.MapExpedition2RemnantGenerationHasAdditionalLuckyRollChancePct);
 
+        // **Whether the site is a Grand Expedition**, since its socket counts are a different population: seven sockets
+        // come up there and almost never anywhere else. It was told from the map name until 2026-10-06. See
+        // Rolls.SocketsFor and Detonator.Grand.
+        var grand = Detonator.Grand(gc);
+
         // **Read the file back BEFORE deciding what is new, which is the whole of the dedupe bug.**
         //
         // _seen is what stops a remnant being written twice, and it was seeded by Remember - called
@@ -246,7 +251,8 @@ internal sealed class Census
                 remnantWithAtLeastSlots.ToString(CultureInfo.InvariantCulture),
                 remnantWithPowerRune.ToString(CultureInfo.InvariantCulture),
                 luckyRolls.ToString(CultureInfo.InvariantCulture),
-                luckyRollChance.ToString(CultureInfo.InvariantCulture)));
+                luckyRollChance.ToString(CultureInfo.InvariantCulture),
+                grand ? "1" : "0"));
         }
 
         if (rows.Count > 0)
@@ -348,7 +354,8 @@ internal sealed class Census
         // stay valid while simply stopping short. See Upgrade.
         "dedupe,activated,selected,reachable,admittedPins," +
         "mapSlotFloor," +
-        "mapRemnantWithAtLeastSlots,mapRemnantWithPowerRune,mapLuckyRolls,mapLuckyRollChancePct";
+        "mapRemnantWithAtLeastSlots,mapRemnantWithPowerRune,mapLuckyRolls,mapLuckyRollChancePct," +
+        "grand";
 
     /// <summary>
     /// Brings an existing file up to the current header, once, leaving its rows alone.
