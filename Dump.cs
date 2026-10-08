@@ -343,6 +343,9 @@ internal static class Dump
                            (took.Took
                                ? $"the remnant read it back after {took.Ms:N0}ms"
                                : $"the remnant never read it back; gave up after {took.Ms:N0}ms") +
+                           (took.RemnantAt == System.Numerics.Vector2.Zero
+                               ? ", read back from no remnant"
+                               : $", read back from the remnant at ({took.RemnantAt.X:0},{took.RemnantAt.Y:0})") +
                            $" ({(DateTime.UtcNow - took.When).TotalSeconds:N1}s ago)"));
 
         var ring = Placement.Verdict;

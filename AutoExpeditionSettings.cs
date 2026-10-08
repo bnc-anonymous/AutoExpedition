@@ -51,7 +51,7 @@ namespace AutoExpedition;
 internal static class Migrated
 {
     /// <summary>Raise this and add a case below whenever a shipped value must reach saved files.</summary>
-    public const int Current = 20;
+    public const int Current = 21;
 
     /// <summary>
     /// The weights whose number the plan actually took from the settings file, and the table row
@@ -373,6 +373,14 @@ internal static class Migrated
         // **20 - the take last hold time moved under Debug.** See DebugSettings.TakeLastHoldMs.
         if (was < 20)
             said.AddRange(CopiedFromPath(saved, "TakeLastHoldMs", settings?.Debug?.TakeLastHoldMs, "the take last hold time"));
+
+        // **21 - remnant drops collected where currency drops are.** A new switch, set as the currency drops one is, so a
+        // file already collecting drops collects the remnants' whole drops too. See RecordingSettings.CollectRemnantDrops.
+        if (was < 21 && settings?.Recording is { } recording && recording.CollectCurrencyDrops.Value)
+        {
+            recording.CollectRemnantDrops.Value = true;
+            said.Add("turned on Collect remnant drops, as Collect currency drops is on");
+        }
 
         settings.ConfigVersion = Current;
 
@@ -3372,14 +3380,16 @@ public class PropagationDisplaySettings
 
     /// <summary>
     /// A rune this remnant propagates that an earlier remnant in the chain already propagates, in the line under the
-    /// remnant: its socket adds nothing to the waves after it. See Overlay.Remnants.
+    /// remnant and in each row of the Runeshape Combinations window: its socket adds nothing to the waves after it. See
+    /// Overlay.RuneLinePieces.
     /// </summary>
     [Menu("Upstream duplicate colour")]
     public ColorNode UpstreamDuplicateColour { get; set; } = new ColorNode(Color.FromArgb(255, 235, 90, 90));
 
     /// <summary>
     /// A rune this remnant is the first to propagate that a later remnant in the chain propagates as well, with the
-    /// combination the plan takes there, in the line under the remnant. See Overlay.Remnants.
+    /// combination the plan takes there, in the line under the remnant and in each row of the Runeshape Combinations
+    /// window. See Overlay.RuneLinePieces.
     /// </summary>
     [Menu("Downstream duplicate colour")]
     public ColorNode DownstreamDuplicateColour { get; set; } = new ColorNode(Color.FromArgb(255, 255, 150, 50));
@@ -3952,8 +3962,9 @@ public class RecordingSettings
     /// </summary>
     [Menu("Collect currency drops",
         "Writes, in the dumps folder: drops.csv - each drop of the currencies\n" +
-        "named below, with the monster or remnant that dropped it. Needs\n" +
-        "\"Collect dig site spawns\".")]
+        "named below, with the monster or remnant that dropped it - and\n" +
+        "chests.csv - each chest opened, so a chest's drops can be told from\n" +
+        "a remnant's. Needs \"Collect dig site spawns\".")]
     public ToggleNode CollectCurrencyDrops { get; set; } = new ToggleNode(false);
 
     /// <summary>
@@ -3979,26 +3990,19 @@ public class RecordingSettings
     public TextNode DropsToRecord { get; set; } = new TextNode("Chaos Orb; Orb of Annulment; Divine Orb; Verisium");
 
     /// <summary>
-    /// Whether the spawn census watches what Bond moves, writing dumps/bond_deaths.csv and dumps/bond_gains.csv. It re-reads
-    /// every counted monster's affixes four times a second while a Bond monster lives, which is its only cost. Needs
-    /// Collect dig site spawns. See Spawns.BondTransfers.
+    /// Whether the spawn census records every item a remnant drops as it completes - its reward and what it drops when it
+    /// shatters, whatever the item - to dumps/remnant_items.csv, with each item's base name, class, rarity, item level and
+    /// stack. Off by default with the rest of data collection. See Spawns.RemnantItem.
+    ///
+    /// Apart from Collect currency drops because it measures something different: what a remnant's whole drop is made of,
+    /// where that one follows four named currencies to the monster or remnant that dropped them. Four currencies gave too
+    /// few loot events to tell one rune's effect on loot from luck (2026-10-07).
     /// </summary>
-    [Menu("Collect Bond transfers",
-        "Writes, in the dumps folder: bond_deaths.csv and bond_gains.csv - each\n" +
-        "Bond monster's death and every modifier a monster gains near one.\n" +
+    [Menu("Collect remnant drops",
+        "Writes, in the dumps folder: remnant_items.csv - every item each remnant\n" +
+        "drops as it completes, with its name, class, rarity and stack.\n" +
         "Needs \"Collect dig site spawns\".")]
-    public ToggleNode CollectBondTransfers { get; set; } = new ToggleNode(false);
-
-    /// <summary>
-    /// How often, in milliseconds, Collect Bond transfers re-reads every counted monster's affixes while a Bond monster
-    /// lives. A gain is credited to the nearest Bond death in the 1.5 seconds before the read that saw it, so when
-    /// several Bond monsters die together a slower read leaves more deaths able to claim one gain; the candidates
-    /// column of bond_gains.csv counts them. 60 is about two server ticks. See Spawns.BondTransfers.
-    /// </summary>
-    [Menu("Bond transfer read interval (ms)",
-        "How often affixes are re-read while a Bond monster lives. Shorter tells\n" +
-        "apart transfers from deaths close together in time, at the cost of more reads.")]
-    public RangeNode<int> BondTransferReadMs { get; set; } = new RangeNode<int>(60, 16, 500);
+    public ToggleNode CollectRemnantDrops { get; set; } = new ToggleNode(false);
 
     /// <summary>
     /// What the spawn census has seen at this dig site - monsters unearthed, seen dying, vanished, and drops recorded -
@@ -4099,6 +4103,28 @@ public class RecordingSettings
         "Writes no file. Warns in the log when more Expedition Complete\n" +
         "banners show than dig sites were started.")]
     public ToggleNode WatchFinished { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether the spawn census watches what Bond moves, writing dumps/bond_deaths.csv and dumps/bond_gains.csv. It re-reads
+    /// every counted monster's affixes four times a second while a Bond monster lives, which is its only cost. Needs
+    /// Collect dig site spawns. See Spawns.BondTransfers.
+    /// </summary>
+    [Menu("Collect Bond transfers",
+        "Writes, in the dumps folder: bond_deaths.csv and bond_gains.csv - each\n" +
+        "Bond monster's death and every modifier a monster gains near one.\n" +
+        "Needs \"Collect dig site spawns\".")]
+    public ToggleNode CollectBondTransfers { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// How often, in milliseconds, Collect Bond transfers re-reads every counted monster's affixes while a Bond monster
+    /// lives. A gain is credited to the nearest Bond death in the 1.5 seconds before the read that saw it, so when
+    /// several Bond monsters die together a slower read leaves more deaths able to claim one gain; the candidates
+    /// column of bond_gains.csv counts them. 60 is about two server ticks. See Spawns.BondTransfers.
+    /// </summary>
+    [Menu("Bond transfer read interval (ms)",
+        "How often affixes are re-read while a Bond monster lives. Shorter tells\n" +
+        "apart transfers from deaths close together in time, at the cost of more reads.")]
+    public RangeNode<int> BondTransferReadMs { get; set; } = new RangeNode<int>(60, 16, 500);
 }
 
 public class DebugSettings

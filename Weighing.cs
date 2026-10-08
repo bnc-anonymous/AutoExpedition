@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using ExileCore2.Shared.Nodes;
 
 namespace AutoExpedition;
@@ -750,11 +751,18 @@ internal static class Weighing
         if (string.IsNullOrWhiteSpace(said))
             return "";
 
-        foreach (var effect in TableGrammar.Effects(said, out _) ?? [])
+        var effects = TableGrammar.Effects(said, out _) ?? [];
+        var runic = filed.StartsWith("rune:", StringComparison.Ordinal);
+
+        foreach (var effect in effects)
         {
             // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
             // An empowered clause restates a plain one. See TableGrammar.EffectsOfRow.
             if (effect.Own || effect.Empowered == true)
+                continue;
+
+            // A rune's split-off share is grouped under its own key, not the row's. See IsSplitEffect.
+            if (runic && IsSplitEffect(effect, effects))
                 continue;
 
             if (string.IsNullOrWhiteSpace(effect.Stat))
@@ -1426,6 +1434,10 @@ internal static class Weighing
         if (IsLiftKey(id))
             return Empowering;
 
+        // A rune's split-off share adds within the stat its effects name. See SplitShareKeyOf.
+        if (IsSplitShareKey(id))
+            return "+" + StatOfSplitShareKey(id);
+
         var rune = Wrt.Of(Wrt.Id.Rune(id));
 
         // **The effect says it now, where a reserved word in another column used to.** A rune that
@@ -1678,7 +1690,9 @@ internal static class Weighing
     /// <summary>Whether this rune has an effect that lands on things - a share - besides any lift. See LiftsOfRune.</summary>
     public static bool HasShareEffect(string id)
     {
-        foreach (var effect in StoredEffectsOfRune(id))
+        // A split-off share is booked under its own key, so a lift beside one still leaves the rune a pure amplifier:
+        // Power's item quantity does not move it out of the amplifiers' group. See IsSplitEffect.
+        foreach (var effect in MainEffectsOfRune(id))
         {
             if (!effect.Own && !IsLiftEffect(effect))
                 return true;
@@ -1705,6 +1719,10 @@ internal static class Weighing
 
         if (tags.Length == 0)
             return 0L;
+
+        // A split-off share is lifted as its rune is, less any class the rune lifts itself: Bond's item quantity is
+        // doubled by Power, and Power's own is not. See SplitShareKeyOf.
+        id = IsSplitShareKey(id) ? RuneOfKey(id) : id;
 
         var said = Wrt.Of(Wrt.Id.Rune(id))?.Tags;
 
@@ -1747,6 +1765,136 @@ internal static class Weighing
     public static string BaseOfLiftKey(string id) => IsLiftKey(id) ? id[..^LiftKeySuffix.Length] : id;
 
     private const string LiftKeySuffix = "\u0001lift";
+
+    /// <summary>
+    /// The key a rune's split-off share travels under: the rune's id, a separator, and the stat its effects name. Booked,
+    /// grouped and lifted as an effect of its own, so a rune row may hold a share in its own group and a share in a stat
+    /// pool at once - Bond's rares-only value beside the 1% item quantity every runic modifier gives. See
+    /// SplitEffectsOfRune.
+    /// </summary>
+    public static string SplitShareKeyOf(string id, string stat) => id + SplitShareSeparator + stat;
+
+    /// <summary>Whether an effect id is a rune's split-off share. See SplitShareKeyOf.</summary>
+    public static bool IsSplitShareKey(string id) => id != null && id.Contains(SplitShareSeparator);
+
+    /// <summary>The stat a split-off share key names, or empty for any other id. See SplitShareKeyOf.</summary>
+    public static string StatOfSplitShareKey(string id)
+    {
+        var at = id?.IndexOf(SplitShareSeparator, StringComparison.Ordinal) ?? -1;
+
+        return at < 0 ? "" : id[(at + 1)..];
+    }
+
+    /// <summary>
+    /// The rune an effect key belongs to: the id with a lift key's suffix or a split-off share's stat taken off, or the
+    /// id unchanged. For questions about the rune rather than the key - which classes lift it, whether it is Power,
+    /// whether two keys are one rune. See LiftKeyOf and SplitShareKeyOf.
+    /// </summary>
+    public static string RuneOfKey(string id)
+    {
+        if (id == null)
+            return null;
+
+        var at = id.IndexOf(SplitShareSeparator, StringComparison.Ordinal);
+
+        return BaseOfLiftKey(at < 0 ? id : id[..at]);
+    }
+
+    private const char SplitShareSeparator = '\u0002';
+
+    /// <summary>
+    /// Whether this effect of a rune row is scored apart from the row's main share, under SplitShareKeyOf its stat.
+    ///
+    /// **Each share effect names its own group.** A row is one share in one group until it has two effects that cannot
+    /// sit together: an effect naming a stat splits off when the row also holds a lift, or a share outside that stat.
+    /// Power's "rune.effect *= +100%" and Bond's rares-only "+15%" stay the row's own; the "as
+    /// increased_quantity_of_items_dropped_by_monsters" beside them joins that pool as every other rune's does. A row
+    /// whose shares all name one stat, or name none, splits nothing - which is every row written before this existed.
+    ///
+    /// Own effects and "empowered" restatements never split: own effects are read per combination, and an empowered
+    /// clause restates a plain one. See TableGrammar.Effect.
+    /// </summary>
+    internal static bool IsSplitEffect(TableGrammar.Effect effect, TableGrammar.Effect[] row)
+    {
+        if (effect.Own || effect.Empowered == true || IsLiftEffect(effect) || string.IsNullOrWhiteSpace(effect.Stat))
+            return false;
+
+        var stat = effect.Stat.Trim();
+
+        foreach (var other in row)
+        {
+            if (other.Own || other.Empowered == true)
+                continue;
+
+            if (IsLiftEffect(other))
+                return true;
+
+            if (!string.Equals((other.Stat ?? "").Trim(), stat, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A rune row's effects that are its main share, its lift and its own effects: everything but what IsSplitEffect
+    /// sends to a split-off key. What Runes.Weight, Runes.Scope and the row's group read. Empty for a split-off key.
+    /// </summary>
+    internal static TableGrammar.Effect[] MainEffectsOfRune(string id)
+    {
+        if (IsSplitShareKey(id))
+            return [];
+
+        var effects = StoredEffectsOfRune(id);
+
+        return Array.Exists(effects, x => IsSplitEffect(x, effects))
+            ? Array.FindAll(effects, x => !IsSplitEffect(x, effects))
+            : effects;
+    }
+
+    /// <summary>
+    /// The effects one key is scored from: a split-off key's effects of its stat, or the rune's main effects. See
+    /// SplitShareKeyOf and MainEffectsOfRune.
+    /// </summary>
+    internal static TableGrammar.Effect[] EffectsOfKey(string id)
+    {
+        if (!IsSplitShareKey(id))
+            return MainEffectsOfRune(id);
+
+        var effects = StoredEffectsOfRune(RuneOfKey(id));
+        var stat = StatOfSplitShareKey(id);
+
+        return Array.FindAll(effects, x => IsSplitEffect(x, effects) &&
+                                           string.Equals(x.Stat.Trim(), stat, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// The split-off share keys of a rune, one per stat its split effects name, in the order the row writes them; empty
+    /// for a rune with none, which is most of them. See IsSplitEffect.
+    /// </summary>
+    public static string[] SplitShareKeysOfRune(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id) || IsSplitShareKey(id))
+            return [];
+
+        var effects = StoredEffectsOfRune(BaseOfLiftKey(id));
+        List<string> keys = null;
+
+        foreach (var effect in effects)
+        {
+            if (!IsSplitEffect(effect, effects))
+                continue;
+
+            var key = SplitShareKeyOf(BaseOfLiftKey(id), effect.Stat.Trim());
+
+            keys ??= new List<string>(1);
+
+            if (!keys.Exists(x => string.Equals(x, key, StringComparison.OrdinalIgnoreCase)))
+                keys.Add(key);
+        }
+
+        return keys?.ToArray() ?? [];
+    }
 
     /// <summary>
     /// What to type in Multiplicative behaviour for a rune that scales the others. See GroupKeyOfEffect.
@@ -2337,24 +2485,28 @@ internal static class Weighing
 
         List<(string, int, float, bool)> found = null;
 
-        foreach (var rune in reward.Carrying)
+        foreach (var carried in reward.Carrying)
         {
-            var scope = Runes.Scope(rune);
-
-            if (scope.Trim().Length == 0)
-                continue;
-
-            foreach (var (tag, percent) in Tags.Scope(scope, out _))
+            // The rune, then any split-off share of it that is scoped too. See SplitShareKeyOf.
+            foreach (var rune in SplitShareKeysOfRune(carried).Prepend(carried))
             {
-                if (percent <= 0f)
+                var scope = Runes.Scope(rune);
+
+                if (scope.Trim().Length == 0)
                     continue;
 
-                // **Kept per rune rather than summed per tag.** Two runes reaching the same thing
-                // are two runes, and with stacking off each is credited once against the most it
-                // could ever reach - which a total that has forgotten where it came from cannot be.
-                // See Planner.Book.
-                found ??= new List<(string, int, float, bool)>(2);
-                found.Add((rune, tag, percent, false));
+                foreach (var (tag, percent) in Tags.Scope(scope, out _))
+                {
+                    if (percent <= 0f)
+                        continue;
+
+                    // **Kept per rune rather than summed per tag.** Two runes reaching the same thing
+                    // are two runes, and with stacking off each is credited once against the most it
+                    // could ever reach - which a total that has forgotten where it came from cannot be.
+                    // See Planner.Book.
+                    found ??= new List<(string, int, float, bool)>(2);
+                    found.Add((rune, tag, percent, false));
+                }
             }
         }
 
@@ -2887,7 +3039,14 @@ internal static class Weighing
                 }
 
                 if (!known)
+                {
                     found.Add((rune, Runes.UnscopedWeight(rune)));
+
+                    // Its split-off shares with it, so a chosen recipe's rune brings them. See
+                    // Planner.WeightsOfChosenRunes and SplitShareKeyOf.
+                    foreach (var split in SplitShareKeysOfRune(rune))
+                        found.Add((split, Runes.UnscopedWeight(split)));
+                }
             }
         }
 
@@ -2935,7 +3094,13 @@ internal static class Weighing
             }
 
             if (!known)
+            {
                 found.Add((pick, most));
+
+                // Its split-off shares with it, each booked under its own key. See SplitShareKeyOf.
+                foreach (var split in SplitShareKeysOfRune(pick))
+                    found.Add((split, Runes.UnscopedWeight(split)));
+            }
         }
 
         return found.Count == 0 ? null : found.ToArray();

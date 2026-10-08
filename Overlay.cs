@@ -4085,7 +4085,15 @@ internal static class Overlay
     /// Planner.RuneTally.
     /// </summary>
     private static void RuneLine(Graphics graphics, AutoExpeditionSettings settings, Planner.RuneTally runes,
-        Vector2 at)
+        Vector2 at) =>
+        DrawRuneLinePieces(graphics, RuneLinePieces(settings, runes), at, RewardBackground);
+
+    /// <summary>
+    /// The pieces of the line under a remnant, each with its colour. Shared with each row of the Runeshape Combinations
+    /// window, so a rune is coloured the same way in both. See RuneLine and Options.Draw.
+    /// </summary>
+    internal static List<(string Text, Color Colour)> RuneLinePieces(AutoExpeditionSettings settings,
+        Planner.RuneTally runes)
     {
         var colours = settings.Display.Remnants.Propagation;
         var pieces = new List<(string Text, Color Colour)>
@@ -4117,6 +4125,13 @@ internal static class Overlay
                 colour));
         }
 
+        return pieces;
+    }
+
+    /// <summary>Draws the pieces of a rune line one after another on one background. See RuneLinePieces.</summary>
+    internal static void DrawRuneLinePieces(Graphics graphics, List<(string Text, Color Colour)> pieces, Vector2 at,
+        Color background)
+    {
         var width = 0f;
         var height = 0f;
 
@@ -4128,7 +4143,7 @@ internal static class Overlay
             height = MathF.Max(height, size.Y);
         }
 
-        graphics.DrawBox(new RectangleF(at.X, at.Y, width, height), RewardBackground);
+        graphics.DrawBox(new RectangleF(at.X, at.Y, width, height), background);
 
         var x = at.X;
 

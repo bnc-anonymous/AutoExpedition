@@ -369,15 +369,40 @@ internal sealed class Spawns
         public double FirstSeen;
         public double LastSeen;
 
+        /// <summary>The item's base name, where it landed and its first stack, for knowing it again when re-dropped. See Drops.</summary>
+        public string Name;
+        public Vector2 At;
+        public int FirstStack;
+
+        /// <summary>Where the remnant it is credited to stands, or null. See DropsHeader.</summary>
+        public Vector2? RemnantAt;
+
         public override string ToString() =>
             string.Join(",", FirstColumns,
                 LargestStack.ToString(CultureInfo.InvariantCulture),
                 PlayerDistance.ToString("0.#", CultureInfo.InvariantCulture),
-                (LastSeen - FirstSeen).ToString("0.###", CultureInfo.InvariantCulture));
+                (LastSeen - FirstSeen).ToString("0.###", CultureInfo.InvariantCulture),
+                RemnantAt is { } remnant ? ((int)remnant.X).ToString(CultureInfo.InvariantCulture) : "-1",
+                RemnantAt is { } again ? ((int)again.Y).ToString(CultureInfo.InvariantCulture) : "-1");
     }
+
+    /// <summary>Each chest's opened state when last read, by entity id, so an opening is seen as it happens. See ChestOpenings.</summary>
+    private readonly Dictionary<uint, bool> _chestOpened = new();
+
+    /// <summary>chests.csv's rows for this run. See ChestOpenings.</summary>
+    private readonly List<string> _chestRows = new();
 
     /// <summary>drops.csv's rows for this run. See RecordedDrop.</summary>
     private List<string> DropRows() => _drops.ConvertAll(x => x.ToString());
+
+    /// <summary>Items a remnant was credited with this run, in the order first seen, each a row of remnant_items.csv. See RemnantItem.</summary>
+    private readonly List<RecordedDrop> _remnantItems = new();
+
+    /// <summary>The same items by ground item id, for reading each again while it lies there. See RemnantItem.</summary>
+    private readonly Dictionary<uint, RecordedDrop> _remnantItemsById = new();
+
+    /// <summary>remnant_items.csv's rows for this run. See RemnantItem.</summary>
+    private List<string> RemnantItemRows() => _remnantItems.ConvertAll(x => x.ToString());
 
     /// <summary>Each counted monster's non-rune affixes at its last read, by entity id. See BondTransfers.</summary>
     private readonly Dictionary<uint, HashSet<string>> _affixesById = new();
@@ -605,6 +630,10 @@ internal sealed class Spawns
         _itemsSeen.Clear();
         _drops.Clear();
         _dropsById.Clear();
+        _remnantItems.Clear();
+        _remnantItemsById.Clear();
+        _chestOpened.Clear();
+        _chestRows.Clear();
         _affixesById.Clear();
         _bondDeaths.Clear();
         _bondDeathRows.Clear();
@@ -914,8 +943,9 @@ internal sealed class Spawns
         var deaths = Safe.Read(() => settings.Recording.CollectMonsterDeaths.Value, true);
         var drops = Safe.Read(() => settings.Recording.CollectCurrencyDrops.Value, true);
         var bond = Safe.Read(() => settings.Recording.CollectBondTransfers.Value, true);
+        var remnantDrops = Safe.Read(() => settings.Recording.CollectRemnantDrops.Value, false);
 
-        if (deaths || drops || bond)
+        if (deaths || drops || bond || remnantDrops)
             Deaths(monsters);
 
         if (deaths)
@@ -925,8 +955,11 @@ internal sealed class Spawns
             BondTransfers(monsters,
                 TimeSpan.FromMilliseconds(Safe.Read(() => settings.Recording.BondTransferReadMs.Value, 60)));
 
-        if (drops)
-            Drops(gc, settings);
+        if (drops || remnantDrops)
+        {
+            Drops(gc, settings, drops, remnantDrops);
+            ChestOpenings(gc);
+        }
     }
 
     /// <summary>Starts recording a run: its clock, its key, and the map's and atlas's monster stats.</summary>
@@ -1343,17 +1376,77 @@ internal sealed class Spawns
                 : -1, -1);
 
     /// <summary>
+    /// Records every chest seen opening while the run is recorded: where, when, and what it is. A chest already open when
+    /// first seen is not recorded, since when it opened is not known.
+    ///
+    /// **So a remnant's drops can be told from a chest's.** A currency drop is credited to the nearest remnant that gave
+    /// its reward within RemnantDropWindow and RemnantDropRadius, whatever else opened there; a chest opened beside it in
+    /// that window - a bright currency chest drops divines fairly often - was counted as the remnant's. With the openings
+    /// written down, the analysis can leave out drops near one. Behind the currency drops switch, since it serves them.
+    /// Strongboxes open themselves when the chain sets them off; they are recorded too, flagged, and readers may drop them.
+    /// </summary>
+    private void ChestOpenings(GameController gc)
+    {
+        var chests = Safe.Read(gc, static g =>
+            g.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Chest, out var of) ? of : null, null);
+
+        if (chests == null)
+            return;
+
+        var since = (DateTime.UtcNow - _first).TotalSeconds;
+
+        foreach (var chest in chests)
+        {
+            var id = Safe.Read(chest, static e => e.Id, 0u);
+
+            if (id == 0u)
+                continue;
+
+            var opened = Safe.Read(chest, static e => e.GetComponent<Chest>()?.IsOpened ?? false, false);
+
+            if (!_chestOpened.TryGetValue(id, out var was))
+            {
+                _chestOpened[id] = opened;
+
+                continue;
+            }
+
+            if (was || !opened)
+                continue;
+
+            _chestOpened[id] = true;
+
+            var at = Safe.Read(chest, static e => e.GridPos, Vector2.Zero);
+
+            _chestRows.Add(string.Join(",",
+                _run,
+                since.ToString("0.###", CultureInfo.InvariantCulture),
+                ((int)at.X).ToString(CultureInfo.InvariantCulture),
+                ((int)at.Y).ToString(CultureInfo.InvariantCulture),
+                id.ToString(CultureInfo.InvariantCulture),
+                Clean(Safe.Read(chest, static e => e.Path, "") ?? ""),
+                Clean(Safe.Read(chest, static e => e.RenderName, "") ?? ""),
+                Safe.Read(chest, static e => e.GetComponent<ObjectMagicProperties>()?.Rarity.ToString(), "") ?? "",
+                Safe.Read(chest, static e => e.GetComponent<Chest>()?.IsStrongbox ?? false, false) ? "1" : "0",
+                Safe.Read(chest, static e => e.GetComponent<Chest>()?.IsLarge ?? false, false) ? "1" : "0"));
+        }
+    }
+
+    /// <summary>
     /// Records each new ground item named in RecordingSettings.DropsToRecord: where and when it appeared, its stack
     /// size, and the monster that most likely dropped it - the nearest death within DropFromDeath grid in the
     /// DropAfterDeath seconds before, with how many deaths qualified, so ambiguous drops can be left out. One landing at a
     /// remnant as it completes - its reward, or what it drops when it shatters - is credited to that remnant and to no
     /// monster. See RemnantDropped.
+    ///
+    /// With remnantDrops, every new ground item a remnant is credited with, whatever its name, also goes to
+    /// remnant_items.csv. See RemnantItem.
     /// </summary>
-    private void Drops(GameController gc, AutoExpeditionSettings settings)
+    private void Drops(GameController gc, AutoExpeditionSettings settings, bool currencies, bool remnantDrops)
     {
-        var wanted = ItemNamesToRecord(settings);
+        var wanted = currencies ? ItemNamesToRecord(settings) : new HashSet<string>();
 
-        if (wanted.Count == 0)
+        if (wanted.Count == 0 && !remnantDrops)
             return;
 
         var since = (DateTime.UtcNow - _first).TotalSeconds;
@@ -1363,31 +1456,65 @@ internal sealed class Spawns
         {
             var id = Safe.Read(item, static e => e.Id, 0u);
 
-            // A drop already recorded is read again: its stack, and that it is still there. See RecordedDrop.
-            if (id != 0u && _dropsById.TryGetValue(id, out var known))
+            // A drop already recorded is read again: its stack, and that it is still there. See RecordedDrop. An item can be
+            // in both files, so both are read.
+            var readAgain = false;
+
+            foreach (var byId in new[] { _dropsById, _remnantItemsById })
             {
+                if (id == 0u || !byId.TryGetValue(id, out var known))
+                    continue;
+
                 var now = Safe.Read(item, static e => e.GetComponent<WorldItem>()?.ItemEntity?.GetComponent<Stack>()?.Size ?? 0, 0);
 
                 known.LargestStack = Math.Max(known.LargestStack, now);
                 known.LastSeen = since;
-
-                continue;
+                readAgain = true;
             }
 
-            if (id == 0u || !_itemsSeen.Add(id))
+            if (readAgain)
+                continue;
+
+            if (id == 0u || _itemsSeen.Contains(id))
                 continue;
 
             var inner = Safe.Read(item, static e => e.GetComponent<WorldItem>()?.ItemEntity, null);
             var path = Safe.Read(inner, static e => e.Metadata, "") ?? "";
+
+            // An item first seen before its own entity has loaded has no path, so no name. It is read again on a later
+            // frame rather than marked seen: marking it lost 9 of 1,107 remnant items as blank rows (2026-10-07), and
+            // would lose a recorded currency the same way.
+            if (path.Length == 0)
+                continue;
+
+            _itemsSeen.Add(id);
             var name = path.Length == 0
                 ? ""
                 : Safe.Read(() => gc.Files.BaseItemTypes.Translate(path)?.BaseName, "") ?? "";
+            var stack = Math.Max(1, Safe.Read(inner, static e => e.GetComponent<Stack>()?.Size ?? 1, 1));
+            var at = Safe.Read(item, static e => e.GridPos, Vector2.Zero);
+
+            if (remnantDrops)
+                RemnantItem(gc, id, inner, path, name, stack, at, since, player);
 
             if (!wanted.Contains(name))
                 continue;
 
-            var stack = Math.Max(1, Safe.Read(inner, static e => e.GetComponent<Stack>()?.Size ?? 1, 1));
-            var at = Safe.Read(item, static e => e.GridPos, Vector2.Zero);
+            // **The same drop again, not a new one.** With the inventory full, picking an item up drops it straight back
+            // where it was, under a new id - which counted one stack of 8 Chaos Orbs twice (2026-10-07). So an item of the
+            // same name and stack, within RedropRadius of a recorded drop no longer on the ground, inside RedropWindow,
+            // is that drop: it is read on from here and not recorded again.
+            var redropped = _drops.Find(x => x.Name == name && x.FirstStack == stack && x.LastSeen < since &&
+                                             since - x.LastSeen <= RedropWindow && Vector2.Distance(x.At, at) <= RedropRadius);
+
+            if (redropped != null)
+            {
+                _dropsById[id] = redropped;
+                redropped.LastSeen = since;
+
+                continue;
+            }
+
             var remnant = RemnantDropped(at, since, name, out var asReward);
             Arrival from = null;
             var candidates = 0;
@@ -1423,6 +1550,10 @@ internal sealed class Spawns
                 PlayerDistance = player == Vector2.Zero ? -1f : Vector2.Distance(player, at),
                 FirstSeen = since,
                 LastSeen = since,
+                Name = name,
+                At = at,
+                FirstStack = stack,
+                RemnantAt = remnant >= 0 ? _waves[remnant].At : null,
             };
 
             _dropsById[id] = recorded;
@@ -1442,6 +1573,68 @@ internal sealed class Spawns
                 remnant.ToString(CultureInfo.InvariantCulture),
                 asReward ? "1" : "0");
         }
+    }
+
+    /// <summary>
+    /// Records a new ground item to remnant_items.csv if a remnant is credited with it - landing within RemnantDropRadius
+    /// of a remnant in the RemnantDropWindow after its reward, the rule drops.csv uses - whatever the item is. Its base
+    /// name, item class, rarity (from its Mods component, "None" for an item without one, such as currency), item level
+    /// and metadata path are kept with it, and whether it is the remnant's reward. A re-drop from a full inventory is read
+    /// as the drop it was, as in Drops.
+    ///
+    /// **Every item rather than four currencies**, because four were too few to tell one rune's effect from luck: 229
+    /// Chaos Orbs and 111 Divine Orbs over 34 Grand runs (2026-10-07). A remnant drops many items, each a loot event.
+    /// </summary>
+    private void RemnantItem(GameController gc, uint id, Entity inner, string path, string name, int stack, Vector2 at,
+        double since, Vector2 player)
+    {
+        var remnant = RemnantDropped(at, since, name, out var asReward);
+
+        if (remnant < 0)
+            return;
+
+        var redropped = _remnantItems.Find(x => x.Name == name && x.FirstStack == stack && x.LastSeen < since &&
+                                                since - x.LastSeen <= RedropWindow && Vector2.Distance(x.At, at) <= RedropRadius);
+
+        if (redropped != null)
+        {
+            _remnantItemsById[id] = redropped;
+            redropped.LastSeen = since;
+
+            return;
+        }
+
+        var rarity = Safe.Read(inner, static e => e.GetComponent<Mods>() is { } mods ? mods.ItemRarity.ToString() : "None", "None");
+        var level = Safe.Read(inner, static e => e.GetComponent<Mods>()?.ItemLevel ?? -1, -1);
+        var itemClass = path.Length == 0 ? "" : Safe.Read(() => gc.Files.BaseItemTypes.Translate(path)?.ClassName, "") ?? "";
+
+        var recorded = new RecordedDrop
+        {
+            LargestStack = stack,
+            PlayerDistance = player == Vector2.Zero ? -1f : Vector2.Distance(player, at),
+            FirstSeen = since,
+            LastSeen = since,
+            Name = name,
+            At = at,
+            FirstStack = stack,
+            RemnantAt = _waves[remnant].At,
+            FirstColumns = string.Join(",",
+                _run,
+                since.ToString("0.###", CultureInfo.InvariantCulture),
+                ((int)at.X).ToString(CultureInfo.InvariantCulture),
+                ((int)at.Y).ToString(CultureInfo.InvariantCulture),
+                remnant.ToString(CultureInfo.InvariantCulture),
+                asReward ? "1" : "0",
+                Clean(name),
+                Clean(itemClass),
+                rarity,
+                level.ToString(CultureInfo.InvariantCulture),
+                stack.ToString(CultureInfo.InvariantCulture),
+                Clean(path)),
+        };
+
+        _remnantItemsById[id] = recorded;
+        _remnantItems.Add(recorded);
     }
 
     /// <summary>
@@ -1512,6 +1705,12 @@ internal sealed class Spawns
 
     /// <summary>How many seconds after a remnant's reward state what it drops may land. A first guess; see RemnantDropped.</summary>
     private const double RemnantDropWindow = 15d;
+
+    /// <summary>How near a recorded drop an item of the same name and stack must land to be that drop re-dropped. Chosen, not measured. See Drops.</summary>
+    private const float RedropRadius = 3f;
+
+    /// <summary>How long after a recorded drop left the ground it may come back as itself. Chosen, not measured. See Drops.</summary>
+    private const double RedropWindow = 30d;
 
     /// <summary>How far from a remnant its RuneEncounterController may stand, in grid. Seen on the same cell.</summary>
     private const float ControllerRange = 3f;
@@ -2281,9 +2480,30 @@ internal sealed class Spawns
     /// it completed, or -1, and asReward whether the item is that remnant's selected reward. stack is the size on the first
     /// frame the item was seen and stackLargest the largest read while it lay there; playerDistance how far the player
     /// was, in grid, when it was first seen, and seenFor how long it stayed in sight. See Drops and RecordedDrop.
+    ///
+    /// remnantX and remnantY are where the credited remnant stands, or -1: the remnant index alone was not stable across
+    /// a run (2026-10-07: one remnant credited with divines 144 s and over 1,000 grid apart), so a reader can check the
+    /// drop landed near it.
     /// </summary>
+    /// <summary>
+    /// chests.csv's columns: every chest seen opening during a run. path is the chest's metadata, name its render name,
+    /// rarity its own, and strongbox and large the Chest component's flags. See ChestOpenings.
+    /// </summary>
+    private const string ChestsHeader = "run,seconds,x,y,id,path,name,rarity,strongbox,large";
+
+    /// <summary>
+    /// remnant_items.csv's columns: every item a remnant is credited with as it completes, whatever it is. remnant is its
+    /// index and asReward whether the item is its selected reward, as in drops.csv; item the base name, class the item
+    /// class, rarity Normal / Magic / Rare / Unique or None for an item with no Mods component, itemLevel -1 where
+    /// unread, path the item's metadata. stack, stackLargest, playerDistance, seenFor, remnantX and remnantY as in
+    /// drops.csv. See RemnantItem.
+    /// </summary>
+    private const string RemnantItemsHeader =
+        "run,seconds,x,y,remnant,asReward,item,class,rarity,itemLevel,stack,path,stackLargest,playerDistance,seenFor,remnantX,remnantY";
+
     private const string DropsHeader =
-        "run,seconds,x,y,item,stack,monster,distance,afterDeath,candidates,remnant,asReward,stackLargest,playerDistance,seenFor";
+        "run,seconds,x,y,item,stack,monster,distance,afterDeath,candidates,remnant,asReward,stackLargest,playerDistance,seenFor," +
+        "remnantX,remnantY";
 
     /// <summary>
     /// The index of the blast that set off whatever is at a point, or -1: the earliest in the chain within range, since
@@ -2894,6 +3114,12 @@ internal sealed class Spawns
             if (_drops.Count > 0)
                 AppendUnderHeader(Path.Combine(Path.GetDirectoryName(_path) ?? ".", "drops.csv"), DropsHeader, DropRows());
 
+            if (_remnantItems.Count > 0)
+                AppendUnderHeader(Path.Combine(Path.GetDirectoryName(_path) ?? ".", "remnant_items.csv"), RemnantItemsHeader,
+                    RemnantItemRows());
+
+            AppendUnderHeader(Path.Combine(Path.GetDirectoryName(_path) ?? ".", "chests.csv"), ChestsHeader, _chestRows);
+
             AppendUnderHeader(Path.Combine(Path.GetDirectoryName(_path) ?? ".", "bond_deaths.csv"), BondDeathsHeader,
                 _bondDeathRows);
             AppendUnderHeader(Path.Combine(Path.GetDirectoryName(_path) ?? ".", "bond_gains.csv"), BondGainsHeader,
@@ -2926,6 +3152,18 @@ internal sealed class Spawns
                 {
                     File.WriteAllLines(Path.Combine(directory, $"drops_unsaved_{stamp}.csv"),
                         System.Linq.Enumerable.Concat(new[] { DropsHeader }, DropRows()));
+                }
+
+                if (_remnantItems.Count > 0)
+                {
+                    File.WriteAllLines(Path.Combine(directory, $"remnant_items_unsaved_{stamp}.csv"),
+                        System.Linq.Enumerable.Concat(new[] { RemnantItemsHeader }, RemnantItemRows()));
+                }
+
+                if (_chestRows.Count > 0)
+                {
+                    File.WriteAllLines(Path.Combine(directory, $"chests_unsaved_{stamp}.csv"),
+                        System.Linq.Enumerable.Concat(new[] { ChestsHeader }, _chestRows));
                 }
 
                 DebugWindow.LogMsg($"[AutoExpedition] The spawn census was saved to spawns_unsaved_{stamp}.csv instead.", 5f);

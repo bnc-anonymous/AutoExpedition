@@ -141,6 +141,11 @@ internal static class Propagation
 
             seen.Add(id);
 
+            // A split-off share is a rune's second share, and summed by the same rule as its first. See
+            // Weighing.SplitShareKeyOf.
+            foreach (var split in Weighing.SplitShareKeysOfRune(id))
+                total += Runes.UnscopedWeight(split);
+
             // **A scoped rune is spent through its scope and must not be summed here too.** This
             // total is spent against the monsters the chain unearths; a rune that says it reaches
             // chests is paid against chests in Planner.Settle, and adding it to both would pay it
@@ -218,6 +223,19 @@ internal static class Propagation
                 continue;
 
             seen.Add(id);
+
+            // **Its split-off shares first, each an entry of its own**, on the waves its slot reaches, so a rune that only
+            // lifts - Power - still brings the item quantity it carries beside its lift. See Weighing.SplitShareKeyOf.
+            foreach (var split in Weighing.SplitShareKeysOfRune(id))
+            {
+                var splitWorth = Locally(split) * WaveShareOfSlot(slot, runes.Count);
+
+                if (splitWorth <= 0f)
+                    continue;
+
+                total += splitWorth;
+                found.Add((split, splitWorth));
+            }
 
             // **A local slot reaches this remnant's own waves, which are monsters.**
             //

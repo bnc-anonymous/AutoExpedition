@@ -981,9 +981,12 @@ internal sealed class Rolling
 
         foreach (var (rune, _) in Rolls.Runes)
         {
+            // Local worth with any split-off share added, since a local slot pays both on the same waves. See
+            // Weighing.SplitShareKeyOf.
             found[rune] = (Safe.Read(() => Runes.Weight(rune), 0f),
                 Safe.Read(() => Runes.Scope(rune), "") ?? "",
-                Safe.Read(() => Propagation.Locally(rune), 0f));
+                Safe.Read(() => Propagation.Locally(rune) +
+                                Weighing.SplitShareKeysOfRune(rune).Sum(Propagation.Locally), 0f));
         }
 
         return found;
@@ -2767,7 +2770,13 @@ internal sealed class Rolling
                     }
 
                     if (!known2)
+                    {
                         weights.Add((id, Runes.UnscopedWeight(id)));
+
+                        // Its split-off shares with it, as Weighing.PropagatingRuneWeights lists them.
+                        foreach (var split in Weighing.SplitShareKeysOfRune(id))
+                            weights.Add((split, Runes.UnscopedWeight(split)));
+                    }
                 }
                 else
                 {

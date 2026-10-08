@@ -415,7 +415,7 @@ internal static class Options
             RemnantOffers.Note(gc, mine ?? Whose(gc, scan), options.Select(o => Safe.Read(() => o?.Recipe, null)));
 
         var chosen = Pick(gc, settings, valuation, scan, plan);
-        var rows = new List<(RectangleF Rect, double Value, string Waves, int Index)>();
+        var rows = new List<(RectangleF Rect, double Value, List<(string Text, Color Colour)> Waves, int Index)>();
         var index = -1;
 
         foreach (var option in options)
@@ -458,6 +458,7 @@ internal static class Options
             // what this row holds and what is arriving from earlier links. Only the inherited figure
             // belongs to the remnant, which is why that one is taken from the objective as it stands.
             string line = null;
+            List<(string Text, Color Colour)> pieces = null;
 
             if (landing is { } runes && priced != null)
             {
@@ -468,6 +469,10 @@ internal static class Options
                 var tally = Planner.RuneTallyOfOption(runes, priced.Locals, priced.Carrying, priced.SlotRunes);
 
                 line = Propagation.RunesOnWaves(tally);
+
+                // Coloured as the line under the remnant is - an upstream or downstream duplicate in its own colour -
+                // through the same function. See Overlay.RuneLinePieces.
+                pieces = Overlay.RuneLinePieces(settings, tally);
 
                 // The row the planner took, by recipe where both sides know it. Names alone put
                 // the TAKEN marker on whichever same-named row came first. See Priced.
@@ -494,7 +499,7 @@ internal static class Options
                               : "NO PRICED REWARD of that name, so nothing is drawn"));
             }
 
-            rows.Add((rect, valuation.Value(recipe), line, index));
+            rows.Add((rect, valuation.Value(recipe), pieces, index));
         }
 
         if (rows.Count == 0)
@@ -521,13 +526,12 @@ internal static class Options
             if (!Within(view, rect))
                 continue;
 
-            // Top left of the list, in the same amber the world line uses - the game borders the
-            // propagating slots in yellow, so all three agree on screen without anybody being told
-            // they are the same fact.
+            // Top left of the row, in the world line's colours: amber, as the game borders the propagating slots in
+            // yellow, with a rune an earlier remnant already sends or a later one sends too in its duplicate colour.
             if (waves != null)
             {
-                graphics.DrawTextWithBackground(waves, new Vector2(rect.Left + 4f, rect.Top + 2f),
-                    settings.Display.Remnants.Propagation.PassColour, settings.Display.Remnants.RuneshapeCombinationsWindow.WindowPriceBackground);
+                Overlay.DrawRuneLinePieces(graphics, waves, new Vector2(rect.Left + 4f, rect.Top + 2f),
+                    settings.Display.Remnants.RuneshapeCombinationsWindow.WindowPriceBackground);
             }
 
             // Bottom right, inside the option. Right-aligned means the figures line up on their

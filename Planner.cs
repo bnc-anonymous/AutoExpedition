@@ -462,6 +462,66 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     }
 
     /// <summary>
+    /// OwnOfChoice as the payout pays it: the change on each of the recipe's wave parts and each "per" effect's worth
+    /// times what the shares in force on these waves multiply that class by, where OwnOfChoice counts them at face value.
+    /// The waves the combination has over its recipe stay at face value, as the payout leaves them. For Best.
+    ///
+    /// **Ranked at face value, own effects lost to rewards on any site with relics.** Every share in force pays on the
+    /// monsters an own effect adds - on a Frigid Bluffs site (2026-10-07) relics and runes multiplied a remnant's
+    /// monsters by 4.1 and its rares by 16 - so an option holding Oath was ranked 638 below Uhtred's Saga and paid
+    /// 1,152 above it.
+    ///
+    /// Leaves out the combination's own local shares and a passed-in lift, both of which the payout puts in the product.
+    /// See Planner.SharesInForceAt and Planner.PaidProductOfMask.
+    /// </summary>
+    public float OwnPaidOfChoice(int c, float magicScale, float rareScale, double lift, PlanEnvironment env,
+        float[] shares, int groups, int width)
+    {
+        var change = 0f;
+
+        if (OwnEffectsOfChoices is { } all && c >= 0 && c < all.Length && all[c] != null)
+        {
+            var (rareMask, magicMask) = (0L, 0L);
+
+            foreach (var (mask, part, _) in Parts ?? [])
+            {
+                var rare = (mask & (1L << Tags.Rares)) != 0L;
+                var magic = !rare && (mask & (1L << Tags.Magics)) != 0L;
+
+                if (rare && rareMask == 0L)
+                    rareMask = mask;
+
+                if (magic && magicMask == 0L)
+                    magicMask = mask;
+
+                var (worth, _) = OwnFactorsOfPart(c, mask, lift);
+
+                if (part > 0f && worth != 1f)
+                    change += part * (rare ? rareScale : magic ? magicScale : 1f) * (worth - 1f) *
+                              (float)Planner.PaidProductOfMask(env, shares, groups, width, mask);
+            }
+
+            if (MagicAndRareWavesOfChoices is { } waves && c < waves.Length)
+            {
+                if (rareMask != 0L)
+                    change += waves[c].Rare * rareScale * (OwnFactorsOfPart(c, rareMask, lift).Worth - 1f);
+
+                if (magicMask != 0L)
+                    change += waves[c].Magic * magicScale * (OwnFactorsOfPart(c, magicMask, lift).Worth - 1f);
+            }
+        }
+
+        if (CreatedOfChoices is { } created && c >= 0 && c < created.Length && created[c] is { } entries)
+        {
+            foreach (var entry in entries)
+                change += CreatedOfEntry(c, entry, magicScale, rareScale, lift) *
+                          (float)Planner.PaidProductOfMask(env, shares, groups, width, entry.Mask);
+        }
+
+        return change;
+    }
+
+    /// <summary>
     /// What the monsters combination c's "per" effects add to this remnant's waves are worth at face value, all of
     /// them. Added to content by OwnOfChoice; the payout lifts each by the shares reaching its row. See CreatedOfEntry.
     /// </summary>
@@ -569,9 +629,12 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
         if (CarriedWaveSharesOfChoices is not { } all || c < 0 || c >= all.Length || all[c] is not { } shares)
             return 1f;
 
+        // A split-off share sits in its rune's slot. See Weighing.SplitShareKeyOf.
+        var of = Weighing.RuneOfKey(id);
+
         foreach (var (rune, share) in shares)
         {
-            if (string.Equals(rune, id, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(rune, of, StringComparison.OrdinalIgnoreCase))
                 return share;
         }
 
@@ -737,7 +800,8 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     /// </param>
     public (float Reward, float Carries, float Local, (string Id, float Worth)[] Locals, string[] Runes, (string Id, int Tag, float Percent, bool Flat)[] Spread) Best(float downstream, float local,
         PlanEnvironment env, float[][] sums, int at, int distinct, out int chose, float magicScale = 1f,
-        float rareScale = 1f, double passedLift = 0d)
+        float rareScale = 1f, double passedLift = 0d, float[] sharesInForce = null, int groups = 0, int width = 0,
+        (int Key, int Link)[] laterSends = null, int laterCount = 0, float[] after = null)
     {
         chose = -1;
 
@@ -793,6 +857,9 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             // booked set to consult and the gross figure stands. See DiscountedForDuplicates.
             var carried = Planner.DiscountedForDuplicates(env, this, choice.Runes, choice.Carries, at, distinct);
 
+            // Less what a later remnant sends anyway. See Planner.LaterSentReach.
+            var laterSent = Planner.LaterSentReach(env, this, choice.Runes, at, distinct, laterSends, laterCount, after);
+
             var held = Planner.DiscountedForDuplicates(env, this, choice.Locals, choice.Local, at, distinct);
 
             // **And what the lifts it holds add to what it propagates.** A held Power sends the beneficial runes it
@@ -824,6 +891,9 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
                 }
             }
 
+            // What the held lifts added, kept apart for the trail below.
+            var heldLiftReach = reach - spreadReach;
+
             // **And what an amplifier it propagates lifts**: each class's lift on the shares already booked that the
             // class lifts, from this link on. Only for a rune that adds as well - a pure amplifier is weighed by its lift
             // as a carry, as Power always has been. See Planner.AmplifierWorthAt.
@@ -838,9 +908,14 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             var passed = PassedLiftOfChoice(env, heldLifts, passedLift);
             var onOwnWaves = passed * ShareOfWavesPassedLift;
 
-            var worth = choice.Reward + TractionOfChoice(c, magicScale, rareScale) +
-                        OwnOfChoice(c, magicScale, rareScale, passed) +
-                        (float)((carried * downstream * (1d + passed) + held * local * (1d + onOwnWaves) +
+            var traction = TractionOfChoice(c, magicScale, rareScale);
+
+            // **As the payout pays it, where the shares in force are known.** See OwnPaidOfChoice.
+            var own = sharesInForce != null
+                ? OwnPaidOfChoice(c, magicScale, rareScale, passed, env, sharesInForce, groups, width)
+                : OwnOfChoice(c, magicScale, rareScale, passed);
+            var worth = choice.Reward + traction + own +
+                        (float)(((carried * downstream - laterSent) * (1d + passed) + held * local * (1d + onOwnWaves) +
                                  reach + spreadReach * passed) / 100d);
 
             // **What each option was ranked at, kept only when somebody is reading.** The winner
@@ -850,8 +925,11 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             // the only place that answer can come from.
             Planner.ChoiceRankingTrail?.Add(
                 $"{(Named != null && c < Named.Length ? Named[c] : "?")}: reward {choice.Reward:N1}" +
-                $" + carried {carried:N2}% x {downstream:N0} + local {held:N2}% x {local:N0}" +
-                $" + scoped {reach:N1} = {worth:N1}");
+                $" + carried {carried:N2}% x {downstream:N0}{(laterSent > 0d ? $" less {laterSent / 100d:N1} sent later anyway" : "")} + local {held:N2}% x {local:N0}" +
+                $" + scoped {reach:N1} (spread {spreadReach:N1}, held lifts {heldLiftReach:N1}, amplifiers " +
+                $"{reach - spreadReach - heldLiftReach:N1}, passed lift {passed:0.##}) + traction {traction:N1} + own {own:N1}" +
+                (sharesInForce != null ? " (as paid)" : "") +
+                $" = {worth:N1}");
 
             if (worth > most)
             {
@@ -5845,6 +5923,41 @@ internal static class Planner
             return most;
         }
 
+        // **The shares in force at a link, laid out as the payout's prefix**, for a remnant ranking its combinations:
+        // what has been rated at this link or before - relics, scoped carries, banked runes - and the runes booked so far
+        // that are in force here, which are rated only after every choice is made. Links are walked in order, so both
+        // hold everything sourced at or before the link. See PlanTarget.OwnPaidOfChoice.
+        float[] SharesInForceAt(int at)
+        {
+            var shares = _sharesInForce = Grow(_sharesInForce, groups * width);
+
+            for (var x = 0; x < groups * width; x++)
+            {
+                var sum = 0f;
+
+                for (var a = 0; a <= at && a < links; a++)
+                    sum += rates[x * links + a];
+
+                shares[x] = sum;
+            }
+
+            for (var r = 0; r < distinct; r++)
+            {
+                if (_carriedFrom[r] > at || _carriedWeights[r] <= 0f || (_carriedFlat != null && _carriedFlat[r]))
+                    continue;
+
+                var g = _carriedGroup[r];
+                var k = Indexed(env, _carriedTag[r] < 0 ? Tags.Monsters : _carriedTag[r]);
+
+                if (g < 0 || g >= groups || g == env.Empowering || k < 0)
+                    continue;
+
+                shares[g * width + k] += _carriedWeights[r] / 100f;
+            }
+
+            return shares;
+        }
+
         // **Cleared, because this is per-thread scratch reused on every score.** A marker with no
         // ordinary runes reads whatever the last chain left at its index otherwise, and attaches
         // somebody else's runes to its waves.
@@ -5900,6 +6013,39 @@ internal static class Planner
         for (var t = 0; t < found; t++)
             order[counts[step[touched[t]]]++] = t;
 
+        // **Which runes each remnant would send, before any of them has chosen**, so a remnant can see a later one sending
+        // the same rune. Choices are made in link order, so a later remnant's real pick is not known when an earlier one
+        // ranks; this ranks every remnant once with nothing booked, as one would choose with nothing arriving. One
+        // provisional pick each, not iterated. See Planner.LaterSentReach.
+        var laterCount = 0;
+        var trailKept = ChoiceRankingTrail;
+
+        ChoiceRankingTrail = null;
+
+        for (var k = 0; k < found; k++)
+        {
+            var i = touched[order[k]];
+
+            if (env.Targets[i].Choices is not { Length: > 0 } offered)
+                continue;
+
+            var provisional = offered.Length == 1
+                ? offered[0]
+                : env.Targets[i].Best(after[step[i]], monsters[step[i]] + monstersExtra[step[i]], env, taggedAfter,
+                    step[i], 0, out _, tractionOf[order[k]], rareTractionOf[order[k]]);
+
+            foreach (var id in provisional.Runes ?? [])
+            {
+                if (id == null)
+                    continue;
+
+                _laterSends = Grow(_laterSends, laterCount + 1);
+                _laterSends[laterCount++] = (NumberOfEffect(env, Weighing.RuneOfKey(id)), step[i]);
+            }
+        }
+
+        ChoiceRankingTrail = trailKept;
+
         for (var k = 0; k < found; k++)
         {
             var t = order[k];
@@ -5915,7 +6061,9 @@ internal static class Planner
 
             var choice = env.Targets[i].Best(after[step[i]], monsters[step[i]] + monstersExtra[step[i]],
                 env, taggedAfter, step[i], distinct, out var chose, tractionOf[t], rareTractionOf[t],
-                PowerPassedTo(step[i]));
+                PowerPassedTo(step[i]),
+                env.Targets[i].Choices is { Length: > 1 } ? SharesInForceAt(step[i]) : null, groups, width,
+                _laterSends, laterCount, after);
 
             // The combination the full chain took, when ScoreOfEachBlast has pinned it, so that passes with fewer
             // sources differ in the sources alone.
@@ -6822,23 +6970,20 @@ internal static class Planner
     private static (string Id, float Weight)[] WeightsOfChosenRunesUncached((string Id, float Weight)[] table,
         string[] chosen)
     {
-        var found = new (string, float)[chosen.Length];
-        var count = 0;
+        var found = new List<(string, float)>(chosen.Length);
 
+        // **Every entry of the rune, not the first**: a rune with a split-off share is listed under its id and under
+        // that share's key, and the recipe naming the rune takes both. See Weighing.SplitShareKeyOf.
         foreach (var id in chosen)
         {
             foreach (var (known, weight) in table)
             {
-                if (!string.Equals(known, id, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                found[count++] = (known, weight);
-
-                break;
+                if (string.Equals(Weighing.RuneOfKey(known), id, StringComparison.OrdinalIgnoreCase))
+                    found.Add((known, weight));
             }
         }
 
-        return count == found.Length ? found : found[..count];
+        return found.ToArray();
     }
 
     /// <summary>
@@ -6952,17 +7097,16 @@ internal static class Planner
 
         foreach (var id in chosen)
         {
-            if (id == null || !IsRuneAlreadySent(env, id, cell, at, distinct))
+            if (id == null)
                 continue;
 
+            // Each key of the rune struck on its own booking: its id and any split-off share, which Book keeps apart.
+            // See Weighing.SplitShareKeyOf.
             foreach (var (known, weight) in held)
             {
-                if (!string.Equals(known, id, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                struck += weight;
-
-                break;
+                if (string.Equals(Weighing.RuneOfKey(known), id, StringComparison.OrdinalIgnoreCase) &&
+                    IsRuneAlreadySent(env, known, cell, at, distinct))
+                    struck += weight;
             }
         }
 
@@ -7021,6 +7165,55 @@ internal static class Planner
     /// <summary>Whether anything upstream is already sending this rune to the given remnant.</summary>
     internal static bool IsRuneAlreadySentTo(PlanEnvironment env, PlanTarget target, string id, int at, int distinct) =>
         IsRuneAlreadySent(env, id, CellKeyOf(target.Grid), at, distinct);
+
+    /// <summary>
+    /// What the shares in force on a remnant's waves multiply one part of them by in the payout, for the part's class:
+    /// Multiplied over shares laid out as the payout's prefix, with no lift. For PlanTarget.OwnPaidOfChoice. See
+    /// SharesInForceAt.
+    /// </summary>
+    internal static double PaidProductOfMask(PlanEnvironment env, float[] shares, int groups, int width, long mask) =>
+        Multiplied(shares, null, groups, width, ClassOfMask(env, mask), 0d, null, null, env.IncreaseBaseOfGroup);
+
+    /// <summary>
+    /// The part of what a combination's propagated runes reach that a later remnant on the chain sends them to anyway:
+    /// for each rune it would be the first to send, its weight times what the chain unearths from the first later link
+    /// whose provisional pick sends it. In the units of carried percent times monster weight. For PlanTarget.Best. See
+    /// Settle's provisional pass.
+    ///
+    /// **A rune sent again further down is worth only the links before the second sender.** Booking keeps the earlier
+    /// copy, so the chain gains it from this link to the later one, and the later remnant's socket would have covered
+    /// the rest. Ranked on the whole of the downstream reach, 3x Orb of Alchemy sending Adaptive tied 3x Glassblower's
+    /// Bauble sending Prismatic on a Frigid Bluffs layout where a remnant four links on sent Adaptive too, and scored
+    /// 198.5 below it.
+    /// </summary>
+    internal static double LaterSentReach(PlanEnvironment env, PlanTarget target, string[] runes, int at, int distinct,
+        (int Key, int Link)[] later, int laterCount, float[] after)
+    {
+        if (later == null || laterCount == 0 || runes is not { Length: > 0 } || after == null)
+            return 0d;
+
+        var covered = 0d;
+
+        foreach (var (id, weight) in WeightsOfChosenRunes(target, runes) ?? [])
+        {
+            if (id == null || weight <= 0f || IsRuneAlreadySentTo(env, target, id, at, distinct))
+                continue;
+
+            var key = NumberOfEffect(env, Weighing.RuneOfKey(id));
+            var first = int.MaxValue;
+
+            for (var x = 0; x < laterCount; x++)
+            {
+                if (later[x].Key == key && later[x].Link > at && later[x].Link < first)
+                    first = later[x].Link;
+            }
+
+            if (first < after.Length)
+                covered += weight * after[first];
+        }
+
+        return covered;
+    }
 
     /// <summary>Whether anything upstream is already sending this rune to that remnant.</summary>
     private static bool IsRuneAlreadySent(PlanEnvironment env, string id, (int X, int Y) cell, int at,
@@ -7288,7 +7481,8 @@ internal static class Planner
                     continue;
                 }
 
-                if (_carriedRune[r])
+                // A split-off share is its rune's second booking and not another rune. See Weighing.SplitShareKeyOf.
+                if (_carriedRune[r] && !Weighing.IsSplitShareKey(_carriedNames[r]))
                 {
                     runes++;
 
@@ -7360,8 +7554,8 @@ internal static class Planner
 
                 for (var r = 0; r < distinct; r++)
                 {
-                    if (!_carriedRune[r] || _carriedRich[r] <= 0f || _carriedWeights[r] <= 0f ||
-                        _carriedFrom[r] > mineAt)
+                    if (!_carriedRune[r] || Weighing.IsSplitShareKey(_carriedNames[r]) || _carriedRich[r] <= 0f ||
+                        _carriedWeights[r] <= 0f || _carriedFrom[r] > mineAt)
                         continue;
 
                     if (adds.Contains(_carriedNames[r], StringComparer.OrdinalIgnoreCase))
@@ -7832,7 +8026,7 @@ internal static class Planner
         if (carried is not { Length: > 0 })
             return [];
 
-        var holdsPower = carried.Any(IsPower) || (locals ?? []).Any(x => IsPower(Weighing.BaseOfLiftKey(x.Id)));
+        var holdsPower = carried.Any(IsPower) || (locals ?? []).Any(x => IsPower(Weighing.RuneOfKey(x.Id)));
 
         if (!holdsPower)
             return [];
@@ -7863,21 +8057,30 @@ internal static class Planner
                 adds.Add(id);
         }
 
+        // Propagating names every rune the row would send, upstream duplicates too, so the window can colour them as the
+        // line under the remnant does. Downstream is the remnant's standing figure, like Arriving: what later remnants
+        // send is set by their own choices, not by which row this one takes.
         return new RuneTally(RunesInLocals(optionLocals) + (optionPropagates?.Length ?? 0), remnant.Inherited,
             wasted, adds.ToArray(), arriving,
+            Propagating: (optionPropagates ?? []).Where(id => id != null).ToArray(),
+            Downstream: remnant.Downstream,
             Empowered: EmpoweredCarriesOfCombination(optionPropagates, optionLocals),
             PerWave: Propagation.RunesPerWave(optionSlots, arriving));
     }
 
     /// <summary>
-    /// How many runes a combination's local entries are: a rune that adds and lifts has two entries, its share and its
-    /// lift key, and is one rune. See Weighing.LiftKeyOf.
+    /// How many runes a combination's local entries are. A rune can have several: its share, its lift key and any
+    /// split-off share, and is one rune. Counted by Weighing.RuneOfKey, each rune at its first entry. See
+    /// Weighing.LiftKeyOf and Weighing.SplitShareKeyOf.
     /// </summary>
+    internal static int RunesInLocals((string Id, float Worth)[] locals) =>
+        RunesInLocalsArriving(locals, _ => true);
+
     /// <summary>
-    /// How many of the runes in a combination's local slots already arrive, counted as RunesInLocals counts them: a lift
-    /// key as its rune, and once only where its rune's share is listed too. On a Grazed Prairie site (2026-10-06) a
-    /// remnant holding Power, filed as its lift key, with Power arriving from upstream read "16 (7+10-1)" against 15
-    /// runes on its last wave. See Weighing.LiftKeyOf.
+    /// How many of the runes in a combination's local slots already arrive, counted as RunesInLocals counts them: each
+    /// rune once, however many entries it has. On a Grazed Prairie site (2026-10-06) a remnant holding Power, filed as its
+    /// lift key, with Power arriving from upstream read "16 (7+10-1)" against 15 runes on its last wave, from counting
+    /// one rune per entry.
     /// </summary>
     internal static int RunesInLocalsArriving((string Id, float Worth)[] locals, Func<string, bool> arrives)
     {
@@ -7888,57 +8091,17 @@ internal static class Planner
 
         for (var i = 0; i < locals.Length; i++)
         {
-            var id = locals[i].Id;
+            var rune = Weighing.RuneOfKey(locals[i].Id);
 
-            if (id == null)
+            if (rune == null)
                 continue;
 
-            var rune = Weighing.BaseOfLiftKey(id);
+            var earlier = false;
 
-            if (Weighing.IsLiftKey(id))
-            {
-                var listed = false;
+            for (var j = 0; j < i && !earlier; j++)
+                earlier = string.Equals(Weighing.RuneOfKey(locals[j].Id), rune, StringComparison.OrdinalIgnoreCase);
 
-                for (var j = 0; j < locals.Length && !listed; j++)
-                    listed = string.Equals(locals[j].Id, rune, StringComparison.OrdinalIgnoreCase);
-
-                if (listed)
-                    continue;
-            }
-
-            if (arrives(rune))
-                count++;
-        }
-
-        return count;
-    }
-
-    internal static int RunesInLocals((string Id, float Worth)[] locals)
-    {
-        if (locals is not { Length: > 0 })
-            return 0;
-
-        var count = 0;
-
-        for (var i = 0; i < locals.Length; i++)
-        {
-            var id = locals[i].Id;
-
-            if (!Weighing.IsLiftKey(id))
-            {
-                count++;
-
-                continue;
-            }
-
-            // A lift key counts unless its rune's share is listed too.
-            var rune = Weighing.BaseOfLiftKey(id);
-            var listed = false;
-
-            for (var j = 0; j < locals.Length && !listed; j++)
-                listed = string.Equals(locals[j].Id, rune, StringComparison.OrdinalIgnoreCase);
-
-            if (!listed)
+            if (!earlier && arrives(rune))
                 count++;
         }
 
@@ -8331,7 +8494,9 @@ internal static class Planner
 
         for (var r = 0; r < distinct; r++)
         {
-            if (_carriedBy[r] != cell || _carriedNames[r] == null || _carriedWeights[r] <= 0f)
+            // A split-off share names no rune of its own; its rune's booking names it. See Weighing.SplitShareKeyOf.
+            if (_carriedBy[r] != cell || _carriedNames[r] == null || _carriedWeights[r] <= 0f ||
+                Weighing.IsSplitShareKey(_carriedNames[r]))
                 continue;
 
             found ??= new List<string>(2);
@@ -10890,6 +11055,12 @@ internal static class Planner
     /// <summary>The share each group picks up at each link, per relevant tag. See Multiplied.</summary>
     [ThreadStatic] private static float[] _rates;
 
+    /// <summary>Scratch for Settle's SharesInForceAt.</summary>
+    [ThreadStatic] private static float[] _sharesInForce;
+
+    /// <summary>Scratch for Settle's provisional pass: each provisional pick's propagated runes and its link.</summary>
+    [ThreadStatic] private static (int Key, int Link)[] _laterSends;
+
     /// <summary>The shares no rune contributed, per group, tag and link. See Tags.UnaffectedByRunes.</summary>
     [ThreadStatic] private static float[] _ratesWithoutRunes;
 
@@ -11118,7 +11289,15 @@ internal static class Planner
                 factor *= 1d + heldLifts[a];
         }
 
-        return factor;
+        // **Only the part of the lift its group takes**, as the payout applies it: Bond's row writes 15% plain and 18%
+        // empowered, so a held Power lifts it by a fifth, not double. Ranked at double, a Grazed Prairie remnant
+        // (2026-10-06) holding Power and sending Bond was credited 288 for the lift where the payout paid 58, and chose
+        // a combination that cost its chain about 500. See Amplification.LiftedFactorOfGroup.
+        var band = GroupIndexOfEffect(env, id);
+
+        return amplified.ReachOfGroup is { } reach && band >= 0 && band < reach.Length
+            ? 1d + (factor - 1d) * reach[band]
+            : factor;
     }
 
     /// <summary>

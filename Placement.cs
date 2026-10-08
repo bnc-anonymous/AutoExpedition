@@ -647,6 +647,20 @@ internal sealed class Placement
                 NextWindowSaid = $"the window for the next remnant came up {(DateTime.UtcNow - _awaitingSince).TotalMilliseconds:0}ms " +
                                  $"after the last reward took ({DateTime.Now:HH:mm:ss})";
 
+            // **A window the run did not open belongs to no remnant the run was acting on.** Only Opened means this run
+            // clicked a combinations button and is waiting for its window; any other window was put up by the game for
+            // a remnant an explosive just landed on. A rewrite or chore set up meanwhile named a different remnant, and
+            // left in place it was taken for this window's: the pick was checked against that remnant, never read
+            // back, and the run waited out Answers (751ms on a dump, 2026-10-08). Cleared, the window is identified by
+            // its own options, and the rewrite or chore is worked out again after the pick. See Options.Whose.
+            if (_step != Step.Opened)
+            {
+                _change = null;
+                _wanted = null;
+                _chore = null;
+                Opened = null;
+            }
+
             Choose(gc, settings, valuation, scan);
 
             return;
@@ -904,7 +918,8 @@ internal sealed class Placement
                         RecordSetByPlacement(Safe.Read(_picked, static e => e.GridPos, Vector2.Zero), _pickingRecipe);
 
                     Picked = (_picking, Took(gc),
-                        (DateTime.UtcNow - _clicked).TotalMilliseconds, DateTime.UtcNow);
+                        (DateTime.UtcNow - _clicked).TotalMilliseconds, DateTime.UtcNow,
+                        Safe.Read(_picked, static e => e.GridPos, Vector2.Zero));
 
                     // The rewrite this pick was for is done, so it must not answer for the next window, which an
                     // explosive landing on another remnant opens. See Begin.
@@ -1423,7 +1438,9 @@ internal sealed class Placement
         // rather than assuming it did. See _picking.
         _picking = name ?? "";
         _pickingRecipe = recipe ?? "";
-        _picked = _change?.Entity ?? _chore;
+
+        // The window's own remnant where the run did not open it, so the pick is read back from the remnant clicked.
+        _picked = _change?.Entity ?? _chore ?? Options.Whose(gc, scan)?.Entity;
 
         _input.SetTolerance(12);
         _input.MoveTo(rect);
@@ -1781,9 +1798,10 @@ internal sealed class Placement
     ///
     /// For the dump. A remnant picked twice is a race nobody can see from the outside, so the one
     /// thing worth writing down is how long the round trip actually takes on this connection - the
-    /// ceiling in Answers is a guess until there are numbers beside it.
+    /// ceiling in Answers is a guess until there are numbers beside it. RemnantAt is the remnant the pick was read back
+    /// from, zero where none could be named.
     /// </summary>
-    public static (string Reward, bool Took, double Ms, DateTime When) Picked { get; private set; }
+    public static (string Reward, bool Took, double Ms, DateTime When, Vector2 RemnantAt) Picked { get; private set; }
 
     /// <summary>Records what Ready last answered. See Verdict.</summary>
     private static bool Note(bool go, string why, bool record)
@@ -1892,6 +1910,18 @@ internal sealed class Placement
 
         if (id != 0u)
             _settling[id] = DateTime.UtcNow;
+
+        // **And the remnant whose window it was, when the game put it up.** Neither field above names it then, so it
+        // was left out, and AfterPick - looking for an undecided remnant under the explosive just placed - found it
+        // still reading undecided before the server answered, and waited NextWindowWithin for a window that had
+        // already been dealt with.
+        var picked = Safe.Read(() => _picked?.Id ?? 0u, 0u);
+
+        if (picked != 0u)
+        {
+            _rewrote.Add(picked);
+            _settling[picked] = DateTime.UtcNow;
+        }
     }
 
     /// <summary>How many times one button may be re-aimed before the run gives up on it.</summary>

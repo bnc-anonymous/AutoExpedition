@@ -237,6 +237,12 @@ internal static class TableGrammar
     /// Multiplicative behaviour's "+name" and "*name" sigils, where the same distinction was carried
     /// by punctuation in a different column from the number it applied to.
     ///
+    /// On a rune row each share effect is scored in the group its own stat names. An effect naming a stat beside a lift,
+    /// or beside a share outside that stat, is booked apart from the row's main share under a key of its own: Bond's
+    /// rares-only "+15%" keeps its own factor while "monster.weight *= +1.03% as
+    /// increased_quantity_of_items_dropped_by_monsters" adds with every other rune's item quantity. See
+    /// Weighing.IsSplitEffect.
+    ///
     /// <paramref name="Own"/>, written "own" at the end of the effect, means it reaches the waves of the remnant
     /// holding the rune and nothing else: not later links, not other remnants the same explosive catches. It
     /// applies whichever slot the rune sits in. Read on rune rows only; the planner applies it per combination,

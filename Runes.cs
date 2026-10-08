@@ -81,7 +81,7 @@ internal static class Runes
     {
         var parts = new List<string>(2);
 
-        foreach (var effect in TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _))
+        foreach (var effect in EffectsOfKey(id))
         {
             // An 'own' effect reaches the holding remnant's waves only, per combination. See Weighing.OwnEffectsOfRunes.
             if (effect.Own)
@@ -133,7 +133,7 @@ internal static class Runes
     /// </summary>
     public static float Weight(string id)
     {
-        var effects = TableGrammar.EffectsOfRow(Wrt.Id.Rune(id), out _);
+        var effects = EffectsOfKey(id);
 
         // **Its share before its lift**, so a rune that adds and lifts - Rebirth - is weighed by what it adds and lifts
         // through its effect number. A rune that only lifts - Power - answers with its lift, which is what booking it has
@@ -155,6 +155,14 @@ internal static class Runes
     }
 
 
+
+    /// <summary>
+    /// The effects a rune id or a split-off share key is weighed and scoped by, less any "empowered" clause, which
+    /// restates a plain one. A rune's main effects only: a clause split off under its own key is read there. See
+    /// Weighing.EffectsOfKey and TableGrammar.EffectsOfRow.
+    /// </summary>
+    private static TableGrammar.Effect[] EffectsOfKey(string id) =>
+        Array.FindAll(Weighing.EffectsOfKey(id), x => x.Empowered != true);
 
     /// <summary>
     /// What a rune nobody has an opinion about is worth: the value most of the tail carries.
