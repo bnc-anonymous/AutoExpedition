@@ -49,9 +49,10 @@ internal sealed class Landed
     /// the check answering nothing at all.
     ///
     /// The ground facts are still taken at landing, because those are about terrain and terrain does
-    /// not move. The router questions are left null and filled in by the first later frame that finds
-    /// the search idle. Nothing is overwritten once answered: the verdict worth having is the one that
-    /// was true of the chain as it stood, not of whatever the plan has become since.
+    /// not move. The router questions are left null and asked when a dump is written with the search
+    /// idle. Asked on the first idle frame, they were five routings in one frame, and on a site whose
+    /// router held its limit of 4,000,000 paths that frame took 4.9 seconds (2026-10-10 13:31:26). Only
+    /// the dump reads them. Nothing is overwritten once answered.
     /// </summary>
     private sealed class Note
     {
@@ -85,7 +86,7 @@ internal sealed class Landed
 
         public int Bare = -2;
 
-        /// <summary>Null until a frame catches the search idle. See Resolve.</summary>
+        /// <summary>Null until a dump is written with the search idle. See Resolve.</summary>
         public Certainty? Said;
 
         public readonly Vector2[] Steps = new Vector2[Around.Length];
@@ -96,14 +97,20 @@ internal sealed class Landed
 
     private readonly List<Note> _notes = new();
     private int _known;
+
+    /// <summary>The environment as of the last frame, and whether a solve was running then. See Describe.</summary>
+    private PlanEnvironment _env;
+
+    private bool _searching;
     private uint _area;
 
     /// <summary>
-    /// Notices an explosive that was not there last frame, and answers what it can when it can.
+    /// Notices an explosive that was not there last frame, and takes the ground facts about it. The reach
+    /// questions wait for a dump. See Note.
     /// </summary>
     /// <param name="searching">
     /// Whether a solve is running. The reach questions go through the environment's own router, which
-    /// the search thread is using at the same time, so they wait for an idle frame. See Note.
+    /// the search thread is using at the same time, so a dump asks them only when none is. See Note.
     /// </param>
     public void Observe(GameController gc, Terrain ground, Obstacles blocking,
         PlanEnvironment env, bool searching)
@@ -135,8 +142,8 @@ internal sealed class Landed
             _known = placed.Length;
         }
 
-        if (!searching && env != null)
-            Resolve(env);
+        _env = env;
+        _searching = searching;
 
         if (!searching)
             Measure(gc, ground, blocking);
@@ -206,6 +213,9 @@ internal sealed class Landed
         if (_notes.Count == 0)
             return "nothing placed yet";
 
+        if (!_searching && _env != null)
+            Resolve(_env);
+
         var text = new List<string> { $"{_notes.Count} placed:" };
 
         foreach (var note in _notes)
@@ -221,7 +231,7 @@ internal sealed class Landed
             Certainty.Yes => "REACHABLE",
             Certainty.No => "NOT reachable - the model would not have planned this",
             Certainty.Unknown => "unknown, the router never settled it",
-            _ => "still waiting for an idle frame to ask",
+            _ => "not asked: a solve was running when the dump was written",
         };
 
         var lines = new List<string>
@@ -322,7 +332,7 @@ internal sealed class Landed
         }
 
         lines.Add(asked < Around.Length
-            ? "        neighbours in reach: still waiting for an idle frame to ask all four"
+            ? "        neighbours in reach: not asked, a solve was running when the dump was written"
             : $"        neighbours in reach: {within} of 4, furthest is " +
               $"({note.Steps[furthest].X:+0;-0;0},{note.Steps[furthest].Y:+0;-0;0}) at " +
               $"{Vector2.Distance(note.From, note.To + note.Steps[furthest]):0.#}" +

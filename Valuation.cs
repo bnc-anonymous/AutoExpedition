@@ -95,9 +95,10 @@ internal sealed class Valuation
     /// <summary>Every recipe, bucketed by RuneCountRequired. See where it is built.</summary>
     private readonly TimeCache<ILookup<int, Expedition2Recipe>> _recipesByRuneCount;
 
-    /// <summary>What one Divine and one Chaos are worth in exalts, or zero when unknown.</summary>
+    /// <summary>What one Divine, one Chaos and one Vaal Orb are worth in exalts, or zero when unknown.</summary>
     private double _divine;
     private double _chaos;
+    private double _vaal;
 
     public Valuation(GameController gc, AutoExpeditionSettings settings)
     {
@@ -144,6 +145,7 @@ internal sealed class Valuation
     {
         "Divine" => _divine > 0d ? _divine : 1d,
         "Chaos" => _chaos > 0d ? _chaos : 1d,
+        "Vaal" => _vaal > 0d ? _vaal : 1d,
         _ => 1d,
     };
 
@@ -152,6 +154,7 @@ internal sealed class Valuation
     {
         "Divine" => _divine > 0d,
         "Chaos" => _chaos > 0d,
+        "Vaal" => _vaal > 0d,
         _ => true,
     };
 
@@ -283,8 +286,10 @@ internal sealed class Valuation
 
         if (frozen && _stored != null)
         {
-            // Whatever answered before still answers, or nothing downstream would believe the table.
+            // Whatever answered before still answers, or nothing downstream would believe the table. The rates too, as
+            // last stored: the freeze returned before any was read, and no tablet could be priced in chaos under it.
             Priced = true;
+            UseRates(0d, 0d, 0d);
 
             return _held = _stored;
         }
@@ -297,8 +302,7 @@ internal sealed class Valuation
 
         Priced = value != null;
 
-        _divine = Rate(value, "Divine Orb");
-        _chaos = Rate(value, "Chaos Orb");
+        UseRates(Rate(value, "Divine Orb"), Rate(value, "Chaos Orb"), Rate(value, "Vaal Orb"));
 
         var recipes = Safe.Read(() => _gc.Files.Expedition2Recipes.EntriesList, null);
 
@@ -363,6 +367,101 @@ internal sealed class Valuation
 
     /// <summary>Which area the held table was built in. See BuildPrices.</summary>
     private uint _heldIn;
+
+    /// <summary>
+    /// The Divine, Chaos and Vaal Orb rates in use: those read live, each stored when it changes; a stored one where the
+    /// live one is missing. Vaal for tablets, which are often listed in it: 442 of 1587 cached listings on 2026-10-10. With NinjaPricer failing to fetch, there was no rate at all (every dump 2026-10-09 23:13 to
+    /// 23:45), so no tablet listed in chaos or divine could be priced - and before that was handled, one listed only in
+    /// chaos was taken as worthless and reforged. Rates move slowly enough that the last read is a fair stand-in.
+    /// </summary>
+    private void UseRates(double liveDivine, double liveChaos, double liveVaal)
+    {
+        var stored = StoredRates();
+
+        _divine = liveDivine > 0d ? liveDivine : stored.Divine;
+        _chaos = liveChaos > 0d ? liveChaos : stored.Chaos;
+        _vaal = liveVaal > 0d ? liveVaal : stored.Vaal;
+
+        // Each live rate replaces its stored one; a missing one keeps what was stored.
+        if (liveDivine > 0d || liveChaos > 0d || liveVaal > 0d)
+        {
+            var keep = (Divine: _divine, Chaos: _chaos, Vaal: _vaal);
+
+            if (keep != stored)
+                StoreRates(keep.Divine, keep.Chaos, keep.Vaal);
+        }
+
+        RatesSaid = liveDivine > 0d && liveChaos > 0d && liveVaal > 0d
+            ? "live"
+            : _divine > 0d || _chaos > 0d || _vaal > 0d
+                ? $"stored, from {_ratesStoredAt:yyyy-MM-dd HH:mm} (live: divine {(liveDivine > 0d ? "read" : "missing")}, " +
+                  $"chaos {(liveChaos > 0d ? "read" : "missing")}, vaal {(liveVaal > 0d ? "read" : "missing")})"
+                : "none: no live rates and none stored";
+    }
+
+    /// <summary>Where the last rates read are stored. See UseRates.</summary>
+    private static string RatesFile => Path.Combine(Kept.Home, "last_rates.tsv");
+
+    /// <summary>Which rates are in use, for the dump. See UseRates.</summary>
+    public static string RatesSaid { get; private set; } = "not read yet";
+
+    /// <summary>The rates as stored, read once and kept; noughts when there are none.</summary>
+    private (double Divine, double Chaos, double Vaal)? _ratesStored;
+
+    private DateTime _ratesStoredAt;
+
+    private (double Divine, double Chaos, double Vaal) StoredRates()
+    {
+        if (_ratesStored is { } kept)
+            return kept;
+
+        if (Kept.Home.Length == 0)
+            return (0d, 0d, 0d);
+
+        try
+        {
+            if (File.Exists(RatesFile))
+            {
+                var lines = File.ReadAllLines(RatesFile);
+                var divine = double.Parse(lines[0].Split('\t')[1], CultureInfo.InvariantCulture);
+                var chaos = double.Parse(lines[1].Split('\t')[1], CultureInfo.InvariantCulture);
+                // A file written before vaal was read has two lines.
+                var vaal = lines.Length > 2 ? double.Parse(lines[2].Split('\t')[1], CultureInfo.InvariantCulture) : 0d;
+
+                _ratesStoredAt = File.GetLastWriteTime(RatesFile);
+                return (_ratesStored = (divine, chaos, vaal)).Value;
+            }
+        }
+        catch (Exception)
+        {
+            // An unreadable file is taken as none: the live rates write a fresh one.
+        }
+
+        return (_ratesStored = (0d, 0d, 0d)).Value;
+    }
+
+    private void StoreRates(double divine, double chaos, double vaal)
+    {
+        if (Kept.Home.Length == 0)
+            return;
+
+        try
+        {
+            File.WriteAllLines(RatesFile,
+            [
+                "Divine Orb\t" + divine.ToString("R", CultureInfo.InvariantCulture),
+                "Chaos Orb\t" + chaos.ToString("R", CultureInfo.InvariantCulture),
+                "Vaal Orb\t" + vaal.ToString("R", CultureInfo.InvariantCulture),
+            ]);
+
+            _ratesStored = (divine, chaos, vaal);
+            _ratesStoredAt = DateTime.Now;
+        }
+        catch (Exception)
+        {
+            // Tried again when the rates next change.
+        }
+    }
 
     /// <summary>Where the last prices read are stored. See StoredPrices.</summary>
     private static string PricesFile => Path.Combine(Kept.Home, "last_prices.tsv");

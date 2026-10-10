@@ -831,10 +831,15 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             // are not to hand the old approximation stands in, which is the estimate paths only.
             var reach = 0d;
 
-            foreach (var (_, tag, percent, _) in choice.Spread ?? [])
+            // As paid where the shares in force are known: times the other groups on the tag's class. See
+            // Planner.PaidFactorOfScopedEffect.
+            double PaidFactor(string id, int tag, bool flat) =>
+                sharesInForce == null || flat ? 1d : Planner.PaidFactorOfScopedEffect(env, sharesInForce, groups, width, id, tag);
+
+            foreach (var (id, tag, percent, flat) in choice.Spread ?? [])
             {
                 if (percent > 0f)
-                    reach += percent * Planner.Reach(env, tag, sums, null, at, downstream);
+                    reach += percent * Planner.Reach(env, tag, sums, null, at, downstream) * PaidFactor(id, tag, flat);
             }
 
             // What the combination's scoped runes reach, before the lifts below add to it. See passedLift.
@@ -856,6 +861,27 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             // Both halves are discounted. distinct is nought on the estimate paths, where there is no
             // booked set to consult and the gross figure stands. See DiscountedForDuplicates.
             var carried = Planner.DiscountedForDuplicates(env, this, choice.Runes, choice.Carries, at, distinct);
+
+            // As paid where the shares in force are known: each rune's factor, by its weight, over the monsters by type.
+            // See Planner.PaidFactorOfCarriedEffect.
+            var carriedFactor = 1d;
+
+            if (sharesInForce != null && Planner.WeightsOfChosenRunes(this, choice.Runes) is { Length: > 0 } carriedRunes)
+            {
+                var (weighed, paidWeight) = (0d, 0d);
+
+                foreach (var (id, weight) in carriedRunes)
+                {
+                    if (weight <= 0f)
+                        continue;
+
+                    weighed += weight;
+                    paidWeight += weight * Planner.PaidFactorOfCarriedEffect(env, sharesInForce, groups, width, id, sums, at, downstream);
+                }
+
+                if (weighed > 0d)
+                    carriedFactor = paidWeight / weighed;
+            }
 
             // Less what a later remnant sends anyway. See Planner.LaterSentReach.
             var laterSent = Planner.LaterSentReach(env, this, choice.Runes, at, distinct, laterSends, laterCount, after);
@@ -882,12 +908,12 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
                         reach += (factor - 1d) * weight * downstream;
                 }
 
-                foreach (var (id, tag, percent, _) in choice.Spread ?? [])
+                foreach (var (id, tag, percent, flat) in choice.Spread ?? [])
                 {
                     var factor = Planner.HeldFactorOfEffect(env, id, heldLifts);
 
                     if (percent > 0f && factor > 1d && !Planner.IsRuneAlreadySentTo(env, this, id, at, distinct))
-                        reach += (factor - 1d) * percent * Planner.Reach(env, tag, sums, null, at, downstream);
+                        reach += (factor - 1d) * percent * Planner.Reach(env, tag, sums, null, at, downstream) * PaidFactor(id, tag, flat);
                 }
             }
 
@@ -915,7 +941,7 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
                 ? OwnPaidOfChoice(c, magicScale, rareScale, passed, env, sharesInForce, groups, width)
                 : OwnOfChoice(c, magicScale, rareScale, passed);
             var worth = choice.Reward + traction + own +
-                        (float)(((carried * downstream - laterSent) * (1d + passed) + held * local * (1d + onOwnWaves) +
+                        (float)(((carried * downstream - laterSent) * carriedFactor * (1d + passed) + held * local * (1d + onOwnWaves) +
                                  reach + spreadReach * passed) / 100d);
 
             // **What each option was ranked at, kept only when somebody is reading.** The winner
@@ -925,7 +951,8 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             // the only place that answer can come from.
             Planner.ChoiceRankingTrail?.Add(
                 $"{(Named != null && c < Named.Length ? Named[c] : "?")}: reward {choice.Reward:N1}" +
-                $" + carried {carried:N2}% x {downstream:N0}{(laterSent > 0d ? $" less {laterSent / 100d:N1} sent later anyway" : "")} + local {held:N2}% x {local:N0}" +
+                $" + carried {carried:N2}% x {downstream:N0}{(laterSent > 0d ? $" less {laterSent / 100d:N1} sent later anyway" : "")}" +
+                $"{(carriedFactor != 1d ? $" x {carriedFactor:N2} as paid" : "")} + local {held:N2}% x {local:N0}" +
                 $" + scoped {reach:N1} (spread {spreadReach:N1}, held lifts {heldLiftReach:N1}, amplifiers " +
                 $"{reach - spreadReach - heldLiftReach:N1}, passed lift {passed:0.##}) + traction {traction:N1} + own {own:N1}" +
                 (sharesInForce != null ? " (as paid)" : "") +
@@ -7173,6 +7200,90 @@ internal static class Planner
     /// </summary>
     internal static double PaidProductOfMask(PlanEnvironment env, float[] shares, int groups, int width, long mask) =>
         Multiplied(shares, null, groups, width, ClassOfMask(env, mask), 0d, null, null, env.IncreaseBaseOfGroup);
+
+    /// <summary>
+    /// What one point of an unscoped carried effect is paid per point of the monster weight from link at onwards, given
+    /// the shares in force: the weight split into rare, magic and the rest, each paid the product of every other group
+    /// on its class, over the effect's own group's base. 1 where the split or the group is not to hand. For
+    /// PlanTarget.Best, so a carried rune is ranked as paid, as scoped ones and own effects are.
+    ///
+    /// The split comes from the per-tag sums, which hold a tag only when some effect on the site is scoped at it. A tag
+    /// nothing is scoped at has no share of its own, so its monsters are paid as the rest are and need no split.
+    ///
+    /// Without it a carried Cold at +1% was ranked at 1% of the downstream monsters on a site whose relic doubled
+    /// rares, where the payout paid about 2% on the rares among them, while a rune scoped at rares was ranked at the
+    /// doubled figure.
+    /// </summary>
+    internal static double PaidFactorOfCarriedEffect(PlanEnvironment env, float[] shares, int groups, int width, string id,
+        float[][] sums, int at, float downstream)
+    {
+        var g = id == null ? -1 : GroupIndexOfEffect(env, id);
+        var k = Indexed(env, Tags.Monsters);
+
+        if (shares == null || downstream <= 0f || g < 0 || g >= groups || k < 0 || g == env.Empowering)
+            return 1d;
+
+        var rares = Math.Min(Reach(env, Tags.Rares, sums, null, at), downstream);
+        var magics = Math.Min(Reach(env, Tags.Magics, sums, null, at), downstream - rares);
+        var rest = downstream - rares - magics;
+        var monster = (1L << Tags.Monsters) | (1L << Tags.Modifiables);
+
+        var paid = rest * PaidFactorOfShare(env, shares, groups, width, g, k, ClassOfMask(env, monster | (1L << Tags.Normals)));
+
+        if (rares > 0f)
+            paid += rares * PaidFactorOfShare(env, shares, groups, width, g, k, ClassOfMask(env, monster | (1L << Tags.Rares)));
+
+        if (magics > 0f)
+            paid += magics * PaidFactorOfShare(env, shares, groups, width, g, k, ClassOfMask(env, monster | (1L << Tags.Magics)));
+
+        return paid / downstream;
+    }
+
+    /// <summary>
+    /// What one point of a scoped effect is paid per point of the weight it reaches, given the shares in force: the
+    /// product of every other group on the tag's class, over the effect's own group's base. 1 where the effect's group
+    /// or tag is not one the payout lays out. For PlanTarget.Best, so a scoped carry is ranked as paid, as its own
+    /// effects are. See OwnPaidOfChoice.
+    ///
+    /// Without it a site's relics were in the own effects and not in the spread: a Bond at +15% rare monsters on a
+    /// site whose relic doubled rares was ranked at half its pay against own effects counted at the full product, and
+    /// lost to a reward the chain then scored 124 below it (2026-10-09).
+    ///
+    /// The shares are those in force at the ranking link, so a relic first reached further down is not counted.
+    /// </summary>
+    internal static double PaidFactorOfScopedEffect(PlanEnvironment env, float[] shares, int groups, int width, string id, int tag)
+    {
+        var g = id == null ? -1 : GroupIndexOfEffect(env, id);
+        var k = Indexed(env, tag < 0 ? Tags.Monsters : tag);
+
+        if (shares == null || g < 0 || g >= groups || k < 0 || g == env.Empowering)
+            return 1d;
+
+        var mask = (1L << (tag < 0 ? Tags.Monsters : tag)) | (1L << Tags.Modifiables);
+
+        if (tag >= 0 && Tags.Monsterly(tag))
+            mask |= 1L << Tags.Monsters;
+
+        return PaidFactorOfShare(env, shares, groups, width, g, k, ClassOfMask(env, mask));
+    }
+
+    /// <summary>
+    /// What one point of a share in group g at relevant tag k is paid on class cls per point of that class's weight:
+    /// the product of every other group on the class, over group g's base. See PaidFactorOfScopedEffect.
+    /// </summary>
+    private static double PaidFactorOfShare(PlanEnvironment env, float[] shares, int groups, int width, int g, int k, int cls)
+    {
+        var slot = g * width + k;
+        var held = shares[slot];
+        var before = Multiplied(shares, null, groups, width, cls, 0d, null, null, env.IncreaseBaseOfGroup);
+
+        // The product is linear in one group's share, so one step of a point gives the factor exactly.
+        shares[slot] = held + 0.01f;
+        var after = Multiplied(shares, null, groups, width, cls, 0d, null, null, env.IncreaseBaseOfGroup);
+        shares[slot] = held;
+
+        return (after - before) / 0.01d;
+    }
 
     /// <summary>
     /// The part of what a combination's propagated runes reach that a later remnant on the chain sends them to anyway:

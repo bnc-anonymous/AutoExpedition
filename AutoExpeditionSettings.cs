@@ -51,7 +51,7 @@ namespace AutoExpedition;
 internal static class Migrated
 {
     /// <summary>Raise this and add a case below whenever a shipped value must reach saved files.</summary>
-    public const int Current = 21;
+    public const int Current = 34;
 
     /// <summary>
     /// The weights whose number the plan actually took from the settings file, and the table row
@@ -152,6 +152,14 @@ internal static class Migrated
 
         var was = settings.ConfigVersion;
         var said = new List<string>();
+
+        // **34 - the tablet settings went into the Prices, Automation, Trade site and Crafting by hand sections**, and
+        // the price thresholds were renamed: Reforging bench limit and Bad price became one Reforge under, Good and
+        // Excellent price became Low tier under and Mid tier under, their colours the tiers' colours, Low value price
+        // became Cheap price. First, ahead of steps 25 to 33, which adjust some of these values and must find them where
+        // they now live. See TabletSettingsRegrouped.
+        if (was < 34 && settings?.TabletRerolling is { } regrouped && TabletSettingsRegrouped(saved, regrouped) is { Length: > 0 } sections)
+            said.Add(sections);
 
         // **1 - the two implicit pack counts stopped being probabilities**, and were lifted off
         // nought so a Researcher's six implicit RARE packs were not priced at nothing. It edited the
@@ -382,9 +390,260 @@ internal static class Migrated
             said.Add("turned on Collect remnant drops, as Collect currency drops is on");
         }
 
+        // **22 - the tablet modifier table as first read off Expedition Tablets.** The first version of the table filled a
+        // row's text with the affix's name ("Brimming") and had no row for the Verisium Remnant chance, so a tablet
+        // carrying it read as not worth a Regal. See TabletRerollingSettings.UpdateFromFirstDump.
+        if (was < 22 && settings?.TabletRerolling is { } tablets)
+            said.Add(tablets.UpdateFromFirstDump());
+
+        // **23 - trade stats on the tablet modifier table**, for pricing finished tablets. See TabletRerollingSettings.FillTradeStats.
+        if (was < 23 && settings?.TabletRerolling is { } priced && priced.FillTradeStats() is { Length: > 0 } filled)
+            said.Add(filled);
+
+        // **24 - a value threshold per tablet modifier**, and the random map modifier's Divine rule. See
+        // TabletRerollingSettings.SetRandomModifierRule.
+        if (was < 24 && settings?.TabletRerolling is { } ruled && ruled.SetRandomModifierRule() is { Length: > 0 } rule)
+            said.Add(rule);
+
+        // **25 - short names for the tablet hover table, and a bad price floor.** See
+        // TabletRerollingSettings.SetShortNamesAndThresholds.
+        if (was < 25 && settings?.TabletRerolling is { } named)
+            said.Add(named.SetShortNamesAndThresholds());
+
+        // **26 - every known tablet modifier's trade stat.** See TabletRerollingSettings.KnownTradeStats.
+        if (was < 26 && settings?.TabletRerolling is { } known && known.FillKnownTradeStats() is { Length: > 0 } stats)
+            said.Add(stats);
+
+        // **27 - tablet modifier texts as the game writes them.** See TabletRerollingSettings.KnownTexts.
+        if (was < 27 && settings?.TabletRerolling is { } worded && worded.UseGameTexts() is { Length: > 0 } texts)
+            said.Add(texts);
+
+        // **28 - Regal weights in place of Should Regal and pairs.** A saved row's old choices are read into its weight
+        // as it loads; this sets the default rows' weights where they had none. See TabletModifierRow.Weight.
+        if (was < 28 && settings?.TabletRerolling is { } weighed)
+            said.Add(weighed.SetDefaultRegalWeights());
+
+        // **29 - a short name on every tablet modifier.** See TabletRerollingSettings.FillShortNames.
+        if (was < 29 && settings?.TabletRerolling is { } shortNamed && shortNamed.FillShortNames() is { Length: > 0 } shortNames)
+            said.Add(shortNames);
+
+        // **30 - the tablet automation settings moved from Automation into the Expedition Tablet Rerolling section**, and
+        // Reforge full auto and Expedition Tablet Crafting became one Enable tablet automation, on where either was. Read
+        // out of the settings file, as the old properties are gone. See TabletRerollingSettings.EnableTabletAutomation.
+        if (was < 30 && settings?.TabletRerolling is { } automated && TabletAutomationMoved(saved, automated) is { Length: > 0 } moved)
+            said.Add(moved);
+
+        // **31 - the action zones' place moved into the drawing**, so their offset sliders read 0 where they were set.
+        // Taken off a saved offset only where the file holds one: a file from before the zones keeps the new 0. See
+        // Tablets.ZonesInsetFromArea.
+        if (was < 31 && settings?.TabletRerolling is { } zoned && ZoneOffsetsLowered(saved, zoned) is { Length: > 0 } lowered)
+            said.Add(lowered);
+
+        // **32 - blank rows out of the tablet modifier table.** See TabletRerollingSettings.RemoveBlankRows.
+        if (was < 32 && settings?.TabletRerolling is { } blanked && blanked.RemoveBlankRows() is { Length: > 0 } blanks)
+            said.Add(blanks);
+
+        // **33 - the pricing progress line's place moved into the drawing**, as the action zones' did at 31: 1690 and 1230
+        // from the stash's corner, as it was placed then. It hangs from the inventory now, at the same place on screen;
+        // see Tablets.ProgressRightOfInventory.
+        if (was < 33 && settings?.TabletRerolling is { } progressed && ProgressOffsetsLowered(saved, progressed) is { Length: > 0 } progress)
+            said.Add(progress);
+
         settings.ConfigVersion = Current;
 
         return said.Count == 0 ? "" : string.Join("; ", said);
+    }
+
+    /// <summary>
+    /// Step 34's renames: a saved name to the name it has now. Bad price is not carried: it and the reforging limit
+    /// became one Reforge under, and the reforging limit's value is kept, as a wrong reforge loses a tablet.
+    /// </summary>
+    private static readonly Dictionary<string, string> TabletSettingsRenamed = new()
+    {
+        ["ReforgingValueLimitChaos"] = "ReforgeUnderChaos",
+        ["GoodFromChaos"] = "LowTierUnderChaos",
+        ["ExcellentFromChaos"] = "MidTierUnderChaos",
+        ["BadColour"] = "LowTierColour",
+        ["GoodColour"] = "MidTierColour",
+        ["ExcellentColour"] = "HighTierColour",
+        ["LowValueUpToDivine"] = "CheapPriceUpToDivine",
+        ["LowValueFreshHours"] = "CheapPriceFreshHours",
+        ["MinimumWeightToPrice"] = "MinimumWeightToKeep",
+    };
+
+    /// <summary>
+    /// Step 34: each tablet setting saved directly under TabletRerolling set where it lives now, under its new name where
+    /// it has one. A node saved as {"Value": ...} and a colour saved as a bare string both; Refolded reads only the
+    /// first, and would have reset every colour. Empty when nothing was moved or the file cannot be read.
+    /// </summary>
+    private static string TabletSettingsRegrouped(string saved, TabletRerollingSettings tablets)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(saved) || !File.Exists(saved))
+                return "";
+
+            using var file = JsonDocument.Parse(File.ReadAllText(saved));
+
+            if (!file.RootElement.TryGetProperty("TabletRerolling", out var section) || section.ValueKind != JsonValueKind.Object)
+                return "";
+
+            var moved = 0;
+
+            foreach (var node in section.EnumerateObject())
+            {
+                if (node.Name == "BadFromChaos")
+                    continue;
+
+                var value = node.Value.ValueKind switch
+                {
+                    JsonValueKind.Object when node.Value.TryGetProperty("Value", out var held) => held,
+                    JsonValueKind.String => node.Value,
+                    _ => default,
+                };
+
+                if (value.ValueKind == JsonValueKind.Undefined)
+                    continue;
+
+                var name = TabletSettingsRenamed.TryGetValue(node.Name, out var now) ? now : node.Name;
+
+                // Only the four sections: a setting still on TabletRerolling itself loaded where it was.
+                foreach (var into in new object[] { tablets.Prices, tablets.TabletAutomation, tablets.TradeSite, tablets.CraftingByHand })
+                {
+                    if (Rehomed(into, name, value))
+                    {
+                        moved++;
+                        break;
+                    }
+                }
+            }
+
+            return moved == 0 ? "" : $"moved {moved} tablet setting(s) into Prices, Automation, Trade site and Crafting by hand";
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// Step 33: the pricing progress line's built-in place taken off its saved offsets, so it stays where it was. Only an
+    /// offset the file holds is changed.
+    /// </summary>
+    /// <summary>The progress line's built-in place when step 33 shipped, from the stash's corner. See ProgressOffsetsLowered.</summary>
+    private const int ProgressRightOfStashAtStep33 = 1690;
+
+    private const int ProgressBelowStashTopAtStep33 = 1230;
+
+    private static string ProgressOffsetsLowered(string saved, TabletRerollingSettings tablets)
+    {
+        try
+        {
+            if (saved.Length == 0 || !File.Exists(saved) ||
+                Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(saved))["TabletRerolling"] is not Newtonsoft.Json.Linq.JObject section)
+                return "";
+
+            bool Held(string name) => section[name]?["Value"]?.Type == Newtonsoft.Json.Linq.JTokenType.Integer;
+
+            var said = new List<string>();
+
+            if (Held("PricingProgressXOffset"))
+            {
+                var was = tablets.TradeSite.PricingProgressXOffset.Value;
+
+                tablets.TradeSite.PricingProgressXOffset.Value = was - ProgressRightOfStashAtStep33;
+                said.Add($"X {was} to {tablets.TradeSite.PricingProgressXOffset.Value}");
+            }
+
+            if (Held("PricingProgressYOffset"))
+            {
+                var was = tablets.TradeSite.PricingProgressYOffset.Value;
+
+                tablets.TradeSite.PricingProgressYOffset.Value = was - ProgressBelowStashTopAtStep33;
+                said.Add($"Y {was} to {tablets.TradeSite.PricingProgressYOffset.Value}");
+            }
+
+            return said.Count == 0 ? "" : $"took the pricing progress line's built-in place off its offsets ({string.Join(", ", said)})";
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// Step 31: the action zones' built-in place taken off their saved offsets, so they stay where they were. Only an
+    /// offset the file holds is changed. Empty when there is none or the file cannot be read.
+    /// </summary>
+    private static string ZoneOffsetsLowered(string saved, TabletRerollingSettings tablets)
+    {
+        try
+        {
+            if (saved.Length == 0 || !File.Exists(saved) ||
+                Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(saved))["TabletRerolling"] is not Newtonsoft.Json.Linq.JObject section)
+                return "";
+
+            bool Held(string name) => section[name]?["Value"]?.Type == Newtonsoft.Json.Linq.JTokenType.Integer;
+
+            var said = new List<string>();
+
+            if (Held("ActionZonesXOffset"))
+            {
+                var was = tablets.TabletAutomation.ActionZonesXOffset.Value;
+
+                tablets.TabletAutomation.ActionZonesXOffset.Value = was - Tablets.ZonesInsetFromArea;
+                said.Add($"X {was} to {tablets.TabletAutomation.ActionZonesXOffset.Value}");
+            }
+
+            if (Held("ActionZonesYOffset"))
+            {
+                var was = tablets.TabletAutomation.ActionZonesYOffset.Value;
+
+                tablets.TabletAutomation.ActionZonesYOffset.Value = was - Tablets.ZonesDropBelowArea;
+                said.Add($"Y {was} to {tablets.TabletAutomation.ActionZonesYOffset.Value}");
+            }
+
+            return said.Count == 0 ? "" : $"took the action zones' built-in place off their offsets ({string.Join(", ", said)})";
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// Step 30: the saved Automation.TabletRerolling values onto the Expedition Tablet Rerolling section. Empty when the
+    /// file has none or cannot be read.
+    /// </summary>
+    private static string TabletAutomationMoved(string saved, TabletRerollingSettings tablets)
+    {
+        try
+        {
+            if (saved.Length == 0 || !File.Exists(saved) ||
+                Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(saved))["Automation"]?["TabletRerolling"] is not Newtonsoft.Json.Linq.JObject old)
+                return "";
+
+            bool? Switch(string name) => old[name]?["Value"]?.Type == Newtonsoft.Json.Linq.JTokenType.Boolean ? old[name]["Value"].ToObject<bool>() : null;
+            int? Number(string name) => old[name]?["Value"]?.Type == Newtonsoft.Json.Linq.JTokenType.Integer ? old[name]["Value"].ToObject<int>() : null;
+
+            if (Switch("ReforgeFullAuto") == true || Switch("TabletCrafting") == true)
+                tablets.TabletAutomation.EnableTabletAutomation.Value = true;
+
+            if (Switch("TidyAfterCraftAndReforge") is { } tidy)
+                tablets.TabletAutomation.TidyAfterCraftAndReforge.Value = tidy;
+
+            if (Number("PauseBetweenClicksMs") is { } pause)
+                tablets.TabletAutomation.PauseBetweenClicksMs.Value = pause;
+
+            if (Number("ShortestMoveBetweenTabletsMs") is { } shortest)
+                tablets.TabletAutomation.ShortestMoveBetweenTabletsMs.Value = shortest;
+
+            return "moved the tablet automation settings into the Expedition Tablet Rerolling section";
+        }
+        catch (Exception)
+        {
+            return "";
+        }
     }
 
     /// <summary>
@@ -1091,7 +1350,11 @@ public class AutoExpeditionSettings : ISettings
         "Once a plan is in place and solving is stopped, walk into range of\n" +
         "bombs and press to automatically pick rewards and place explosives.\n" +
         "Once the expedition has started, press to shatter remnants and open\n" +
-        "excavated chests.")]
+        "excavated chests.\n" +
+        "\n" +
+        "In a hideout or town, press to price every Expedition Tablet\n" +
+        "seen, or over a tablet to price that one first. Hold it over a\n" +
+        "tablet to open its search on the trade site.")]
     public HotkeyNodeV2 ActionHotkey { get; set; } = new HotkeyNodeV2(Keys.F4);
 
     /// <summary>
@@ -1312,6 +1575,11 @@ public class AutoExpeditionSettings : ISettings
 
     [Submenu(CollapsedByDefault = true)]
     public SolverSettings Solver { get; set; } = new SolverSettings();
+
+    /// <summary>Borders on Expedition Tablets by the currency each takes next. See TabletRerollingSettings and Tablets.</summary>
+    [Menu("Expedition Tablet Rerolling")]
+    [Submenu(CollapsedByDefault = true)]
+    public TabletRerollingSettings TabletRerolling { get; set; } = new TabletRerollingSettings();
 
     /// <summary>
     /// The Data collection section: every switch for what the plugin writes to its dumps folder as evidence.
@@ -2526,11 +2794,36 @@ public class AutomationSettings
     /// <summary>Whether a switch below is on AND automation is on at all.</summary>
     public bool On(ToggleNode switched) => Enable.Value && switched.Value;
 
+    /// <summary>
+    /// The Expedition Tablet Rerolling section's Enable tablet automation, drawn here as well, so it can be changed from
+    /// either place. Not a second setting: the checkbox reads and writes that one node, looked up as it is drawn, and
+    /// nothing here is saved. See TabletRerollingSettings.EnableTabletAutomation.
+    /// </summary>
+    [JsonIgnore]
+    public CustomNode EnableTabletAutomationUi { get; set; } = new CustomNode(() =>
+    {
+        if (TabletAutomationOf?.Invoke() is not { } node)
+            return;
+
+        var on = node.Value;
+
+        if (ImGui.Checkbox("Enable tablet automation", ref on))
+            node.Value = on;
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("The same switch as in Expedition Tablet Rerolling: the Craft, Reforge, and Craft and\n" +
+                             "Reforge zones along the bottom of the fragment tab.");
+    });
+
+    /// <summary>The live settings' Enable tablet automation node, set by the plugin. See EnableTabletAutomationUi.</summary>
+    internal static Func<ToggleNode> TabletAutomationOf;
+
     [Menu("Pre-expedition")]
     public PreExpeditionSettings PreExpedition { get; set; } = new PreExpeditionSettings();
 
     [Menu("Post-expedition")]
     public PostExpeditionSettings PostExpedition { get; set; } = new PostExpeditionSettings();
+
 }
 
 /// <summary>
@@ -4125,6 +4418,36 @@ public class RecordingSettings
         "How often affixes are re-read while a Bond monster lives. Shorter tells\n" +
         "apart transfers from deaths close together in time, at the cost of more reads.")]
     public RangeNode<int> BondTransferReadMs { get; set; } = new RangeNode<int>(60, 16, 500);
+
+    /// <summary>
+    /// Whether the plugin's own reforges are written to dumps/tablet_reforges.csv: the three tablets in and the one out,
+    /// once it is identified, every modifier with its tier digits and values. For working out modifier weights. See
+    /// Tablets.RollsReforged.
+    /// </summary>
+    [Menu("Collect tablet reforge results",
+        "Writes, in the dumps folder: tablet_reforges.csv - each reforge's three\n" +
+        "tablets and the tablet it made, once identified.")]
+    public ToggleNode CollectTabletReforges { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether the crafting run's currency uses are written to dumps/tablet_crafts.csv: the currency and the tablet
+    /// before and after. Apart from reforges because a craft adds to a tablet where a reforge makes a new one. See
+    /// Tablets.RollsCrafted.
+    /// </summary>
+    [Menu("Collect tablet craft results",
+        "Writes, in the dumps folder: tablet_crafts.csv - each currency the crafting\n" +
+        "run uses, with the tablet before and after.")]
+    public ToggleNode CollectTabletCrafts { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether every tablet seen unidentified and later identified is written to dumps/tablet_identifications.csv, with
+    /// its modifiers and what may say its tier - metadata, base name, item level, implicits - for whether a higher-tier
+    /// drop rolls better modifiers. See Tablets.RollsWatchIdentified.
+    /// </summary>
+    [Menu("Collect tablet identifications",
+        "Writes, in the dumps folder: tablet_identifications.csv - every tablet seen\n" +
+        "unidentified and then identified, with its modifiers and tier.")]
+    public ToggleNode CollectTabletIdentifications { get; set; } = new ToggleNode(false);
 }
 
 public class DebugSettings
@@ -5249,7 +5572,7 @@ public class DebugSettings
     /// Under Debug since 2026-10-06, as a timing few need to change; it was at the root of the settings, and
     /// migration 20 carries a saved value over.
     /// </summary>
-    [Menu("Take last hold time (ms)")]
+    [Menu("Take last hold time (ms)", "Also how long the action key is held over a tablet to open it on the trade site.")]
     public RangeNode<int> TakeLastHoldMs { get; set; } = new RangeNode<int>(750, 300, 3000);
 
     public DebugSettings()

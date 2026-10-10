@@ -323,6 +323,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // Beside the dumps, because a snapshot is read by the same people reading those and an offline run
         // wants both from one folder. See Layout.
         Layout.Folder = Path.Combine(ConfigDirectory, "dumps", "layouts");
+
+        // Kept beside the settings, not in dumps: it is a working cache, not evidence. See TabletPricing.
+        TabletPricing.CacheFile = Path.Combine(ConfigDirectory, "tablet_prices.json");
+        Tablets.SubTabFile = Path.Combine(ConfigDirectory, "tablet_subtabs.json");
         Wrt.Load();
 
         // Where the weights used to live. Named rather than derived inside Migrated so the one
@@ -330,6 +334,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         var saved = Path.Combine(ConfigDirectory, "..", "global", "AutoExpedition_settings.json");
 
         var settled = Migrated.Apply(Settings, saved);
+
+        // The Automation tab's copy of the checkbox reads whatever settings the plugin holds as it is drawn. See
+        // AutomationSettings.EnableTabletAutomationUi.
+        AutomationSettings.TabletAutomationOf = () => Settings?.TabletRerolling?.TabletAutomation.EnableTabletAutomation;
 
         if (settled.Length > 0)
             LogMessage($"AutoExpedition: updated saved settings - {settled}", 10f);
@@ -344,6 +352,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Wrt.Load();
 
         _input = new ExileInput2Client(GameController, "AutoExpedition");
+        Tablets.Input = _input;
         _scan = new Scan(GameController) { Home = ConfigDirectory };
         _scouted.Home = ConfigDirectory;
         Kept.Home = ConfigDirectory;
@@ -390,6 +399,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // ListNode choices are not serialised, so they have to be supplied on every start or the
         // dropdown comes up empty with a saved value it cannot show.
         Settings.Display.Prices.PriceIn.SetListValues(new List<string> { "Exalted", "Divine", "Chaos" });
+        Settings.TabletRerolling.TradeSite.PriceFrom.SetListValues(TabletRerollingSettings.PriceMethods.Select(x => x.Name).ToList());
         // One search to choose.
         Settings.Solver.Advanced.Strategy.SetListValues(new List<string> { SolverSettings.DestroyRepair });
 
@@ -511,6 +521,60 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         Graphics.DrawBox(new ExileCore2.Shared.RectangleF(at.X, at.Y, wide * left, high),
             Color.FromArgb(230, (Color)Settings.Display.ThePlan.StepColour));
     }
+
+    /// <summary>
+    /// A bar under the cursor while the action key is held over a priced tablet in a hideout or town, full when the key
+    /// goes down and empty when the hold opens its search, as the take last hold's bar; then "Opened in browser" there
+    /// for OpenedNoteFor once the browser has been asked to open it. See Tick.
+    /// </summary>
+    private void DrawTabletKeyHold()
+    {
+        var cursor = Safe.Read(() => new Vector2(GameController.IngameState.MousePosX, GameController.IngameState.MousePosY),
+            Vector2.Zero);
+
+        if (cursor == Vector2.Zero)
+            return;
+
+        var at = new Vector2(cursor.X - 40f, cursor.Y + 44f);
+        var age = (DateTime.UtcNow - TabletPricing.OpenedAt).TotalSeconds;
+
+        // Placed, backed and faded as CursorWarning's words are, in white: it reports success, not a warning.
+        if (age < OpenedNoteFor.TotalSeconds)
+        {
+            const string note = "Opened in browser";
+            var window = Safe.Read(GameController, static g => g.Window.GetWindowRectangle(), default);
+            var size = Graphics.MeasureText(note);
+            var noteAt = new Vector2(
+                Math.Clamp(cursor.X + 16f, 0f, Math.Max(0f, window.Width - size.X - 4f)),
+                Math.Clamp(cursor.Y + 44f, 0f, Math.Max(0f, window.Height - size.Y - 4f)));
+            var alpha = (int)(255 * Math.Clamp(OpenedNoteFor.TotalSeconds - age, 0d, 1d));
+
+            Graphics.DrawTextWithBackground(note, noteAt, Color.FromArgb(alpha, Color.White),
+                Color.FromArgb(alpha * 200 / 255, Color.Black));
+            return;
+        }
+
+        if (_tabletKeyDownAt == DateTime.MinValue || _tabletKeyHeld || Tablets.HoveredSearch(GameController, Settings) == null)
+            return;
+
+        var holdMs = Math.Max(1, Settings.Debug.TakeLastHoldMs.Value);
+        var left = 1f - (float)Math.Clamp((DateTime.UtcNow - _tabletKeyDownAt).TotalMilliseconds / holdMs, 0d, 1d);
+        const float wide = 80f;
+        const float high = 6f;
+
+        Graphics.DrawBox(new ExileCore2.Shared.RectangleF(at.X - 1f, at.Y - 1f, wide + 2f, high + 2f), Color.Black);
+        Graphics.DrawBox(new ExileCore2.Shared.RectangleF(at.X, at.Y, wide * left, high),
+            Color.FromArgb(230, (Color)Settings.Display.ThePlan.StepColour));
+    }
+
+    /// <summary>How long "Opened in browser" stays under the cursor.</summary>
+    private static readonly TimeSpan OpenedNoteFor = TimeSpan.FromSeconds(2);
+
+    /// <summary>When the action key went down in a hideout or town, or MinValue while it is up. See Tick.</summary>
+    private DateTime _tabletKeyDownAt = DateTime.MinValue;
+
+    /// <summary>Whether the action key's hold has already opened a tablet's search, so its release prices nothing.</summary>
+    private bool _tabletKeyHeld;
 
     /// <summary>When the must take key went down, or MinValue while it is up. See DebugSettings.TakeLastHoldMs.</summary>
     private DateTime _insistDownAt = DateTime.MinValue;
@@ -880,6 +944,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             _census.Observe(this, GameController, _scan, _valuation);
             RemnantOffers.Flush(this);
         }
+
+        // What reforges, crafts and identifications rolled, written by the tablet section as it sees them. See
+        // Tablets.RollsFlush.
+        Tablets.RollsFlush(this);
 
         // What each marker actually turns into. Every frame rather than on the sweep, because a
         // monster that dies between two sweeps is a monster that never appeared as far as a sampled
@@ -1476,7 +1544,39 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         SolveAfterMarks(down);
 
-        if (Settings.ActionHotkey.PressedOnce() && !_placement.Busy)
+        var actionPressed = Settings.ActionHotkey.PressedOnce();
+
+        // **In a hideout or a town the key is the tablets'.** A tap prices them (Tablets.ActOnActionKey) when the key
+        // comes up; held for the take last hold time over a priced tablet, it opens that tablet's search on the trade
+        // site instead. The tap waits for the key to come up so the two can be told apart, as the must take key's does.
+        if (Tablets.ActionKeyIsForTablets(GameController, Settings))
+        {
+            if (actionPressed)
+            {
+                _tabletKeyDownAt = DateTime.UtcNow;
+                _tabletKeyHeld = false;
+            }
+
+            if (_tabletKeyDownAt != DateTime.MinValue)
+            {
+                if (!Settings.ActionHotkey.IsPressed())
+                {
+                    if (!_tabletKeyHeld)
+                        Tablets.ActionKeyPressed();
+
+                    _tabletKeyDownAt = DateTime.MinValue;
+                }
+                else if (!_tabletKeyHeld &&
+                         DateTime.UtcNow - _tabletKeyDownAt >= TimeSpan.FromMilliseconds(Settings.Debug.TakeLastHoldMs.Value))
+                    _tabletKeyHeld = Tablets.OpenHoveredOnTradeSite(GameController, Settings);
+            }
+
+            actionPressed = false;
+        }
+        else
+            _tabletKeyDownAt = DateTime.MinValue;
+
+        if (actionPressed && !_placement.Busy)
         {
 
             // **Pressing the key at a dig site is asking to see it, whatever the press then does.**
@@ -1659,7 +1759,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         }
     }
 
-    public override void OnUnload() => _boundary.Save(this);
+    public override void OnUnload()
+    {
+        _boundary.Save(this);
+        TabletPricing.Flush();
+        Tablets.FlushSubTabBook();
+    }
 
     /// <summary>
     /// One long sentence broken into lines that fit, on word boundaries.
@@ -1827,11 +1932,17 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         }
 
 
+        // Before the panel gate and the dig-site test: the stash and the inventory are panels, and tablets are rerolled
+        // in a hideout. See Tablets.
+        using (Spent.On("Tablets.Draw"))
+            Tablets.Draw(Graphics, GameController, Settings, _valuation);
+
         // Before the dig-site test, because a warning such as No input or Busy is not about a dig site.
         using (Spent.On("CursorWarning.Draw"))
             CursorWarning.Draw(Graphics, GameController, Settings);
 
         DrawTakeLastHold();
+        DrawTabletKeyHold();
 
         // Before the dig-site test, because Bond's rares fight in the encounters after it.
         if (Settings.Display.Remnants.Propagation.BondRuneRadius && !Panels.Hidden(GameController))

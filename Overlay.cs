@@ -886,6 +886,46 @@ internal static class Overlay
         return percent >= 100 ? colour : Color.FromArgb(colour.A * percent / 100, colour);
     }
 
+    /// <summary>
+    /// Whether a filled circle on the ground projects to a shape that can be filled: every point of its rim lands as a
+    /// real screen point within a window's breadth of the window, and the whole is no wider or taller than half the
+    /// window. A ring around a marker is a few hundred pixels at most.
+    ///
+    /// **A filled circle is a fan of triangles between projected points, and one bad point spreads it over the screen.**
+    /// The only check before was that the centre landed on screen. A player reported the screen washed red across all
+    /// or part of it, the part changing with where they stood, and traced it to the Normal monsters colour with debug
+    /// off and no placement indicator up; purple, the remnant colour, was reported before. This fill is the only one
+    /// the plugin draws, and Astrayed draws it on a hand-placed explosive's lost markers with debug off - so it is the
+    /// suspect, though a bad projection has not been seen in a dump. Failing the check, the ring is drawn as an outline.
+    /// </summary>
+    private static bool FillsSafely(GameController gc, Vector3 world, float radius, int segments)
+    {
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default);
+
+        if (camera == null || window.Width <= 0f || window.Height <= 0f)
+            return false;
+
+        var low = new Vector2(float.MaxValue);
+        var high = new Vector2(float.MinValue);
+
+        for (var i = 0; i < Math.Max(8, segments); i++)
+        {
+            var angle = i * MathF.Tau / Math.Max(8, segments);
+            var rim = world + new Vector3(MathF.Cos(angle) * radius, MathF.Sin(angle) * radius, 0f);
+            var at = Safe.Read((camera, rim), static x => x.camera.WorldToScreen(x.rim), Vector2.Zero);
+
+            if (at == Vector2.Zero || !float.IsFinite(at.X) || !float.IsFinite(at.Y) ||
+                at.X < -window.Width || at.X > 2f * window.Width || at.Y < -window.Height || at.Y > 2f * window.Height)
+                return false;
+
+            low = Vector2.Min(low, at);
+            high = Vector2.Max(high, at);
+        }
+
+        return high.X - low.X <= window.Width / 2f && high.Y - low.Y <= window.Height / 2f;
+    }
+
     private static void Shape(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         Target target, Vector3 world, bool lit)
     {
@@ -912,7 +952,11 @@ internal static class Overlay
 
         if (lit)
         {
-            graphics.DrawFilledCircleInWorld(world, radius, colour, segments, false);
+            if (FillsSafely(gc, world, radius, segments))
+                graphics.DrawFilledCircleInWorld(world, radius, colour, segments, false);
+            else
+                graphics.DrawCircleInWorld(world, radius, colour, 2f, segments, false);
+
             graphics.DrawCircleInWorld(world, radius * 1.25f, covered, 2f, segments, false);
         }
         else
@@ -2634,6 +2678,12 @@ internal static class Overlay
             rect = Detonator.ToggleRect(gc);
 
         if (rect.Width <= 0f || rect.Height <= 0f)
+            return;
+
+        // Not in a hideout or town, where there is no dig site. The button's rect is kept there with the button hidden
+        // (142x128 at 1738,1275, visible False, in a hideout dump 2026-10-09 21:40), and the readout drew an empty
+        // background on it.
+        if (Safe.Read(gc, static g => g.Area.CurrentArea is { } area && (area.IsHideout || area.IsTown), false))
             return;
 
         var step = (Color)settings.Display.ThePlan.StepColour;

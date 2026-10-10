@@ -62,6 +62,7 @@ public sealed class ExileInput2Client
     private Func<string, Vector2> _expected;
     private Func<string, bool> _forget;
     private Func<string, int, bool> _setTolerance;
+    private Func<string, int, bool> _setShortestMove;
     private Func<string, string> _stopped;
 
     private bool _looked;
@@ -155,6 +156,7 @@ public sealed class ExileInput2Client
             _expected = b.GetMethod<Func<string, Vector2>>("ExileInput2.Expected");
             _forget = b.GetMethod<Func<string, bool>>("ExileInput2.Forget");
             _setTolerance = b.GetMethod<Func<string, int, bool>>("ExileInput2.SetTolerance");
+            _setShortestMove = b.GetMethod<Func<string, int, bool>>("ExileInput2.SetShortestMove");
             _stopped = b.GetMethod<Func<string, string>>("ExileInput2.Stopped");
         }
         catch
@@ -359,6 +361,18 @@ public sealed class ExileInput2Client
     {
         Look();
         return _setTolerance?.Invoke(_me, px) ?? false;
+    }
+
+    /// <summary>
+    /// This caller's own Shortest Move in milliseconds, in place of ExileInput2's menu setting. It is added to every
+    /// move's time, near or far (Travel: shortest + per root pixel x root of distance), so set it for the moves it is
+    /// meant for and back for the rest. Up to 1000; a negative value goes back to the menu's. Kept until changed, so set it back when done. Needs the cursor
+    /// taken. False from an ExileInput2 too old to have it.
+    /// </summary>
+    public bool SetShortestMove(int ms)
+    {
+        Look();
+        return _setShortestMove?.Invoke(_me, ms) ?? false;
     }
 
     /// <summary>Presses and releases a key.</summary>

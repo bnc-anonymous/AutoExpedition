@@ -772,6 +772,7 @@ internal static class Dump
     {
         DetonatorSection(b, gc);
         Window(b, gc);
+        TabletSection(b, gc);
         Labels(b, gc);
         TerrainGrid(b, gc, Scan);
         MapStats(b, gc);
@@ -785,6 +786,13 @@ internal static class Dump
         AtlasPassives(b, gc);
         RemnantSlotsFromTheClient(b);
         Entities(b, gc, range);
+    }
+
+    /// <summary>Every Expedition Tablet on screen and its modifiers, for building the tablet modifier table. See Tablets.</summary>
+    private static void TabletSection(StringBuilder b, GameController gc)
+    {
+        SectionHeader(b, "=== Expedition Tablets in the stash and inventory ===");
+        b.AppendLine(Safe.Read(() => Tablets.Describe(gc, Settings?.TabletRerolling ?? new TabletRerollingSettings()), "  could not be read"));
     }
 
     // ------------------------------------------------------------------ detonator
@@ -3050,7 +3058,7 @@ internal static class Dump
                      $"opening cap {(Settings?.Solver.Advanced.DestroyAndRepair.OpeningMs.Value is > 0 and var ms ? $"{ms}ms" : "none")}, " +
                      $"at a kick, restart if behind the pool by {Settings?.Solver.Advanced.DestroyAndRepair.RescueBelow.Value:0.#}% " +
                      $"(shaken {Settings?.Solver.Advanced.DestroyAndRepair.RestartShakes.Value}), " +
-                     $"frozen prices {Settings?.Debug.FreezePrices.Value} (stored prices: {Valuation.PricesFileSaid}), " +
+                     $"frozen prices {Settings?.Debug.FreezePrices.Value} (stored prices: {Valuation.PricesFileSaid}; rates: {Valuation.RatesSaid}), " +
                      $"kick after no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StagnationKickPercent.Value ?? -1}% of the window " +
                      $"or {Settings?.Solver.Advanced.DestroyAndRepair.StagnationKickRounds.Value ?? -1} rounds (0 = off), " +
                      $"at a kick, restart if no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StallRestartMs.Value ?? -1}ms (0 = off), " +
