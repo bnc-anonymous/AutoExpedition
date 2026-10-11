@@ -572,11 +572,18 @@ internal static partial class Tablets
                 }
 
                 if (!OnStashTab(gc, CurrencyTabIcon, "the currency tab"))
+                {
+                    // Stopped, rather than on its way to the tab: there is no currency tab, and none in the inventory.
+                    if (_reforgingStep == ReforgingStep.Idle)
+                        CursorWarning.Show("Missing currency");
+
                     return;
+                }
 
                 if (CurrencyTabStackOf(gc, baseName) is not { } kept)
                 {
                     StopReforging($"no {baseName} in the inventory or the currency tab");
+                    CursorWarning.Show("Missing currency");
                     return;
                 }
 

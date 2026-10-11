@@ -19,13 +19,17 @@ namespace AutoExpedition;
 /// </summary>
 internal static class CursorWarning
 {
-    /// <summary>The placement status words that are warnings. Every other status stays in the score area.</summary>
+    /// <summary>
+    /// The placement status words that are warnings. Every other status stays in the score area. Missing currency is a
+    /// tablet crafting run's, stopped for want of an orb. See TabletCraftingRun.
+    /// </summary>
     private static readonly HashSet<string> Words = new(StringComparer.Ordinal)
     {
         "Bad camera angle", "Too far", "Unclickable", "Too far from runes button", "Panel failure, choose manually",
         "Failed to scroll", "Marker load failure", "Moving", "Deviated", "Placement failure", "Placement refused",
         "Placement lands wrong", "Marker not lit", "Placement key not working", "Timeout", "Window did not open",
         "Failed to click", "ExileInput2 input refused", "ExileInput2 not installed", "ExileInput2 busy", "No plan",
+        "Missing currency",
     };
 
     /// <summary>
