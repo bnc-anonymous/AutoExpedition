@@ -216,6 +216,19 @@ internal static partial class Tablets
 
         b.AppendLine($"    numbered sub-tabs found by their numbers: {subTabs.Count}");
 
+        // Every candidate, with its parent's children, so a bar the rule misses can be read from the dump.
+        var candidates = SingleDigitElements(content);
+
+        b.AppendLine($"    elements labelled with one digit and wider than tall: {candidates.Count}");
+
+        foreach (var group in candidates.GroupBy(x => Safe.Read(x.Element, static e => e.Parent?.Address ?? 0L, 0L)))
+        {
+            var parent = Safe.Read(group.First().Element, static e => e.Parent, null);
+
+            b.AppendLine($"      digits {string.Join(",", group.Select(x => x.Number))} under one parent");
+            Row("      their parent", parent);
+        }
+
         foreach (var (number, element) in subTabs)
         {
             var rect = Safe.Read(element, static e => e.GetClientRectCache, default);
@@ -265,15 +278,37 @@ internal static partial class Tablets
     }
 
     /// <summary>
-    /// The fragment tab's numbered sub-tabs, by number: the children of the one element whose children are labelled with
-    /// single digits, one each, 1 to 6 among them and none twice. Found by that, not by size: a size window measured at
-    /// 1440 (80x38, taken as 60-100 by 28-48) found none at 3840x2160, where the interface is half as large again, and a
-    /// run sent the cursor to a Tablets page already open and waited on sub-tabs it could not see (a tester's dumps,
-    /// 2026-10-11). Not by place either: the selected sub-tab moves to the bar's last child (dumps of 2026-10-09).
-    /// Only elements with 6 to 12 children are asked, so the tablet grid's 96 cells are never read for text.
+    /// The fragment tab's numbered sub-tabs, by number: of the elements labelled with a single digit and wider than tall,
+    /// the ones sharing a parent with 1 to 6 among them and no digit twice. Found by that, not by size: a size window
+    /// measured at 1440 (80x38, taken as 60-100 by 28-48) found none at 3840x2160, where the interface is half as large
+    /// again, and a run sent the cursor to a Tablets page already open (a tester's dumps, 2026-10-11). Not by place: the
+    /// selected sub-tab moves to the bar's last child (dumps of 2026-10-09). Not by what else the bar holds either: a
+    /// test that every visible child of the bar was a digit found nothing at 1440 (dump 2026-10-11 10:39:43), so the bar
+    /// holds something else as well. The shape keeps out the tablet type icons, square tiles whose counts can be a digit.
     /// </summary>
     internal static List<(int Number, Element Element)> NumberedSubTabs(Element content)
     {
+        foreach (var group in SingleDigitElements(content).GroupBy(x => Safe.Read(x.Element, static e => e.Parent?.Address ?? 0L, 0L)))
+        {
+            if (group.Key == 0L)
+                continue;
+
+            var numbers = group.Select(x => x.Number).ToList();
+
+            if (numbers.Distinct().Count() == numbers.Count && Enumerable.Range(1, 6).All(numbers.Contains))
+                return group.OrderBy(x => x.Number).ToList();
+        }
+
+        return [];
+    }
+
+    /// <summary>
+    /// Every visible element under the fragment tab's content whose only text is a digit 1 to 9 and which is wider than
+    /// tall, by 1.4 or more: a numbered sub-tab is 80x38 at 1440, a tablet type icon 72x72. Not looked inside once found.
+    /// </summary>
+    internal static List<(int Number, Element Element)> SingleDigitElements(Element content)
+    {
+        var found = new List<(int, Element)>();
         var stack = new Stack<(Element, int)>();
         var visited = 0;
 
@@ -286,45 +321,20 @@ internal static partial class Tablets
             if (!Safe.Read(element, static e => e.IsVisible, false))
                 continue;
 
-            var children = Safe.Read(element, static e => e.Children, null) ?? [];
+            var rect = Safe.Read(element, static e => e.GetClientRectCache, default);
 
-            if (children.Count is >= 6 and <= 12 && SubTabsAmong(children) is { } tabs)
-                return tabs;
+            if (rect.Height > 0f && rect.Width >= 1.4f * rect.Height && SingleDigitOf(element) is > 0 and var number)
+            {
+                found.Add((number, element));
+                continue;
+            }
 
             if (depth < 12)
-                foreach (var child in children)
+                foreach (var child in Safe.Read(element, static e => e.Children, null) ?? [])
                     stack.Push((child, depth + 1));
         }
 
-        return [];
-    }
-
-    /// <summary>
-    /// These children as numbered sub-tabs, when they are: every visible one labelled with a single digit and nothing
-    /// else, at least six, 1 to 6 among them and no digit twice. Null when not.
-    /// </summary>
-    private static List<(int Number, Element Element)> SubTabsAmong(IList<Element> children)
-    {
-        var found = new List<(int Number, Element Element)>();
-
-        foreach (var child in children)
-        {
-            if (!Safe.Read(child, static e => e.IsVisible, false))
-                continue;
-
-            var number = SingleDigitOf(child);
-
-            if (number == 0)
-                return null;
-
-            found.Add((number, child));
-        }
-
-        var numbers = found.Select(x => x.Number).ToList();
-
-        return found.Count >= 6 && numbers.Distinct().Count() == numbers.Count && Enumerable.Range(1, 6).All(numbers.Contains)
-            ? found.OrderBy(x => x.Number).ToList()
-            : null;
+        return found;
     }
 
     /// <summary>The digit 1 to 9 that is the only text under an element, or 0 when it is not one.</summary>
