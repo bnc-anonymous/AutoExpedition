@@ -131,13 +131,18 @@ internal static partial class Tablets
     private const int MostCombinedPasses = 20;
 
     /// <summary>
-    /// The zones' rectangles, left to right, along the bottom of the stash's item area, or none when the stash is closed
-    /// or the zones are off. The area is the stash's StashInventoryPanel: 7,119 873x1030 in a dump of 2026-10-09 22:46,
-    /// with nothing under the cursor at 584,1061 but the panel itself.
+    /// The zones' rectangles, left to right, under the stash's item area, or none when the stash is closed, the zones are
+    /// off or their text has not been measured yet. The area is the stash's StashInventoryPanel: 7,119 873x1030 in a dump
+    /// of 2026-10-09 22:46, with nothing under the cursor at 584,1061 but the panel itself.
+    ///
+    /// Each zone is sized from its text, which the HUD draws the same size at every resolution, and the row is centred
+    /// where it was at 1440. Sized from the stash instead, the zones shrank below 1440 around text that did not, and the
+    /// text ran past their edges. The gap between zones is a fixed 8 pixels. Craft and Reforge are left out with Hide
+    /// individual Craft/Reforge zones on, or when all five would be wider than the item area.
     /// </summary>
     private static List<(ActionZone Zone, RectangleF Rect)> ActionZones(GameController gc, TabletRerollingSettings settings)
     {
-        if (!_automationOn || !_tabletAutomation || _stashRect.Width <= 0f || !_onFragmentTab)
+        if (!_automationOn || !_tabletAutomation || _stashRect.Width <= 0f || !_onFragmentTab || _zoneTextSize is not { } text)
             return [];
 
         var panel = Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement.StashInventoryPanel, null);
@@ -146,50 +151,100 @@ internal static partial class Tablets
         if (area.Width <= 0f)
             area = _stashRect;
 
-        // Every size and place is in pixels of the item area at 1440, the sliders' included, and is drawn in pixels of
-        // this one: the area read from the game, over its 873 there. At 3840x2160 the zones were drawn at 1440's size
-        // and place under a stash half as large again (a tester's dumps, 2026-10-11).
-        var s = area.Width / ItemAreaWidthAt1440;
-        var margin = 12f * s;
-        var gap = 8f * s;
-        var height = Math.Max(20f, settings.TabletAutomation.ActionZonesHeight.Value) * s;
-        var total = Math.Max(120f, settings.TabletAutomation.ActionZonesWidth.Value) * s;
+        const float gap = 8f;
+        var padding = text.LineHeight / 2f;
+        // Four lines - the header, the title and two counts - and the half-height Withdraw and Deposit two each.
+        var halfHeight = 2f * text.LineHeight + 2f + padding;
+        var height = Math.Max(4f * text.LineHeight + 2f + 2f * padding, 2f * halfHeight + gap);
+        var individual = text.CraftOrReforgeWidth + 2f * padding;
+        var combined = text.CraftAndReforgeWidth + 2f * padding;
+        var stacked = text.WithdrawOrDepositWidth + 2f * padding;
+        var allFive = 2f * individual + combined + stacked + 3f * gap;
+        var hideIndividual = settings.TabletAutomation.HideIndividualCraftReforgeZones.Value || allFive > area.Width;
+        var total = hideIndividual ? combined + stacked + gap : allFive;
 
-        // Craft and Reforge keeps the third it had with three zones, its text needing it; Withdraw takes a fifth, and
-        // Craft and Reforge share what is left.
-        var combined = (total - 2f * gap) / 3f;
-        var withdraw = total * WithdrawZoneShare;
-        var width = (total - 3f * gap - combined - withdraw) / 2f;
-        var top = area.Bottom - height + (-6f + ZonesDropBelowArea + settings.TabletAutomation.ActionZonesYOffset.Value) * s;
-        var left = area.Left + margin + (ZonesInsetFromArea + settings.TabletAutomation.ActionZonesXOffset.Value) * s;
+        // The offset sliders are in pixels of the item area at 1440, drawn in pixels of this one: its width over its 873
+        // there.
+        var unit = area.Width / ItemAreaWidthAt1440;
+        var centreX = area.Left + (RowCentreRightOfArea + settings.TabletAutomation.ActionZonesXOffset.Value) * unit;
+        var centreY = area.Bottom + (RowCentreBelowArea + settings.TabletAutomation.ActionZonesYOffset.Value) * unit;
+        var left = centreX - total / 2f;
+        var top = centreY - height / 2f;
+        var zones = new List<(ActionZone Zone, RectangleF Rect)>();
 
-        return
-        [
-            (ActionZone.Craft, new RectangleF(left, top, width, height)),
-            (ActionZone.Reforge, new RectangleF(left + width + gap, top, width, height)),
-            (ActionZone.CraftAndReforge, new RectangleF(left + 2f * (width + gap), top, combined, height)),
-            // Withdraw over Deposit, each half the height, the gap between them.
-            (ActionZone.Withdraw, new RectangleF(left + 2f * (width + gap) + combined + gap, top, withdraw, (height - gap) / 2f)),
-            (ActionZone.Deposit, new RectangleF(left + 2f * (width + gap) + combined + gap, top + (height + gap) / 2f, withdraw,
-                (height - gap) / 2f)),
-        ];
+        if (!hideIndividual)
+        {
+            zones.Add((ActionZone.Craft, new RectangleF(left, top, individual, height)));
+            zones.Add((ActionZone.Reforge, new RectangleF(left + individual + gap, top, individual, height)));
+            left += 2f * (individual + gap);
+        }
+
+        zones.Add((ActionZone.CraftAndReforge, new RectangleF(left, top, combined, height)));
+        // Withdraw over Deposit, each half the height, the gap between them.
+        zones.Add((ActionZone.Withdraw, new RectangleF(left + combined + gap, top, stacked, (height - gap) / 2f)));
+        zones.Add((ActionZone.Deposit, new RectangleF(left + combined + gap, top + (height + gap) / 2f, stacked, (height - gap) / 2f)));
+
+        return zones;
     }
 
     /// <summary>
-    /// How far right of the item area's left edge, past the margin, and how far below its bottom the zones sit before
-    /// their offset sliders: 13 and 125, where the player set the sliders in game (2026-10-09). Built in so the sliders
-    /// read 0 there; Migrated step 31 took them off saved offsets.
+    /// The HUD font's line height and the widest line of each kind of zone, measured on each draw for ActionZones, which
+    /// runs where no Graphics is to hand. Null before the first draw.
+    /// </summary>
+    private static ZoneTextSize? _zoneTextSize;
+
+    private readonly record struct ZoneTextSize(float LineHeight, float CraftOrReforgeWidth, float CraftAndReforgeWidth,
+        float WithdrawOrDepositWidth);
+
+    /// <summary>
+    /// Measures every line the zones can show, the counts at three digits, so a zone keeps its width as counts and the
+    /// header change.
+    /// </summary>
+    private static ZoneTextSize MeasureZoneText(Graphics graphics)
+    {
+        string[] headers = [$"Hover and {_actionKeyName}:", $"{_actionKeyName} to stop"];
+        var wide = new ZoneCounts(888, 888, 888, 888);
+
+        float Widest(params ActionZone[] zones) =>
+            zones.SelectMany(zone => ZoneText(zone, wide) is var (title, lines) ? [.. headers, title, .. lines] : headers)
+                .Max(line => graphics.MeasureText(line).X);
+
+        return new ZoneTextSize(graphics.MeasureText("Hg").Y + 2f, Widest(ActionZone.Craft, ActionZone.Reforge),
+            Widest(ActionZone.CraftAndReforge), Widest(ActionZone.Withdraw, ActionZone.Deposit));
+    }
+
+    /// <summary>A zone's title and the grey lines under it.</summary>
+    private static (string Title, string[] Lines) ZoneText(ActionZone zone, ZoneCounts counts) => zone switch
+    {
+        ActionZone.Reforge => ("Reforge Tablets", [$"{counts.JunkInStash} in stash", $"{counts.JunkCarried} in inventory"]),
+        ActionZone.Craft => ("Craft Tablets", [$"{counts.Unidentified} unidentified", $"{counts.Craftable} craftable"]),
+        ActionZone.Withdraw => ("Withdraw", []),
+        ActionZone.Deposit => ("Deposit", []),
+        _ => ("Craft and Reforge", ["Full auto"]),
+    };
+
+    /// <summary>
+    /// The centre of the zones' row from the item area's bottom left, in pixels at 1440: where the row's centre was when
+    /// it was 802x100, 12 in from the area's left past ZonesInsetFromArea, its bottom ZonesDropBelowArea - 6 below the
+    /// area's bottom. Those were the zones' size and place set in game (2026-10-09) before they were sized from their text.
+    /// </summary>
+    private const float RowCentreRightOfArea = 12f + ZonesInsetFromArea + 802f / 2f;
+
+    /// <inheritdoc cref="RowCentreRightOfArea"/>
+    private const float RowCentreBelowArea = ZonesDropBelowArea - 6f - 100f / 2f;
+
+    /// <summary>
+    /// How far right of the item area's left edge, past a margin of 12, and how far below its bottom the zones' row sat
+    /// before the offset sliders: 13 and 125, where the player set the sliders in game (2026-10-09). Built in so the sliders
+    /// read 0 there; Migrated step 31 took them off saved offsets. See RowCentreRightOfArea.
     /// </summary>
     internal const int ZonesInsetFromArea = 13;
 
-    /// <summary>The stash item area's width at 2560x1440, which the zones' built-in sizes and places were measured against.</summary>
+    /// <summary>The stash item area's width at 2560x1440, which the offset sliders' pixels are measured against.</summary>
     private const float ItemAreaWidthAt1440 = 873f;
 
     /// <inheritdoc cref="ZonesInsetFromArea"/>
     internal const int ZonesDropBelowArea = 125;
-
-    /// <summary>The Withdraw zone's share of the zones' width. Chosen to fit "Hover and F4:".</summary>
-    private const float WithdrawZoneShare = 0.19f;
 
     /// <summary>The zone under the cursor, or null.</summary>
     private static ActionZone? ZoneUnderCursor(GameController gc, TabletRerollingSettings settings)
@@ -352,27 +407,19 @@ internal static partial class Tablets
     /// <summary>Draws the zones, the one under the cursor lit, each with what is waiting for it.</summary>
     private static void DrawActionZones(Graphics graphics, GameController gc, TabletRerollingSettings settings)
     {
+        _zoneTextSize = MeasureZoneText(graphics);
+
         var zones = ActionZones(gc, settings);
 
         if (zones.Count == 0)
             return;
 
         var under = _reforgingHasCursor ? null : ZoneUnderCursor(gc, settings);
-        var counts = _zoneCounts;
-        var height = graphics.MeasureText("Hg").Y + 2f;
+        var height = _zoneTextSize.Value.LineHeight;
 
         foreach (var (zone, rect) in zones)
         {
-            var (title, lines, available) = zone switch
-            {
-                ActionZone.Reforge => ("Reforge Tablets",
-                    new[] { $"{counts.JunkInStash} in stash", $"{counts.JunkCarried} in inventory" }, true),
-                ActionZone.Craft => ("Craft Tablets",
-                    new[] { $"{counts.Unidentified} unidentified", $"{counts.Craftable} craftable" }, true),
-                ActionZone.Withdraw => ("Withdraw", Array.Empty<string>(), true),
-                ActionZone.Deposit => ("Deposit", Array.Empty<string>(), true),
-                _ => ("Craft and Reforge Tablets", new[] { "Craft and Reforge exhaustively" }, true),
-            };
+            var (title, lines) = ZoneText(zone, _zoneCounts);
 
             var running = _reforgingHasCursor && zone switch
             {
@@ -384,7 +431,7 @@ internal static partial class Tablets
             };
 
             var lit = zone == under || running;
-            var text = available ? Color.White : Dim;
+            var text = Color.White;
 
             // Lighter than a label's background, so the zones read as areas to hover rather than buttons, outlined as the
             // fragment tab is; the one lit only a little stronger.

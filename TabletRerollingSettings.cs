@@ -329,13 +329,24 @@ public class TabletAutomationSettings
     [Menu("Action zones Y offset")]
     public RangeNode<int> ActionZonesYOffset { get; set; } = new RangeNode<int>(0, -500, 500);
 
-    /// <summary>How tall the action zones are. See EnableTabletAutomation.</summary>
-    [Menu("Action zones height")]
-    public RangeNode<int> ActionZonesHeight { get; set; } = new RangeNode<int>(100, 40, 200);
+    /// <summary>
+    /// Leaves out the Craft and Reforge zones of their own, keeping Craft and Reforge together, Withdraw and Deposit.
+    /// The zones are sized from their text, which is the same size at every resolution while the stash is not, so below
+    /// 1440 the five crowd the stash. Set once, on the first draw, to whether the game window is under 1440 tall (see
+    /// HideIndividualCraftReforgeZonesSetForScreen); the player's choice after that. Whatever it says, the two are left
+    /// out on a draw where all five would be wider than the stash's item area. See Tablets.ActionZones.
+    /// </summary>
+    [Menu("Hide individual Craft/Reforge zones",
+        "Shows only Craft and Reforge, Withdraw and Deposit.\n" +
+        "On by default below 1440p, where all five zones crowd the stash.")]
+    public ToggleNode HideIndividualCraftReforgeZones { get; set; } = new ToggleNode(false);
 
-    /// <summary>How wide the action zones are together, the gaps between them included. See EnableTabletAutomation.</summary>
-    [Menu("Action zones width", "All zones together, including the gaps.")]
-    public RangeNode<int> ActionZonesWidth { get; set; } = new RangeNode<int>(802, 400, 1200);
+    /// <summary>
+    /// Whether HideIndividualCraftReforgeZones has been set from the game window's height. Once true, never set again,
+    /// so the player's own choice stands.
+    /// </summary>
+    [IgnoreMenu]
+    public bool HideIndividualCraftReforgeZonesSetForScreen { get; set; }
 }
 
 /// <summary>

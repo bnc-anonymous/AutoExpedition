@@ -99,6 +99,13 @@ internal static partial class Tablets
         _valuation = valuation;
         _automationOn = settings.Automation.Enable.Value;
         _tabletAutomation = tablets.TabletAutomation.EnableTabletAutomation.Value;
+
+        if (!tablets.TabletAutomation.HideIndividualCraftReforgeZonesSetForScreen &&
+            Safe.Read(gc, static g => g.Window.GetWindowRectangle().Height, 0f) is > 0f and var screenHeight)
+        {
+            tablets.TabletAutomation.HideIndividualCraftReforgeZones.Value = screenHeight < 1440f;
+            tablets.TabletAutomation.HideIndividualCraftReforgeZonesSetForScreen = true;
+        }
         _tidyAfterCraftAndReforge = tablets.TabletAutomation.TidyAfterCraftAndReforge.Value;
         _pauseBetweenClicksMs = tablets.TabletAutomation.PauseBetweenClicksMs.Value;
         _shortestMoveMs = tablets.TabletAutomation.ShortestMoveBetweenTabletsMs.Value;
