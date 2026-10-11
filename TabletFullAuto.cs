@@ -771,15 +771,7 @@ internal static partial class Tablets
     /// A numbered sub-tab's number, read as NumberedSubTabs reads it: an element of a sub-tab's size whose only text
     /// below it is a digit from 1 to 9. 0 when it is not one.
     /// </summary>
-    private static int SubTabNumberOf(Element element)
-    {
-        var rect = Safe.Read(element, static e => e.GetClientRectCache, default);
-
-        return rect.Width is >= 60f and <= 100f && rect.Height is >= 28f and <= 48f &&
-               TextsUnder(element) is [var only] && only.Length == 1 && char.IsDigit(only[0]) && only[0] != '0'
-            ? only[0] - '0'
-            : 0;
-    }
+    private static int SubTabNumberOf(Element element) => SingleDigitOf(element);
 
     /// <summary>The selected sub-tab by a search of the whole tab: the one that is its parent's last child.</summary>
     private static int SelectedSubTabBySearch(Element content)

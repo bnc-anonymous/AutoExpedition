@@ -2113,8 +2113,14 @@ internal sealed class Planning
     /// Public because the overlay has to ask the same question: a re-solved plan holds only what is
     /// LEFT, so a marker an earlier blast already took appears in no plan and read as unreached.
     /// One rule with two callers rather than two readings of it.
+    ///
+    /// **Or through an explodable one of them reaches**: one in content with a blast of its own (Target.Sets) within
+    /// an explosive's reach, whose blast reaches this target. Left out, a marker taken last through an explodable the
+    /// final explosive set off read "take last - NOT REACHED" once it was down, and a re-solve went on planning for
+    /// content already taken that way. One level only, as the planner's: these objects do not set each other off. See
+    /// Chained.
     /// </summary>
-    public static bool Taken(Target target, Vector2[] placed, float radius)
+    public static bool Taken(Target target, Vector2[] placed, float radius, List<Target> content)
     {
         if (target == null)
             return false;
@@ -2125,6 +2131,24 @@ internal sealed class Planning
         {
             if (Vector2.DistanceSquared(at, target.Grid) <= reach * reach)
                 return true;
+        }
+
+        foreach (var explodable in content ?? [])
+        {
+            if (explodable.Sets <= 0f || ReferenceEquals(explodable, target) || explodable.Spent)
+                continue;
+
+            var setOff = radius + Extents.Of(explodable);
+            var span = explodable.Sets + Extents.Of(target);
+
+            if (Vector2.DistanceSquared(explodable.Grid, target.Grid) > span * span)
+                continue;
+
+            foreach (var at in placed ?? [])
+            {
+                if (Vector2.DistanceSquared(at, explodable.Grid) <= setOff * setOff)
+                    return true;
+            }
         }
 
         return false;
@@ -2141,7 +2165,7 @@ internal sealed class Planning
             if (target.Spent)
                 continue;
 
-            if (Taken(target, placed, radius))
+            if (Taken(target, placed, radius, content))
                 caught.Add(target);
             else
                 left.Add(target);

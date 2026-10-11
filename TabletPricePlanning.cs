@@ -125,6 +125,51 @@ internal static partial class Tablets
     /// <inheritdoc cref="ProgressRightOfInventory"/>
     internal const int ProgressBelowInventoryTop = 1230;
 
+    /// <summary>
+    /// Where the pricing progress line's bottom left sits, and what one pixel at 1440 is here, for its offset sliders and
+    /// the lines under it: under the inventory's gold amount, read from the game, 2.26 and 1.65 of the amount's own height
+    /// left of it and below it - where the line was at 1440, the amount at 1746,1163 80x23 (dump 2026-10-10 18:21:50).
+    /// Without the amount, ProgressRightOfInventory and ProgressBelowInventoryTop from the inventory's corner, a pixel being
+    /// the inventory's width over its 887 at 1440. Null with the inventory closed.
+    /// </summary>
+    private static (Vector2 At, float Pixel)? ProgressAnchor(GameController gc, TabletRerollingSettings settings)
+    {
+        if (InventoryRect(gc) is not { Width: > 0f } inventory)
+            return null;
+
+        Vector2 at;
+        float pixel;
+
+        if (GoldAmountRect(gc) is { Height: > 0f } gold)
+        {
+            pixel = gold.Height / 23f;
+            at = new Vector2(gold.Left - 2.26f * gold.Height, gold.Bottom + 1.65f * gold.Height);
+        }
+        else
+        {
+            pixel = inventory.Width / 887f;
+            at = new Vector2(inventory.Left + (4f + ProgressRightOfInventory) * pixel, inventory.Top + (ProgressBelowInventoryTop - 6f) * pixel);
+        }
+
+        return (at + new Vector2(settings.TradeSite.PricingProgressXOffset.Value, settings.TradeSite.PricingProgressYOffset.Value) * pixel,
+            pixel);
+    }
+
+    /// <summary>
+    /// The inventory's gold amount, the element at 5, 6, 1 under the inventory panel whose text is a number - "13,450,229"
+    /// at 1746,1163 80x23 at 1440 and "28,954,643" at 2619,1744 120x32 at 2160 (dumps of 2026-10-10 and 11). Empty when it
+    /// is not there or does not read as a number, as after a patch that moves it.
+    /// </summary>
+    private static RectangleF GoldAmountRect(GameController gc)
+    {
+        var amount = Safe.Read(gc, static g => g.IngameState.IngameUi.InventoryPanel?.GetChildFromIndices(5, 6, 1), null);
+        var text = Safe.Read(amount, static e => e.Text, null) ?? "";
+
+        return text.Length > 0 && text.All(c => char.IsDigit(c) || c is ',' or '.' or ' ')
+            ? Safe.Read(amount, static e => e.GetClientRectCache, default)
+            : default;
+    }
+
     /// <summary>The inventory panel's rectangle, empty when it is closed. The progress line hangs from it.</summary>
     private static RectangleF InventoryRect(GameController gc) =>
         Safe.Read(gc, static g => g.IngameState.IngameUi.InventoryPanel is { IsVisible: true } panel ? panel.GetClientRectCache : default,
@@ -619,15 +664,13 @@ internal static partial class Tablets
         else
             return;
 
-        if (InventoryRect(gc) is not { Width: > 0f } inventory)
+        if (ProgressAnchor(gc, settings) is not { } anchor)
             return;
 
         var size = graphics.MeasureText(line);
 
-        graphics.DrawTextWithBackground(line,
-            new Vector2(inventory.Left + 4f + ProgressRightOfInventory + settings.TradeSite.PricingProgressXOffset.Value,
-                inventory.Top - size.Y - 6f + ProgressBelowInventoryTop + settings.TradeSite.PricingProgressYOffset.Value), Color.White,
-            FontAlign.Left, LabelBackground);
+        graphics.DrawTextWithBackground(line, new Vector2(anchor.At.X, anchor.At.Y - size.Y), Color.White, FontAlign.Left,
+            LabelBackground);
     }
 
     /// <summary>The merchant window as the tablet reader sees it, for the dump: whether it is open and what it lists.</summary>

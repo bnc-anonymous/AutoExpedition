@@ -146,18 +146,22 @@ internal static partial class Tablets
         if (area.Width <= 0f)
             area = _stashRect;
 
-        const float margin = 12f;
-        const float gap = 8f;
-        var height = Math.Max(20f, settings.TabletAutomation.ActionZonesHeight.Value);
-        var total = Math.Max(120f, settings.TabletAutomation.ActionZonesWidth.Value);
+        // Every size and place is in pixels of the item area at 1440, the sliders' included, and is drawn in pixels of
+        // this one: the area read from the game, over its 873 there. At 3840x2160 the zones were drawn at 1440's size
+        // and place under a stash half as large again (a tester's dumps, 2026-10-11).
+        var s = area.Width / ItemAreaWidthAt1440;
+        var margin = 12f * s;
+        var gap = 8f * s;
+        var height = Math.Max(20f, settings.TabletAutomation.ActionZonesHeight.Value) * s;
+        var total = Math.Max(120f, settings.TabletAutomation.ActionZonesWidth.Value) * s;
 
         // Craft and Reforge keeps the third it had with three zones, its text needing it; Withdraw takes a fifth, and
         // Craft and Reforge share what is left.
         var combined = (total - 2f * gap) / 3f;
         var withdraw = total * WithdrawZoneShare;
         var width = (total - 3f * gap - combined - withdraw) / 2f;
-        var top = area.Bottom - height - 6f + ZonesDropBelowArea + settings.TabletAutomation.ActionZonesYOffset.Value;
-        var left = area.Left + margin + ZonesInsetFromArea + settings.TabletAutomation.ActionZonesXOffset.Value;
+        var top = area.Bottom - height + (-6f + ZonesDropBelowArea + settings.TabletAutomation.ActionZonesYOffset.Value) * s;
+        var left = area.Left + margin + (ZonesInsetFromArea + settings.TabletAutomation.ActionZonesXOffset.Value) * s;
 
         return
         [
@@ -177,6 +181,9 @@ internal static partial class Tablets
     /// read 0 there; Migrated step 31 took them off saved offsets.
     /// </summary>
     internal const int ZonesInsetFromArea = 13;
+
+    /// <summary>The stash item area's width at 2560x1440, which the zones' built-in sizes and places were measured against.</summary>
+    private const float ItemAreaWidthAt1440 = 873f;
 
     /// <inheritdoc cref="ZonesInsetFromArea"/>
     internal const int ZonesDropBelowArea = 125;

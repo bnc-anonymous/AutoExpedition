@@ -154,6 +154,31 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     // or null for the environment's own rule. See Weighing.TractionByBeforeOfTarget and Planner.TractionScalesOfTarget.
     (float Normal, float Magic, float Rare)[] TractionByBefore = null)
 {
+    /// <summary>
+    /// This target with combination c its only one: Choices and every list kept in the same order as it narrowed to that
+    /// entry together. One place, so a list added later cannot be left behind: the placed score narrowed three of the
+    /// eight and read the first combination's carried wave shares, slot runes and created monsters for the one set,
+    /// scoring a chain placed exactly as planned, with every reward as planned, 84.7 above its plan (dump 2026-10-11
+    /// 00:16:54). See Scoring.Chosen.
+    /// </summary>
+    public PlanTarget WithOnlyChoice(int c)
+    {
+        static T[] One<T>(T[] all, int c) => all is { } a && c >= 0 && c < a.Length ? [a[c]] : null;
+
+        return this with
+        {
+            Choices = One(Choices, c),
+            Named = One(Named, c),
+            Recipes = One(Recipes, c),
+            MagicAndRareWavesOfChoices = One(MagicAndRareWavesOfChoices, c),
+            OwnEffectsOfChoices = One(OwnEffectsOfChoices, c),
+            HeldLiftOfChoices = One(HeldLiftOfChoices, c),
+            CarriedWaveSharesOfChoices = One(CarriedWaveSharesOfChoices, c),
+            SlotRunesOfChoices = One(SlotRunesOfChoices, c),
+            CreatedOfChoices = One(CreatedOfChoices, c),
+        };
+    }
+
     /// <summary>The rune in each slot of combination c's recipe, or null when not known. See Propagation.RunesPerWave.</summary>
     public string[] SlotRunesOfChoice(int c) =>
         SlotRunesOfChoices is { } all && c >= 0 && c < all.Length ? all[c] : null;
@@ -12029,26 +12054,26 @@ internal static class Planner
         BoundAudited(env, verdict.Total);
         var catches = new List<Vector2[]>(chain.Count);
         var taken = new HashSet<int>();
+        var covers = CoverageOfEnvironment(env);
 
+        // **What each blast catches as Evaluate counts it: its coverage, and what an explodable it reaches catches with
+        // its own blast, at the same step.** Only the coverage was listed, so a marker taken last through an explodable
+        // the final explosive set off was in no blast's catches and the overlay read it "take last - NOT REACHED",
+        // where the score had it held. One level only, as Evaluate: these objects do not set each other off.
         foreach (var point in chain)
         {
             var here = new List<Vector2>();
 
-            for (var i = 0; i < env.Targets.Count; i++)
+            foreach (var caught in covers.Of(point))
             {
-                if (taken.Contains(i))
-                    continue;
+                if (taken.Add(caught))
+                    here.Add(env.Targets[caught].Grid);
 
-                var target = env.Targets[i];
-
-                if (!target.Wanted)
-                    continue;
-
-                if (!Catches(env, point, target))
-                    continue;
-
-                taken.Add(i);
-                here.Add(target.Grid);
+                foreach (var also in env.Targets[caught].Sets ?? [])
+                {
+                    if (taken.Add(also))
+                        here.Add(env.Targets[also].Grid);
+                }
             }
 
             catches.Add(here.ToArray());

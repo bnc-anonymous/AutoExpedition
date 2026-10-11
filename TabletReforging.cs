@@ -530,7 +530,8 @@ internal static partial class Tablets
             var cursor = Safe.Read(gc, static g => new Vector2(g.IngameState.MousePosX, g.IngameState.MousePosY), Vector2.Zero);
 
             LogReforging($"ExileInput2 stopped ({stopped}) moving to {_reforgingDoing} in {RectSaid(_sentTarget)}, " +
-                         $"{(DateTime.UtcNow - _sentAt).TotalMilliseconds:0}ms after it was sent, the cursor read at ({cursor.X:0},{cursor.Y:0})");
+                         $"{(DateTime.UtcNow - _sentAt).TotalMilliseconds:0}ms after it was sent, the cursor read at ({cursor.X:0},{cursor.Y:0})" +
+                         (Input.StopDetail() is { Length: > 0 } detail ? $"; ExileInput2: {detail}" : ""));
 
             // **A move that never landed is tried once more, as a failed click is.** Releasing clears ExileInput2's stop and
             // lets go of every key it held for this run, shift included, so a currency run picks its orb up again. A

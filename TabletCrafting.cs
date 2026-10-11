@@ -207,7 +207,7 @@ internal static partial class Tablets
     private static void DrawCraftingRequirements(Graphics graphics, GameController gc, TabletRerollingSettings settings)
     {
         if (!settings.CraftingByHand.ShowMetCraftingRequirements && !settings.CraftingByHand.ShowUnmetCraftingRequirements ||
-            InventoryRect(gc) is not { Width: > 0f } panel)
+            ProgressAnchor(gc, settings) is not { } anchor)
             return;
 
         var need = CraftingNeedTotals(settings);
@@ -229,8 +229,7 @@ internal static partial class Tablets
 
         // Under the pricing progress line, at its offsets: its row is kept whether it shows or not.
         var height = graphics.MeasureText("Hg").Y + 4f;
-        var at = new Vector2(panel.Left + 4f + ProgressRightOfInventory + settings.TradeSite.PricingProgressXOffset.Value,
-            panel.Top - height - 2f + ProgressBelowInventoryTop + settings.TradeSite.PricingProgressYOffset.Value);
+        var at = new Vector2(anchor.At.X, anchor.At.Y + 4f * anchor.Pixel - height);
 
         foreach (var (text, colour) in lines)
         {

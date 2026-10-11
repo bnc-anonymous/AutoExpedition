@@ -65,6 +65,8 @@ public sealed class ExileInput2Client
     private Func<string, int, bool> _setShortestMove;
     private Func<string, string> _stopped;
 
+    private Func<string, string> _stopDetail;
+
     private bool _looked;
 
     /// <summary>When the first lookup ran, and when the last retry did. See Look.</summary>
@@ -158,6 +160,7 @@ public sealed class ExileInput2Client
             _setTolerance = b.GetMethod<Func<string, int, bool>>("ExileInput2.SetTolerance");
             _setShortestMove = b.GetMethod<Func<string, int, bool>>("ExileInput2.SetShortestMove");
             _stopped = b.GetMethod<Func<string, string>>("ExileInput2.Stopped");
+            _stopDetail = b.GetMethod<Func<string, string>>("ExileInput2.StopDetail");
         }
         catch
         {
@@ -339,6 +342,16 @@ public sealed class ExileInput2Client
     {
         Look();
         return _stopped?.Invoke(_me) ?? "";
+    }
+
+    /// <summary>
+    /// What ExileInput2 saw when it last stopped this plugin, in one line, for a log or a dump: where the cursor was put
+    /// and where it was found. Empty before any stop, or from an ExileInput2 too old to say.
+    /// </summary>
+    public string StopDetail()
+    {
+        Look();
+        return _stopDetail?.Invoke(_me) ?? "";
     }
 
     /// <summary>Whether the cursor has been taken away from this plugin. See <see cref="Stopped"/>.</summary>

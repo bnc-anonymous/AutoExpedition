@@ -629,21 +629,9 @@ internal sealed class Scoring
                         if (!same)
                             continue;
 
-                        // The per-combination wave change goes with its combination, or index nought reads
-                        // the first recipe's. See PlanTarget.TractionOfChoice.
-                        forced = target with
-                        {
-                            Choices = [target.Choices[i]],
-                            MagicAndRareWavesOfChoices = target.MagicAndRareWavesOfChoices is { } waves && i < waves.Length
-                                ? [waves[i]]
-                                : null,
-                            OwnEffectsOfChoices = target.OwnEffectsOfChoices is { } own && i < own.Length
-                                ? [own[i]]
-                                : null,
-                            HeldLiftOfChoices = target.HeldLiftOfChoices is { } lifts && i < lifts.Length
-                                ? [lifts[i]]
-                                : null,
-                        };
+                        // Every per-combination list goes with its combination, or index nought reads the first
+                        // recipe's. See PlanTarget.WithOnlyChoice.
+                        forced = target.WithOnlyChoice(i);
                         pinned = true;
 
                         break;

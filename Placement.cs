@@ -531,8 +531,12 @@ internal sealed class Placement
 
         if (!string.IsNullOrEmpty(stopped))
         {
-            Give(stopped == "PlayerMovedTheMouse" ? "Stopped" : "Stopped",
-                stopped == "PlayerMovedTheMouse" ? "you moved the mouse" : "stopped: " + stopped);
+            // What ExileInput2 saw, for the dump: false stops right after an explosive opened the reward window could
+            // not be told from a hand on the mouse (2026-10-10 12:57, 2026-10-11 00:13).
+            var detail = _input.StopDetail();
+
+            Give("Stopped", (stopped == "PlayerMovedTheMouse" ? "you moved the mouse" : "stopped: " + stopped) +
+                            (detail.Length > 0 ? " - " + detail : ""));
 
             return;
         }

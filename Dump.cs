@@ -1892,7 +1892,12 @@ internal static class Dump
 
         var found = 0;
 
-        Walk(b, root, "", 0, ref found);
+        // **Chat is not recorded**: other players' names and messages, and the guild's notice, which a dump posted to
+        // ask for help would publish (one did, 2026-10-11). The chat's elements are skipped whole, by identity rather
+        // than by place in the tree, so local chat with no channel mark goes too. See ChatElements.
+        var chat = ChatElements(gc);
+
+        Walk(b, root, "", 0, ref found, chat);
 
         if (found == 0)
             b.AppendLine("  nothing visible has any text on it");
@@ -1900,8 +1905,19 @@ internal static class Dump
         b.AppendLine();
     }
 
+    /// <summary>The addresses of the chat's elements - its panel, box and title - none of whose text a dump records.</summary>
+    private static HashSet<long> ChatElements(GameController gc) =>
+        new[]
+            {
+                Safe.Read(gc, static g => (long)(g.IngameState.IngameUi.ChatPanel?.Address ?? 0), 0L),
+                Safe.Read(gc, static g => (long)(g.IngameState.IngameUi.ChatBox?.Address ?? 0), 0L),
+                Safe.Read(gc, static g => (long)(g.IngameState.IngameUi.ChatTitlePanel?.Address ?? 0), 0L),
+            }
+            .Where(a => a != 0L)
+            .ToHashSet();
+
     private static void Walk(StringBuilder b, ExileCore2.PoEMemory.Element element, string path, int depth,
-        ref int found)
+        ref int found, HashSet<long> chat)
     {
         if (element == null || depth > 6 || found > 400)
             return;
@@ -1919,6 +1935,13 @@ internal static class Dump
                 continue;
 
             var here = path.Length == 0 ? i.ToString() : $"{path},{i}";
+
+            if (chat.Contains(Safe.Read(kid, static e => (long)e.Address, 0L)))
+            {
+                b.AppendLine($"  [{here}]  chat - not recorded");
+                continue;
+            }
+
             var text = Safe.Read(() => kid.Text, null);
 
             if (!string.IsNullOrWhiteSpace(text))
@@ -1930,7 +1953,7 @@ internal static class Dump
                 found++;
             }
 
-            Walk(b, kid, here, depth + 1, ref found);
+            Walk(b, kid, here, depth + 1, ref found, chat);
         }
     }
 

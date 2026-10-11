@@ -3146,7 +3146,7 @@ internal static class Overlay
             // Asked of Planning, which owns the rule that decides what the bombs on the ground have
             // claimed, rather than measured again here. See Planning.Taken.
             if (by == 0 && blast.Radius(gc, settings) is { } reach &&
-                Safe.Read(() => Planning.Taken(target, Detonator.PlacedExplosiveGridPositions(gc), reach), false))
+                Safe.Read(() => Planning.Taken(target, Detonator.PlacedExplosiveGridPositions(gc), reach, targets), false))
                 by = -2;
 
             // The same four words either way round: what was asked, and whether the plan managed
