@@ -1580,6 +1580,13 @@ internal sealed record PlanEnvironment(
 /// question asked before a click is "is the game catching what this spot was picked for" rather
 /// than "does my geometry still agree with itself". The second question is the one that produced
 /// phantom expectations no amount of aiming could satisfy.
+///
+/// Includes what an explodable the link reaches takes with its own blast; SetOff says which those are, since the game
+/// highlights only what the explosive reaches itself.
+/// </param>
+/// <param name="SetOff">
+/// Index-parallel with Catches: the grid positions in each link's catches that it takes only through an explodable's
+/// blast. Placement does not expect these highlighted. See Plan.HighlightedBy.
 /// </param>
 /// <param name="Plain">
 /// What the chain is worth to the player: the same total with insistence taken back out.
@@ -1591,13 +1598,25 @@ internal sealed record PlanEnvironment(
 /// </param>
 /// <param name="Missed">How many insisted markers this chain drops. See Verdict.Missed.</param>
 internal sealed record Plan(List<Vector2> Points, double Weight, int Covered, string Note = "",
-    List<Vector2[]> Catches = null, double Plain = 0d, int Missed = 0)
+    List<Vector2[]> Catches = null, double Plain = 0d, int Missed = 0, List<Vector2[]> SetOff = null)
 {
     public static readonly Plan Empty = new(new List<Vector2>(), 0d, 0);
 
     /// <summary>What link <paramref name="index"/> was chosen for, or nothing when unrecorded.</summary>
     public Vector2[] CaughtBy(int index) =>
         Catches != null && index >= 0 && index < Catches.Count ? Catches[index] : [];
+
+    /// <summary>
+    /// What the game highlights under link <paramref name="index"/>'s placement circle: its catches less those taken
+    /// only through an explodable's blast. Checked against the highlight, those were reported unlit though the
+    /// explodable going off takes them (2026-10-11).
+    /// </summary>
+    public Vector2[] HighlightedBy(int index)
+    {
+        var setOff = SetOff != null && index >= 0 && index < SetOff.Count ? SetOff[index] : [];
+
+        return setOff.Length == 0 ? CaughtBy(index) : CaughtBy(index).Where(at => !setOff.Contains(at)).ToArray();
+    }
 }
 
 /// <summary>
@@ -12053,6 +12072,7 @@ internal static class Planner
 
         BoundAudited(env, verdict.Total);
         var catches = new List<Vector2[]>(chain.Count);
+        var setOff = new List<Vector2[]>(chain.Count);
         var taken = new HashSet<int>();
         var covers = CoverageOfEnvironment(env);
 
@@ -12063,20 +12083,26 @@ internal static class Planner
         foreach (var point in chain)
         {
             var here = new List<Vector2>();
+            var direct = covers.Of(point).ToHashSet();
+            var throughExplodable = new List<Vector2>();
 
-            foreach (var caught in covers.Of(point))
+            foreach (var caught in direct)
             {
                 if (taken.Add(caught))
                     here.Add(env.Targets[caught].Grid);
 
                 foreach (var also in env.Targets[caught].Sets ?? [])
                 {
-                    if (taken.Add(also))
+                    if (!direct.Contains(also) && taken.Add(also))
+                    {
                         here.Add(env.Targets[also].Grid);
+                        throughExplodable.Add(env.Targets[also].Grid);
+                    }
                 }
             }
 
             catches.Add(here.ToArray());
+            setOff.Add(throughExplodable.ToArray());
         }
 
         // **A plan that drops a requirement says so.** It is still the plan - the best chain there
@@ -12099,6 +12125,6 @@ internal static class Planner
             : "";
 
         return new Plan(chain, verdict.Total, verdict.Covered, note, catches, verdict.Plain,
-            verdict.Missed);
+            verdict.Missed, setOff);
     }
 }

@@ -1182,7 +1182,7 @@ internal sealed class Placement
         }
 
         _target = next;
-        _expect = _plan.CaughtBy(index);
+        _expect = _plan.HighlightedBy(index);
         _arms = 0;
         _short = 0;
         _offSpotFrames = 0;
