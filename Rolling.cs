@@ -57,7 +57,12 @@ internal sealed class Rolling
 
     /// <summary>What to do about one remnant, and why.</summary>
     /// <param name="Gain">What a roll is worth to the chain as it stands, exactly. See ScoreRollOutcomes.</param>
-    internal sealed record RollAdvice(Vector2 Grid, double Gain, string Why, bool Refused = false);
+    /// <param name="TakenWhenWeighed">
+    /// The recipe the plan took at this remnant when the verdict was weighed, or null when none was recorded. See
+    /// RecipeTakenAt and Divert.
+    /// </param>
+    internal sealed record RollAdvice(Vector2 Grid, double Gain, string Why, bool Refused = false,
+        string TakenWhenWeighed = null);
 
     /// <summary>
     /// The advice as it stands, keyed by the remnant's cell so the overlay can find it.
@@ -1868,6 +1873,16 @@ internal sealed class Rolling
             if (verdict.Gain < MinimumAdvisedGain)
                 continue;
 
+            // **A verdict weighed while the plan took another recipe here is not about this remnant any more.** The
+            // continuous mode keeps verdicts through re-solves, which is fine while each remnant's part in the chain
+            // stays put, but a re-solve that takes a different recipe at a remnant changes what a roll there would
+            // destroy. Seen 2026-10-14: a re-solve took Ancient Rune of Witchcraft at (644,1104), making it the
+            // chain's only Opulent source, while the verdict from before - "credited source of Protective, +510" -
+            // still advised rolling it. Passed over until a pass weighs it against the recipe now taken.
+            if (verdict.TakenWhenWeighed is { } taken && RecipeTakenAt(target.Grid) is { } takenNow &&
+                !string.Equals(taken, takenNow, StringComparison.Ordinal))
+                continue;
+
             var cost = SolelySourcedWeight(env, i);
 
             if (Advised is { } was && Vector2.Distance(was.Grid, target.Grid) < 1f)
@@ -2063,7 +2078,23 @@ internal sealed class Rolling
 
     private static void RecordAdvice(Dictionary<(int X, int Y), RollAdvice> said, Vector2 grid, double gain,
         string why, bool refused = false) =>
-        said[((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y))] = new RollAdvice(grid, gain, why, refused);
+        said[((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y))] =
+            new RollAdvice(grid, gain, why, refused, RecipeTakenAt(grid));
+
+    /// <summary>
+    /// The recipe the last detailed pass took at the remnant on this cell - its id, or its reward name where it has
+    /// no id - or null when there is none or the record is out of date after a roll. See Planner.Chosen.
+    /// </summary>
+    private static string RecipeTakenAt(Vector2 grid)
+    {
+        if (Planner.RuneTallyOutOfDate)
+            return null;
+
+        return Safe.Read(() =>
+            Planner.Chosen.TryGetValue(((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y)), out var picked)
+                ? string.IsNullOrEmpty(picked.Recipe) ? picked.Reward : picked.Recipe
+                : null, null);
+    }
 
     /// <summary>
     /// Why this remnant is not a candidate, or null when it is one.

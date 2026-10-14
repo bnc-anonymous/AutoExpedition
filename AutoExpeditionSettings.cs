@@ -4762,8 +4762,7 @@ public class RewardSettings
     /// does not mark it again on the next sweep. Marking something the plugin proposed and then
     /// having it reinstated is the behaviour that makes an automatic setting feel like an argument.
     ///
-    /// In exalts. Two hundred and fifty is not a number anybody needs talking into: a remnant worth
-    /// that much is worth building the chain around. Nought switches it off, and the key still works.
+    /// In exalts; 2000 by default. Nought switches it off, and the key still works.
     /// </summary>
     [Menu("Automatically set Must Take on rewards >= (exalts)")]
     public RangeNode<float> MustTakeAbove { get; set; } = new RangeNode<float>(2000f, 0f, 5000f);

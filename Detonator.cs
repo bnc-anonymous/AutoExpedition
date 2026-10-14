@@ -787,7 +787,10 @@ internal static class Detonator
                 }
             }
 
-            if (said < 0)
+            // A detonator's activated state has only been seen at 0 and 1. Anything else is a bad read - seen
+            // 2026-10-14 as 1492430880 at a site with nothing placed and nothing fired, which latched the site as set
+            // off and stopped its plan being drawn. Such a read answers nothing rather than "set off".
+            if (said is not (0 or 1))
                 continue;
 
             // **Every detonator this walk passes, not only this site's.** The walk is the whole
