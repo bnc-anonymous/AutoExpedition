@@ -813,11 +813,14 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     /// Monster weight this link and every later one unearths - what a PROPAGATING rune reaches.
     /// </param>
     /// <param name="local">
-    /// Monster weight this link alone unearths - what every other rune in the combination reaches.
+    /// Monster weight of this remnant's own waves - what every other rune in the combination reaches. See
+    /// OwnWavesOfTag.
     ///
-    /// A remnant's runes are modifiers on the monsters its own explosive turns up; the propagating
-    /// slot is the one that also follows the chain onwards. So both terms are real, they simply
-    /// reach different distances, and a combination is chosen on the sum of them.
+    /// The propagating slot follows the chain onwards; the ordinary slots reach the monsters this remnant sends up and
+    /// nothing else, as the payout pays them (see Settle's _localsOf). So both terms are real, they simply reach
+    /// different distances, and a combination is chosen on the sum of them. This was the monster weight the whole blast
+    /// unearthed, which the payout had stopped paying: where a blast caught three remnants, a recipe's ordinary runes were
+    /// ranked on 1,534 against the 185 they are paid on (dump 2026-10-12 13:12:11).
     /// </param>
     /// <param name="chose">
     /// Which entry of Choices was taken, so a detailed pass can publish the decision rather than
@@ -5358,7 +5361,6 @@ internal static class Planner
         var tractionOf = _tractionOf = Grow(_tractionOf, Math.Max(found, 1));
         var rareTractionOf = _rareTractionOf = Grow(_rareTractionOf, Math.Max(found, 1));
         var normalTractionOf = _normalTractionOf = Grow(_normalTractionOf, Math.Max(found, 1));
-        var monstersExtra = _monstersExtra = Grow(_monstersExtra, Math.Max(chain.Count, 1));
 
         for (var t = 0; t < found; t++)
         {
@@ -5366,9 +5368,6 @@ internal static class Planner
             rareTractionOf[t] = 1f;
             normalTractionOf[t] = 1f;
         }
-
-        for (var s = 0; s < chain.Count; s++)
-            monstersExtra[s] = 0f;
 
         if (tractive)
         {
@@ -5420,7 +5419,6 @@ internal static class Planner
 
                 content += tractionWorth;
                 ContentToLink(step[i], tractionWorth);
-                monstersExtra[step[i]] += extraMonsters;
 
                 for (var s = 0; s <= step[i]; s++)
                     after[s] += extraMonsters;
@@ -6102,7 +6100,8 @@ internal static class Planner
 
             var provisional = offered.Length == 1
                 ? offered[0]
-                : env.Targets[i].Best(after[step[i]], monsters[step[i]] + monstersExtra[step[i]], env, taggedAfter,
+                : env.Targets[i].Best(after[step[i]],
+                    env.Targets[i].OwnWavesOfTag(-1, tractionOf[order[k]], rareTractionOf[order[k]]), env, taggedAfter,
                     step[i], 0, out _, tractionOf[order[k]], rareTractionOf[order[k]]);
 
             foreach (var id in provisional.Runes ?? [])
@@ -6130,7 +6129,8 @@ internal static class Planner
                 ? new List<string>(env.Targets[i].Choices.Length)
                 : null;
 
-            var choice = env.Targets[i].Best(after[step[i]], monsters[step[i]] + monstersExtra[step[i]],
+            // The ordinary runes ranked on this remnant's own waves, where the payout pays them. See Best's local.
+            var choice = env.Targets[i].Best(after[step[i]], env.Targets[i].OwnWavesOfTag(-1, tractionOf[t], rareTractionOf[t]),
                 env, taggedAfter, step[i], distinct, out var chose, tractionOf[t], rareTractionOf[t],
                 PowerPassedTo(step[i]),
                 env.Targets[i].Choices is { Length: > 1 } ? SharesInForceAt(step[i]) : null, groups, width,
@@ -6865,7 +6865,7 @@ internal static class Planner
                 if (hit < 0)
                     continue;
 
-                var mine = already.Best(after[hit], monsters[hit], env, taggedAfter, hit, 0, out var mineChose);
+                var mine = already.Best(after[hit], already.OwnWavesOfTag(-1, 1f, 1f), env, taggedAfter, hit, 0, out var mineChose);
 
                 _localCount = Grow(_localCount, locals + 1);
                 _localReach = Grow(_localReach, locals + 1);
@@ -8952,7 +8952,6 @@ internal static class Planner
     /// many remnants each link first catches. See Settle.</summary>
     [ThreadStatic] private static float[] _tractionOf;
 
-    [ThreadStatic] private static float[] _monstersExtra;
 
     [ThreadStatic] private static float[] _rareTractionOf;
 

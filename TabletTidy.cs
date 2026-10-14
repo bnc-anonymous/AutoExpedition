@@ -112,6 +112,8 @@ internal static partial class Tablets
         _tidyWanted = tidy;
         _tidyRounds = 0;
         _tidyMoved = 0;
+        _tidyLeftoversNoted = false;
+        TidyLeftovers.Clear();
         BeginTidyRound();
         _tidyPhase = TidyPhase.PutAway;
 
@@ -129,6 +131,23 @@ internal static partial class Tablets
     /// <summary>Whether the tidy itself follows the put-away. See StartTidy.</summary>
     private static bool _tidyWanted;
 
+    /// <summary>
+    /// The junk tablets the craft and reforge run left in the inventory, too few to reforge, by entity address: kept back
+    /// from the put-away and deposited last, after the tidy, so they land after every other tablet rather than in the
+    /// gaps the tidy then works round. Noted once, as the put-away begins. See DepositLeftovers.
+    /// </summary>
+    private static readonly HashSet<long> TidyLeftovers = [];
+
+    private static bool _tidyLeftoversNoted;
+
+    /// <summary>
+    /// Deposits the leftover junk tablets still in the inventory. True while one is on its way; false once none is left.
+    /// See TidyLeftovers.
+    /// </summary>
+    private static bool DepositLeftovers(GameController gc) =>
+        TidyLeftovers.Count > 0 &&
+        MoveNext(gc, InventoryTablets().Where(t => TidyLeftovers.Contains(AddressOf(t))), DepositedTablet, false, room: int.MaxValue);
+
     /// <summary>One round: to the fragment tab, then a scan from sub-tab 1.</summary>
     private static void BeginTidyRound()
     {
@@ -145,30 +164,46 @@ internal static partial class Tablets
         _moved = 0;
     }
 
-    private static void StepTidy(GameController gc)
+    private static void StepTidy(GameController gc, TabletRerollingSettings settings)
     {
         switch (_tidyPhase)
         {
             case TidyPhase.PutAway:
             {
+                // The junk too few to reforge, kept back to go in last. See TidyLeftovers.
+                if (!_tidyLeftoversNoted)
+                {
+                    _tidyLeftoversNoted = true;
+
+                    foreach (var tablet in TabletsBroughtOut(gc).Where(t => t.Uses == FullUses && IsJunk(gc, t, settings)))
+                        TidyLeftovers.Add(AddressOf(tablet));
+                }
+
                 // **One put-away at the end, of everything kept between passes**: the tablets into the earliest gaps,
                 // then the currency stacks to the currency tab, a ctrl+click sending each from whichever tab shows.
-                if (MoveNext(gc, TabletsBroughtOut(gc).Where(t => t.Uses == FullUses), DepositedTablet, false, room: int.MaxValue))
+                if (MoveNext(gc, TabletsBroughtOut(gc).Where(t => t.Uses == FullUses && !TidyLeftovers.Contains(AddressOf(t))),
+                        DepositedTablet, false, room: int.MaxValue))
                     return;
 
-                if (SuppliedStacksCarried(gc).Where(s => s.Rect.Width > 0f).ToList() is [var (rect, name), ..])
+                if (SuppliedStacksCarried(gc).Where(s => s.Rect.Width > 0f).ToList() is { Count: > 0 } stacks)
                 {
-                    var before = InventoryCurrencyHeld(gc).GetValueOrDefault(name);
-
-                    Send(rect, true, $"the {name} back", () => InventoryCurrencyHeld(gc).GetValueOrDefault(name) < before, null);
+                    SendStackBack(gc, stacks);
                     return;
                 }
 
                 if (!_tidyWanted)
                 {
+                    // No tidy: the leftovers go in now, last of the put-away.
+                    if (DepositLeftovers(gc))
+                        return;
+
                     StopReforging(_tidyAfter);
                     return;
                 }
+
+                // A fresh batch for the deposits that follow: the leftovers' are their own.
+                ReforgingSent.Clear();
+                _moved = 0;
 
                 _tidyPhase = TidyPhase.Navigate;
                 _navigateStep = 0;
@@ -254,6 +289,11 @@ internal static partial class Tablets
             }
 
             case TidyPhase.Finish:
+                // **The leftover junk last, after the tidy**: into the first free cells, past every other tablet. See
+                // TidyLeftovers.
+                if (DepositLeftovers(gc))
+                    return;
+
                 if (_tidyLastSubTab > 0 && SelectedSubTab(gc) != _tidyLastSubTab)
                 {
                     ClickSubTab(gc, _tidyLastSubTab);
@@ -300,9 +340,10 @@ internal static partial class Tablets
     {
         var all = TidyScanned.SelectMany(x => x.Value).ToList();
 
+        // Nothing to arrange: finished, which still deposits the leftover junk. See TidyLeftovers.
         if (all.Count == 0)
         {
-            StopReforging(_tidyAfter);
+            FinishTidy(_tidyAfter);
             return;
         }
 
@@ -387,10 +428,12 @@ internal static partial class Tablets
         LogReforging($"tidied, {_tidyMoved} tablet(s) moved over {_tidyRounds + 1} round(s)");
         // Where the tablets end once compact - the sub-tab holding the T-th - not the last the scan saw tablets in, which a
         // round finishing without a scan after it has just emptied.
-        var last = LastFilledIndex();
+        var last = LastFilledIndex(TidyLeftovers.Count);
 
         _tidyLastSubTab = last < 0 ? 0 : last / (TidyColumns * TidyRows) + 1;
         _tidyPhase = TidyPhase.Finish;
+        ReforgingSent.Clear();
+        _moved = 0;
     }
 
     /// <summary>The grid as the last scan found it: its top left cell's corner and the size of a cell.</summary>
@@ -429,13 +472,13 @@ internal static partial class Tablets
     private static int FreeCellsBefore(int index, List<int> usedAt) => index - usedAt.Count(u => u < index);
 
     /// <summary>
-    /// The last place in fill order a tablet holds once compact: the last used tablet, or the last of the cells the
-    /// full-use ones fill around them, whichever is later. -1 with none.
+    /// The last place in fill order a tablet holds once compact, with extra more full-use tablets deposited after: the last
+    /// used tablet, or the last of the cells the full-use ones fill around them, whichever is later. -1 with none.
     /// </summary>
-    private static int LastFilledIndex()
+    private static int LastFilledIndex(int extra = 0)
     {
         var usedAt = new List<int>();
-        var fullUse = 0;
+        var fullUse = extra;
 
         foreach (var (subTab, tablets) in TidyScanned)
         {

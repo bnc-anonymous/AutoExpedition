@@ -206,9 +206,14 @@ internal static class Overlay
         // A switch per kind of site, because the two are different amounts of colour: an ordinary
         // expedition paints a patch around the markers, a Grand one paints a map. See
         // Display.UnscoutedGround.ShowUnscoutedExpedition.
+        //
+        // **Not once the site has been set off.** The wash asks the player to walk the ground while there is still a
+        // chain to plan, which is so until detonation; after it, it painted a finished Grand site as if nobody had been
+        // there, once a true cold start had deleted the record of the ground walked (2026-10-12). Explosives down do
+        // not hide it: the rest of the chain is still planned over that ground.
         if ((Detonator.Grand(gc)
                 ? settings.Display.UnscoutedGround.ShowUnscoutedGrand
-                : settings.Display.UnscoutedGround.ShowUnscoutedExpedition).Value)
+                : settings.Display.UnscoutedGround.ShowUnscoutedExpedition).Value && !Detonator.SetOffHere(gc))
             using (Spent.On("Minimap.Unscouted"))
             {
                 Minimap.Unscouted(graphics, gc, settings, scouted);
@@ -270,7 +275,7 @@ internal static class Overlay
         }
 
         // The way to the remnant worth rolling, on the map. See Minimap.Rolls.
-        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.RollLineOnMinimap)
+        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.RollLineOnMinimap && RollLineInRange(gc, settings))
             using (Spent.On("Minimap.Rolls"))
             {
                 Minimap.Rolls(graphics, gc, settings);
@@ -311,29 +316,24 @@ internal static class Overlay
         // Start means the site is live, not merely that the setting is on - PanelReady is the
         // plugin's own test for the detonator panel having been filled in for the encounter in front
         // of you, which is the earliest moment there is an expedition to loot.
-        var fromStart = string.Equals(
-            Safe.Read(settings, static s => s.Automation.PostExpedition.LineFrom.Value,
-                PostExpeditionSettings.FromStart),
-            PostExpeditionSettings.FromStart, StringComparison.Ordinal);
-
-        // **Or the site has been set off.** Coming back through a portal to a detonated site, the detonator panel
-        // is never filled in again - it reads 0 of 0 - so "the site is live" went false exactly when there was
-        // loot to walk to, and a shatterable remnant beside the player got no line. A site that has gone off is
-        // at least as live as one about to.
-        var looting = settings.Automation.PostExpedition.Line &&
-                      (fromStart ? Detonator.PanelReady(gc) || Detonator.SetOffHere(gc) : Ending.ProbablyOver);
-
-        if (looting)
+        if (LootLineAtSite(gc, settings))
             using (Spent.On("Loot"))
             {
                 Loot(graphics, gc, settings, scan, covered);
             }
 
-        if (settings.Display.Remnants.Rerolls.RollLineInWorld)
+        if (settings.Display.Remnants.Rerolls.RollLineInWorld && RollLineInRange(gc, settings))
             using (Spent.On("Rolls"))
             {
                 Rolls(graphics, gc, settings, covered);
             }
+
+        // **Each remnant's socket count on the map, over the reward and reroll lines**, which are all drawn by now: a
+        // line through a number made it hard to read. See Minimap.SocketCounts.
+        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rewards.DrawSocketCountOnMinimap)
+            using (Spent.On("Minimap.SocketCounts"))
+                Minimap.SocketCounts(graphics, gc, settings, targets);
+
 
         // Outside that switch on purpose: it has nothing to do with wanting a line towards loot.
         using (Spent.On("Baited"))
@@ -405,6 +405,11 @@ internal static class Overlay
         // Everything else this pass draws keeps its own master switch: `debugging` is required
         // alongside each individual toggle below, so letting the pass run for the flag's sake does
         // not turn the marker rings, the art labels or the score lines on behind anybody's back.
+        // **The reward lines' prices at the window's edge, over everything drawn for play**: the socket counts on the map
+        // and the text under each remnant - its pick, its most expensive choice, what it propagates. Only the debug
+        // passes below come after. See Lines.
+        DrawEdgePrices(graphics, settings);
+
         var debugging = settings.Debug.ShowOverlay;
 
         if (!debugging && !settings.Debug.ShowUnpriced && !settings.Debug.ShowUnexpected)
@@ -490,7 +495,7 @@ internal static class Overlay
 
                 var where = target.Where(gc);
 
-                if (where == Vector3.Zero)
+                if (where == Vector3.Zero || !OutlineProjectsSanely(gc, where, target.Sets * Detonator.GridToWorld, 32))
                     continue;
 
                 graphics.DrawCircleInWorld(where, target.Sets * Detonator.GridToWorld,
@@ -898,6 +903,39 @@ internal static class Overlay
     /// the plugin draws, and Astrayed draws it on a hand-placed explosive's lost markers with debug off - so it is the
     /// suspect, though a bad projection has not been seen in a dump. Failing the check, the ring is drawn as an outline.
     /// </summary>
+    /// <summary>
+    /// Whether a ring on the ground projects as a ring: every point of its rim a real screen point within
+    /// OutlineSlackWindows window breadths of the window. A barrel's ring is drawn for barrels hundreds of grid away, and
+    /// after a reload one such ring drew as a straight line across the screen in the barrel colour (2026-10-12); a
+    /// point far off the screen or behind the camera projects wildly, and the outline joins it to its neighbours. A ring
+    /// failing the check is not drawn. Unlike FillsSafely there is no limit on its size: a barrel's blast is wide.
+    /// </summary>
+    private static bool OutlineProjectsSanely(GameController gc, Vector3 world, float radius, int segments)
+    {
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default);
+
+        if (camera == null || window.Width <= 0f || window.Height <= 0f)
+            return false;
+
+        for (var i = 0; i < Math.Max(8, segments); i++)
+        {
+            var angle = i * MathF.Tau / Math.Max(8, segments);
+            var rim = world + new Vector3(MathF.Cos(angle) * radius, MathF.Sin(angle) * radius, 0f);
+            var at = Safe.Read((camera, rim), static x => x.camera.WorldToScreen(x.rim), Vector2.Zero);
+
+            if (at == Vector2.Zero || !float.IsFinite(at.X) || !float.IsFinite(at.Y) ||
+                at.X < -OutlineSlackWindows * window.Width || at.X > (1f + OutlineSlackWindows) * window.Width ||
+                at.Y < -OutlineSlackWindows * window.Height || at.Y > (1f + OutlineSlackWindows) * window.Height)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>How far past the window, in window breadths, a ring's rim may project and the ring still be drawn. Chosen.</summary>
+    private const float OutlineSlackWindows = 2f;
+
     private static bool FillsSafely(GameController gc, Vector3 world, float radius, int segments)
     {
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
@@ -2162,6 +2200,21 @@ internal static class Overlay
     /// mark twice rather than two marks to learn. One pixel: it is a hint about where to go next,
     /// not a route, and the chain's own polyline is already on the screen. See RollLineInWorld.
     /// </summary>
+    /// <summary>
+    /// Whether the remnant worth a reroll is within Only to rerolls within of the player, or there is no limit, for both
+    /// of its lines. False with nothing advised. See RerollDisplaySettings.RollLineWithin.
+    /// </summary>
+    private static bool RollLineInRange(GameController gc, AutoExpeditionSettings settings)
+    {
+        if (Rolling.Here.Advised is not { } best || best.Grid == Vector2.Zero)
+            return false;
+
+        var within = settings.Display.Remnants.Rerolls.RollLineWithin.Value;
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        return within <= 0 || player != Vector2.Zero && Vector2.Distance(player, best.Grid) <= within;
+    }
+
     private static void Rolls(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         List<RectangleF> covered)
     {
@@ -2288,6 +2341,26 @@ internal static class Overlay
         graphics.DrawText(Curio.Says, text, Color.Magenta);
     }
 
+    /// <summary>
+    /// Whether the autoloot line is drawn to this dig site's loot now: Draw autoloot line on, and the site live or set
+    /// off as Draw the loot line from asks. Away from a dig site, or before then, Autoloot.DrawLine draws the line to
+    /// listed items alone.
+    /// </summary>
+    internal static bool LootLineAtSite(GameController gc, AutoExpeditionSettings settings)
+    {
+        var fromStart = string.Equals(
+            Safe.Read(settings, static s => s.Automation.PostExpedition.LineFrom.Value,
+                PostExpeditionSettings.FromStart),
+            PostExpeditionSettings.FromStart, StringComparison.Ordinal);
+
+        // **Or the site has been set off.** Coming back through a portal to a detonated site, the detonator panel
+        // is never filled in again - it reads 0 of 0 - so "the site is live" went false exactly when there was
+        // loot to walk to, and a shatterable remnant beside the player got no line. A site that has gone off is
+        // at least as live as one about to.
+        return settings.Automation.PostExpedition.Line &&
+               (fromStart ? Detonator.PanelReady(gc) || Detonator.SetOffHere(gc) : Ending.ProbablyOver);
+    }
+
     private static void Loot(Graphics graphics, GameController gc, AutoExpeditionSettings settings,
         Scan scan, List<RectangleF> covered)
     {
@@ -2336,16 +2409,28 @@ internal static class Overlay
             nearestGrid = grid;
         }
 
-        foreach (var target in scan.At(site))
+        using (Spent.On("Loot/Remnants"))
         {
-            if (!target.Shatterable)
-                continue;
+            foreach (var target in scan.At(site))
+            {
+                if (!target.Shatterable)
+                    continue;
 
-            var world = target.Where(gc);
+                var world = target.Where(gc);
 
-            if (world != Vector3.Zero)
-                Offer(world, target.Grid, Vector2.Distance(at, target.Grid));
+                if (world != Vector3.Zero)
+                    Offer(world, target.Grid, Vector2.Distance(at, target.Grid));
+            }
         }
+
+        // An item on either autoloot list competes with the expedition's loot. See AutolootSettings.LineToListedItems.
+        using (Spent.On("Loot/Listed"))
+        {
+            if (settings.Automation.Autoloot.LineToListedItems && Autoloot.NearestListedItem(gc, settings) is { } listed)
+                Offer(listed.World, listed.Grid, listed.Away);
+        }
+
+        using var chestsTimed = Spent.On("Loot/Chests");
 
         // The chests come from the entity list, because a scan chest is the MARKER and the blast
         // has already consumed it by the time any of this is on screen.
@@ -2380,17 +2465,18 @@ internal static class Overlay
 
             var grid = Safe.Read(chest, static e => e.GridPos, Vector2.Zero);
 
-            // A chest the player cannot walk to - penned behind an explosive gate that is still shut - is not loot
-            // to walk towards. See WalkableFromPlayer.
-            if (grid != Vector2.Zero && !WalkableFromPlayer.CanWalkTo(gc, at, grid))
-                continue;
-
             // **A finite bound, because SiteReach is infinite on a Grand site.** That infinity is
             // right for deciding which markers belong to a site - a Grand one has no radius - and
             // wrong as a search radius: it made every targetable chest in the map a candidate, and
             // this loop deliberately does not filter on metadata, so an ordinary chest anywhere would
             // qualify. Never observed, because the loot within the site is almost always nearer.
+            // Before the walk, which is a path search: it ran for chests outside the site too.
             if (grid == Vector2.Zero || FromSite(grid, site, placed) > MathF.Min(Detonator.SiteReach(gc), Belongs))
+                continue;
+
+            // A chest the player cannot walk to - penned behind an explosive gate that is still shut - is not loot
+            // to walk towards. See WalkableFromPlayer.
+            if (!WalkableFromPlayer.CanWalkTo(gc, at, grid))
                 continue;
 
             var world = Safe.Read(chest, static e => e.Pos, Vector3.Zero);
@@ -2418,7 +2504,7 @@ internal static class Overlay
             : Clip(window, from, trusted ? to : from + toward * (window.Width + window.Height));
 
         if (end != Vector2.Zero && !Panels.Covers(covered, end))
-            graphics.DrawLine(from, end, 1f, Color.White);
+            graphics.DrawLine(from, end, Autoloot.LineThickness(settings), settings.Automation.Autoloot.LineColour.Value);
     }
 
     /// <summary>
@@ -2809,16 +2895,29 @@ internal static class Overlay
 
         var presolve = whole ? "Presolve" : "Partial presolve";
 
-        if (presolving && settings.Display.ScoreArea.DrawPresolve)
+        // A continuous presolve pass is followed by another, so it reads as continuous rather than as a countdown that
+        // runs out and refills. The figure in brackets is seconds since the plan last improved. See the solving line.
+        if (presolving && Planning.RunningContinuous && settings.Display.ScoreArea.DrawPresolve)
+        {
+            var gain = Planning.LastGainAt == DateTime.MinValue
+                ? ""
+                : $" ({(DateTime.UtcNow - Planning.LastGainAt).TotalSeconds:0})";
+
+            readout.Line(($"{presolve}: continuous{gain}", later));
+        }
+        else if (presolving && settings.Display.ScoreArea.DrawPresolve)
         {
             readout.Line(($"{presolve}: {left}", later));
             readout.Bar(along, later);
         }
         else if (Rehearsal.Passes > 0 && settings.Display.ScoreArea.DrawPresolve)
         {
+            // Exhausted: the exhaustive spot search found nothing better on a simple site. See Planning.Exhausted.
+            var state = planning.Exhausted ? "exhausted" : Rehearsal.Settled ? "done" : "ready";
+
             readout.Line((
-                $"{presolve}: {(Rehearsal.Settled ? "done" : "ready")} ({Rehearsal.Passes})",
-                whole && Rehearsal.Settled ? step : later));
+                $"{presolve}: {state} ({Rehearsal.Passes})",
+                whole && (Rehearsal.Settled || planning.Exhausted) ? step : later));
         }
 
         // **A continuous pass has no end to count down to.** It runs until something restarts it or the key
@@ -3473,7 +3572,7 @@ internal static class Overlay
             // where the cursor would have to go for it. See Placement.Pointed.
             using (Spent.On("Reachable/Ready"))
             {
-                ready[i] = placement.Ready(gc, settings, plan.Points[i], from, plan.CaughtBy(i),
+                ready[i] = placement.Ready(gc, settings, plan.Points[i], from, plan.HighlightedBy(i),
                     covered, out _, first);
             }
 
@@ -3544,6 +3643,9 @@ internal static class Overlay
     private static void Lines(Graphics graphics, GameController gc, List<Target> targets,
         AutoExpeditionSettings settings, Valuation valuation, List<RectangleF> covered)
     {
+        // Any left from a frame that did not reach DrawEdgePrices. See EdgePrices.
+        EdgePrices.Clear();
+
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
 
         if (camera == null)
@@ -3614,13 +3716,28 @@ internal static class Overlay
             if (!off)
                 continue;
 
-            var text = Prices.Text(target.Rewards[0].Value, settings, valuation);
+            EdgePrices.Add((Prices.Text(target.Rewards[0].Value, settings, valuation), end));
+        }
+    }
+
+    /// <summary>
+    /// The reward lines' prices at the window's edge, held by Lines and drawn by DrawEdgePrices once everything they should
+    /// sit over is down - the minimap's socket counts among it.
+    /// </summary>
+    private static readonly List<(string Text, Vector2 At)> EdgePrices = [];
+
+    /// <summary>Draws the prices Lines held, centred on each line's end, and forgets them. See EdgePrices.</summary>
+    private static void DrawEdgePrices(Graphics graphics, AutoExpeditionSettings settings)
+    {
+        foreach (var (text, at) in EdgePrices)
+        {
             var size = graphics.MeasureText(text);
 
-            graphics.DrawTextWithBackground(text,
-                new Vector2(end.X - size.X / 2f, end.Y - size.Y / 2f),
+            graphics.DrawTextWithBackground(text, new Vector2(at.X - size.X / 2f, at.Y - size.Y / 2f),
                 settings.Display.Remnants.Rewards.LineColour, Color.Black);
         }
+
+        EdgePrices.Clear();
     }
 
     /// <summary>How far inside the window a point has to be to count as on screen.</summary>
@@ -4233,8 +4350,11 @@ internal static class Overlay
             // this stage measured 101,953 bytes a frame over 12 remnants with the closures already
             // taken out of it, so the recomputation is the remaining suspect. Unverified: it needs a
             // dump to confirm the bytes actually move.
+            // GetClientRect, not GetClientRectCache: the label objects are kept between reads of the list, and a kept
+            // one's cached rectangle trailed the camera, so the propagation text shook; reading the list every frame
+            // made it smooth again (2026-10-11). See Ground.Labels.
             if (id != 0 && labels.TryGetValue(id, out var label) &&
-                Safe.Read(label, static l => l.GetClientRectCache, default) is { Width: > 0f } rect)
+                Safe.Read(label, static l => l.GetClientRect(), default) is { Width: > 0f } rect)
                 return new Vector2(rect.Left, rect.Bottom + 2f);
         }
 
@@ -4245,8 +4365,12 @@ internal static class Overlay
             : Safe.Read((Camera: camera, World: world), static x => x.Camera.WorldToScreen(x.World), Vector2.Zero);
     }
 
+    /// <summary>The label dictionary of the last full read of the list. See Labels.</summary>
+    private static Dictionary<uint, Element> _labelsOfIds;
+    private static long _labelsRead = -1;
+
     /// <summary>
-    /// The on-screen label for each thing that has one, by entity id. Built once a frame.
+    /// The on-screen label for each thing that has one, by entity id. Built once per read of the list.
     ///
     /// The ELEMENT rather than its rect, because the label is not only a place to hang text under:
     /// the game's own Liquid Verisium button lives inside it, so what is wanted is something that
@@ -4254,7 +4378,21 @@ internal static class Overlay
     /// </summary>
     private static Dictionary<uint, Element> Labels(GameController gc)
     {
+        // Ids and elements change only with the list; where each element is drawn is read from it live. See
+        // Ground.ReadNumber.
+        var read = Ground.Labels(gc);
+
+        if (Ground.OnOwnerThread && _labelsRead == Ground.ReadNumber && _labelsOfIds != null)
+            return _labelsOfIds;
+
         var found = new Dictionary<uint, Element>();
+
+        if (Ground.OnOwnerThread)
+        {
+            _labelsOfIds = found;
+            _labelsRead = Ground.ReadNumber;
+        }
+
         // The full list, not the visible subset. A dump taken standing on a remnant found three
         // labels in ItemsOnGroundLabelsVisible - all of them for remnants four hundred grid units
         // away, projecting off the top of the screen - and nothing for the one underfoot. Whatever
@@ -4471,7 +4609,7 @@ internal static class Overlay
         if (!Safe.Read(at, static e => e.IsVisible, false))
             return default;
 
-        var rect = Safe.Read(at, static e => e.GetClientRectCache, default);
+        var rect = Safe.Read(at, static e => e.GetClientRect(), default);
 
         return rect.Width > 0f && rect.Height > 0f ? rect : default;
     }

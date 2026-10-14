@@ -248,7 +248,7 @@ internal static partial class Tablets
     /// type or sub-tab is the selected one: the full-auto run clicked the Expedition tablets with them already selected
     /// (2026-10-09), so what marks the selected one is looked for here.
     /// </summary>
-    private static string LitFlagsSaid(Element element, string indent)
+    internal static string LitFlagsSaid(Element element, string indent, int deepest = 2)
     {
         var b = new StringBuilder();
         var stack = new Stack<(Element, string, int)>();
@@ -265,7 +265,7 @@ internal static partial class Tablets
                          $"saturated {Safe.Read(at, static e => e.IsSaturated, false)} border {Safe.Read(at, static e => e.BordColor.ToString(), "?")} " +
                          $"texture \"{Safe.Read(at, static e => e.TextureName, "")}\"");
 
-            if (depth >= 2)
+            if (depth >= deepest)
                 continue;
 
             var children = Safe.Read(at, static e => e.Children, null) ?? [];

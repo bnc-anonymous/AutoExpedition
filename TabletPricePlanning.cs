@@ -160,7 +160,7 @@ internal static partial class Tablets
     /// at 1746,1163 80x23 at 1440 and "28,954,643" at 2619,1744 120x32 at 2160 (dumps of 2026-10-10 and 11). Empty when it
     /// is not there or does not read as a number, as after a patch that moves it.
     /// </summary>
-    private static RectangleF GoldAmountRect(GameController gc)
+    internal static RectangleF GoldAmountRect(GameController gc)
     {
         var amount = Safe.Read(gc, static g => g.IngameState.IngameUi.InventoryPanel?.GetChildFromIndices(5, 6, 1), null);
         var text = Safe.Read(amount, static e => e.Text, null) ?? "";
@@ -171,7 +171,7 @@ internal static partial class Tablets
     }
 
     /// <summary>The inventory panel's rectangle, empty when it is closed. The progress line hangs from it.</summary>
-    private static RectangleF InventoryRect(GameController gc) =>
+    internal static RectangleF InventoryRect(GameController gc) =>
         Safe.Read(gc, static g => g.IngameState.IngameUi.InventoryPanel is { IsVisible: true } panel ? panel.GetClientRectCache : default,
             default);
 

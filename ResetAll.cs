@@ -79,6 +79,13 @@ internal static class ResetAll
     /// object already in that set and stops on the spot, which also keeps Enable and ConfigVersion
     /// out of reach of the back door.
     /// </summary>
+    /// <summary>
+    /// Puts one section back as shipped: every node in it, and in its subsections, takes the value it has in a section
+    /// made fresh. For a section's own reset button. See AutolootSettings.ResetSettingsUi.
+    /// </summary>
+    public static void Section(object shipped, object current) =>
+        Copy(shipped, current, new HashSet<object>(ReferenceEqualityComparer.Instance));
+
     private static void Copy(object from, object to, HashSet<object> seen,
         string path = "", List<string> missed = null)
     {

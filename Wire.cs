@@ -60,6 +60,17 @@ internal sealed class Wire
         _slab = slab;
     }
 
+    /// <summary>
+    /// Empties both caches - routed lengths and routed paths - and the path count, so their memory can go. Answers
+    /// asked for afterwards are routed again. See Terrain.ForgetRouting.
+    /// </summary>
+    internal void ForgetRoutes()
+    {
+        _known.Clear();
+        _bent.Clear();
+        Interlocked.Exchange(ref _paths, 0);
+    }
+
     /// <summary>Whether the client published enough for the routine to run at all.</summary>
     public bool Ready => _aim != null && _aim.Length > 0 && _slab != null;
 

@@ -64,6 +64,10 @@
     <Content Include="weight_reference_table_defaults.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- The plugin's own sounds, beside the assembly in sounds/, for the same reason. See Autoloot.SoundNames. -->
+    <Content Include="sounds\*.wav">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>

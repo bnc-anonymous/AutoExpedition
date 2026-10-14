@@ -134,7 +134,11 @@ internal static class Astray
 
             var lost = new List<Vector2>();
 
-            foreach (var wanted in plan.CaughtBy(i))
+            // What this explosive reaches itself, not what an explodable it reaches takes in turn: those lie beyond the
+            // explosive's blast by definition, so measured against it every marker an oil derrick would take read
+            // "Missed" (2026-10-11). The explodable is in this list; while it is reached, so is what it sets off. See
+            // Plan.HighlightedBy.
+            foreach (var wanted in plan.HighlightedBy(i))
             {
                 // The marker's own size, which is most of the answer for a barrel cluster and all
                 // of it for a chest. Nearest by grid, because Catches records positions and the

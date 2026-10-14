@@ -334,6 +334,7 @@ internal static partial class Tablets
             // would have (2026-10-10). See Depositable.
             _depositNext = true;
             _stashEmptied = false;
+            _roomForBench = 0;
             _rounds = 0;
             _reforged = 0;
             _moved = 0;

@@ -168,8 +168,21 @@ internal sealed class Terrain
     private static void Keep(int[][] aim, Peek.Slab slab, Wire wire)
     {
         lock (KeptGate)
+        {
             _kept = (aim, slab, wire);
+
+            if (!RoutersMade.Exists(w => w.TryGetTarget(out var made) && ReferenceEquals(made, wire)))
+                RoutersMade.Add(new WeakReference<Wire>(wire));
+        }
     }
+
+    /// <summary>
+    /// Every router a snapshot has made, held weakly, so ForgetRouting can empty those still alive. A snapshot keeps its
+    /// router - the plugin's ground, the forbidden-ground overlay's and the solve's environment each hold one - so
+    /// dropping only the kept one freed nothing: after a site was set off the kept router held 22 paths while 704,995
+    /// routes, about 130MB, were still in the heap (heap snapshot, 2026-10-12 02:19). Guarded by KeptGate.
+    /// </summary>
+    private static readonly System.Collections.Generic.List<WeakReference<Wire>> RoutersMade = new();
 
     /// <summary>
     /// Drops the kept router, so the next snapshot routes from nothing. Called by a cold start, which promises to
@@ -179,7 +192,19 @@ internal sealed class Terrain
     internal static void ForgetRouting()
     {
         lock (KeptGate)
+        {
             _kept = default;
+
+            // Emptied, not only let go: a snapshot still holding a router then holds an empty one, which fills again
+            // only if something asks it for a route. See RoutersMade.
+            foreach (var weak in RoutersMade)
+            {
+                if (weak.TryGetTarget(out var wire))
+                    wire.ForgetRoutes();
+            }
+
+            RoutersMade.Clear();
+        }
     }
 
     private static bool SameSlab(Peek.Slab a, Peek.Slab b)

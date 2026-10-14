@@ -332,9 +332,22 @@ internal static class Dump
                          : $"\"{ran.Said}\" - {(ran.Why.Length > 0 ? ran.Why : "no detail")} " +
                            $"({(DateTime.UtcNow - ran.When).TotalSeconds:N1}s ago)"));
 
+        // What each action key loot click did about the plan, newest last. See Placement.PlanLootAhead.
+        var lootPlans = Placement.LootPlansSaid;
+
+        b.AppendLine($"  action key loot plans, newest last ({lootPlans.Count}):" + (lootPlans.Count == 0 ? " none since the plugin loaded" : ""));
+
+        foreach (var plan in lootPlans)
+            b.AppendLine("    " + plan);
+
+        // What the post-expedition pass last found and could not click, and why. See Placement.Unclickable.
+        foreach (var thing in Placement.Unclickable)
+            b.AppendLine($"    could not click: {thing}");
+
         var took = Placement.Picked;
 
         b.AppendLine($"  waiting for a second remnant's window after a reward: {Placement.NextWindowSaid}");
+        b.AppendLine($"  what the run decided after its last pick: {Placement.AfterPickSaid}");
 
         b.AppendLine("  the last reward this run clicked: " +
                      (took.When == default
@@ -685,6 +698,7 @@ internal static class Dump
         // Where the summary of the section timings goes once they are known. See SectionHeader.
         var timingsAt = b.Length;
         var whole = System.Diagnostics.Stopwatch.StartNew();
+        _dumpStartedAt = DateTime.UtcNow;
 
         _sectionTimes.Clear();
         _entityTimes.Clear();
@@ -721,6 +735,9 @@ internal static class Dump
 
     /// <summary>The section being written now, whose time is still running. See SectionHeader.</summary>
     private static string _sectionOpen;
+
+    /// <summary>When the dump being written began, for a line that says how far into it a reading was taken.</summary>
+    private static DateTime _dumpStartedAt;
 
     /// <summary>Time since the section being written was opened. See SectionHeader.</summary>
     private static System.Diagnostics.Stopwatch _sectionClock;
@@ -1253,6 +1270,24 @@ internal static class Dump
                          ? "; the live read is below one because the detonator is not loaded, and the latch answers"
                          : ""));
         b.AppendLine($"  the chain's explosives: {Cleared.Said}");
+
+        // **Every explosive standing, whoever placed it**, from the entity list: at another player's site the panel lists
+        // none, and whether their explosives can be seen as entities - to score the host's chain - is what this answers.
+        var standing = new List<string>();
+
+        foreach (var entity in Safe.Read(gc, static g => g.EntityListWrapper.Entities, null) ?? [])
+        {
+            if (!(Safe.Read(entity, static e => e.Metadata, "") ?? "").EndsWith("Expedition/ExpeditionExplosive", StringComparison.Ordinal))
+                continue;
+
+            var at = Safe.Read(entity, static e => e.GridPos, System.Numerics.Vector2.Zero);
+
+            standing.Add($"({at.X:0},{at.Y:0}) id {Safe.Read(entity, static e => e.Id, 0u)} activated {Target.Stated(entity, "activated")} " +
+                         $"exploded {Target.Stated(entity, "exploded")}");
+        }
+
+        b.AppendLine($"  explosive entities standing, whoever placed them ({standing.Count}): " +
+                     (standing.Count == 0 ? "none in the entity list" : string.Join("; ", standing)));
         b.AppendLine($"  Site() = {Describe(site)}, matched against icons within 3 grid units");
         b.AppendLine("  set-off latch writes this area: " +
                      (Detonator.SetOffEvidence.Count == 0 ? "none" : string.Join("; ", Detonator.SetOffEvidence)));
@@ -1637,9 +1672,15 @@ internal static class Dump
         var after = Settings.Automation.PostExpedition;
 
         b.AppendLine($"  automate {Settings.Automation.Enable.Value}, " +
-                     $"shatter {after.Shatter.Value}, chests {after.Chests.Value}, " +
+                     $"action key list: shatter {Autoloot.RankOfLine(Settings.Automation.Autoloot.ItemsOnActionKey, Autoloot.RemnantsLine) != int.MaxValue}, " +
+                     $"chests {Autoloot.RankOfLine(Settings.Automation.Autoloot.ItemsOnActionKey, Autoloot.ExcavatedChestsLine) != int.MaxValue}, " +
                      $"placement enabled {Settings.Automation.PreExpedition.Enable.Value}, " +
                      $"walking {Placement.Walking(gc)}, explosives left {Detonator.ExplosivesInHand(gc)}");
+        b.AppendLine($"  movement, read {(DateTime.UtcNow - _dumpStartedAt).TotalMilliseconds:0}ms into this dump: {Placement.DescribeMovement(gc)}");
+        b.AppendLine($"  the last action key press held for the character to stop: " +
+                     (Placement.HeldPressOutcome.Length > 0 ? Placement.HeldPressOutcome : "none since the plugin loaded"));
+        b.AppendLine($"  what first followed each click the action key run waited on, and how soon, newest last: " +
+                     (Placement.ChoreResponses.Count > 0 ? string.Join(", ", Placement.ChoreResponses) : "none yet"));
 
         // What the SCAN thinks is here, which is a different question from what the entity list
         // holds - and the difference is where two rounds of this have gone missing.
@@ -2143,12 +2184,23 @@ internal static class Dump
     {
         Texts(b, gc);
         Chores(b, gc);
+
+        if (Settings != null)
+        {
+            Autoloot.Describe(b, gc, Settings);
+            InventoryDeposit.Describe(b, gc, Settings);
+        }
         SectionHeader(b, "=== how far the chain is believed to range ===");
         b.AppendLine($"  predicted {Detonator.PlacementRange(gc):0.#} grid " +
                      $"(base {Detonator.BaseReach(gc):0.#}, map {Detonator.PlacementRangePct(gc):+0;-0;+0}%)");
         b.AppendLine($"  base is {(Detonator.Grand(gc) ? "GRAND" : "ordinary")} because the count is " +
                      $"{Detonator.ExplosivesToPlanFor(gc)} against {Detonator.GrandExplosives} - " +
                      $"{Detonator.Counting}");
+        b.AppendLine("  the game's Grand flag, [session+0x98]: " + (Detonator.GrandAreaFields(gc) is { } fields
+            ? $"+0x1B4 = 0x{fields.Kind:X} (Grand at 0x1C or 0x27), +0x2A = 0x{fields.Word:X4} (Grand at 0x1C03) - " +
+              (Detonator.GrandAreaFlag(gc) == true ? "GRAND" : "ordinary")
+            : "unreadable - the walk from ClientExpedition broke") +
+            $"; remnants filed under this site {Detonator.RemnantsAtSite}");
         b.AppendLine("  (the game's own arithmetic, in integers, so it is the limit rather than " +
                      "an estimate of it - nothing measures it any more)");
         b.AppendLine();
@@ -3008,6 +3060,7 @@ internal static class Dump
         b.AppendLine($"  touring: {Repair.TouringSaid}");
         b.AppendLine($"  refining: {Repair.RefiningSaid}");
         b.AppendLine($"  exhaustive spot search, in the solve running now or else the last: {Repair.SpotSearchSaid}");
+        b.AppendLine($"  exhausted, after the last solve: {ExhaustiveSpotSearch.ExhaustedSaid}");
         b.AppendLine($"  relinking the workers' records while solving, since the plugin loaded: {Repair.RelinksDuringSolveSaid}");
         b.AppendLine($"  workers done with their remnant order: {Repair.SpareOrdersSaid}");
         b.AppendLine($"  remnant-order workers after the orders ran out: {Repair.OrdersRanOutSaid}");
@@ -3110,6 +3163,11 @@ internal static class Dump
         b.AppendLine($"  how far reach's bridges really walk: {Repair.Detoured}");
         b.AppendLine($"  bridges the reach operator built: {Planner.Fetches}");
         b.AppendLine($"  what asked for the last solve: {Planning.Asked}");
+        b.AppendLine($"  must-take marks changed by the key, and the solves after them, newest last ({AutoExpedition.MarksSaid.Count}):" +
+                     (AutoExpedition.MarksSaid.Count == 0 ? " none since the plugin loaded" : ""));
+
+        foreach (var mark in AutoExpedition.MarksSaid)
+            b.AppendLine($"    {mark}");
         b.AppendLine($"  every solve at this dig site, {Planning.Journeyed}");
         b.AppendLine($"  re-solving: {Planning.Progress}");
         b.AppendLine($"  marked as must take: {Insisted.Here.Describe(Plan)}");
@@ -3982,7 +4040,8 @@ internal static class Dump
                          $"{(gap.Enumerating ? "enumerating openings" : "not enumerating")}, " +
                          $"pool {gap.PoolThreads} thread(s) with {gap.PoolQueued:N0} queued, " +
                          $"{gap.AllocatedKb:N0}KB allocated by the process; {gap.LastCollection}; {gap.Slow}; " +
-                         $"running: {gap.Jobs}" +
+                         $"running: {gap.Jobs}; {gap.Memory}; host's longest: {gap.HostStages}; a frame later: " +
+                         (gap.HostStagesNext.Length > 0 ? gap.HostStagesNext : "not yet read") +
                          (gap.OutOfFocus ? "; THE GAME WAS OUT OF FOCUS during it" : "") +
                          (gap.AreaChanged ? "; THE AREA CHANGED during it" : ""));
         }
@@ -5136,6 +5195,22 @@ internal static class Dump
             .ToList();
         Section(b, $"monsters within {range} ({monsters.Count})", monsters);
 
+        // Everything under Metadata/Monsters that the entity list does not type as a monster: the player's daemons - a
+        // Tornado is Metadata/Monsters/Daemon/StormDaemonPlayer/GenericStormDaemon - which the list above leaves out.
+        var daemons = all.Where(x => Safe.Read(() => x.Type, EntityType.Error) != EntityType.Monster)
+            .Where(x => (Safe.Read(() => x.Metadata, "") ?? "").StartsWith("Metadata/Monsters/", StringComparison.Ordinal))
+            .Where(x => Near(x, range))
+            .ToList();
+        Section(b, $"daemons and other non-monster entities under Metadata/Monsters within {range} ({daemons.Count})", daemons);
+
+        // Skill effects on the ground - an oil grenade's OilGround and the like - with their components and stats, for
+        // what a ground effect carries. Nearest first, and only so many, since a fight leaves hundreds.
+        var effects = all.Where(x => (Safe.Read(() => x.Metadata, "") ?? "").StartsWith("Metadata/Effects/", StringComparison.Ordinal))
+            .Where(x => Near(x, range))
+            .OrderBy(x => Safe.Read(() => x.DistancePlayer, float.MaxValue))
+            .ToList();
+        Section(b, $"effects within {range}, the nearest {EffectsShown} of {effects.Count}", effects.Take(EffectsShown).ToList());
+
         // The markers, grouped by everything that might tell one from another. If two markers that
         // stand for different content agree on every line here, then nothing in this dump
         // classifies them and the next place to look is the file tables.
@@ -5513,6 +5588,9 @@ internal static class Dump
     private static bool Mentions(Entity entity, string word) =>
         Safe.Read(() => entity.Metadata, "")?.Contains(word, StringComparison.OrdinalIgnoreCase) == true ||
         Safe.Read(() => entity.Path, "")?.Contains(word, StringComparison.OrdinalIgnoreCase) == true;
+
+    /// <summary>How many skill effects on the ground the dump describes, nearest the player first.</summary>
+    private const int EffectsShown = 30;
 
     private static bool Near(Entity entity, int range) =>
         Safe.Read(() => entity.DistancePlayer, float.MaxValue) <= range;

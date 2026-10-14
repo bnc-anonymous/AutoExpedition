@@ -129,6 +129,17 @@ internal static class Detonator
     ///
     /// So it asks the high-water mark. See ExplosivesEverPlacedHere.
     /// </summary>
+    /// <summary>
+    /// Whether the map holds at least one expedition and every one of them has been set off: nothing is left in it to
+    /// plan. Started is not enough - a site with an explosive or two down is still being planned around. See SetOff.
+    /// </summary>
+    public static bool EverySiteSetOff(GameController gc)
+    {
+        var sites = Sites(gc).Where(s => s.Total > 0).ToList();
+
+        return sites.Count > 0 && sites.All(s => SetOff(s.At));
+    }
+
     public static int ExpeditionsNeverStarted(GameController gc)
     {
         var sites = Sites(gc);
@@ -177,6 +188,68 @@ internal static class Detonator
     private const int AreasWithSiteRecordsKept = 8;
 
     /// <summary>
+    /// Where the set-off latch is kept on disk, by area hash, so a reload of the plugin keeps it. Held only in memory, it
+    /// was lost on a reload: standing 598 grid from a set-off site, its detonator not loaded, the site read as not set
+    /// off and its barrels' rings were drawn again (dump 2026-10-12 00:48:20). Set by the plugin from its config
+    /// directory. See SetOff.
+    /// </summary>
+    internal static string SetOffFile { get; set; } = "";
+
+    /// <summary>The latch as read from SetOffFile, by area hash; read once, on the first area swap after loading.</summary>
+    private static Dictionary<uint, List<int[]>> _setOffOnDisk;
+
+    private static Dictionary<uint, List<int[]>> SetOffOnDisk()
+    {
+        if (_setOffOnDisk != null)
+            return _setOffOnDisk;
+
+        try
+        {
+            if (SetOffFile.Length > 0 && System.IO.File.Exists(SetOffFile))
+                _setOffOnDisk = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<uint, List<int[]>>>(System.IO.File.ReadAllText(SetOffFile));
+        }
+        catch (Exception)
+        {
+            // An unreadable file is started afresh: the worst it costs is a site read as not set off until it is.
+        }
+
+        return _setOffOnDisk ??= new Dictionary<uint, List<int[]>>();
+    }
+
+    /// <summary>
+    /// Writes the latch of the area in hand to SetOffFile, keeping the AreasWithSiteRecordsKept most recent areas. Each
+    /// site as its detonator cell and the explosive count it reported, so a set-off Grand site still reads as Grand after
+    /// a reload: its panel reads 0 of 0 once detonated, and without the count it was taken for an ordinary site of five
+    /// and planned again (dump 2026-10-12 13:57:16). An entry of two numbers, from before the count was kept, is a cell
+    /// alone. See _countsOfSites.
+    /// </summary>
+    private static void SaveSetOff()
+    {
+        if (SetOffFile.Length == 0 || _workedFor == 0)
+            return;
+
+        var onDisk = SetOffOnDisk();
+
+        onDisk.Remove(_workedFor);
+        onDisk[_workedFor] = _setOff.Select(c => new[] { c.X, c.Y, _countsOfSites.GetValueOrDefault((_workedFor, c)) }).ToList();
+
+        while (onDisk.Count > AreasWithSiteRecordsKept)
+            onDisk.Remove(onDisk.Keys.First());
+
+        try
+        {
+            var writing = SetOffFile + ".tmp";
+
+            System.IO.File.WriteAllText(writing, Newtonsoft.Json.JsonConvert.SerializeObject(onDisk));
+            System.IO.File.Move(writing, SetOffFile, true);
+        }
+        catch (Exception)
+        {
+            // Tried again on the next latch.
+        }
+    }
+
+    /// <summary>
     /// Swaps the site records over when the area has changed since they were last touched. Called by everything that
     /// writes or reads them with the game in hand, so no one caller being skipped leaves another area's records in
     /// place. See _siteRecordsByArea.
@@ -221,6 +294,21 @@ internal static class Detonator
                 _worked[cell] = most;
 
             _setOff.UnionWith(kept.SetOff);
+        }
+
+        // The latch as kept on disk, for an area entered before the plugin was reloaded.
+        if (entered != 0 && SetOffOnDisk().TryGetValue(entered, out var saved))
+        {
+            _setOff.UnionWith(saved.Where(c => c.Length >= 2).Select(c => (c[0], c[1])));
+
+            // And each site's explosive count, which says whether it was Grand. See SaveSetOff.
+            foreach (var c in saved.Where(c => c.Length >= 3 && c[2] > 0))
+            {
+                var site = (entered, (c[0], c[1]));
+
+                if (c[2] > _countsOfSites.GetValueOrDefault(site))
+                    _countsOfSites[site] = c[2];
+            }
         }
     }
 
@@ -296,6 +384,31 @@ internal static class Detonator
     /// and the plugin notices because it re-derives which planned spots are done from this rather
     /// than from a count it keeps itself. Nothing to keep in step, so nothing to get out of step.
     /// </summary>
+    /// <summary>
+    /// The explosives standing on the ground, from the entity list, in the order they were placed: by entity id, which
+    /// the game hands out as each is made. For another player's site, whose panel lists none of them: nine of a host's
+    /// read there with ids rising along the chain from the detonator, each within reach of the one before (dump
+    /// 2026-10-12 16:30:30). Only those the game has loaded, so a chain part of which is out of range reads short.
+    /// See SiteIsAnotherPlayers.
+    /// </summary>
+    public static Vector2[] ExplosivesStandingInOrder(GameController gc)
+    {
+        var found = new List<(uint Id, Vector2 At)>();
+
+        foreach (var entity in Safe.Read(gc, static g => g.EntityListWrapper.Entities, null) ?? [])
+        {
+            if (!(Safe.Read(entity, static e => e.Metadata, "") ?? "").EndsWith("Expedition/ExpeditionExplosive", StringComparison.Ordinal))
+                continue;
+
+            var at = Safe.Read(entity, static e => e.GridPos, Vector2.Zero);
+
+            if (at != Vector2.Zero)
+                found.Add((Safe.Read(entity, static e => e.Id, 0u), at));
+        }
+
+        return found.OrderBy(x => x.Id).Select(x => x.At).ToArray();
+    }
+
     public static Vector2[] PlacedExplosiveGridPositions(GameController gc)
     {
         using var timing = Spent.On("Detonator.PlacedExplosiveGridPositions");
@@ -683,6 +796,8 @@ internal static class Detonator
             // loaded by then. See SetOff.
             if (said >= 1 && _setOff.Add(((int)MathF.Round(at.X), (int)MathF.Round(at.Y))))
             {
+                SaveSetOff();
+
                 var placedNow = Safe.Read(() => Info(gc)?.PlacedExplosiveCount ?? -1, -1);
 
                 SetOffEvidence.Add($"{DateTime.Now:HH:mm:ss} ({at.X:0},{at.Y:0}) {metadata} read activated {said} " +
@@ -764,6 +879,49 @@ internal static class Detonator
     /// </summary>
     public static readonly List<string> SetOffEvidence = new();
 
+    /// <summary>
+    /// Whether the site in front of the player is another player's: the detonator panel names no dig site - its own
+    /// position and every encounter's at (0,0) - while the detonator is found on the map by its entity. In a party at a
+    /// site that is not the player's own the panel reads nothing (dump 2026-10-12 16:16:37), where at the player's own
+    /// it names the site from well outside it. It is planned, to compare with where its owner goes, for
+    /// AnotherPlayersSiteExplosives; the action key does not place there, only loots. The markers are filed under it.
+    /// See Scan.DetonatorPositions.
+    /// </summary>
+    public static bool SiteIsAnotherPlayers(GameController gc)
+    {
+        // Asked many times a frame - every explosive count goes through it - and the entity read below walks the list.
+        if (DateTime.UtcNow - _anotherPlayersReadAt < AnotherPlayersReadFor)
+            return _anotherPlayers;
+
+        _anotherPlayersReadAt = DateTime.UtcNow;
+        _anotherPlayers = SiteIsAnotherPlayersNow(gc);
+        return _anotherPlayers;
+    }
+
+    private static bool _anotherPlayers;
+    private static DateTime _anotherPlayersReadAt;
+
+    /// <summary>How long SiteIsAnotherPlayers and ExplosivesAtAnotherPlayersSite answer from their last reading. Chosen.</summary>
+    private static readonly TimeSpan AnotherPlayersReadFor = TimeSpan.FromMilliseconds(250);
+
+    private static bool SiteIsAnotherPlayersNow(GameController gc)
+    {
+        var own = Safe.Read(Info(gc), static i => i.DetonatorGridPosition, default);
+
+        if (own.X != 0 || own.Y != 0)
+            return false;
+
+        foreach (var one in Safe.Read(Info(gc), static i => i.Encounters, null) ?? [])
+        {
+            var at = Safe.Read(one, static e => e.DetonatorGridPosition, default);
+
+            if (at.X != 0 || at.Y != 0)
+                return false;
+        }
+
+        return DetonatorGridPositionFromEntity(gc) != Vector2.Zero;
+    }
+
     public static Vector2 DetonatorGridPosition(GameController gc)
     {
         var at = Safe.Read(Info(gc), static i => i.DetonatorGridPosition, default);
@@ -801,6 +959,14 @@ internal static class Detonator
         _seenAt = DateTime.UtcNow;
         _seen = Vector2.Zero;
 
+        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
+        if (area != _detonatorsSeenFor)
+        {
+            DetonatorsSeenInArea.Clear();
+            _detonatorsSeenFor = area;
+        }
+
         var entities = Safe.Read(gc, static g => g.EntityListWrapper.Entities, null);
 
         if (entities == null)
@@ -820,6 +986,9 @@ internal static class Detonator
 
             if (at == Vector2.Zero)
                 continue;
+
+            if (!DetonatorsSeenInArea.Contains(at))
+                DetonatorsSeenInArea.Add(at);
 
             var away = player == Vector2.Zero ? 0f : Vector2.Distance(player, at);
 
@@ -849,6 +1018,14 @@ internal static class Detonator
 
     private static Vector2 _seen;
     private static DateTime _seenAt = DateTime.MinValue;
+
+    /// <summary>
+    /// Every detonator entity seen in this area, kept after it unloads: a detonator far off streams out, and the site
+    /// it marks still exists. Filled by DetonatorGridPositionFromEntity. See Scan.DetonatorPositions.
+    /// </summary>
+    public static readonly System.Collections.Generic.List<Vector2> DetonatorsSeenInArea = [];
+
+    private static uint _detonatorsSeenFor;
     private static readonly TimeSpan Lately = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
@@ -891,6 +1068,10 @@ internal static class Detonator
             _counted = _countsOfSites.TryGetValue((area, cell), out var before) ? before : 0;
         }
 
+        // A count loaded from SetOffFile after this site was first asked about. See SaveSetOff.
+        if (_countsOfSites.TryGetValue((area, cell), out var kept) && kept > _counted)
+            _counted = kept;
+
         // **This site's own entry, not the panel's single figure.** Info.TotalExplosiveCount is one
         // number on a panel that enumerates every expedition in the map, where Encounters carries a
         // count per dig site - so the site being stood in can be asked about directly. See Sites.
@@ -928,6 +1109,10 @@ internal static class Detonator
             _countsOfSites[(area, cell)] = known;
         }
 
+        // Another player's site, whose panel gives no count. See ExplosivesAtAnotherPlayersSite.
+        if (_counted <= 0 && SiteIsAnotherPlayers(gc))
+            return ExplosivesAtAnotherPlayersSite(gc);
+
         return _counted > 0 ? _counted : Assumed;
     }
 
@@ -962,6 +1147,96 @@ internal static class Detonator
 
     /// <summary>What an ordinary Expedition gives you. See Expected.</summary>
     public const int Assumed = 5;
+
+    /// <summary>
+    /// How many explosives another player's site is planned for, or 0 to work it out: its panel gives no count. Set from
+    /// AdvancedSolverSettings.ExplosivesAtAnotherPlayersSite each tick. See ExplosivesAtAnotherPlayersSite.
+    /// </summary>
+    public static int AnotherPlayersSiteExplosives { get; set; }
+
+    /// <summary>The remnants filed under the site in front of the player, set each tick. See ExplosivesAtAnotherPlayersSite.</summary>
+    public static int RemnantsAtSite { get; set; }
+
+    /// <summary>
+    /// The least remnants a site of another player's is taken as Grand for, before its owner has placed more explosives
+    /// than an ordinary site has. Over the recorded runs, Grand sites held 7 to 16 remnants and ordinary ones 3 to 10:
+    /// none with 3 to 6 was Grand and none with 11 or more ordinary; at 7 to 10, 24 runs were Grand and 15 ordinary
+    /// (spawns census, 2026-10-12). So 7 is a lean, not a rule.
+    /// </summary>
+    private const int GrandRemnantsAtLeast = 7;
+
+    /// <summary>
+    /// The game's own test for a Grand Expedition, or null when it cannot be read. The reach code at `0x141F5ABB8` and
+    /// the blast code at `0x1417350B0` take the Grand figures when the area object at `[session+0x98]` reads 0x1C or
+    /// 0x27 at +0x1B4, or 0x1C03 in the word at +0x2A (read from the binary; see NOTES, "The reach"). The session is
+    /// `[[ClientExpedition+0x48]+0x20F0]`, which is there at another player's site, where the panel gives no count.
+    /// </summary>
+    public static bool? GrandAreaFlag(GameController gc) =>
+        GrandAreaFields(gc) is { } fields ? fields.Kind is 0x1C or 0x27 || fields.Word == 0x1C03 : null;
+
+    /// <summary>The two fields GrandAreaFlag tests, raw, or null when the walk to them breaks. Also printed by the dump.</summary>
+    public static (int Kind, ushort Word)? GrandAreaFields(GameController gc)
+    {
+        var expedition = Safe.Read(Info(gc), static i => i.Address, 0L);
+        var owner = expedition == 0 ? 0 : Pointer(gc, expedition + Offsets.ExpeditionOwner);
+        var session = owner == 0 ? 0 : Pointer(gc, owner + Offsets.OwnerSession);
+        var area = session == 0 ? 0 : Pointer(gc, session + Offsets.SessionArea);
+
+        if (area == 0)
+            return null;
+
+        var kind = Safe.Read(() => gc.Memory.ReadBytes(area + Offsets.AreaGrandKind, 4), null);
+        var word = Safe.Read(() => gc.Memory.ReadBytes(area + Offsets.AreaGrandWord, 2), null);
+
+        return kind is { Length: 4 } && word is { Length: 2 }
+            ? (BitConverter.ToInt32(kind, 0), BitConverter.ToUInt16(word, 0))
+            : null;
+    }
+
+    /// <summary>The qword at an address when it looks like a pointer, else 0.</summary>
+    private static long Pointer(GameController gc, long at)
+    {
+        var raw = Safe.Read(() => gc.Memory.ReadBytes(at, 8), null);
+        var value = raw is { Length: 8 } ? BitConverter.ToInt64(raw, 0) : 0L;
+
+        return value > Offsets.Lowest && (value & 7) == 0 ? value : 0L;
+    }
+
+    /// <summary>
+    /// The explosives another player's site is planned for: Explosives at another player's site where set; else Grand's
+    /// GrandExplosives or Assumed, times the map's MapExpeditionExplosivesPct, and never fewer than its owner has placed.
+    /// Grand when GrandAreaFlag says so; where it cannot be read, when its owner has placed more than an ordinary site
+    /// holds or the site has GrandRemnantsAtLeast remnants. The remnant count overcounts on a map with two sites, whose
+    /// remnants are all filed under the one detonator seen (Bazaar, dump 2026-10-14 13:10:14: 16 remnants, two sites).
+    /// The rounding of the map's increase is not known; a run with +29% laid 20 links on 15 (spawns census).
+    /// </summary>
+    public static int ExplosivesAtAnotherPlayersSite(GameController gc)
+    {
+        if (AnotherPlayersSiteExplosives > 0)
+            return AnotherPlayersSiteExplosives;
+
+        if (DateTime.UtcNow - _anotherPlayersCountAt < AnotherPlayersReadFor)
+            return _anotherPlayersCount;
+
+        _anotherPlayersCountAt = DateTime.UtcNow;
+        _anotherPlayersCount = ExplosivesAtAnotherPlayersSiteNow(gc);
+        return _anotherPlayersCount;
+    }
+
+    private static int _anotherPlayersCount;
+    private static DateTime _anotherPlayersCountAt;
+
+    private static int ExplosivesAtAnotherPlayersSiteNow(GameController gc)
+    {
+
+        var increase = Safe.Read(() => gc.IngameState.Data.MapStatsVisible, null) is { } stats &&
+                       stats.TryGetValue(GameStat.MapExpeditionExplosivesPct, out var pct) ? pct : 0;
+        var factor = 1f + increase / 100f;
+        var placed = ExplosivesStandingInOrder(gc).Length;
+        var grand = GrandAreaFlag(gc) ?? (placed > MathF.Round(Assumed * factor) || RemnantsAtSite >= GrandRemnantsAtLeast);
+
+        return Math.Max(placed, (int)MathF.Round((grand ? GrandExplosives : Assumed) * factor));
+    }
 
     /// <summary>
     /// Whether the detonator's own panel can still tell us nothing about this site.
@@ -1034,7 +1309,9 @@ internal static class Detonator
     /// beside it means what it says. See Expected, which latches that same total.
     /// </summary>
     public static int ExplosivesInHand(GameController gc) =>
-        PanelReady(gc) ? Safe.Read(Info(gc), static i => i.RemainingExplosiveCount, 0) : Assumed;
+        PanelReady(gc) ? Safe.Read(Info(gc), static i => i.RemainingExplosiveCount, 0)
+        : SiteIsAnotherPlayers(gc) ? ExplosivesAtAnotherPlayersSite(gc)
+        : Assumed;
 
     /// <summary>
     /// Whether the detonator panel has been filled in for the site in front of you.

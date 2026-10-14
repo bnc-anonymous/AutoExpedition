@@ -65,6 +65,12 @@ internal enum Step
     /// <summary>Walking to a chest the run clicked; waiting to arrive before doing anything else.</summary>
     Arriving,
 
+    /// <summary>
+    /// An item picked up went onto the cursor, the inventory panel being open; the cursor is taking it to a free place
+    /// in the inventory. See Autoloot.PickedUpOntoCursor.
+    /// </summary>
+    PuttingDown,
+
     /// <summary>The combinations window is up; the cursor is on its way to the best option.</summary>
     Choosing,
 
@@ -128,6 +134,48 @@ internal sealed class Placement
     private Vector2 _target;
     private DateTime _deadline;
     private int _placedWhenStarted;
+
+    /// <summary>A run stopped by the character walking, rolling, or a movement key pressed. A cursor warning.</summary>
+    private const string CharacterMoved = "Character moved";
+
+    /// <summary>A run stopped by the player moving the mouse. A cursor warning.</summary>
+    private const string MouseMoved = "Mouse moved";
+
+    /// <summary>A run stopped by a key pressed that does not move the character. A cursor warning.</summary>
+    private const string KeyPressed = "Key pressed";
+
+    /// <summary>A run stopped for any other reason ExileInput2 gives. A cursor warning.</summary>
+    private const string StoppedWord = "Stopped";
+
+    /// <summary>A run abandoned by a cancelling key press or a change of area. Shown nowhere. See Forget.</summary>
+    private const string Cancelled = "Cancelled";
+
+    /// <summary>A press refused because the character is still moving. A cursor warning. See HoldPress.</summary>
+    private const string CharacterMoving = "Character moving";
+
+    /// <summary>
+    /// Whether ExileInput2's stop detail names a key that moves the character: W, A, S and D, the game's movement keys
+    /// by default, or Space, its dodge roll. "the player pressed W" is the detail's form (ExileInput2.cs). Keys rebound
+    /// in the game are not known here, and count as a key.
+    /// </summary>
+    private static bool MovementKeyPressed(string detail) =>
+        System.Text.RegularExpressions.Regex.IsMatch(detail ?? "", @"pressed (W|A|S|D|Space)\b");
+
+    /// <summary>The game's count of explosives placed when the action key was pressed. See AfterPlacing.</summary>
+    private int _placedAtPress;
+
+    /// <summary>
+    /// The word a stop is said with, once this press has placed something: a next spot under the interface is then the
+    /// ordinary end of a press, as an off-screen one is, and nothing is shown: the spot is drawn yellow, not yet
+    /// placeable, which already says it. A press that placed one explosive and found the next under the buff bar raised
+    /// a red "Unclickable" at the cursor (2026-10-12). A press that placed nothing keeps the warning: the press did
+    /// nothing, and the player needs to know why. See CursorWarning.Unshown.
+    /// </summary>
+    private string AfterPlacing(GameController gc, string word) =>
+        word == Obscured && Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0) > _placedAtPress ? NextSpotCovered : word;
+
+    /// <summary>A stop after placing, with the next spot under the interface. Shown nowhere. See AfterPlacing.</summary>
+    private const string NextSpotCovered = "Next spot covered";
     private int _landed;
 
 
@@ -380,15 +428,18 @@ internal sealed class Placement
         _game = gc;
         _planning = planning;
         _scrolls = 0;
+        _lootOnly = false;
+        _placedAtPress = Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0);
 
         // **Not cleared here.** A press is an attempt, and an attempt answers nothing - the marks
         // exist to say "this did not work", and wiping them the moment somebody tries again removes
         // them exactly when they are being read. Only an explosive actually reaching the ground
         // settles the question, so only that clears them. See Step.Confirming.
 
-        if (Walking(gc))
+        if (MovingForPress(gc))
         {
-            Say("Moving", "stand still and press again");
+            if (!HoldPress(settings, looting: false, planning))
+                Say(CharacterMoving, "stand still and press again");
 
             return Status;
         }
@@ -401,6 +452,8 @@ internal sealed class Placement
         // answered "nothing" because everything was still on the skip list from last time, and the
         // run ended at that refusal without ever reaching the line that empties it.
         _skip.Clear();
+        _choresClickedAgain.Clear();
+        _lootPlanned.Clear();
 
         if (!_input.Available)
             {
@@ -464,12 +517,138 @@ internal sealed class Placement
                 return Status;
             }
 
+        // Placement moves at ExileInput2's own speed, whatever a loot run on the same caller name last set. See
+        // AutolootSettings.ShortestMoveWhenAutolootingMs.
+        _input.SetShortestMove(-1);
+
         Advance(gc, settings);
 
         return Status;
     }
 
     /// <summary>Steps the sequence. Called every tick; returns immediately when idle.</summary>
+    /// <summary>
+    /// A run of the post-expedition jobs alone - the action key list's items, and shattering, chests and rewards as the
+    /// list and settings allow, in the list's order - that ends when none is left, and never places an explosive.
+    /// Started by the action key when a listed item is clickable, in place of whatever the key would have done -
+    /// stopping a solve included, which carries on. It picked up the items and stopped, leaving a chest in view
+    /// unopened (2026-10-11). See ListedItemReady.
+    /// </summary>
+    private bool _lootOnly;
+
+    /// <summary>Whether an item on the action key list is clickable now, for the action key to loot it first. See BeginLooting.</summary>
+    public bool ListedItemReady(GameController gc, AutoExpeditionSettings settings) =>
+        settings.Automation.Enable.Value && settings.Automation.Autoloot.EnableAutoloot &&
+        Chore(gc, settings, itemsOnly: true).Of != null;
+
+    /// <summary>Starts a run of the post-expedition jobs alone, in the action key list's order. See _lootOnly.</summary>
+    public string BeginLooting(GameController gc, AutoExpeditionSettings settings)
+    {
+        CursorWarning.Clear();
+
+        _game = gc;
+
+        if (MovingForPress(gc))
+        {
+            if (!HoldPress(settings, looting: true, null))
+                Say(CharacterMoving, "stand still and press again");
+
+            return Status;
+        }
+
+        _skip.Clear();
+        _choresClickedAgain.Clear();
+        _lootPlanned.Clear();
+
+        if (!_input.Available)
+        {
+            Say("ExileInput2 not installed", "ExileInput2 is not installed, so nothing can be picked up");
+
+            return Status;
+        }
+
+        _lootOnly = true;
+        _shattered = 0;
+        _keysStopLooting = settings.Automation.Autoloot.CancelAutolootOnKeyboardInput;
+        _change = null;
+        _wanted = null;
+        _wants.Clear();
+        _clicked = DateTime.MinValue;
+
+        _input.Release();
+
+        if (!_input.Take())
+        {
+            Say("ExileInput2 busy", "another plugin is using the cursor");
+
+            return Status;
+        }
+
+        // The run's own shortest move, or ExileInput2's. See AutolootSettings.ShortestMoveWhenAutolootingMs.
+        var shortest = settings.Automation.Autoloot.ShortestMoveWhenAutolootingMs.Value;
+        _input.SetShortestMove(shortest > 0 ? shortest : -1);
+
+        // A key of the player's - WASD to walk - stops this run, as the mouse does; the plugin's hotkeys excepted. Asked
+        // for on each claim, as ExileInput2 clears it on release. See AutolootSettings.CancelAutolootOnKeyboardInput.
+        if (_keysStopLooting)
+            _input.StopOnPlayerKeys(HotkeysOf(settings));
+
+        Advance(gc, settings);
+
+        return Status;
+    }
+
+    /// <summary>
+    /// Until when an action key press made on the move is held for the character to stop; DateTime.MinValue when none
+    /// is. See AutomationSettings.WaitForCharacterToStopMs.
+    /// </summary>
+    internal DateTime PressHeldUntil { get; private set; } = DateTime.MinValue;
+
+    /// <summary>When the held press was made.</summary>
+    private DateTime _heldPressAt;
+
+    /// <summary>What became of the last press held for the character to stop, for the dump; empty before any.</summary>
+    internal static string HeldPressOutcome { get; private set; } = "";
+
+    /// <summary>Whether the held press is for BeginLooting rather than Begin.</summary>
+    private bool _heldPressLooting;
+
+    /// <summary>The planning the held press hands to Begin; null for a loot run.</summary>
+    private Planning _heldPressPlanning;
+
+    /// <summary>
+    /// Holds a press refused for moving, for Tick to start once the character stops; false when the wait is 0, so the
+    /// caller refuses at once. A press while one is already held keeps the first one's time.
+    /// </summary>
+    private bool HoldPress(AutoExpeditionSettings settings, bool looting, Planning planning)
+    {
+        var ms = settings.Automation.WaitForCharacterToStopMs.Value;
+
+        if (ms <= 0)
+            return false;
+
+        if (PressHeldUntil == DateTime.MinValue)
+        {
+            _heldPressAt = DateTime.UtcNow;
+            PressHeldUntil = _heldPressAt + TimeSpan.FromMilliseconds(ms);
+        }
+
+        _heldPressLooting = looting;
+        _heldPressPlanning = planning;
+
+        return true;
+    }
+
+    /// <summary>Whether the loot run in hand stops on the player's keys. See BeginLooting.</summary>
+    private bool _keysStopLooting;
+
+    /// <summary>The keys this plugin's hotkeys are bound to, which a key stop leaves alone. See BeginLooting.</summary>
+    private static Keys[] HotkeysOf(AutoExpeditionSettings settings) =>
+        new[] { settings.ActionHotkey, settings.TableHotkey, settings.InsistHotkey, settings.Debug.DumpHotkey }
+            .Select(node => Safe.Read(() => node.Value.Key, Keys.None))
+            .Where(key => key != Keys.None)
+            .ToArray();
+
     public void Tick(GameController gc, AutoExpeditionSettings settings, Scan scan, Blast blast,
         Valuation valuation)
     {
@@ -485,11 +664,44 @@ internal sealed class Placement
         _scan = scan;
         _valuation = valuation;
 
+        NoteCharacterPosition(gc);
+
         // Before anything else, including the idle check: an identity that outlives its window is
         // the one way this can answer for a window it did not open. See Opened.
         if (Opened != null && !Safe.Read(gc,
                 static g => g.IngameState.IngameUi.Expedition2Window.IsVisible, false))
             Opened = null;
+
+        // A press held while the character was moving: started once it stops, refused once the wait runs out. See
+        // HoldPress.
+        if (PressHeldUntil != DateTime.MinValue && !Busy)
+        {
+            if (!MovingForPress(gc))
+            {
+                PressHeldUntil = DateTime.MinValue;
+                HeldPressOutcome = $"carried out {(DateTime.UtcNow - _heldPressAt).TotalMilliseconds:0}ms after the press, " +
+                                   $"when the character stopped ({DateTime.UtcNow:HH:mm:ss.fff})";
+
+                if (_heldPressLooting)
+                    BeginLooting(gc, settings);
+                else if (_heldPressPlanning != null)
+                    Begin(gc, settings, _heldPressPlanning);
+
+                return;
+            }
+
+            // The wait is for the character to stop within it; a stop near its end is only confirmed CharacterMovedWithin
+            // later, so that much is added before refusing.
+            if (DateTime.UtcNow >= PressHeldUntil + CharacterMovedWithin)
+            {
+                PressHeldUntil = DateTime.MinValue;
+                HeldPressOutcome = $"refused {(DateTime.UtcNow - _heldPressAt).TotalMilliseconds:0}ms after the press, still moving: " +
+                                   $"{DescribeMovement(gc)} ({DateTime.UtcNow:HH:mm:ss.fff})";
+                Say(CharacterMoving, "stand still and press again");
+
+                return;
+            }
+        }
 
         // Standing still is a condition of the whole run, not just of starting one.
         //
@@ -517,7 +729,17 @@ internal sealed class Placement
             _step != Step.Arriving && _step != Step.Opening && _step != Step.Opened &&
             Walking(gc))
         {
-            Give("Moving", "you started walking, so the run stopped");
+            Give(CharacterMoved, "you started walking, so the run stopped");
+
+            return;
+        }
+
+        // **A dodge roll at any step**: no step's own click rolls the character, so a roll is always the player's. The
+        // walking check above can miss one - a roll read flags 8194 and current action "DodgeRoll" (dump 2026-10-11
+        // 18:46:03), and whether it sets isMoving is not settled. See DodgeRolling.
+        if (_step != Step.Idle && DodgeRolling(gc))
+        {
+            Give(CharacterMoved, "you dodge rolled, so the run stopped");
 
             return;
         }
@@ -535,8 +757,18 @@ internal sealed class Placement
             // not be told from a hand on the mouse (2026-10-10 12:57, 2026-10-11 00:13).
             var detail = _input.StopDetail();
 
-            Give("Stopped", (stopped == "PlayerMovedTheMouse" ? "you moved the mouse" : "stopped: " + stopped) +
-                            (detail.Length > 0 ? " - " + detail : ""));
+            // Said by what the player did, under the cursor: the mouse, or the character moved by a movement key or a
+            // dodge roll; any other key as a key. "Stopped" in the score area said neither. See CursorWarning.Words.
+            var (word, said) = stopped switch
+            {
+                "PlayerMovedTheMouse" => (MouseMoved, "you moved the mouse"),
+                "PlayerPressedAKey" when MovementKeyPressed(detail) => (CharacterMoved, "you pressed a movement key"),
+                "PlayerPressedAKey" => (KeyPressed, "you pressed a key"),
+                "TakenOver" => (StoppedWord, "an instant loot pickup took the cursor - press again"),
+                _ => (StoppedWord, "stopped: " + stopped),
+            };
+
+            Give(word, said + (detail.Length > 0 ? " - " + detail : ""));
 
             return;
         }
@@ -627,6 +859,9 @@ internal sealed class Placement
                         : "placement mode was not on, so the click could not place anything - the " +
                           "toggle key may not have taken"));
             }
+            else if (_step == Step.PuttingDown)
+                Give("Item held", $"{Autoloot.HeldName(Autoloot.PickedUpOntoCursor(gc))} went onto the cursor and did not go " +
+                                  "down into the inventory - put it down by hand");
             else
                 Give("Timeout", $"gave up waiting while {_step.ToString().ToLowerInvariant()}");
 
@@ -650,6 +885,16 @@ internal sealed class Placement
             if (_step == Step.AwaitingWindow)
                 NextWindowSaid = $"the window for the next remnant came up {(DateTime.UtcNow - _awaitingSince).TotalMilliseconds:0}ms " +
                                  $"after the last reward took ({DateTime.Now:HH:mm:ss})";
+
+            // **A window before the explosive count has risen is the explosive landing.** Confirming records what it was
+            // chosen to catch, and the window was checked first: the pick then ran against the explosive before's
+            // remnants, found none of this one's still owed, and the run moved on - the second remnant's window came up
+            // after it had gone (dump 2026-10-12 13:26:48, three remnants under one explosive, one picked). See Landed.
+            if (_step == Step.Confirming)
+            {
+                Landed();
+                _windowLanded = true;
+            }
 
             // **A window the run did not open belongs to no remnant the run was acting on.** Only Opened means this run
             // clicked a combinations button and is waiting for its window; any other window was put up by the game for
@@ -836,6 +1081,13 @@ internal sealed class Placement
                     // has already worked out where the label is exposed. A disagreement is not
                     // worth stopping the run for: something is in front of this one and the next
                     // may be clear, so it gives up on this one and moves on.
+                    // **A moment's grace before believing it**: a move followed from a plan counts as arrived the
+                    // moment the cursor is on its point, and the game's own reading of what is under the cursor lags
+                    // it by a frame or more - so straight away, it can still name the label left behind. See
+                    // PlanLootAhead.
+                    if (!Under(gc) && (_notUnderSince ??= DateTime.UtcNow) is var since && DateTime.UtcNow - since < UnderGrace)
+                        return;
+
                     if (!Under(gc))
                     {
                         // Said out loud, because the alternative is a run that quietly does
@@ -850,9 +1102,43 @@ internal sealed class Placement
                         return;
                     }
 
+                    _notUnderSince = null;
+
                     if (!Sent(_input.Click(), "the click shattering the remnant"))
                         return;
 
+                    // An item is clicked once whether or not it is picked up. See Chore.
+                    if (Safe.Read(_chore, static e => e.HasComponent<WorldItem>(), false))
+                    {
+                        _skip.Add(Safe.Read(_chore, static e => e.Id, 0u));
+                        Autoloot.NoteClicked(gc, _chore);
+
+                        // **An item within pickup reach is taken where the player stands, so the next is clicked at
+                        // once**, the click assumed to have worked, as the tablet runs do; waiting for each label to go
+                        // cost a pause per item. One out of reach starts a walk, which the next click would turn aside,
+                        // so that one is waited for. Judged by distance, not by whether the character is moving: the
+                        // walk begins a frame or more after the click. See Autoloot.PickupReachGrid.
+                        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+                        var item = Safe.Read(_chore, static e => e.GridPos, Vector2.Zero);
+
+                        // Not with the inventory open: the item goes onto the cursor, and the next click would carry it
+                        // off, so its label is waited for and it is put down first. See Step.PuttingDown.
+                        if (player != Vector2.Zero && item != Vector2.Zero &&
+                            Vector2.Distance(player, item) <= Autoloot.PickupReachGrid && !Autoloot.InventoryPanelOpen(gc))
+                        {
+                            _shattered++;
+                            Advance(gc, settings);
+
+                            return;
+                        }
+
+                    }
+
+                    _choreClickedAt = DateTime.UtcNow;
+                    _choreClickedPing = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
+                    _characterAtChoreClick = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+                    _arrivedAtChore = null;
+                    _choreResponseNoted = false;
                     Wait(Step.Shattered);
                 }
 
@@ -864,16 +1150,61 @@ internal sealed class Placement
 
                 return;
 
+            case Step.PuttingDown:
+                if (Autoloot.PickedUpOntoCursor(gc) == null)
+                {
+                    Advance(gc, settings);
+
+                    return;
+                }
+
+                if (!_putDownClicked && _input.Arrived())
+                    _putDownClicked = Sent(_input.Click(), "the click putting the held item down");
+
+                return;
+
             case Step.Shattered:
                 // The label going away - or the chest reporting itself open - is the game accepting
                 // it. Then straight on to the nearest remaining job, so a finished dig site clears
                 // in one press.
+                // An item on the cursor, the inventory being open, is taken too: its ground label can outlast the pickup
+                // by a moment, and the run read the lingering label as a missed click, clicked again and ended without
+                // putting it down (dump 2026-10-14 20:14:06). See Step.PuttingDown.
                 if (_chore == null ||
                     Safe.Read(_chore, static e => e.GetComponent<Chest>()?.IsOpened ?? false, false) ||
-                    Button(gc, _chore, _path).Rect.Width <= 0f)
+                    Button(gc, _chore, _path).Rect.Width <= 0f ||
+                    Autoloot.PickedUpOntoCursor(gc) != null)
                 {
+                    NoteChoreResponse("done");
+
+                    // After a walk: how long the job took to go once the character had stopped at it.
+                    if (_arrivedAtChore is { } arrived)
+                        NoteArrival($"walked there, then done {(DateTime.UtcNow - arrived).TotalMilliseconds:0}ms after stopping");
+
                     _shattered++;
                     Advance(gc, settings);
+                    return;
+                }
+
+                var movedSinceClick = MovedSinceChoreClick(gc);
+
+                // The moment a walk the click started comes to a stop, for how long the job then takes to go.
+                if (movedSinceClick && _arrivedAtChore == null && !MovingForPress(gc))
+                    _arrivedAtChore = DateTime.UtcNow;
+
+                if (movedSinceClick || Walking(gc) || !CharacterIdle(gc))
+                    NoteChoreResponse(movedSinceClick || Walking(gc) ? "walking" : "acting");
+
+                // **A job still there with the character standing idle was missed**, whatever it is - an item, a chest, a
+                // shatter button: the click went elsewhere, as when a monster nudged the character just as it went out,
+                // and the run stood still for the rest of its patience and then said Timeout (2026-10-12). Clicked again
+                // once; missed twice, it is left and the run goes on. While the character walks or acts the click is
+                // being carried out, and the patience still applies.
+                if (DateTime.UtcNow - _choreClickedAt >= ChoreMissedAfter(gc) && !movedSinceClick && !Walking(gc) &&
+                    CharacterIdle(gc))
+                {
+                    NoteChoreResponse("missed");
+                    ClickChoreAgain(gc, settings);
                 }
 
                 return;
@@ -908,7 +1239,13 @@ internal sealed class Placement
                 //
                 // So the window closing only starts the question. The answer is the remnant reading
                 // back what was clicked - see Took - and until it does, this waits.
-                if (Options.Open(gc))
+                //
+                // **A window still open once the pick has taken is the next remnant's**: an explosive over two
+                // remnants opens the second window as the first closes. Waiting for it to close timed the run out -
+                // "Timeout: gave up waiting while chose", with the first remnant having read back its Orb of Chance
+                // 155ms after the click (dump 2026-10-12 02:40:27). Finished here, the window is then taken up by the
+                // check every other step makes for a window opening.
+                if (Options.Open(gc) && !Took(gc))
                     return;
 
                 // Crossed off either way. Whether the pick took is a question about the server;
@@ -958,13 +1295,7 @@ internal sealed class Placement
             case Step.Confirming:
                 if (Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0) > _placedWhenStarted)
                 {
-                    _landed++;
-                    _justPlaced = _expect;
-                    _declined = 0;
-                    _armed = false;
-                    _unlit = Array.Empty<Vector2>();
-                    _spoiled.Clear();
-                    Reason = "";
+                    Landed();
                     Advance(gc, settings);
                 }
 
@@ -979,8 +1310,148 @@ internal sealed class Placement
     /// one press places everything on screen rather than one thing. Every way the run can end ends
     /// here, and each ending says which it was.
     /// </summary>
+    /// <summary>Sends the cursor to a chore's spot and waits for it there. See Advance.</summary>
+    private void StartChore(GameController gc, (Entity Of, int[] Path, string Word, RectangleF At, int Waiting) todo,
+        AutoExpeditionSettings settings = null)
+    {
+        _chore = todo.Of;
+        _path = todo.Path;
+        _notUnderSince = null;
+
+        // **A chore is not a rewrite, and the two cannot both be live.** Choose now asks
+        // which remnant the run is acting on, so a _change left over from an earlier
+        // placement would answer for a window opened by a chore - the very confusion of
+        // identity this pair of fields was just taught to avoid.
+        _change = null;
+        _wanted = _wants.TryGetValue(Safe.Read(todo.Of, static e => e.Id, 0u), out var owed)
+            ? owed
+            : null;
+
+        // Only a chore that opens the combinations window names a remnant; a chest or a
+        // shatter button is not one, and must not leave an identity behind for the next
+        // window that happens to open.
+        Opened = todo.Path == CombinationsPath
+            ? Remnant(Safe.Read(todo.Of, static e => e.Id, 0u))
+            : null;
+        // As tight as the target is, and no tighter.
+        //
+        // The tolerance is how far from the requested point the cursor may settle and
+        // still count as arrived. Twelve is right for a label nothing is covering - the
+        // cursor lands somewhere on it whatever it does - and hopeless for a six pixel
+        // sliver, where arriving twelve pixels out means arriving on the label behind.
+        //
+        // A fixed two was the other mistake: the cursor does not land on a sub-pixel, so a
+        // tolerance below what it can actually achieve means it never reports arrival at
+        // all, the step times out, and nothing is clicked. Hence the floor.
+        var spot = Exposed(gc, Panels.Covered(gc), todo.At,
+            Safe.Read(todo.Of, static e => e.Id, 0u));
+
+        // Inside the gap, not merely near it. Arrival is judged against this number, so a
+        // tolerance equal to the room available lets the cursor report success from just
+        // outside the sliver it was aimed at - which is how a chest with a seven pixel gap
+        // ended up hovering the label behind it and being written off as covered.
+        _input.SetTolerance((int)Math.Clamp(spot.Room - 1f, Closest, 12f));
+
+        // The items after this one, planned with it, when this is not already the next of a plan. See PlanLootAhead.
+        if (settings != null)
+            PlanLootAhead(gc, settings, todo, spot.At);
+
+        if (!Sent(_input.MoveTo(spot.At), "the move to " + todo.Word))
+            return;
+
+        Wait(Step.Shattering);
+        Say("Tidying", todo.Word);
+    }
+
+    /// <summary>
+    /// After an item's label went: with the inventory panel open the item went onto the cursor, so the cursor takes it
+    /// to a free place in the inventory before anything else is clicked. True when that was started, or when there is
+    /// no place for it and the run ended saying so. See Step.PuttingDown.
+    /// </summary>
+    private bool StartPuttingDown(GameController gc)
+    {
+        if (Autoloot.PickedUpOntoCursor(gc) is not { } held)
+            return false;
+
+        _lootPlanned.Clear();
+        MoveToPutDown(gc, held);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Sends the cursor to where a held item goes down - a carried stack with room, or a free place - or ends the run
+    /// saying there is no room. See Autoloot.PutDownPlace.
+    /// </summary>
+    private void MoveToPutDown(GameController gc, Entity held)
+    {
+        if (Autoloot.PutDownPlace(gc, held) is not { } place)
+        {
+            Give("Item held", $"{Autoloot.HeldName(held)} is on the cursor, the inventory being open, and the inventory has " +
+                              "no room to put it down");
+            return;
+        }
+
+        _input.SetTolerance((int)Math.Clamp(Math.Min(place.Width, place.Height) / 2f - 2f, Closest, 12f));
+
+        if (!Sent(_input.MoveTo(place), "the move putting the held item down"))
+            return;
+
+        _putDownClicked = false;
+        Wait(Step.PuttingDown, PutDownPatience);
+        Say("Tidying", $"putting {Autoloot.HeldName(held)} down in the inventory");
+    }
+
+    /// <summary>Whether the click putting the held item down has gone out. See Step.PuttingDown.</summary>
+    private bool _putDownClicked;
+
+    /// <summary>How long the move and click putting a held item down may take. Chosen.</summary>
+    private static readonly TimeSpan PutDownPatience = TimeSpan.FromSeconds(2);
+
     private void Advance(GameController gc, AutoExpeditionSettings settings)
     {
+        // Before any next job: an item a pickup left on the cursor goes down first, whichever way the last job ended.
+        if (StartPuttingDown(gc))
+            return;
+
+        if (_lootOnly)
+        {
+            if (Walking(gc))
+            {
+                Wait(Step.Arriving, Arriving);
+                Say("Tidying", "walking to it");
+
+                return;
+            }
+
+            var todo = Chore(gc, settings);
+
+            if (todo.Of != null)
+            {
+                StartChore(gc, todo, settings);
+
+                return;
+            }
+
+            // **Ending with things out of reach is the ordinary end, not a warning.** It said Unclickable under the
+            // cursor each time a run had taken everything in view and the next thing was off screen - which the
+            // autoloot line already shows (2026-10-11). The detail names it; the dump lists them. See Unclickable.
+            // **Items left for want of room say so under the cursor**: the one thing to act on. See NoRoomFor.
+            if (NoRoomFor.Count > 0)
+            {
+                Give("Inventory full", $"{_shattered} thing{(_shattered == 1 ? "" : "s")} dealt with; {NoRoomFor.Count} listed " +
+                                       $"item(s) left with no room in the inventory - {string.Join(", ", NoRoomFor.Take(5))}");
+                return;
+            }
+
+            Give("Looted", $"{_shattered} thing{(_shattered == 1 ? "" : "s")} dealt with" +
+                           (todo.Waiting > 0
+                               ? $"; {todo.Waiting} more cannot be clicked from here - {Unclickable.FirstOrDefault()}"
+                               : ""));
+
+            return;
+        }
+
         // Nothing left to place is not the same as nothing left to do: a remnant that has been
         // blown and cleared offers a shatter button, and the chain is usually standing among
         // several of them. Nearest first, so the run works outwards from where you are rather than
@@ -1014,59 +1485,13 @@ internal sealed class Placement
 
             if (todo.Of != null)
             {
-                _chore = todo.Of;
-                _path = todo.Path;
-
-                // **A chore is not a rewrite, and the two cannot both be live.** Choose now asks
-                // which remnant the run is acting on, so a _change left over from an earlier
-                // placement would answer for a window opened by a chore - the very confusion of
-                // identity this pair of fields was just taught to avoid.
-                _change = null;
-                _wanted = _wants.TryGetValue(Safe.Read(todo.Of, static e => e.Id, 0u), out var owed)
-                    ? owed
-                    : null;
-
-                // Only a chore that opens the combinations window names a remnant; a chest or a
-                // shatter button is not one, and must not leave an identity behind for the next
-                // window that happens to open.
-                Opened = todo.Path == CombinationsPath
-                    ? Remnant(Safe.Read(todo.Of, static e => e.Id, 0u))
-                    : null;
-                // As tight as the target is, and no tighter.
-                //
-                // The tolerance is how far from the requested point the cursor may settle and
-                // still count as arrived. Twelve is right for a label nothing is covering - the
-                // cursor lands somewhere on it whatever it does - and hopeless for a six pixel
-                // sliver, where arriving twelve pixels out means arriving on the label behind.
-                //
-                // A fixed two was the other mistake: the cursor does not land on a sub-pixel, so a
-                // tolerance below what it can actually achieve means it never reports arrival at
-                // all, the step times out, and nothing is clicked. Hence the floor.
-                var spot = Exposed(gc, Panels.Covered(gc), todo.At,
-                    Safe.Read(todo.Of, static e => e.Id, 0u));
-
-                // Inside the gap, not merely near it. Arrival is judged against this number, so a
-                // tolerance equal to the room available lets the cursor report success from just
-                // outside the sliver it was aimed at - which is how a chest with a seven pixel gap
-                // ended up hovering the label behind it and being written off as covered.
-                _input.SetTolerance((int)Math.Clamp(spot.Room - 1f, Closest, 12f));
-
-                if (!Sent(_input.MoveTo(spot.At), "the move to " + todo.Word))
-                    return;
-
-                Wait(Step.Shattering);
-                Say("Tidying", todo.Word);
+                StartChore(gc, todo, settings);
 
                 return;
             }
 
-            if (todo.Waiting > 0)
-            {
-                Give(Obscured, $"{todo.Waiting} thing{(todo.Waiting == 1 ? " is" : "s are")} ready " +
-                               "to be dealt with and not on screen - walk towards them and press again");
-
-                return;
-            }
+            // Something left that cannot be clicked from here - off screen, or covered - is no longer a warning: the run
+            // goes on to its ordinary end, and the autoloot line points the way. The dump lists them. See Unclickable.
         }
 
         if (Detonator.ExplosivesInHand(gc) <= 0)
@@ -1259,7 +1684,7 @@ internal sealed class Placement
         // Too far from the last explosive, the game will not enter placement mode at all. See PlacementModeRange.
         if (fromLast >= PlacementModeRange)
         {
-            Give("Too far", $"you are {fromLast:0} grid from the last explosive - the game will not show the " +
+            Give("Too far from previous bomb", $"you are {fromLast:0} grid from the last explosive - the game will not show the " +
                             $"placement circle from {PlacementModeRange:0} or more; walk closer");
 
             return;
@@ -1276,7 +1701,7 @@ internal sealed class Placement
         // circle on and straight back off again.
         if (!Reachable(gc, out _, out var word, out var why))
         {
-            Give(word, why);
+            Give(AfterPlacing(gc, word), why);
 
             return;
         }
@@ -1830,6 +2255,22 @@ internal sealed class Placement
     /// </summary>
     private readonly Dictionary<uint, DateTime> _settling = new();
 
+    /// <summary>
+    /// The explosive being confirmed has landed: counted, and what it was chosen to catch kept for AfterPick. From the
+    /// explosive count rising, or from a reward window opening first - which only a landed explosive puts up. See the
+    /// window check in Step.
+    /// </summary>
+    private void Landed()
+    {
+        _landed++;
+        _justPlaced = _expect;
+        _declined = 0;
+        _armed = false;
+        _unlit = Array.Empty<Vector2>();
+        _spoiled.Clear();
+        Reason = "";
+    }
+
     /// <summary>What the last placed explosive was chosen to catch, for AfterPick. Empty before the first lands.</summary>
     private Vector2[] _justPlaced = [];
 
@@ -1847,6 +2288,12 @@ internal sealed class Placement
 
     /// <summary>What the last wait for another remnant's window came to, for the dump.</summary>
     public static string NextWindowSaid { get; private set; } = "no wait for a second window yet";
+
+    /// <summary>What AfterPick last decided: a remnant waited on, or none owed. See AfterPick.</summary>
+    public static string AfterPickSaid { get; private set; } = "no pick yet";
+
+    /// <summary>Whether the explosive was counted as landed by its window, for AfterPickSaid. See Landed.</summary>
+    private bool _windowLanded;
 
     /// <summary>
     /// After a reward is taken, waits for the next remnant's window if the explosive just placed covers another
@@ -1867,6 +2314,12 @@ internal sealed class Placement
                 _justPlaced.Any(at => Vector2.Distance(target.Grid, at) < 1f) &&
                 !_settling.ContainsKey(Safe.Read(() => target.Entity.Id, 0u)) &&
                 Undecided(Safe.Read(() => _valuation.ChosenName(target.Entity), null)));
+
+        // What was decided, for the dump: each time, so a remnant left without its window can be told from one never owed.
+        AfterPickSaid = $"{DateTime.Now:HH:mm:ss.fff} after a pick, {(owed == null ? "no remnant owed a window" : $"waiting on ({owed.Grid.X:0},{owed.Grid.Y:0})")}; " +
+                        $"the explosive was chosen to catch {_justPlaced.Length} marker(s)" +
+                        (_windowLanded ? ", counted as landed when its window came up before the explosive count rose" : "");
+        _windowLanded = false;
 
         if (owed == null)
         {
@@ -2419,10 +2872,15 @@ internal sealed class Placement
 
     /// <summary>
     /// The same question asked by the placement run, which is about to act on the answer.
+    ///
+    /// What the explosive reaches itself, not what an explodable it reaches sets off: a remnant an oil derrick takes can
+    /// lie far off, its button off screen, and there is no walking to it before the explosive goes down. Its window opens
+    /// by itself when the explosive is placed, as the game counts it taken, and Choose picks its reward then; see
+    /// Options.Whose. See Plan.HighlightedBy.
     /// </summary>
     private Target Rewrite(GameController gc, AutoExpeditionSettings settings, int index,
         out Reward want) =>
-        Choosing(gc, settings, _plan.CaughtBy(index), out want);
+        Choosing(gc, settings, _plan.HighlightedBy(index), out want);
 
     /// <summary>
     /// The nearest thing left to tidy up, whatever kind it is.
@@ -2463,8 +2921,12 @@ internal sealed class Placement
                Vector2.Distance(player, at) < Vector2.Distance(player, _plan.Points[index]);
     }
 
+    /// <param name="cursorAt">
+    /// Where the cursor is taken to be when ranking jobs, in place of where it is: the point of the job before, when
+    /// PlanLootAhead asks what follows it. Unclickable is left as it was when this is given.
+    /// </param>
     private (Entity Of, int[] Path, string Word, RectangleF At, int Waiting) Chore(
-        GameController gc, AutoExpeditionSettings settings)
+        GameController gc, AutoExpeditionSettings settings, bool itemsOnly = false, Vector2? cursorAt = null)
     {
         var player = Safe.Read(() => gc.Player.GridPos, Vector2.Zero);
 
@@ -2485,7 +2947,19 @@ internal sealed class Placement
         // happened to be nearest.
         var waiting = 0;
 
-        void Consider(Entity of, int[] into, string says)
+        // The action key list's order, with a party member in the area: a job on a higher line wins, then the more
+        // expensive by NinjaPricer, then the nearer, and a job no line names ranks below every line. Alone, the nearest.
+        // See Autoloot.TopFirstNow.
+        var autoloot = settings.Automation.Autoloot;
+        var topFirst = Autoloot.TopFirstNow(gc);
+        var bestRank = int.MaxValue;
+        var bestPrice = 0d;
+        var bestFromCursor = float.MaxValue;
+        var cursor = cursorAt ?? Autoloot.CursorOnScreen(gc);
+
+        var unclickable = new List<string>();
+
+        void Consider(Entity of, int[] into, string says, int rank = int.MaxValue, double price = 0d)
         {
             if (_skip.Contains(Safe.Read(of, static e => e.Id, 0u)))
                 return;
@@ -2502,14 +2976,32 @@ internal sealed class Placement
             {
                 waiting++;
 
+                // What and why, for the message and the dump: "1 thing is not on screen" named neither (2026-10-11).
+                var away = Vector2.Distance(player, Safe.Read(of, static e => e.GridPos, Vector2.Zero));
+                var why = rect.Width <= 0f ? "its label or button is not shown"
+                    : !OnScreen(gc, rect.Center) ? "its label is off screen"
+                    : "its label is covered by a panel or other labels";
+
+                unclickable.Add($"{ThingSaid(says, of)} {away:0} grid away: {why}");
+
                 return;
             }
 
             var distance = Vector2.Distance(player, Safe.Read(of, static e => e.GridPos, Vector2.Zero));
 
-            if (distance >= closest)
+            // An item within reach needs no walk, so it counts as at the player's feet. See Autoloot.PickupReachGrid.
+            if (Safe.Read(of, static e => e.HasComponent<WorldItem>(), false))
+                distance = Autoloot.WalkToItem(distance);
+
+            var fromCursor = Vector2.Distance(cursor, spot);
+
+            if (nearest != null &&
+                !Autoloot.Beats(topFirst, rank, price, distance, fromCursor, bestRank, bestPrice, closest, bestFromCursor))
                 return;
 
+            bestRank = rank;
+            bestPrice = price;
+            bestFromCursor = fromCursor;
             closest = distance;
             nearest = of;
             path = into;
@@ -2517,12 +3009,18 @@ internal sealed class Placement
             word = says;
         }
 
-        if (settings.Automation.On(after.Shatter) && _scan != null)
+        // Shattering and chests only where the action key list has their ENTITY line: the list is their only switch.
+        // See Autoloot.RemnantsLine.
+        var listing = settings.Automation.Enable.Value && autoloot.EnableAutoloot;
+        var remnantsRank = Autoloot.RankOfLine(autoloot.ItemsOnActionKey, Autoloot.RemnantsLine);
+        var chestsRank = Autoloot.RankOfLine(autoloot.ItemsOnActionKey, Autoloot.ExcavatedChestsLine);
+
+        if (!itemsOnly && listing && remnantsRank != int.MaxValue && _scan != null)
         {
             foreach (var target in _scan.Targets)
             {
                 if (target.Shatterable && target.Entity != null)
-                    Consider(target.Entity, ShatterPath, "shattering a spent remnant");
+                    Consider(target.Entity, ShatterPath, "shattering a spent remnant", remnantsRank);
             }
         }
 
@@ -2541,7 +3039,7 @@ internal sealed class Placement
         // Behind the same switch as the choosing itself: opening the window to pick a reward and
         // picking it are one intention, and a player who has turned the picking off does not want
         // windows opened on their behalf either.
-        if (settings.Automation.On(settings.Automation.PreExpedition.ChooseRewards) && _scan != null && _valuation != null)
+        if (!itemsOnly && settings.Automation.On(settings.Automation.PreExpedition.ChooseRewards) && _scan != null && _valuation != null)
         {
             foreach (var target in _scan.Targets)
             {
@@ -2563,41 +3061,106 @@ internal sealed class Placement
         // site - and the blast consumes the marker and leaves a chest. So a scan target's entity is
         // the thing that is gone, its label belongs to nothing, and every chest counted as
         // unreachable. What wants clicking is the chest itself, which only exists after the blast.
-        if (settings.Automation.On(after.Chests))
+        if (!itemsOnly && listing && chestsRank != int.MaxValue)
         {
-            var chests = Safe.Read(gc, static g =>
-                g.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Chest, out var of)
-                    ? of
-                    : null, null);
+            // A chest's label IS the button - it has no children - so the path is empty.
+            foreach (var chest in ExcavatedChestsToOpen(gc))
+                Consider(chest, [], "opening an excavated chest", chestsRank);
+        }
 
-            foreach (var chest in chests ?? new List<Entity>())
+        // Items on Autoloot's action key list, as one more job, ranked by their line. Each is clicked once: Shattering
+        // skips it after the click, so an item that cannot be picked up - a full inventory - is not clicked again.
+        // **Not one with no room in the inventory**, read from the game's record of it: clicked, it was walked to and
+        // missed twice, every press. Left with the slots kept for instant loot. See InventorySpace.
+        var keepFree = InventorySpace.KeptForInstantLoot(gc, settings);
+        var noRoom = new List<string>();
+
+        if (listing)
+        {
+            foreach (var (item, _, rank, _) in Autoloot.ListedOnGround(gc, autoloot.ItemsOnActionKey))
             {
-                var metadata = Safe.Read(chest, static e => e.Metadata, "") ?? "";
-
-                if (metadata.IndexOf("LeaguesExpedition", StringComparison.OrdinalIgnoreCase) < 0)
+                if (!_skip.Contains(Safe.Read(item, static e => e.Id, 0u)) && !InventorySpace.Fits(gc, item, keepFree))
+                {
+                    noRoom.Add(ThingSaid("picking up a listed item", item));
                     continue;
+                }
 
-                if (Safe.Read(chest, static e => e.GetComponent<Chest>()?.IsOpened ?? true, true))
-                    continue;
-
-                // Filed under Chests is not the same as openable. GenericShatterable - the barrels
-                // a blast breaks - sits at the same path as every reward chest, and this pass would
-                // have sent the cursor to one and clicked at something the game will not let you
-                // target. Targetable is the game answering that question itself.
-                if (!Safe.Read(chest, static e => e.IsTargetable, false))
-                    continue;
-
-                // A chest's label IS the button - it has no children - so the path is empty.
-                Consider(chest, [], "opening an excavated chest");
+                Consider(item, [], "picking up a listed item", rank, Autoloot.ExaltsOfItem(gc, item));
             }
         }
+
+        if (cursorAt == null)
+            NoRoomFor = noRoom;
 
         return (nearest, path, word, at, waiting);
     }
 
+    /// <summary>
+    /// The expedition chests in the entity list that are unopened and targetable: what ENTITY:ExcavatedChests opens. From
+    /// the entity list, not the scan, whose chests are the markers the blast consumed.
+    /// </summary>
+    internal static List<Entity> ExcavatedChestsToOpen(GameController gc)
+    {
+        var found = new List<Entity>();
+        var chests = Safe.Read(gc, static g =>
+            g.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Chest, out var of)
+                ? of
+                : null, null);
+
+        foreach (var chest in chests ?? new List<Entity>())
+        {
+            var metadata = Safe.Read(chest, static e => e.Metadata, "") ?? "";
+
+            if (metadata.IndexOf("LeaguesExpedition", StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+
+            if (Safe.Read(chest, static e => e.GetComponent<Chest>()?.IsOpened ?? true, true))
+                continue;
+
+            // Filed under Chests is not the same as openable. GenericShatterable - the barrels
+            // a blast breaks - sits at the same path as every reward chest, and this pass would
+            // have sent the cursor to one and clicked at something the game will not let you
+            // target. Targetable is the game answering that question itself.
+            if (!Safe.Read(chest, static e => e.IsTargetable, false))
+                continue;
+
+            found.Add(chest);
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// What the last Chore could not click, each with its distance and why: its label not shown, off screen, or covered.
+    /// Named in the Unclickable message and listed in the dump. See Chore.
+    /// </summary>
+    internal static IReadOnlyList<string> Unclickable { get; private set; } = [];
+
+    /// <summary>Listed items left on the ground for want of room in the inventory, by name, at the last look. See Chore.</summary>
+    internal static IReadOnlyList<string> NoRoomFor { get; private set; } = [];
+
+    /// <summary>A job's thing as a player would name it: the item's base name, or a chest or remnant.</summary>
+    private static string ThingSaid(string says, Entity of) =>
+        Safe.Read(of, static e => e.GetComponent<WorldItem>()?.ItemEntity?.GetComponent<Base>()?.Name, null) is { Length: > 0 } item
+            ? item
+            : says switch
+            {
+                "opening an excavated chest" => "an excavated chest",
+                "shattering a spent remnant" => "a spent remnant",
+                "opening the combinations window" => "a remnant's reward",
+                _ => says,
+            };
+
     /// <summary>Whether the cursor is on the thing it was sent to, by whichever test suits it.</summary>
-    private bool Under(GameController gc) =>
-        _path is { Length: > 0 } ? Button(gc, _chore, _path).Lit : Hovered(gc, _chore);
+    private bool Under(GameController gc) => UnderCursor(gc, _chore, _path);
+
+    /// <summary>
+    /// Whether the game says the cursor is on this thing's button: lit, for a button down a path; for a label, the
+    /// game's hovered element being the label, inside it or round it - passing when the game names nothing. Shared with
+    /// the instant loot run. See Hovered.
+    /// </summary>
+    internal static bool UnderCursor(GameController gc, Entity of, int[] path) =>
+        path is { Length: > 0 } ? Button(gc, of, path).Lit : Hovered(gc, of);
 
     /// <summary>
     /// A spot on this rectangle that can actually be clicked, or nothing when none can.
@@ -2611,7 +3174,7 @@ internal sealed class Placement
     /// outside it. Coarse, because the grid is only looking for a gap big enough to put a cursor
     /// in, and forty odd samples of an interface walk is already more work than this deserves.
     /// </summary>
-    private static (Vector2 At, float Room) Exposed(GameController gc, List<RectangleF> covered,
+    internal static (Vector2 At, float Room) Exposed(GameController gc, List<RectangleF> covered,
         RectangleF rect, uint mine = 0u)
     {
         if (rect.Width <= 0f || rect.Height <= 0f)
@@ -2765,6 +3328,10 @@ internal sealed class Placement
     /// Two readings, because neither is reliable alone. Actor.isMoving is the client's own answer
     /// and is what a movement skill sets; the Moving action flag is the same state read from the
     /// action word. Either being set is enough - this is a gate that should err towards refusing.
+    ///
+    /// **Not the position.** Counting a grid position changed within the last 100ms as moving held every
+    /// wait in a run - each arrival at a chest or remnant - 100ms past the character stopping (2026-10-11).
+    /// The position is asked only where an action key press starts something. See MovingForPress.
     /// </summary>
     internal static bool Walking(GameController gc)
     {
@@ -2777,6 +3344,63 @@ internal sealed class Placement
                Safe.Read(actor, static a => (a.Action & ActionFlags.Moving) != 0, false);
     }
 
+    /// <summary>
+    /// Whether an action key press finds the character moving: Walking, a dodge roll under way, or its grid position
+    /// changed within CharacterMovedWithin. A roll sets neither of Walking's flags: read mid-roll, isMoving False, action
+    /// flags 8194, current action "DodgeRoll", animation DodgeRollBack (dump 2026-10-11 18:46:03). The position catches
+    /// other movement that sets no flag, a knockback say. Asked only where a press starts a run, so a run's own waits
+    /// do not pay the lag. See HoldPress.
+    /// </summary>
+    internal static bool MovingForPress(GameController gc) =>
+        DateTime.UtcNow - _characterMovedAt < CharacterMovedWithin || Walking(gc) || DodgeRolling(gc);
+
+    /// <summary>Whether the character's current action is a dodge roll, by its action type's id. See MovingForPress.</summary>
+    private static bool DodgeRolling(GameController gc) =>
+        string.Equals(Safe.Read(gc, static g => g.Player?.GetComponent<Actor>()?.CurrentAction?.ActionType?.Id, "") ?? "",
+            "DodgeRoll", StringComparison.Ordinal);
+
+    /// <summary>
+    /// How recently the character's grid position must have changed to count as moving, for MovingForPress. 50ms is a
+    /// guess at more than the gap between two position updates mid-roll, not a measured figure; it is also how long a
+    /// press waits after the character's last step.
+    /// </summary>
+    private static readonly TimeSpan CharacterMovedWithin = TimeSpan.FromMilliseconds(50);
+
+    private static Vector2 _characterAt;
+    private static DateTime _characterMovedAt = DateTime.MinValue;
+
+    /// <summary>Samples the character's grid position for Walking. Called at the top of every Tick.</summary>
+    internal static void NoteCharacterPosition(GameController gc)
+    {
+        var at = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (at == Vector2.Zero || Vector2.Distance(at, _characterAt) <= 0.5f)
+            return;
+
+        if (_characterAt != Vector2.Zero)
+            _characterMovedAt = DateTime.UtcNow;
+
+        _characterAt = at;
+    }
+
+    /// <summary>
+    /// Each reading Walking takes, and the actor's current action, for the dump: whether a dodge roll sets isMoving or
+    /// the Moving flag is read from a dump taken mid-roll.
+    /// </summary>
+    internal static string DescribeMovement(GameController gc)
+    {
+        var actor = Safe.Read(gc, static g => g.Player?.GetComponent<Actor>(), null);
+        var moved = _characterMovedAt == DateTime.MinValue
+            ? "never seen"
+            : $"{(DateTime.UtcNow - _characterMovedAt).TotalMilliseconds:0}ms ago";
+
+        return $"isMoving {Safe.Read(actor, static a => a.isMoving, false)}, action flags {Safe.Read(actor, static a => a.Action, ActionFlags.None)}, " +
+               $"action id {Safe.Read(actor, static a => (int)a.ActionId, -1)}, current action " +
+               $"\"{Safe.Read(actor, static a => a.CurrentAction?.ActionType?.Id, "") ?? ""}\", animation " +
+               $"{Safe.Read(actor, static a => a.Animation.ToString(), "?")} ({Safe.Read(actor, static a => a.AnimationId, -1)}), " +
+               $"grid position last changed {moved}";
+    }
+
     /// <summary>How many jobs this run has finished, for the word at the end.</summary>
     private int _shattered;
 
@@ -2786,8 +3410,355 @@ internal sealed class Placement
     /// <summary>Whatever the tidy-up pass is currently pointed at.</summary>
     private Entity _chore;
 
+    /// <summary>
+    /// **An action key loot run's jobs planned as one queue**: the job about to be clicked, the jobs after it that can be
+    /// clicked from where the player stands, in the order the run would take them, and the first that needs a walk last.
+    /// Items, spent remnants to shatter and excavated chests alike, each within its own reach - see ReachOfChore.
+    /// Planned, the cursor glides through them rather than starting and stopping at each, and arrives on each point
+    /// without waiting for the game's report of it - as the hideout's deposits and tablet runs do. See ExileInput2's
+    /// PlanClicks.
+    ///
+    /// Each click is still sent in turn as the run reaches it, and ExileInput2 follows the plan only while the point asked
+    /// for is the one planned; any other point drops the plan for that click. Nothing is planned past a walk, which moves
+    /// every label with the camera, nor up to a remnant's combinations window, whose opening hands the run to the reward
+    /// pick.
+    ///
+    /// Worked out by asking Chore for the next job with each one before it set aside, and with the cursor taken to be on
+    /// the job before - as it will be when the run asks - so the order is the run's own. Not done when this click is the
+    /// next of the plan already in hand. Each decision is kept for the dump. See LootPlansSaid.
+    /// </summary>
+    private void PlanLootAhead(GameController gc, AutoExpeditionSettings settings,
+        (Entity Of, int[] Path, string Word, RectangleF At, int Waiting) todo, Vector2 first)
+    {
+        var name = ThingSaid(todo.Word, todo.Of);
+
+        if (_lootPlanned.Count > 0 && _lootPlanned[0] == first)
+        {
+            _lootPlanned.RemoveAt(0);
+            SayLootPlan($"{name}: followed the plan, {_lootPlanned.Count} still planned after it");
+            return;
+        }
+
+        var dropped = _lootPlanned.Count > 0
+            ? $"the plan's next point was ({_lootPlanned[0].X:0},{_lootPlanned[0].Y:0}), this is ({first.X:0},{first.Y:0}) - "
+            : "";
+
+        _lootPlanned.Clear();
+
+        if (ReachOfChore(todo) is not { } firstReach)
+        {
+            SayLootPlan($"{name}: {dropped}not planned - it opens a combinations window");
+            return;
+        }
+
+        // Each item waits for its label and is put down from the cursor before the next. See Step.PuttingDown.
+        if (Autoloot.InventoryPanelOpen(gc))
+        {
+            SayLootPlan($"{name}: {dropped}not planned - the inventory is open, so each item is put down from the cursor");
+            return;
+        }
+
+        if (!WithinReach(gc, todo.Of, firstReach))
+        {
+            SayLootPlan($"{name}: {dropped}not planned - it needs a walk ({Away(gc, todo.Of):0} grid, reach {firstReach:0})");
+            return;
+        }
+
+        var covered = Panels.Covered(gc);
+        var rects = new List<RectangleF> { todo.At };
+        var points = new List<Vector2> { first };
+        var names = new List<string> { name };
+        var setAside = new List<uint>();
+        var ended = $"planned up to {LootPlannedMost}, the most one plan holds";
+
+        try
+        {
+            if (_skip.Add(Safe.Read(todo.Of, static e => e.Id, 0u)))
+                setAside.Add(Safe.Read(todo.Of, static e => e.Id, 0u));
+
+            while (points.Count < LootPlannedMost)
+            {
+                var next = Chore(gc, settings, cursorAt: points[^1]);
+
+                if (next.Of == null)
+                {
+                    ended = "nothing more to click from here";
+                    break;
+                }
+
+                if (ReachOfChore(next) is not { } reach)
+                {
+                    ended = $"{ThingSaid(next.Word, next.Of)} opens a combinations window";
+                    break;
+                }
+
+                var id = Safe.Read(next.Of, static e => e.Id, 0u);
+
+                if (id == 0u || !_skip.Add(id))
+                {
+                    ended = "the next job was already in the plan";
+                    break;
+                }
+
+                setAside.Add(id);
+                rects.Add(next.At);
+                points.Add(Exposed(gc, covered, next.At, id).At);
+                names.Add(ThingSaid(next.Word, next.Of));
+
+                // The first needing a walk ends it: the walk moves every label with the camera.
+                if (!WithinReach(gc, next.Of, reach))
+                {
+                    ended = $"{names[^1]} needs a walk ({Away(gc, next.Of):0} grid, reach {reach:0})";
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            foreach (var id in setAside)
+                _skip.Remove(id);
+        }
+
+        if (points.Count < 2)
+        {
+            SayLootPlan($"{name}: {dropped}not planned - only one job ({ended})");
+            return;
+        }
+
+        var planned = _input.PlanClicks(rects.ToArray(), points.ToArray(), new bool[points.Count],
+            points.Select(_ => Array.Empty<Keys>()).ToArray(), points.Select(_ => -1).ToArray(),
+            settings.Automation.ShowPlannedAutomationAutoloot.Value);
+
+        // The first is moved to now; the rest are what the next clicks are matched against.
+        if (planned)
+            _lootPlanned.AddRange(points.Skip(1));
+
+        SayLootPlan(planned
+            ? $"{name}: {dropped}planned {points.Count} - {string.Join(", ", names)}; ended: {ended}"
+            : $"{name}: {dropped}not planned - ExileInput2 refused the plan of {points.Count}");
+    }
+
+    /// <summary>
+    /// How far from the player a job can be clicked without a walk, in grid, or null for one that opens a remnant's
+    /// combinations window, which no plan runs through. An item, Autoloot.PickupReachGrid. A spent remnant's shatter
+    /// button, the remnant interaction range, Options.Reach. An excavated chest, ExcavatedChestReachGrid.
+    /// </summary>
+    private static float? ReachOfChore((Entity Of, int[] Path, string Word, RectangleF At, int Waiting) todo) =>
+        todo.Path == CombinationsPath ? null
+        : todo.Path == ShatterPath ? Options.Reach
+        : Safe.Read(todo.Of, static e => e.HasComponent<WorldItem>(), false) ? Autoloot.PickupReachGrid
+        : ExcavatedChestReachGrid;
+
+    /// <summary>
+    /// How near an excavated chest must be to open without a walk, in grid. The player's estimate, about an item's
+    /// pickup reach; not measured.
+    /// </summary>
+    private const float ExcavatedChestReachGrid = 23f;
+
+    /// <summary>
+    /// What each action key loot click did about the plan, newest last, kept across areas: followed the plan, planned
+    /// anew and how far, or why not. For the dump. See PlanLootAhead.
+    /// </summary>
+    internal static IReadOnlyList<string> LootPlansSaid
+    {
+        get
+        {
+            lock (LootPlans)
+                return LootPlans.ToList();
+        }
+    }
+
+    private static readonly List<string> LootPlans = new();
+
+    /// <summary>How many LootPlansSaid keeps. Chosen: a few loot runs' worth.</summary>
+    private const int LootPlansKept = 60;
+
+    private static void SayLootPlan(string said)
+    {
+        lock (LootPlans)
+        {
+            LootPlans.Add($"{DateTime.Now:HH:mm:ss.fff} {said}");
+
+            if (LootPlans.Count > LootPlansKept)
+                LootPlans.RemoveAt(0);
+        }
+    }
+
+    /// <summary>When the cursor, arrived, was first read as not on its target. See UnderGrace.</summary>
+    private DateTime? _notUnderSince;
+
+    /// <summary>
+    /// How long an arrived cursor may read as not on its target before the job is given up as covered: the game's hover
+    /// reading follows the cursor by a frame or more. Chosen, several frames at 60 frames a second.
+    /// </summary>
+    private static readonly TimeSpan UnderGrace = TimeSpan.FromMilliseconds(150);
+
+    /// <summary>The points of a loot run's planned clicks still to come, in order. See PlanLootAhead.</summary>
+    private readonly List<Vector2> _lootPlanned = new();
+
+    /// <summary>The most clicks one loot plan holds. Chosen: more than a pile of drops within reach usually has.</summary>
+    private const int LootPlannedMost = 12;
+
+    /// <summary>Whether a thing lies within this many grid of the player, taken where they stand. See ReachOfChore.</summary>
+    private static bool WithinReach(GameController gc, Entity of, float reach) => Away(gc, of) is >= 0f and var away && away <= reach;
+
+    /// <summary>How far a thing is from the player in grid, or -1 when either position cannot be read.</summary>
+    private static float Away(GameController gc, Entity of)
+    {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var at = Safe.Read(of, static e => e.GridPos, Vector2.Zero);
+
+        return player == Vector2.Zero || at == Vector2.Zero ? -1f : Vector2.Distance(player, at);
+    }
+
     /// <summary>Things this run has given up on because something was in front of them.</summary>
     private readonly HashSet<uint> _skip = new();
+
+    /// <summary>Jobs clicked a second time after a miss this run, by entity id. See ClickChoreAgain.</summary>
+    private readonly HashSet<uint> _choresClickedAgain = new();
+
+    /// <summary>When the job being waited on was clicked. See Step.Shattered.</summary>
+    private DateTime _choreClickedAt;
+
+    /// <summary>
+    /// How long after its click a job still there, with the character standing idle, counts as missed: the player's ping
+    /// as the game reports it (ServerData.Latency, taken as milliseconds - not checked; the dump sets it beside each
+    /// response), plus ChoreMissedMarginMs, and never under ChoreMissedLeastMs. A walk or an action cannot begin sooner
+    /// than the game answers, so the window is never shorter than the ping. Measured at a ping of 13 to 14: walks began
+    /// 65 and 67ms after the click and actions 4 to 96ms after, one at 199 (dump 2026-10-12 00:55:33) - so 60ms over the
+    /// ping was under some of them. At 100 over, an action began at 143ms and a click was taken as missed at 119ms with
+    /// the character walking to it, by the player's account (dump 2026-10-12 01:16:51), so the margin is 150. Nineteen
+    /// responses over two dumps, one session. What follows each click, and how
+    /// soon, goes in the dump to tune it by. See ChoreResponses. Too short costs a second click on the same thing, which
+    /// the game takes as the same request.
+    /// </summary>
+    private static TimeSpan ChoreMissedAfter(GameController gc)
+    {
+        var ping = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
+        var ms = ping is > 0 and < 2000 ? ping + ChoreMissedMarginMs : ChoreMissedUnknownPingMs;
+
+        return TimeSpan.FromMilliseconds(Math.Max(ChoreMissedLeastMs, ms));
+    }
+
+    private const int ChoreMissedMarginMs = 150;
+
+    private const int ChoreMissedLeastMs = 80;
+
+    /// <summary>The window when the ping cannot be read. Chosen. See ChoreMissedAfter.</summary>
+    private const int ChoreMissedUnknownPingMs = 150;
+
+    /// <summary>When a walk the job's click started came to a stop, or null. See NoteArrival.</summary>
+    private DateTime? _arrivedAtChore;
+
+    /// <summary>
+    /// Notes, beside the first responses, how long a job took to go after the walk to it stopped: the wait at an item
+    /// before it leaves the ground, which a retry must not cut short. Not otherwise measured. See ChoreResponses.
+    /// </summary>
+    private void NoteArrival(string said)
+    {
+        lock (ChoreResponsesHeld)
+        {
+            if (ChoreResponsesHeld.Count >= ChoreResponsesKept)
+                ChoreResponsesHeld.RemoveAt(0);
+
+            ChoreResponsesHeld.Add($"{said} (ping {_choreClickedPing})");
+        }
+    }
+
+    /// <summary>Where the character stood when the job waited on was clicked. See MovedSinceChoreClick.</summary>
+    private Vector2 _characterAtChoreClick;
+
+    /// <summary>
+    /// Whether the character has moved since the job waited on was clicked: on its way to it, so the click did not miss.
+    /// The position, as well as the moving flags: a click was taken as missed 119ms after it with the character already
+    /// walking to the item, by the player's account, the flags not yet set (dump 2026-10-12 01:16:51). See
+    /// Step.Shattered.
+    /// </summary>
+    private bool MovedSinceChoreClick(GameController gc)
+    {
+        var now = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        return _characterAtChoreClick != Vector2.Zero && now != Vector2.Zero && Vector2.Distance(now, _characterAtChoreClick) > 0.5f;
+    }
+
+    /// <summary>The player's ping as read when the job waited on was clicked, or -1. See NoteChoreResponse.</summary>
+    private int _choreClickedPing = -1;
+
+    /// <summary>
+    /// What followed each of the last ChoreResponsesKept clicks the action key run waited on, and how soon: the walk
+    /// began, an action began, the job was done, or it was taken as missed. Newest last. For the dump.
+    /// </summary>
+    internal static IReadOnlyList<string> ChoreResponses
+    {
+        get
+        {
+            lock (ChoreResponsesHeld)
+                return [.. ChoreResponsesHeld];
+        }
+    }
+
+    private static readonly List<string> ChoreResponsesHeld = [];
+
+    private const int ChoreResponsesKept = 20;
+
+    /// <summary>Whether the click waited on has had its first response noted. See NoteChoreResponse.</summary>
+    private bool _choreResponseNoted;
+
+    /// <summary>Notes the first thing that follows the click waited on, and how long after it. See ChoreResponses.</summary>
+    private void NoteChoreResponse(string what)
+    {
+        if (_choreResponseNoted)
+            return;
+
+        _choreResponseNoted = true;
+
+        lock (ChoreResponsesHeld)
+        {
+            if (ChoreResponsesHeld.Count >= ChoreResponsesKept)
+                ChoreResponsesHeld.RemoveAt(0);
+
+            ChoreResponsesHeld.Add($"{what} {(DateTime.UtcNow - _choreClickedAt).TotalMilliseconds:0}ms (ping {_choreClickedPing})");
+        }
+    }
+
+    /// <summary>Whether the character is doing nothing: no action under way, by its actor's flags. See Step.Shattered.</summary>
+    private static bool CharacterIdle(GameController gc) =>
+        Safe.Read(gc, static g => g.Player.GetComponent<Actor>().Action, ActionFlags.None) == ActionFlags.None;
+
+    /// <summary>
+    /// The job the run is waiting on, clicked again: taken off the skip list so the next job chosen can be it, once per
+    /// job per run. A second miss puts it on the skip list and goes on to the next job. See Step.Shattered.
+    /// </summary>
+    private void ClickChoreAgain(GameController gc, AutoExpeditionSettings settings)
+    {
+        var id = Safe.Read(_chore, static e => e.Id, 0u);
+
+        if (id != 0u && _choresClickedAgain.Add(id))
+        {
+            _skip.Remove(id);
+            Say("Tidying", "the click missed - clicking it again");
+        }
+        else
+            _skip.Add(id);
+
+        Advance(gc, settings);
+    }
+
+    /// <summary>
+    /// The action key pressed while the run waits on a job it clicked: clicked again at once rather than the press being
+    /// ignored until the wait runs out. False when the run is not waiting on a job, and the press is not taken.
+    /// </summary>
+    internal bool PressWhileWaitingOnChore(GameController gc, AutoExpeditionSettings settings)
+    {
+        if (_step != Step.Shattered || _chore == null)
+            return false;
+
+        // A press is the player asking, so it is not counted against the one automatic retry.
+        _skip.Remove(Safe.Read(_chore, static e => e.Id, 0u));
+        Say("Tidying", "clicking it again");
+        Advance(gc, settings);
+        return true;
+    }
 
     /// <summary>
     /// Whether the game says the cursor is over this entity's ground label.
@@ -2942,7 +3913,7 @@ internal sealed class Placement
             return "nothing";
 
         var text = Safe.Read(element, static e => e.Text, null);
-        var rect = Safe.Read(element, static e => e.GetClientRectCache, default);
+        var rect = Safe.Read(element, static e => e.GetClientRect(), default);
 
         return (string.IsNullOrWhiteSpace(text) ? "an unnamed element" : $"\"{text.Trim()}\"") +
                $" ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0})";
@@ -3008,7 +3979,7 @@ internal sealed class Placement
         if (first == null || !Safe.Read(first, static e => e.IsVisible, false))
             return label;
 
-        var rect = Safe.Read(first, static e => e.GetClientRectCache, default);
+        var rect = Safe.Read(first, static e => e.GetClientRect(), default);
 
         return rect.Width > 0f && rect.Height > 0f ? first : label;
     }
@@ -3045,30 +4016,55 @@ internal sealed class Placement
     /// </summary>
     private static List<RectangleF> Neighbours(GameController gc, uint mine)
     {
-        var found = new List<RectangleF>();
-        var labels = Ground.Labels(gc);
+        var all = VisibleLabelRects(gc);
+        var found = new List<RectangleF>(all.Count);
 
-        if (labels == null)
-            return found;
-
-        foreach (var label in labels)
+        foreach (var (id, rect) in all)
         {
-            if (Safe.Read(() => label.ItemOnGround?.Id ?? 0u, 0u) == mine)
-                continue;
-
-            var element = Safe.Read(() => label.Label, null);
-
-            if (element == null || !Safe.Read(element, static e => e.IsVisible, false))
-                continue;
-
-            var rect = Safe.Read(Hit(element), static e => e.GetClientRectCache, default);
-
-            if (rect.Width > 0f && rect.Height > 0f)
+            if (id != mine)
                 found.Add(rect);
         }
 
         return found;
     }
+
+    /// <summary>
+    /// Every visible ground label's clickable rectangle, with its entity id, worked out once per read of the labels on
+    /// the owner thread rather than once per Neighbours call. See Ground.ViewNumber.
+    /// </summary>
+    private static List<(uint Id, RectangleF Rect)> VisibleLabelRects(GameController gc)
+    {
+        var read = Ground.Labels(gc);
+
+        if (Ground.OnOwnerThread && _labelRectsView == Ground.ViewNumber && _labelRects != null)
+            return _labelRects;
+
+        var found = new List<(uint, RectangleF)>();
+
+        foreach (var label in read ?? [])
+        {
+            var element = Safe.Read(label, static l => l.Label, null);
+
+            if (element == null || !Safe.Read(element, static e => e.IsVisible, false))
+                continue;
+
+            var rect = Safe.Read(Hit(element), static e => e.GetClientRect(), default);
+
+            if (rect.Width > 0f && rect.Height > 0f)
+                found.Add((Safe.Read(label, static l => l.ItemOnGround?.Id ?? 0u, 0u), rect));
+        }
+
+        if (Ground.OnOwnerThread)
+        {
+            _labelRects = found;
+            _labelRectsView = Ground.ViewNumber;
+        }
+
+        return found;
+    }
+
+    private static List<(uint Id, RectangleF Rect)> _labelRects;
+    private static long _labelRectsView = -1;
 
     /// <summary>Where on a label the cursor could go, for the dump. Zero when nowhere.</summary>
     /// <summary>
@@ -3088,16 +4084,9 @@ internal sealed class Placement
         if (id == 0u)
             return (default, false);
 
-        var labels = Ground.Labels(gc);
-
-        if (labels == null)
-            return (default, false);
-
-        foreach (var label in labels)
+        // From this read's labels by id, rather than a walk of the whole list per button. See Ground.LabelOf.
+        if (Ground.LabelOf(gc, id) is { } label)
         {
-            if (Safe.Read(() => label.ItemOnGround?.Id ?? 0u, 0u) != id)
-                continue;
-
             var at = Safe.Read(() => label.Label, null);
 
             foreach (var step in path)
@@ -3118,7 +4107,7 @@ internal sealed class Placement
             if (path.Length == 0)
                 at = Hit(at);
 
-            var rect = Safe.Read(at, static e => e.GetClientRectCache, default);
+            var rect = Safe.Read(at, static e => e.GetClientRect(), default);
 
             return rect.Width > 0f && rect.Height > 0f
                 ? (rect, Safe.Read(at, static e => e.HasShinyHighlight, false))
@@ -3665,7 +4654,7 @@ internal sealed class Placement
 
         if (!Reachable(gc, out var at, out var word, out var why))
         {
-            Give(word, why);
+            Give(AfterPlacing(gc, word), why);
 
             return;
         }
@@ -3865,7 +4854,7 @@ internal sealed class Placement
         }
 
         return Safe.Read(at, static e => e.IsVisible, false)
-            ? Safe.Read(at, static e => e.GetClientRectCache, default)
+            ? Safe.Read(at, static e => e.GetClientRect(), default)
             : default;
     }
 
@@ -3978,7 +4967,7 @@ internal sealed class Placement
     }
 
     /// <summary>The warnings that only say the next spot is further away. See Say.</summary>
-    private static readonly HashSet<string> MovingOn = new(StringComparer.Ordinal) { "Bad camera angle", "Too far" };
+    private static readonly HashSet<string> MovingOn = new(StringComparer.Ordinal) { "Bad camera angle", "Too far from previous bomb" };
 
     /// <summary>Hands the cursor back and says why. Every way out of the sequence goes through here.</summary>
     /// <summary>The grid cell a spot rounds to, which is the granularity Refused works in.</summary>
@@ -4061,6 +5050,11 @@ internal sealed class Placement
 
         _armed = false;
 
+        // ExileInput2's own move speed back, for whatever takes the cursor under this name next. See
+        // AutolootSettings.ShortestMoveWhenAutolootingMs.
+        if (_lootOnly)
+            _input.SetShortestMove(-1);
+
         _input.Release();
         _step = Step.Idle;
         Say(status, detail);
@@ -4101,7 +5095,8 @@ internal sealed class Placement
 
         if (_step != Step.Idle)
         {
-            Give("Stopped", "stopped by a key press");
+            // Shown nowhere: the player cancelled it, or left the area. See CursorWarning.Unshown.
+            Give(Cancelled, "stopped by a key press or a change of area");
         }
         else
         {

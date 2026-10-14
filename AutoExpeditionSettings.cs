@@ -51,7 +51,7 @@ namespace AutoExpedition;
 internal static class Migrated
 {
     /// <summary>Raise this and add a case below whenever a shipped value must reach saved files.</summary>
-    public const int Current = 34;
+    public const int Current = 35;
 
     /// <summary>
     /// The weights whose number the plan actually took from the settings file, and the table row
@@ -449,6 +449,12 @@ internal static class Migrated
         if (was < 33 && settings?.TabletRerolling is { } progressed && ProgressOffsetsLowered(saved, progressed) is { Length: > 0 } progress)
             said.Add(progress);
 
+        // **35 - Shatter remnants and Open excavated chests became lines of the action key list**, ENTITY:Remnants and
+        // ENTITY:ExcavatedChests, and the checkboxes went. A checkbox saved off takes its line out, so the job stays off.
+        // See AutolootSettings.ItemsOnActionKey.
+        if (was < 35 && settings?.Automation?.Autoloot is { } looted && ChoresIntoActionKeyList(saved, looted) is { Length: > 0 } listed)
+            said.Add(listed);
+
         settings.ConfigVersion = Current;
 
         return said.Count == 0 ? "" : string.Join("; ", said);
@@ -534,6 +540,44 @@ internal static class Migrated
     private const int ProgressRightOfStashAtStep33 = 1690;
 
     private const int ProgressBelowStashTopAtStep33 = 1230;
+
+    /// <summary>
+    /// Step 35: the ENTITY line of each of Shatter remnants and Open excavated chests saved off, taken out of the action
+    /// key list. Empty when neither was off or the file cannot be read.
+    /// </summary>
+    private static string ChoresIntoActionKeyList(string saved, AutolootSettings autoloot)
+    {
+        try
+        {
+            if (saved.Length == 0 || !File.Exists(saved) ||
+                Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(saved))["Automation"]?["PostExpedition"] is not Newtonsoft.Json.Linq.JObject after)
+                return "";
+
+            bool Off(string name) => after[name]?["Value"]?.Type == Newtonsoft.Json.Linq.JTokenType.Boolean && !(bool)after[name]["Value"];
+
+            var said = new List<string>();
+
+            foreach (var (name, line) in new[] { ("Shatter", Autoloot.RemnantsLine), ("Chests", Autoloot.ExcavatedChestsLine) })
+            {
+                if (!Off(name))
+                    continue;
+
+                var kept = Array.FindAll((autoloot.ItemsOnActionKey.Value ?? "").Split('\n'),
+                    x => !string.Equals(x.Trim(), line, StringComparison.OrdinalIgnoreCase));
+
+                autoloot.ItemsOnActionKey.Value = string.Join("\n", kept);
+                said.Add(line);
+            }
+
+            return said.Count == 0
+                ? ""
+                : $"took {string.Join(" and ", said)} out of the action key list, as {(said.Count == 1 ? "its checkbox was" : "their checkboxes were")} off";
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
 
     private static string ProgressOffsetsLowered(string saved, TabletRerollingSettings tablets)
     {
@@ -631,9 +675,6 @@ internal static class Migrated
 
             if (Switch("TidyAfterCraftAndReforge") is { } tidy)
                 tablets.TabletAutomation.TidyAfterCraftAndReforge.Value = tidy;
-
-            if (Number("PauseBetweenClicksMs") is { } pause)
-                tablets.TabletAutomation.PauseBetweenClicksMs.Value = pause;
 
             if (Number("ShortestMoveBetweenTabletsMs") is { } shortest)
                 tablets.TabletAutomation.ShortestMoveBetweenTabletsMs.Value = shortest;
@@ -1107,8 +1148,9 @@ internal static class PriceOverrideEditor
 
         ImGui.TextUnformatted("Manual price overrides: one per line, reward name=exalts.");
 
-        // A line more than the entries, so there is always room to type the next one.
-        var height = ImGui.GetTextLineHeightWithSpacing() * (Math.Max(3, entries.Length) + 1) + 6f;
+        // A line more than the entries, so there is always room to type the next one. A line in the box is the font's
+        // height, without the spacing between items; with it, every entry added a few pixels of empty box.
+        var height = ImGui.GetTextLineHeight() * (Math.Max(3, entries.Length) + 1) + ImGui.GetStyle().FramePadding.Y * 2f;
 
         if (ImGui.InputTextMultiline("###aeOverrides", ref box, 8192,
                 new System.Numerics.Vector2(ImGui.GetContentRegionAvail().X - 20f, height)))
@@ -1117,6 +1159,96 @@ internal static class PriceOverrideEditor
 
             settings.Rewards.Overrides.Value = string.Join("\n", back);
         }
+    }
+}
+
+/// <summary>
+/// A list of item names as a box of one name a line, growing with the entries, in place of the host's single-line field,
+/// as PriceOverrideEditor draws the manual price overrides. Blank lines are dropped. See AutolootSettings.
+/// </summary>
+internal static class ItemListEditor
+{
+    /// <summary>
+    /// What an autoloot list's lines may be, shown on hovering the (i) beside its heading. See Autoloot.RemnantsLine.
+    /// </summary>
+    public const string ListLinesHelp =
+        "One line each, in order:\n" +
+        "- an item's name: its base type (\"Divine Orb\") or a unique's name, ignoring case\n" +
+        "- conditions, all of which must hold, separated by spaces:\n" +
+        "    CLASS:StackableCurrency - the game's item class (shown for each item in an F6 dump)\n" +
+        "    METADATA:Metadata/Items/Currency/ - the start of the item's metadata path\n" +
+        "    ART:Mageblood - the item's art name: a unique, identified or not\n" +
+        "    MIN:5ex (or 1d, 10c) - NinjaPricer's price for the item and its stack, at least;\n" +
+        "      alone, any item priced that high, uniques included (magic and rare gear have no price)\n" +
+        "  e.g. CLASS:Omen MIN:1d, or MIN:2d alone\n" +
+        "- ENTITY:Remnants - shatter spent remnants\n" +
+        "- ENTITY:ExcavatedChests - open excavated chests\n" +
+        "\n" +
+        "Without its ENTITY line, that job is not done.\n" +
+        "\n" +
+        "With a party member in the area, higher lines go first, and items on one line go most\n" +
+        "expensive first by NinjaPricer, stack included. Alone: of the items within pickup reach,\n" +
+        "the one nearest the cursor; with none in reach, the nearest.";
+
+    public static void Draw(string heading, string id, Func<AutoExpeditionSettings, TextNode> listOf, string help = "")
+    {
+        if (Dump.Settings is not { } settings || listOf(settings) is not { } list)
+            return;
+
+        var entries = (list.Value ?? "").Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var box = string.Join("\n", entries);
+
+        ImGui.TextUnformatted(heading);
+
+        if (help.Length > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled("(i)");
+
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(help);
+        }
+
+        // A line more than the entries, so there is always room to type the next one. A line in the box is the font's
+        // height, without the spacing between items; with it, every entry added a few pixels of empty box.
+        var height = ImGui.GetTextLineHeight() * (Math.Max(3, entries.Length) + 1) + ImGui.GetStyle().FramePadding.Y * 2f;
+
+        if (ImGui.InputTextMultiline(id, ref box, 8192, new System.Numerics.Vector2(ImGui.GetContentRegionAvail().X - 20f, height)))
+            list.Value = string.Join("\n", box.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    /// <summary>
+    /// A checkbox for a setting that lives elsewhere, drawn here as well: the same node, read and written as it is drawn,
+    /// under the label it has where it lives. See AutolootSettings.
+    /// </summary>
+    public static void Mirror(string label, string help, Func<AutoExpeditionSettings, ToggleNode> nodeOf)
+    {
+        if (Dump.Settings is not { } settings || nodeOf(settings) is not { } node)
+            return;
+
+        var on = node.Value;
+
+        // The label as it reads where the setting lives, with an id of its own so the two copies never share ImGui state.
+        if (ImGui.Checkbox($"{label}###aeMirror{label}", ref on))
+            node.Value = on;
+
+        if (help.Length > 0 && ImGui.IsItemHovered())
+            ImGui.SetTooltip(help);
+    }
+
+    /// <summary>A slider for a setting that lives elsewhere, drawn here as well, as Mirror draws a checkbox.</summary>
+    public static void MirrorSlider(string label, string help, Func<AutoExpeditionSettings, RangeNode<int>> nodeOf)
+    {
+        if (Dump.Settings is not { } settings || nodeOf(settings) is not { } node)
+            return;
+
+        var value = node.Value;
+
+        if (ImGui.SliderInt($"{label}###aeMirror{label}", ref value, node.Min, node.Max))
+            node.Value = value;
+
+        if (help.Length > 0 && ImGui.IsItemHovered())
+            ImGui.SetTooltip(help);
     }
 }
 
@@ -2143,7 +2275,35 @@ public class AdvancedSolverSettings
         new ListNode { Value = SolverSettings.DestroyRepair };
 
 
-    [Menu("Exhaustive search on simple sites")]
+    /// <summary>
+    /// Two searches for sites with little on them. During a solve, a site of up to three kinds of content is solved by
+    /// trying each order of the kinds, each covered greedily, as a floor for the search. After a solve, on a site whose
+    /// only wanted markers are at most ten stops - remnants, multiplying relics and must-takes, typically a site seen
+    /// from afar - every order of the stops is laid again over every spot catching each; when that finds nothing
+    /// better within two seconds the site is exhausted and continuous solving stops until the site changes. Neither is
+    /// a proof. See Planner.TryEnumeratedSolve and ExhaustiveSpotSearch.IsChainExhausted.
+    /// </summary>
+    /// <summary>
+    /// How many explosives a chain is planned for at another player's site, in a party, or 0 to work it out: 15 for a
+    /// Grand site and 5 otherwise, times the map's explosives increase, and never fewer than its owner has placed. Its
+    /// detonator panel gives no count. Planned only to compare with where its owner goes: the action key does not place
+    /// there. See Detonator.ExplosivesAtAnotherPlayersSite.
+    /// </summary>
+    [Menu("Explosives at another player's site (0 = work it out)",
+        "In a party, at a site that is another player's, the game gives no explosive count.\n" +
+        "The plan there - to compare with where they go - is made for this many explosives.\n" +
+        "0 works it out: 15 on a Grand site, 5 otherwise, times the map's explosives increase,\n" +
+        "and never fewer than they have placed. A site is taken as Grand once they place more\n" +
+        "than an ordinary site allows, or when it holds 7 or more remnants.\n" +
+        "Nothing is placed there by the action key; it only loots.")]
+    public RangeNode<int> ExplosivesAtAnotherPlayersSite { get; set; } = new RangeNode<int>(0, 0, 40);
+
+    [Menu("Exhaustive search on simple sites",
+        "On a site with only a few kinds of content, also tries each order of the kinds.\n\n" +
+        "On a site whose only markers are up to ten remnants, multiplying relics or must-takes\n" +
+        "(a site seen from afar, before its monsters load), tries every order of them after each\n" +
+        "solve. If none beats the plan, the site reads as exhausted and continuous solving\n" +
+        "stops until something there changes.")]
     public ToggleNode UseEnumeratedSolve { get; set; } = new ToggleNode(true);
 
     [Submenu(CollapsedByDefault = true)]
@@ -2769,7 +2929,14 @@ public class AutomationSettings
     ///
     /// Drawing is not automation and is not gated by this - the line to loot still points the way.
     /// </summary>
-    [Menu("Enable automation")]
+    [Menu("Enable automation",
+        "Lets the plugin move the mouse, click and press keys for you:\n" +
+        "- placing explosives and choosing rewards\n" +
+        "- autoloot and instant loot\n" +
+        "- autodeposit and the tablet runs\n\n" +
+        "Requires the ExileInput2 plugin, installed and enabled: it is what moves the mouse\n" +
+        "and presses the keys. Without it, nothing here does anything.\n\n" +
+        "Off, the plugin still plans, draws and prices; it never touches the mouse or keyboard.")]
     public ToggleNode Enable { get; set; } = new ToggleNode(true);
 
     /// <summary>
@@ -2790,6 +2957,47 @@ public class AutomationSettings
     /// </summary>
     [Menu("Use the Toggle Highlighting key when buttons are obscured")]
     public ToggleNode Unhide { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// How long an action key press made while the character is still moving is held, in milliseconds, for a placement
+    /// run, a reward choice or an autoloot run, which refuse to start on the move. The run starts the moment the
+    /// character stops within it; past it, the press is refused with "Character moving" as before. 0 refuses at once. Pressing
+    /// again while one is held does nothing more. See Placement.PressHeldUntil.
+    /// </summary>
+    [Menu("Wait for the character to stop (ms)",
+        "A press of the action key while your character is still moving is held this long.\n" +
+        "If the character stops in time, the action goes ahead. 0 refuses at once.")]
+    public RangeNode<int> WaitForCharacterToStopMs { get; set; } = new RangeNode<int>(500, 0, 1000);
+
+    /// <summary>
+    /// Whether the clicks a hideout or town run plans ahead are drawn on screen as it goes, by ExileInput2: each mouse
+    /// path, the current one bright; L or R where a button goes down (bright) and comes up (dim); C, S or A where a
+    /// modifier does. The inventory deposit and the tablet runs - crafting, reforging, depositing, withdrawing, tidying -
+    /// draw what they have planned: a batch of tablets or items in full, a single click on its own. Explosive placement
+    /// never draws. Needs an ExileInput2 with PlanClicks. See InventoryDeposit.PlanQueue and Tablets.PlanAhead.
+    ///
+    /// Named for the hideout in its label; the property keeps its old name so a saved value is kept, and is to follow in
+    /// a change of its own. See ShowPlannedAutomationAutoloot.
+    /// </summary>
+    [Menu("Show planned automation: Hideout",
+        "Draws the mouse moves and clicks the hideout's automation has planned, as it goes:\n" +
+        "- each path the mouse will take, the current one bright\n" +
+        "- L or R where a button goes down (bright) and comes up (dim)\n" +
+        "- C, S or A where ctrl, shift or alt goes down (bright) and comes up (dim)\n" +
+        "For the inventory deposit and the tablet runs; explosive placement never draws them.")]
+    public ToggleNode ShowPlannedAutomation { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Whether the clicks an action key loot run plans ahead are drawn, as the hideout's are: the items, spent remnants
+    /// and excavated chests that can be clicked without a walk, in the order they will be clicked, and the first one
+    /// that needs a walk last. See Placement.PlanLootAhead.
+    /// </summary>
+    [Menu("Show planned automation: Autoloot",
+        "Draws the mouse moves and clicks an action key loot run has planned, as it goes, the\n" +
+        "same way as the hideout's: the items, spent remnants and chests that can be clicked\n" +
+        "from where you stand, in the order they will be clicked, then the first one that\n" +
+        "needs a walk.")]
+    public ToggleNode ShowPlannedAutomationAutoloot { get; set; } = new ToggleNode(true);
 
     /// <summary>Whether a switch below is on AND automation is on at all.</summary>
     public bool On(ToggleNode switched) => Enable.Value && switched.Value;
@@ -2824,6 +3032,408 @@ public class AutomationSettings
     [Menu("Post-expedition")]
     public PostExpeditionSettings PostExpedition { get; set; } = new PostExpeditionSettings();
 
+    [Menu("Autoloot")]
+    public AutolootSettings Autoloot { get; set; } = new AutolootSettings();
+
+    [Menu("Autodeposit")]
+    public AutodepositSettings Autodeposit { get; set; } = new AutodepositSettings();
+
+}
+
+/// <summary>
+/// Picking up items: the autoloot line, two lists of item names and how the instant list moves the mouse. The lists are
+/// the only switch for shattering and chests, by their ENTITY lines. Draw autoloot line and Only towards loot within are
+/// Automation > Post-expedition's own, drawn here as well. The two
+/// Enable switches first, then the line's settings, then an Autoloot heading over the action key list and an Instant Autoloot heading over the
+/// instant list. A subsection of Automation, under Post-expedition. See Autoloot.
+/// </summary>
+[Submenu(CollapsedByDefault = true)]
+public class AutolootSettings
+{
+    /// <summary>
+    /// The post-expedition pass does what the action key list says: picks up its items, and shatters spent remnants and
+    /// opens excavated chests where it has their ENTITY lines. Off, the list is kept and none of it is done. Needs Enable
+    /// automation. See Placement.Chore.
+    /// </summary>
+    [Menu("Enable Autoloot",
+        "Does what the action key list below says when you press the action key\n" +
+        "(F4 by default). Needs Enable automation on.\n" +
+        "- with a listed item clickable, the press picks it up, then carries on\n" +
+        "  with everything else on the list until nothing clickable is left\n" +
+        "- otherwise the list is worked through during explosive placement, once\n" +
+        "  nothing is left to place or a job is nearer than the next spot\n" +
+        "- ENTITY:Remnants shatters spent remnants, ENTITY:ExcavatedChests opens\n" +
+        "  excavated chests; without those lines neither is done\n" +
+        "- one job at a time: with a party member in the area, higher lines first,\n" +
+        "  then the more expensive, then the nearer; alone, the nearest first\n" +
+        "- moving the mouse stops it, and so does a key with Cancel autoloot on\n" +
+        "  keyboard input; your input is never blocked\n" +
+        "Off, the list is kept and none of it is done.")]
+    public ToggleNode EnableAutoloot { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Items on the instant list are picked up as they appear, and the instant loot sounds play. Off, neither happens.
+    /// Off by default: it moves the mouse and can block the player's input without a key being pressed. Needs Enable
+    /// automation. See Autoloot.Tick.
+    /// </summary>
+    [Menu("Enable Instant Autoloot",
+        "Picks up items on the instant list below the moment they can be clicked,\n" +
+        "one at a time, best first. Needs Enable automation on.\n" +
+        "- only with a party member in the area, unless Disable instant autoloot\n" +
+        "  when no party members are in the area is off\n" +
+        "- moves the mouse to each item, clicks once and hands the mouse back\n" +
+        "- can block your mouse until the click and your keys until the pickup,\n" +
+        "  with Block mouse and keyboard during instant loot\n" +
+        "- press the action key (F4 by default) to end a block and stop that pickup\n" +
+        "- letters, digits and Space you were holding are pressed again after a block\n" +
+        "- plays a sound when a listed item appears, and when it is picked up or lost")]
+    public ToggleNode EnableInstantAutoloot { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Instant loot picks items up only while a party member is in the area, where there is a race for them; alone they
+    /// are left for the action key, and the instant loot sound is silent too. Party members are found as Automatic list
+    /// order finds them. See Autoloot.PartyInArea.
+    /// </summary>
+    [Menu("Disable instant autoloot when no party members are in the area",
+        "Alone, instant loot items are not picked up by themselves,\n" +
+        "and the instant loot sounds do not play.\n" +
+        "A party member counts as in the area when their party portrait\n" +
+        "shows no portal icon, or when they are near enough to be seen.")]
+    public ToggleNode DisableInstantAutolootWithoutParty { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Inventory cells the action key's looting leaves free, so instant loot has room for what it is there to race for:
+    /// only while instant loot is on and a party member is in the area. Instant loot itself may use them. An item that
+    /// would leave fewer free is left on the ground, as is any with no room at all, rather than clicked and walked to.
+    /// A stackable item fits while a stack of it carried has room, whatever cells are free. See InventorySpace.
+    /// </summary>
+    [Menu("Inventory slots kept for instant loot",
+        "With instant loot on and a party member in the area, the action key's looting\n" +
+        "leaves this many inventory slots free for instant loot.\n" +
+        "Items that would not fit are left on the ground; stackable items that go onto\n" +
+        "a stack you carry still go in.")]
+    public RangeNode<int> InventorySlotsKeptForInstantLoot { get; set; } = new RangeNode<int>(2, 0, 5);
+    /// <summary>Post-expedition's Draw autoloot line, drawn here as well; not a second setting. See PostExpeditionSettings.Line.</summary>
+    [JsonIgnore]
+    public CustomNode LineUi { get; set; } = new CustomNode(() => ItemListEditor.Mirror("Draw autoloot line",
+        "The same switch as in Automation > Post-expedition.", static s => s.Automation.PostExpedition.Line));
+
+    /// <summary>Post-expedition's Only towards loot within, drawn here as well. See PostExpeditionSettings.LineWithin.</summary>
+    [JsonIgnore]
+    public CustomNode LineWithinUi { get; set; } = new CustomNode(() => ItemListEditor.MirrorSlider("Only towards loot within (grid, 0 = any)",
+        "The same slider as in Automation > Post-expedition: how far from you\nloot may be and still get the autoloot line.",
+        static s => s.Automation.PostExpedition.LineWithin));
+
+    /// <summary>The autoloot line's width in pixels. See PostExpeditionSettings.Line.</summary>
+    [Menu("Autoloot line thickness")]
+    public RangeNode<int> LineThickness { get; set; } = new RangeNode<int>(1, 1, 3);
+
+    /// <summary>The autoloot line's colour. See PostExpeditionSettings.Line.</summary>
+    [Menu("Autoloot line colour")]
+    public ColorNode LineColour { get; set; } = new ColorNode(Color.White);
+
+    /// <summary>
+    /// The autoloot line also points at the nearest item on either list below, anywhere, not only at expedition loot at
+    /// a live dig site. See Autoloot.DrawLine.
+    /// </summary>
+    [Menu("Draw autoloot line to listed items", "Also point the line at the nearest item on either list below,\n" +
+                                                 "anywhere in a map, not only at expedition loot.")]
+    public ToggleNode LineToListedItems { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Puts every setting this section shows back as shipped: its own, both lists included, and the two it draws from
+    /// Post-expedition (Draw autoloot line, Only towards loot within). Greyed
+    /// until Ctrl is held, as the other reset buttons are, since there is no undo.
+    /// </summary>
+    [JsonIgnore]
+    public CustomNode ResetSettingsUi { get; set; } = new CustomNode(() =>
+    {
+        var armed = ImGui.GetIO().KeyCtrl;
+
+        ImGui.BeginDisabled(!armed);
+
+        if (ImGui.Button("Reset all autoloot settings to defaults###aeResetAutolootSettings") && armed &&
+            Dump.Settings is { } settings)
+        {
+            var after = settings.Automation.PostExpedition;
+            var shippedAfter = new PostExpeditionSettings();
+
+            ResetAll.Section(new AutolootSettings(), settings.Automation.Autoloot);
+            after.Line.Value = shippedAfter.Line.Value;
+            after.LineWithin.Value = shippedAfter.LineWithin.Value;
+        }
+
+        ImGui.EndDisabled();
+
+        if (!armed)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled("hold Ctrl");
+        }
+    });
+
+    [JsonIgnore]
+    public CustomNode AutolootGroup { get; set; } = Section.Of("Autoloot");
+ 
+   /// <summary>
+    /// With EnableAutoloot, items the post-expedition pass picks up with its other jobs when the action key is
+    /// pressed: one name a line, the base type ("Divine Orb") or a unique's name, ignoring case. Each is clicked once.
+    /// A line ENTITY:Remnants or ENTITY:ExcavatedChests turns on shattering spent remnants or opening excavated chests:
+    /// without the line, that job is not done. With a party member in the area the list orders those against the items.
+    /// See Autoloot.TopFirstNow.
+    /// The lists are the only switch for these jobs. See Placement.Chore.
+    /// </summary>
+    [IgnoreMenu]
+    public TextNode ItemsOnActionKey { get; set; } = new TextNode(
+        "ART:Headhunter\nCLASS:StackableCurrency MIN:1c\nCLASS:Omen MIN:3c\nCLASS:Expedition2Logbooks MIN:3c\n" +
+        "CLASS:UncutReservationGemStackable MIN:3c\nCLASS:UncutSkillGemStackable MIN:3c\nCLASS:SoulCore MIN:3c\n" +
+        "CLASS:TowerAugmentation MIN:3c\nExpedition Tablet\nCLASS:VaultKey MIN:3c\nMIN:1d");
+
+    [JsonIgnore]
+    public CustomNode ItemsOnActionKeyUi { get; set; } = new CustomNode(() => ItemListEditor.Draw(
+        "Autoloot list when pressing action key", "###aeItemsOnActionKey",
+        static s => s.Automation.Autoloot.ItemsOnActionKey, ItemListEditor.ListLinesHelp));
+
+    /// <summary>
+    /// Add class and Add unique: each starts a three-second countdown under the cursor; when it ends, the hovered item
+    /// goes on the bottom of the action key list, as "CLASS:&lt;class&gt; MIN:5ex" or "ART:&lt;art name&gt;". See
+    /// AddListLineFromHover.
+    /// </summary>
+    [JsonIgnore]
+    public CustomNode AddFromHoverUi { get; set; } = new CustomNode(() =>
+    {
+        if (ImGui.Button("Add class###aeAddClass"))
+            AddListLineFromHover.Start(AddListLineFromHover.LineKind.Class);
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Add unique###aeAddUnique"))
+            AddListLineFromHover.Start(AddListLineFromHover.LineKind.Unique);
+
+        ImGui.SameLine();
+        ImGui.TextDisabled("(i)");
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Adds the item you hover to the bottom of the list above.\n" +
+                             "- press, then hover an item in your inventory within 3 seconds\n" +
+                             "  (an open stash tab, or a label on the ground, also works)\n" +
+                             "- a green bar under the cursor counts down\n" +
+                             "- Add class adds CLASS:<the item's class> MIN:5ex; edit the price as you like\n" +
+                             "- Add unique adds ART:<the unique's art name>, which finds that unique\n" +
+                             "  identified or not, at any price; add MIN: to it for a floor\n" +
+                             "- a line already on the list is not added again");
+    });
+
+    /// <summary>
+    /// A keyboard key the player presses stops the action key's autoloot run, as moving the mouse does; the key itself
+    /// still reaches the game. The plugin's own hotkeys (action, table, insist, dump) do not count, nor do keys the plugin
+    /// sends or mouse buttons. Only the run a press of the action key starts with a listed item clickable: explosive
+    /// placement and instant autoloot are not stopped by keys. Needs an ExileInput2 with StopOnPlayerKeys. See
+    /// Placement.BeginLooting.
+    /// </summary>
+    [Menu("Cancel autoloot on keyboard input",
+        "Stops the action key's autoloot as soon as you press a key, as moving\n" +
+        "the mouse does. Press the action key again to carry on.\n" +
+        "- any keyboard key counts, such as WASD to walk away\n" +
+        "- the key still does what it does in the game\n" +
+        "- this plugin's hotkeys and mouse buttons do not count\n" +
+        "- explosive placement and instant autoloot are not affected")]
+    public ToggleNode CancelAutolootOnKeyboardInput { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// ExileInput2's Shortest Move for the action key's autoloot run, in place of ExileInput2's own 40ms: a move takes
+    /// this plus Move Time Per Root Pixel times the square root of its length in pixels, so this is the term that sets
+    /// the pace of short hops between labels, as Shortest move between tablets does for tablets. 0 uses ExileInput2's
+    /// own. 150 is a starting value, not a measured one. Set when the run starts and handed back when it ends, as
+    /// explosive placement and the tablet runs share the caller name. Instant autoloot has its own speed. Needs an
+    /// ExileInput2 with SetShortestMove. See Placement.BeginLooting.
+    /// </summary>
+    [Menu("Shortest move when autolooting (ms)",
+        "The least time the mouse takes to move to each thing the action key loots.\n" +
+        "Raise it if short hops click too quickly. 0 uses ExileInput2's own setting.")]
+    public RangeNode<int> ShortestMoveWhenAutolootingMs { get; set; } = new RangeNode<int>(150, 0, 400);
+    [JsonIgnore]
+    public CustomNode InstantAutolootGroup { get; set; } = Section.Of("Instant Autoloot");
+
+    /// <summary>
+    /// Items picked up as soon as their label is on screen, with no key: one name a line, as ItemsOnActionKey, in the order
+    /// Autoloot.TopFirstNow gives. ENTITY:Remnants and ENTITY:ExcavatedChests shatter spent remnants and open chests the
+    /// same way. Each is clicked once, and the next waits for the
+    /// last one's label or button to go. Needs Enable automation and EnableInstantAutoloot. See Autoloot.
+    /// </summary>
+    [IgnoreMenu]
+    public TextNode InstantLootItems { get; set; } = new TextNode("Mirror of Kalandra\nHinekora's Lock\nART:Mageblood\nPerfect Chaos Orb\nMIN:10d");
+
+    [JsonIgnore]
+    public CustomNode InstantLootItemsUi { get; set; } = new CustomNode(() => ItemListEditor.Draw(
+        "Instant autoloot list", "###aeInstantLootItems",
+        static s => s.Automation.Autoloot.InstantLootItems, ItemListEditor.ListLinesHelp));
+
+    /// <summary>
+    /// For an instant loot pickup, the player's mouse movement, presses and wheel are dropped from the start of the move
+    /// until the click, Mouse block time at most, so the click lands where it was sent; and the player's keys are let go
+    /// and their presses dropped from the start of the move until the item is picked up - at most two seconds after the
+    /// click, sooner when no walk starts within 400ms of it or the action key cancels - so a walk on WASD does not carry
+    /// the character away from an item it was sent to. Each item of several taken in turn blocks again, so a burst can
+    /// block for longer than one pickup. Off, the player's mouse still does not stop the pickup for the block time, and
+    /// can move where the click lands, and the keyboard is left alone. Needs an ExileInput2 with IgnorePlayerMouse and
+    /// BlockPlayerKeys. See Autoloot.
+    /// </summary>
+    [Menu("Block mouse and keyboard during instant loot", "Your mouse is ignored until an instant loot item is clicked, for the\n" +
+                                                         "block time at most, and your keys until it is picked up: at most two\n" +
+                                                         "seconds after the click. Several items are taken one after another,\n" +
+                                                         "each blocking again.\n" +
+                                                         "Off, your movement can shift the click or walk you away from it.")]
+    public ToggleNode BlockInputForInstantLoot { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Blocks the mouse and keyboard for instant loot only while a party member is in the area, where an item can be lost
+    /// to them; alone there is no race to win. Party members are found as Automatic list order finds them. See
+    /// Autoloot.PartyInArea.
+    /// </summary>
+    [Menu("Only block input with party members in the area", "Alone, instant loot still clicks, but leaves your mouse\n" +
+                                                             "and keyboard alone. Only matters with Disable instant\n" +
+                                                             "autoloot when no party members are in the area off:\n" +
+                                                             "on, instant loot does not run alone at all.")]
+    public ToggleNode BlockInputOnlyWithParty { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Presses again, when the key block ends, the keys the player held when it began and still holds: A-Z, 0-9 and Space
+    /// only, so no modifier or function key is ever sent and no combination such as Alt+F4 can form. A key first pressed
+    /// during the block is not restored. Off, every held key stays up until pressed again. Needs an ExileInput2 whose
+    /// BlockPlayerKeys takes restoreHeldKeys. See BlockInputForInstantLoot.
+    /// </summary>
+    [Menu("Restore held keys after instant loot", "Keys you were holding when the block began, and still hold\n" +
+                                                  "when it ends, are pressed again, so a walk on a held key goes on.\n" +
+                                                  "Letters, digits and Space only.")]
+    public ToggleNode RestoreHeldKeysAfterInstantLoot { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// A press of the action key while instant loot blocks input ends the block, mouse and keyboard, and the plugin lets
+    /// go of that pickup: before the click, nothing is clicked; after it, the walk the click started is the game's and
+    /// goes on until the player moves, which is intended - the press hands control back, it does not undo the click.
+    /// The item is not tried again; the next listed item is, so a press ends one pickup, not instant loot. The press is
+    /// dropped, so it does not also start what the action key does. Needs an ExileInput2 whose BlockPlayerKeys takes
+    /// cancelKey. See BlockInputForInstantLoot.
+    /// </summary>
+    [Menu("Action key ends the input block",
+        "Pressing the action key while your input is blocked gives you back\n" +
+        "your mouse and keyboard at once.\n" +
+        "- before the click, the item is not clicked\n" +
+        "- after the click, your character keeps walking to it until you move\n" +
+        "- that item is not tried again, but the next listed item is\n" +
+        "- the press does nothing else")]
+    public ToggleNode ActionKeyEndsInputBlock { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// How long an instant loot pickup has, and how long the player's mouse is ignored or blocked for, in milliseconds.
+    /// Ended early once the click is sent. A move that has not arrived by then is given up. See BlockInputForInstantLoot.
+    /// </summary>
+    [Menu("Mouse block time (ms)",
+        "The longest an instant loot pickup has the mouse, from the move to the click.\n" +
+        "- a move that has not arrived by then is given up, and the item not clicked\n" +
+        "- the block ends at the click, however much time is left\n" +
+        "- with Block mouse and keyboard during instant loot off, your mouse is not\n" +
+        "  blocked, but moving it does not stop the pickup for this long")]
+    public RangeNode<int> MouseBlockMs { get; set; } = new RangeNode<int>(500, 125, 1000);
+
+    /// <summary>The instant loot move as a teleport rather than a fast movement. See Autoloot.FastMoveTimePerRootPixel.</summary>
+    [Menu("Teleport the mouse for instant loot", "Puts the cursor on the item at once instead of moving it there.")]
+    public ToggleNode TeleportForInstantLoot { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether an instant loot click goes out the moment the cursor reaches the item, from ExileInput2's own input thread,
+    /// rather than on the HUD's next frame after arriving. The HUD stalls for 300 to 500ms at times while the game is
+    /// slow over a frame, and the click waited for each. The checks still run on the HUD's frames while the cursor travels
+    /// - the label sliding with the camera, the interface over it, the item gone - re-aiming or holding the click back;
+    /// through a stall they cannot, and the click goes where the item was seen. Needs an ExileInput2 with
+    /// ClickOnArrival. See Autoloot.StepMoving.
+    /// </summary>
+    [Menu("Click instant loot without waiting for the HUD",
+        "Clicks the item the moment the cursor reaches it, rather than on the HUD's next frame,\n" +
+        "so a HUD stall after a drop does not hold the click back.\n\n" +
+        "While the cursor travels, the item is still checked each frame: a label that slid is\n" +
+        "re-aimed at, and an item covered or gone is not clicked. During a stall those checks\n" +
+        "cannot run, and the click goes where the item was seen.")]
+    public ToggleNode ClickInstantLootWithoutWaiting { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// How many times an instant loot item is clicked again when its label is still there once the character has
+    /// stopped moving - a walk to it cut short. 0 is the item clicked once. See Autoloot.Tick.
+    /// </summary>
+    [Menu("Instant loot retries", "Clicks an instant loot item again if it is still there\n" +
+                                  "once your character has stopped moving.")]
+    public RangeNode<int> InstantLootRetries { get; set; } = new RangeNode<int>(1, 0, 1);
+    /// <summary>"Instant autoloot: name" under the cursor for 4 seconds after each instant click. See Autoloot.DrawPickupNote.</summary>
+    [Menu("Show instant loot message", "Shows \"Instant autoloot: <name>\" under the cursor for 4 seconds\nafter each instant pickup.")]
+    public ToggleNode ShowInstantLootMessage { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Plays Instant loot sound once for each item on the instant list whose label comes on screen. Needs Enable
+    /// automation and EnableInstantAutoloot, as the pickup does. See Autoloot.SoundForNewItems.
+    /// </summary>
+    [Menu("Play sound for instant loot", "Plays the instant loot sound when items on the instant list appear,\n" +
+                                         "once for items that appear together.\n" +
+                                         "Needs Enable automation and Enable Instant Autoloot on, and a party\n" +
+                                         "member in the area while Disable instant autoloot when no party\n" +
+                                         "members are in the area is on.")]
+    public ToggleNode PlayInstantLootSound { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Plays Instant loot success sound when an instantly clicked item reaches the player's inventory, and Instant loot
+    /// failure sound when its label goes with no more of it carried: a party member took it, or the inventory is full.
+    /// Nothing for an item still on the ground when the pickup gives up, or a pickup never clicked or cancelled. See
+    /// Autoloot.SoundForResult.
+    /// </summary>
+    [Menu("Play sound for instant loot result", "Plays the success sound when an instant loot item reaches your\n" +
+                                                "inventory, and the failure sound when it is gone and you did not get it.")]
+    public ToggleNode PlayInstantLootResultSound { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// The sound for PlayInstantLootSound, by name without the extension: the plugin's own (autoloot, shipped in sounds/) or a
+    /// .wav file in the HUD's Sounds folder. The list is both folders' files, read at start. See Autoloot.SoundNames.
+    /// </summary>
+    [Menu("Instant loot sound", "The plugin's own sound, or a .wav file from the HUD's Sounds folder.")]
+    public ListNode InstantLootSound { get; set; } = new ListNode { Value = "autoloot" };
+
+    /// <summary>The sound for an instant loot item reaching the inventory, chosen as Instant loot sound is. See PlayInstantLootResultSound.</summary>
+    [Menu("Instant loot success sound", "Played when an instant loot item reaches your inventory.")]
+    public ListNode InstantLootSuccessSound { get; set; } = new ListNode { Value = "noice" };
+
+    /// <summary>The sound for an instant loot item not reaching the inventory, chosen as Instant loot sound is. See PlayInstantLootResultSound.</summary>
+    [Menu("Instant loot failure sound", "Played when an instant loot item is gone and did not reach your inventory.")]
+    public ListNode InstantLootFailureSound { get; set; } = new ListNode { Value = "uh_oh" };
+
+    /// <summary>
+    /// Instant loot sound's loudness, as a percentage of the file's own: 100 plays it as recorded, above 100 louder,
+    /// clipped where a sample would overflow. See Autoloot.SoundAtVolume.
+    /// </summary>
+    [Menu("Instant loot sound volume (%)", "The volume of all three instant loot sounds.\n" +
+                                           "100 plays them as recorded; above 100 is louder.")]
+    public RangeNode<int> InstantLootSoundVolume { get; set; } = new RangeNode<int>(100, 0, 300);
+
+    /// <summary>Plays Instant loot sound, or the success or failure sound, now at its volume, to hear it. See InstantLootSound.</summary>
+    [JsonIgnore]
+    public CustomNode PlayInstantLootSoundUi { get; set; } = new CustomNode(() =>
+    {
+        if (Dump.Settings is not { } settings)
+            return;
+
+        var autoloot = settings.Automation.Autoloot;
+
+        if (ImGui.Button("Play instant loot sound"))
+            Autoloot.PlaySound(autoloot.InstantLootSound.Value, autoloot.InstantLootSoundVolume.Value);
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Play success"))
+            Autoloot.PlaySound(autoloot.InstantLootSuccessSound.Value, autoloot.InstantLootSoundVolume.Value);
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Play failure"))
+            Autoloot.PlaySound(autoloot.InstantLootFailureSound.Value, autoloot.InstantLootSoundVolume.Value);
+    });
 }
 
 /// <summary>
@@ -2833,7 +3443,122 @@ public class AutomationSettings
 /// The safety model is not in here, and deliberately so: the player moving the mouse is what stops
 /// an automated placement, and that is ExileInput2's job rather than a setting.
 /// </summary>
-[Submenu(CollapsedByDefault = false)]
+/// <summary>
+/// Moving the inventory's items to the open stash tab with the action key, from a Deposit zone right of the inventory's
+/// gold amount, drawn while the stash and the inventory are both open. Cells kept in the grid are left alone. See
+/// InventoryDeposit.
+/// </summary>
+[Submenu(CollapsedByDefault = true)]
+public class AutodepositSettings
+{
+    /// <summary>The Deposit zone and what the action key does on it. Needs Enable automation. See InventoryDeposit.</summary>
+    [Menu("Enable Autodeposit",
+        "With the stash and inventory open, a Deposit zone shows to the right of\n" +
+        "your gold. Needs Enable automation on.\n" +
+        "- hover it to see which inventory cells it would empty\n" +
+        "- press the action key (F4 by default) there to move their items to\n" +
+        "  the open stash tab\n" +
+        "- stackable items go with a ctrl+right click, every stack of that kind\n" +
+        "  at once, unless a kept cell holds one too; then each stack goes alone\n" +
+        "- other items go one ctrl+click each\n" +
+        "- moving the mouse, closing the stash or inventory, or pressing the\n" +
+        "  action key again stops it\n" +
+        "- green cells in the grid below are never emptied")]
+    public ToggleNode EnableAutodeposit { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// ExileInput2's Shortest Move for each move of a deposit run after its first, in place of ExileInput2's own 40ms; 0
+    /// uses ExileInput2's own. A move takes this plus Move time per root pixel between items times the square root of its
+    /// length in pixels: 40 here with 10 there makes a hop to the next cell about 125ms and one across the inventory about
+    /// 240ms, where 67 with ExileInput2's own 6 made every hop much the same, 115 to 145ms (2026-10-11). Put back when
+    /// the run ends. See InventoryDeposit.
+    /// </summary>
+    [Menu("Shortest move between items (ms)",
+        "The fixed part of every move from one item to the next.\n" +
+        "Lower is faster. 0 uses ExileInput2's own setting.")]
+    public RangeNode<int> ShortestMoveBetweenItemsMs { get; set; } = new RangeNode<int>(40, 0, 400);
+
+    /// <summary>
+    /// ExileInput2's Move Time Per Root Pixel for a deposit run, in place of its own 6: the part of a move that grows with
+    /// its length, so a long hop takes longer than a short one. 0 uses ExileInput2's own. Put back when the run ends. See
+    /// ShortestMoveBetweenItemsMs.
+    /// </summary>
+    [Menu("Move time per root pixel between items (ms)",
+        "The part of each move that grows with its length: higher makes long\n" +
+        "hops take longer than short ones. 0 uses ExileInput2's own setting.")]
+    public RangeNode<int> MoveTimePerRootPixelBetweenItemsMs { get; set; } = new RangeNode<int>(10, 0, 30);
+
+    /// <summary>
+    /// The inventory cells never emptied, as row * 12 + column, comma separated: row 0 is the top, column 0 the left.
+    /// An item counts as kept when any cell it covers is. By default the two rightmost columns. Edited in
+    /// KeptInventoryCellsUi. See InventoryDeposit.KeptCells.
+    /// </summary>
+    [IgnoreMenu]
+    public TextNode KeptInventoryCells { get; set; } = new TextNode("10,11,22,23,34,35,46,47,58,59");
+
+    /// <summary>The inventory's 12 by 5 cells as buttons: a click keeps a cell, green, or frees it. See KeptInventoryCells.</summary>
+    [JsonIgnore]
+    public CustomNode KeptInventoryCellsUi { get; set; } = new CustomNode(() =>
+    {
+        if (Dump.Settings is not { } settings)
+            return;
+
+        var node = settings.Automation.Autodeposit.KeptInventoryCells;
+        var kept = InventoryDeposit.KeptCells(settings);
+
+        ImGui.TextUnformatted("Kept inventory cells");
+        ImGui.SameLine();
+        ImGui.TextDisabled("(i)");
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("The inventory, 12 cells wide and 5 high. Click a cell to keep it:\n" +
+                             "green cells are never deposited.\n" +
+                             "- an item counts as kept when any cell it covers is green\n" +
+                             "- a stackable item in a green cell makes the same kind elsewhere\n" +
+                             "  go one stack at a time, so the kept stack stays");
+
+        var changed = false;
+        var size = new System.Numerics.Vector2(22f, 22f);
+
+        for (var row = 0; row < InventoryDeposit.Rows; row++)
+        {
+            for (var column = 0; column < InventoryDeposit.Columns; column++)
+            {
+                var index = row * InventoryDeposit.Columns + column;
+                var isKept = kept.Contains(index);
+
+                if (column > 0)
+                    ImGui.SameLine(0f, 2f);
+
+                ImGui.PushStyleColor(ImGuiCol.Button, isKept ? new System.Numerics.Vector4(0.2f, 0.65f, 0.25f, 1f)
+                    : new System.Numerics.Vector4(0.25f, 0.25f, 0.28f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, isKept ? new System.Numerics.Vector4(0.3f, 0.8f, 0.35f, 1f)
+                    : new System.Numerics.Vector4(0.38f, 0.38f, 0.42f, 1f));
+
+                if (ImGui.Button($"###aeKeptCell{index}", size))
+                {
+                    if (!kept.Remove(index))
+                        kept.Add(index);
+
+                    changed = true;
+                }
+
+                ImGui.PopStyleColor(2);
+            }
+        }
+
+        if (ImGui.Button("Keep none###aeKeepNone"))
+        {
+            kept.Clear();
+            changed = true;
+        }
+
+        if (changed)
+            node.Value = string.Join(",", System.Linq.Enumerable.OrderBy(kept, i => i));
+    });
+}
+
+[Submenu(CollapsedByDefault = true)]
 public class PreExpeditionSettings
 {
     /// <summary>
@@ -2867,7 +3592,7 @@ public class PreExpeditionSettings
 /// instead of finishing all of one kind and then walking the site again for the other. A dig
 /// site whose remnants and chests are interleaved is cleared in the order you would walk it.
 /// </summary>
-[Submenu(CollapsedByDefault = false)]
+[Submenu(CollapsedByDefault = true)]
 public class PostExpeditionSettings
 {
     /// <summary>When the loot line starts being drawn. See LineFrom.</summary>
@@ -2897,10 +3622,11 @@ public class PostExpeditionSettings
     public ListNode LineFrom { get; set; } = new ListNode { Value = FromStart };
 
     /// <summary>
-    /// A hairline to whatever is nearest still worth picking up.
+    /// A line to whatever is nearest still worth picking up, and with Autoloot's Draw autoloot line to listed items on,
+    /// to the nearest item on either autoloot list as well. Shown in the Autoloot section too, the same node.
     ///
-    /// White and one pixel, because it is a pointer rather than a statement: everything else drawn
-    /// on the ground says what a thing is, and this only says which way. Off-screen loot gets the
+    /// White and one pixel by default (Autoloot line colour and thickness), because it is a pointer rather than a
+    /// statement: everything else drawn on the ground says what a thing is, and this only says which way. Off-screen loot gets the
     /// line clipped to the edge of the window, which is the case it is really for - by the time
     /// looting starts the interesting things are behind you as often as in front.
     ///
@@ -2909,7 +3635,7 @@ public class PostExpeditionSettings
     /// earlier is either still to be blown or not yet worth walking to - true, and not worth
     /// refusing the line over, so the choice is a setting rather than a rule.
     /// </summary>
-    [Menu("Draw thin white line towards nearest loot")]
+    [Menu("Draw autoloot line")]
     public ToggleNode Line { get; set; } = new ToggleNode(true);
 
     /// <summary>
@@ -2925,23 +3651,6 @@ public class PostExpeditionSettings
     [Menu("Only towards loot within (grid, 0 = any)")]
     public RangeNode<int> LineWithin { get; set; } = new RangeNode<int>(0, 0, 1000);
 
-    /// <summary>
-    /// Click the shatter button on remnants that have been blown and cleared.
-    ///
-    /// The button only works up close, which is why distance decides the order.
-    /// </summary>
-    [Menu("Shatter remnants")]
-    public ToggleNode Shatter { get; set; } = new ToggleNode(true);
-
-    /// <summary>
-    /// Click the ground label of an excavated chest that has not been opened.
-    ///
-    /// This one walks the character, unlike every other click the plugin makes - a chest is opened
-    /// by going to it. That is inherent to the job rather than a choice, and it is why this is a
-    /// switch rather than something that simply happens.
-    /// </summary>
-    [Menu("Open excavated chests")]
-    public ToggleNode Chests { get; set; } = new ToggleNode(true);
 }
 
 /// <summary>
@@ -3439,6 +4148,15 @@ public class RemnantRewardSettings
     public ColorNode RewardColour { get; set; } = new ColorNode(Color.FromArgb(255, 190, 120, 255));
 
     /// <summary>
+    /// Each remnant's socket count written just under it on the minimap and the large map, in the propagating rune
+    /// colour, so the big remnants can be picked out across the map. Remnants not yet spent; needs Draw plan on minimap.
+    /// See Minimap.SocketCounts.
+    /// </summary>
+    [Menu("Draw socket count on minimap", "Writes each remnant's socket count just under it on the minimap\n" +
+                                          "and the large map. Needs Draw plan on minimap on.")]
+    public ToggleNode DrawSocketCountOnMinimap { get; set; } = new ToggleNode(true);
+
+    /// <summary>
     /// Draws a line towards any remnant worth more than this, in the unit chosen above.
     ///
     /// Gated on value because a line to every remnant is five lines across the screen saying
@@ -3579,6 +4297,17 @@ public class RerollDisplaySettings
     /// </summary>
     [Menu("Draw line in world")]
     public ToggleNode RollLineInWorld { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// How far from the player, in grid, the remnant worth a reroll may be for its line to be drawn, in the world and on
+    /// the minimap; 0 for any distance. A recommendation exists for the site from the moment it is solved, so with no
+    /// limit the line pointed across the map at a site 2,402 grid away (dump 2026-10-12 03:48:34). Measured from the
+    /// player, as the reward lines' Only to rewards within is, and with the same default.
+    /// </summary>
+    [Menu("Only to rerolls within (grid, 0 = any)",
+        "Draws the reroll line only when the remnant worth rerolling is this close to you,\n" +
+        "in grid. 0 draws it from anywhere in the map.")]
+    public RangeNode<int> RollLineWithin { get; set; } = new RangeNode<int>(1000, 0, 2000);
 
     /// <summary>
     /// How thick the line to the next planned reroll is drawn in the world.
@@ -5285,6 +6014,7 @@ public class DebugSettings
     /// </summary>
     [Menu("Announce the Bait rune if it appears")]
     public ToggleNode WatchBait { get; set; } = new ToggleNode(false);
+
 
 
     /// <summary>

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -67,6 +67,14 @@ internal static partial class Tablets
     private static List<string> _stashTabItemPathsAtRead = [];
 
     /// <summary>
+    /// The sub-tab showing when the last read took the fragment tab's tablets, or 0 when it did not. The sub-tab records
+    /// are written two frames after the read, and a run can click to the next sub-tab in between: asked then, the tablets
+    /// of one sub-tab were filed under the next - sub-tab 2's 36 also recorded as sub-tab 3's, the records adding up to
+    /// 168 against the button's 132, so every run went through all six (2026-10-12 12:08:30). See NoteSubTab.
+    /// </summary>
+    private static int _subTabAtRead;
+
+    /// <summary>
     /// The most elements visited under the visible stash tab looking for tablets. The Fragment tab's tablet section does
     /// not list its items in VisibleInventoryItems reliably, so its element tree is walked as TabletHelper does
     /// (StashElement.StashInventoryPanel, the child at IndexVisibleStash, down), within these bounds.
@@ -107,13 +115,14 @@ internal static partial class Tablets
             tablets.TabletAutomation.HideIndividualCraftReforgeZonesSetForScreen = true;
         }
         _tidyAfterCraftAndReforge = tablets.TabletAutomation.TidyAfterCraftAndReforge.Value;
-        _pauseBetweenClicksMs = tablets.TabletAutomation.PauseBetweenClicksMs.Value;
         _shortestMoveMs = tablets.TabletAutomation.ShortestMoveBetweenTabletsMs.Value;
         _shortestMoveDepositingMs = tablets.TabletAutomation.ShortestMoveWhenDepositingMs.Value;
+        _showPlanned = settings.Automation.ShowPlannedAutomation.Value;
         _recordReforges = settings.Recording.CollectTabletReforges.Value;
         _recordCrafts = settings.Recording.CollectTabletCrafts.Value;
         _recordIdentifications = settings.Recording.CollectTabletIdentifications.Value;
         _actionKeyName = Safe.Read(() => settings.ActionHotkey.Value.Key.ToString(), "F4") is { Length: > 0 } key ? key : "F4";
+        _latencyMs = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
 
         // **The read of the screen and what is worked out from it, over three frames.** Done in one, it made a frame of
         // about 36ms every 150ms (15 read, 14 sub-tab records, 7 crafting needs, dump 2026-10-09 22:09), and ExileInput2,
@@ -139,6 +148,15 @@ internal static partial class Tablets
 
             using (Spent.On("Tablets/CountForZones"))
                 CountForZones(gc, tablets);
+        }
+        else if (InventoryDeposit.Running)
+        {
+            // **No read while a deposit run goes.** A read took about 10ms on the currency tab, every 150ms, and each
+            // was a slow frame the cursor moved across (dump 2026-10-11 22:19:28: 24 reads, 24 frames over 20ms). The
+            // inventory's tablets are dropped, since the run is moving them; the stash tab's stay where they were. The
+            // next read comes on the first frame after the run, _read being older than ReadEvery by then.
+            if (Seen.Any(t => t.Where == "inventory"))
+                Seen = Seen.Where(t => t.Where != "inventory").ToList();
         }
         else if (DateTime.UtcNow - _read >= ReadEvery)
         {
@@ -587,6 +605,47 @@ internal static partial class Tablets
         _ => TabletAction.None,
     };
 
+    /// <summary>
+    /// An item picked up onto the cursor, or null: the player's Cursor1 inventory, or an element under
+    /// IngameUi.Cursor carrying an entity. A tablet picked up read as a child of IngameUi.Cursor with its entity (dump
+    /// 2026-10-13 21:36:13); Cursor1 with an item picked up is not yet checked, and read empty with a currency
+    /// right-clicked for use, which stays in its stack (see HeldOnCursor). Currency is left out, so a right-clicked one
+    /// never reads as held here.
+    /// </summary>
+    internal static Entity ItemHeldOnCursor(GameController gc) => ItemOnCursor(gc, false);
+
+    /// <summary>
+    /// An item picked up onto the cursor, or null, read as ItemHeldOnCursor reads it; with currencyToo, currency counts
+    /// as well, for an orb picked up off the ground rather than right-clicked for use. See Autoloot.PickedUpOntoCursor.
+    /// </summary>
+    internal static Entity ItemOnCursor(GameController gc, bool currencyToo)
+    {
+        var holders = Safe.Read(gc, static g => g.IngameState.ServerData.PlayerInventories, null);
+        var cursorInventory = holders?.FirstOrDefault(h => Safe.Read(h, static x => x.TypeId, InventoryNameE.None) == InventoryNameE.Cursor1);
+
+        foreach (var slot in Safe.Read(cursorInventory, static c => c.Inventory.InventorySlotItems, null) ?? [])
+        {
+            var item = Safe.Read(slot, static s => s.Item, null);
+            var metadata = Safe.Read(item, static e => e.Metadata, null);
+
+            if (!string.IsNullOrEmpty(metadata) && (currencyToo || !IsCurrencyMetadata(metadata)))
+                return item;
+        }
+
+        foreach (var child in Safe.Read(gc, static g => g.IngameState.IngameUi.Cursor?.Children, null) ?? [])
+        {
+            var item = Safe.Read(child, static c => c.Entity, null);
+            var metadata = Safe.Read(item, static e => e.Metadata, null);
+
+            if (!string.IsNullOrEmpty(metadata) && (currencyToo || !IsCurrencyMetadata(metadata)))
+                return item;
+        }
+
+        return null;
+    }
+
+    private static bool IsCurrencyMetadata(string metadata) => metadata.StartsWith("Metadata/Items/Currency/", StringComparison.Ordinal);
+
     /// <summary>IngameUi.Cursor's action string, or blank.</summary>
     private static string CursorAction(GameController gc) =>
         Safe.Read(gc, static g => g.IngameState.IngameUi.Cursor?.ActionString, "") ?? "";
@@ -666,6 +725,7 @@ internal static partial class Tablets
 
         _stashRect = default;
         _stashTabItemPathsAtRead = [];
+        _subTabAtRead = 0;
 
         if (stash != null && Safe.Read(stash, static s => s.IsVisible, false))
         {
@@ -678,10 +738,13 @@ internal static partial class Tablets
             var index = Safe.Read(stash, static s => s.IndexVisibleStash, -1);
             var tab = panel != null && index >= 0 ? Safe.Read(() => panel.Children[index], null) : null;
 
-            if (tab != null)
+            // The walk only on the fragment tab, the one tab whose item list misses tablets. Elsewhere the list has them
+            // all, and the walk was most of a read: 7.6ms of about 10 on the currency tab, every 150ms (dump 2026-10-11
+            // 22:19:28). NoteSubTab, the one user of the paths it gathers, also wants the fragment tab's sub-tabs.
+            if (tab != null && index == StashTabWithIcon(gc, FragmentTabIcon))
             {
                 using (Spent.On("Tablets/Read/Walk"))
-                    Walk(found, entities, tab, paths: _stashTabItemPathsAtRead);
+                    ReadFragmentTab(gc, found, entities, tab);
             }
         }
 
@@ -709,10 +772,270 @@ internal static partial class Tablets
         return found;
     }
 
+    /// <summary>
+    /// The fragment tab's tablets, and the metadata of every item it shows into _stashTabItemPathsAtRead.
+    ///
+    /// **The sub-tab's item container read directly, the tab walked only to find it.** The fragment tab's own item list is
+    /// empty (dump 2026-10-11 23:04:58), so its tablets are found among its elements, and a walk of them was about 6ms
+    /// a read, every 150ms. Every tablet of a sub-tab, of every tablet type, is a child of one container - Expedition
+    /// tablet 26 and Precursor tablet 87 of sub-tab 1 both under StashElement 2,0,0,0,1,1,21,0,0,0,1,0,0,0 in the dev
+    /// tree, sub-tabs 2 and 3 at 1,0,0 and 2,0,0 in place of 0,0,0 (2026-10-11) - with the types not chosen hidden. So
+    /// once a walk has found the tablets' shared parent, a read takes that container's visible children alone: a
+    /// currency used, a tablet moved in or out, all happen among them. A full walk again when the sub-tab changes, when
+    /// the container cannot be reached or shows no tablet, and every ContainerWalkEvery as a safety net.
+    ///
+    /// A route to the container, not the element: a kept element goes stale when the game rebuilds it, as the sub-tab
+    /// bar did (see SelectedSubTab).
+    ///
+    /// The walk does not go below an element carrying a tablet: elements below one are taken to carry the same tablet
+    /// - not checked; the dump's count of tablets found by the walk says whether any are lost.
+    /// </summary>
+    private static void ReadFragmentTab(GameController gc, List<TabletOnScreen> found, HashSet<long> entities, Element tab)
+    {
+        var subTab = SelectedSubTab(gc);
+        _subTabAtRead = subTab;
+        var container = _tabletContainerRoute == null ? null : Safe.Read(() => tab.GetChildFromIndices(_tabletContainerRoute), null);
+        var why = _tabletContainerRoute == null ? "no container known"
+            : subTab != _tabletContainerSubTab ? $"sub-tab {_tabletContainerSubTab} to {subTab}"
+            : DateTime.UtcNow - _tabletContainerWalkedAt >= ContainerWalkEvery ? "every 2s"
+            : container == null ? "container unreachable"
+            : !Safe.Read(container, static c => c.IsVisible, false) ? "container not visible"
+            : null;
+
+        if (why == null)
+        {
+            var before = found.Count;
+            var children = Safe.Read(container, static c => c.Children, null) ?? [];
+            var shown = 0;
+
+            foreach (var child in children)
+            {
+                if (!Safe.Read(child, static c => c.IsVisibleLocal, false) || Safe.Read(child, static c => c.Entity, null) is not { } entity)
+                    continue;
+
+                shown++;
+
+                var path = Safe.Read(entity, static e => e.Metadata, null) ?? "";
+
+                if (path.Length > 0)
+                    _stashTabItemPathsAtRead.Add(path);
+
+                Add(found, entities, "stash tab elements", child, entity, path, knownVisible: true);
+            }
+
+            if (found.Count > before)
+            {
+                _containerReads++;
+                _containerReadSaid = $"{children.Count} child(ren), {shown} visible with an item, {found.Count - before} tablet(s)";
+                return;
+            }
+
+            _stashTabItemPathsAtRead.Clear();
+            why = "no tablet in the container";
+        }
+
+        ContainerWalkReasons[why] = ContainerWalkReasons.GetValueOrDefault(why) + 1;
+
+        var holders = new List<Element>();
+        var visited = Walk(found, entities, tab, paths: _stashTabItemPathsAtRead, holders: holders, belowTablets: false);
+        var tabletElements = found.Where(t => t.Where == "stash tab elements").Select(t => t.Element).ToList();
+        var parents = tabletElements.Select(e => Safe.Read(e, static x => x.Parent, null)).ToList();
+        var parentAddresses = parents.Select(p => Safe.Read(p, static x => x.Address, 0L)).Distinct().ToList();
+
+        _tabletContainerRoute = parentAddresses is [not 0L] ? RouteFrom(Safe.Read(tab, static t => t.Address, 0L), parents[0]) : null;
+        _tabletContainerSubTab = subTab;
+        _tabletContainerWalkedAt = DateTime.UtcNow;
+        _containerWalks++;
+
+        _fragmentTabWalkSaid = $"last walk of the fragment tab: {visited} element(s) visited, {holders.Count} carrying an item, " +
+                               $"{tabletElements.Count} tablet(s) found by it under {parentAddresses.Count} parent(s), sub-tab {subTab}, container " +
+                               (_tabletContainerRoute == null ? "none" : $"at [{string.Join(",", _tabletContainerRoute)}]");
+    }
+
+    /// <summary>The child indices from the fragment tab's element to its sub-tab's tablet container. See ReadFragmentTab.</summary>
+    private static int[] _tabletContainerRoute;
+
+    /// <summary>The sub-tab showing when _tabletContainerRoute was found, and when.</summary>
+    private static int _tabletContainerSubTab;
+
+    private static DateTime _tabletContainerWalkedAt;
+
+    /// <summary>How long the container is read before the tab is walked again regardless.</summary>
+    private static readonly TimeSpan ContainerWalkEvery = TimeSpan.FromSeconds(2);
+
+    /// <summary>Reads of the fragment tab by its container and by a walk, since load, and the last of each. For the dump.</summary>
+    private static int _containerReads, _containerWalks;
+
+    private static string _containerReadSaid = "none yet";
+
+    /// <summary>Why the fragment tab was walked rather than its container read, with how often, since load. For the dump.</summary>
+    private static readonly Dictionary<string, int> ContainerWalkReasons = [];
+
+    private static string _fragmentTabWalkSaid = "no walk of the fragment tab yet";
+
+    /// <summary>The fragment tab's reads by container against by walk, for the dump. See ReadFragmentTab.</summary>
+    private static string FragmentTabReadSaid =>
+        $"fragment tab reads: {_containerReads} of its tablet container (last: {_containerReadSaid}), {_containerWalks} by a walk (" +
+        string.Join(", ", ContainerWalkReasons.OrderByDescending(x => x.Value).Select(x => $"{x.Value}x {x.Key}")) + "); " +
+        _fragmentTabWalkSaid;
+
+    /// <summary>The child indices from the element at topAddress down to this one, or null when it is not below it.</summary>
+    private static int[] RouteFrom(long topAddress, Element element)
+    {
+        var route = new List<int>();
+
+        for (var at = element; at != null && route.Count <= DeepestElement; at = Safe.Read(at, static e => e.Parent, null))
+        {
+            if (Safe.Read(at, static e => e.Address, 0L) == topAddress)
+            {
+                route.Reverse();
+                return [.. route];
+            }
+
+            if (Safe.Read(at, static e => e.IndexInParent, null) is not { } index)
+                return null;
+
+            route.Add(index);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// What the game's item list for the visible stash tab holds - the list Read takes first, before any walk - by
+    /// metadata, with the tab's inventory type. For the dump: whether the list holds the fragment tab's tablets.
+    /// </summary>
+    private static string VisibleStashListSaid(GameController gc)
+    {
+        var visible = Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement?.VisibleStash, null);
+        var items = Safe.Read(visible, static v => v.VisibleInventoryItems, null);
+
+        if (items == null)
+            return $"visible stash tab's item list: unreadable (type {Safe.Read(visible, static v => v.InvType.ToString(), "none")})";
+
+        var names = items.Select(i => Safe.Read(i, static x => x.Item?.Metadata, null) ?? "(none)").ToList();
+        var grouped = string.Join(", ", names.GroupBy(x => x).OrderByDescending(g => g.Count()).Take(6).Select(g => $"{g.Count()}x {g.Key}"));
+
+        return $"visible stash tab's item list: type {Safe.Read(visible, static v => v.InvType.ToString(), "?")}, {names.Count} item(s), " +
+               $"{names.Count(x => x.StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase))} Expedition tablet(s)" +
+               (grouped.Length > 0 ? $": {grouped}" : "");
+    }
+
+    /// <summary>
+    /// The visible stash tab's server-side contents, and those of each of its sub-inventories: cell positions, a hash,
+    /// and which items are tablets, matched against the tablets the walk found by entity address. For the dump: whether
+    /// the fragment tab's tablets can be had with their cells without walking its elements.
+    /// </summary>
+    private static string VisibleStashServerSaid(GameController gc, IReadOnlyList<TabletOnScreen> seen)
+    {
+        var b = new StringBuilder();
+        var visible = Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement?.VisibleStash, null);
+        var walked = seen.Where(t => t.Where == "stash tab elements")
+            .ToDictionary(t => Safe.Read(t.Entity, static e => e.Address, 0L), t => t.Rect);
+
+        void Describe(Inventory inventory, string name)
+        {
+            var server = Safe.Read(inventory, static i => i.ServerInventory, null);
+            var slots = Safe.Read(server, static s => s.InventorySlotItems, null);
+
+            b.AppendLine($"    {name}: type {Safe.Read(inventory, static i => i.InvType.ToString(), "?")}, visible " +
+                         $"{Safe.Read(inventory, static i => i.IsVisible, false)}, nested {Safe.Read(inventory, static i => i.IsNestedInventory, false)}, " +
+                         $"nested index {Safe.Read(inventory, static i => i.NestedVisibleInventoryIndex, null)?.ToString() ?? "none"}, item list " +
+                         $"{Safe.Read(inventory, static i => i.VisibleInventoryItems?.Count ?? -1, -1)}; server inventory " +
+                         (server == null
+                             ? "unreadable"
+                             : $"{Safe.Read(server, static s => s.InventType.ToString(), "?")} {Safe.Read(server, static s => s.Columns, -1)}x" +
+                               $"{Safe.Read(server, static s => s.Rows, -1)}, {Safe.Read(server, static s => s.ItemCount, -1L)} item(s), hash " +
+                               $"{Safe.Read(server, static s => s.Hash, 0L)}, {slots?.Count ?? -1} slot item(s)"));
+
+            var tablets = 0;
+            var matched = 0;
+
+            foreach (var slot in slots ?? [])
+            {
+                var entity = Safe.Read(slot, static x => x.Item, null);
+
+                if (!(Safe.Read(entity, static e => e.Metadata, null) ?? "").StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                tablets++;
+
+                var address = Safe.Read(entity, static e => e.Address, 0L);
+                var onScreen = walked.TryGetValue(address, out var rect);
+
+                if (onScreen)
+                    matched++;
+
+                if (tablets <= 5)
+                {
+                    var client = Safe.Read(slot, static x => x.GetClientRect(), default);
+
+                    b.AppendLine($"      tablet at cell ({Safe.Read(slot, static x => x.PosX, -1)},{Safe.Read(slot, static x => x.PosY, -1)}), " +
+                                 $"size {Safe.Read(slot, static x => x.SizeX, -1)}x{Safe.Read(slot, static x => x.SizeY, -1)}, version " +
+                                 $"{Safe.Read(slot, static x => x.Version, -1)}, slot's own rect ({client.X:0},{client.Y:0} {client.Width:0}x{client.Height:0}), " +
+                                 (onScreen ? $"the walk's element at ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0})" : "not found by the walk"));
+                }
+            }
+
+            b.AppendLine($"      {tablets} tablet(s) among the slot items, {matched} of them the same entity as a tablet the walk found");
+        }
+
+        if (visible == null)
+            return "  visible stash tab's server inventory: no visible stash" + Environment.NewLine;
+
+        b.AppendLine($"  visible stash tab's server inventory, and its sub-inventories (the walk found {walked.Count} tablet(s)):");
+        Describe(visible, "the tab");
+
+        var subs = Safe.Read(visible, static v => v.SubInventories, null) ?? [];
+
+        for (var i = 0; i < subs.Count && i < 12; i++)
+            Describe(subs[i], $"sub-inventory {i}");
+
+        if (subs.Count == 0)
+            b.AppendLine("    no sub-inventories");
+
+        // The same, for the visible tab's entry in the stash's own list of tabs, and for every server-side inventory that
+        // is not the player's: one of them may be the fragment tab's contents.
+        var index = Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement.IndexVisibleStash, -1);
+        var entries = Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement.Inventories, null);
+
+        b.AppendLine($"  the stash's list of tabs: {entries?.Count ?? -1} entr(ies), the visible one {index}");
+
+        if (entries != null && index >= 0 && index < entries.Count)
+            Describe(Safe.Read(entries[index], static e => e.Inventory, null), $"entry {index} \"{Safe.Read(entries[index], static e => e.TabName, "?")}\"");
+
+        var holders = Safe.Read(gc, static g => g.IngameState.ServerData.NPCInventories, null) ?? [];
+
+        b.AppendLine($"  server-side inventories not the player's: {holders.Count}");
+
+        for (var i = 0; i < holders.Count && i < 40; i++)
+        {
+            var server = Safe.Read(holders[i], static h => h.Inventory, null);
+            var slots = Safe.Read(server, static x => x.InventorySlotItems, null) ?? [];
+            var tablets = slots.Where(x => (Safe.Read(x, static y => y.Item?.Metadata, null) ?? "")
+                .StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase)).ToList();
+            var matched = tablets.Count(x => walked.ContainsKey(Safe.Read(x, static y => y.Item?.Address ?? 0L, 0L)));
+
+            b.AppendLine($"    [{i}] id {Safe.Read(holders[i], static h => h.Id, -1)}, type {Safe.Read(holders[i], static h => h.TypeId.ToString(), "?")}, " +
+                         $"{Safe.Read(server, static x => x.InventType.ToString(), "?")} {Safe.Read(server, static x => x.Columns, -1)}x" +
+                         $"{Safe.Read(server, static x => x.Rows, -1)}, {slots.Count} slot item(s), {tablets.Count} tablet(s), {matched} the same " +
+                         $"entity as one the walk found, hash {Safe.Read(server, static x => x.Hash, 0L)}" +
+                         (tablets.Count > 0
+                             ? $", first at cell ({Safe.Read(tablets[0], static y => y.PosX, -1)},{Safe.Read(tablets[0], static y => y.PosY, -1)})"
+                             : ""));
+        }
+
+        return b.ToString();
+    }
+
+
     /// <summary>The visible stash tab's elements, depth first and bounded, for tablets the item list missed.</summary>
     /// <param name="paths">Where to add the metadata of every item met, when wanted.</param>
-    private static void Walk(List<TabletOnScreen> found, HashSet<long> entities, Element tab, string where = "stash tab elements",
-        List<string> paths = null)
+    /// <param name="holders">Where to add every visible element carrying an item, when wanted.</param>
+    /// <param name="belowTablets">Whether to go on below an element carrying an Expedition tablet.</param>
+    /// <returns>How many elements were visited.</returns>
+    private static int Walk(List<TabletOnScreen> found, HashSet<long> entities, Element tab, string where = "stash tab elements",
+        List<string> paths = null, List<Element> holders = null, bool belowTablets = true)
     {
         var stack = new Stack<(Element Element, int Depth)>();
         var visited = 0;
@@ -725,17 +1048,31 @@ internal static partial class Tablets
 
             visited++;
 
-            if (element == null || !Safe.Read(element, static e => e.IsVisible, false))
+            // Below the top, only the element's own flag: the walk never goes below an element that is not visible, so
+            // its parents are already known visible. IsVisible is taken to read up the parent chain - not checked, as
+            // the HUD's assembly is obfuscated - which made each element's check as deep as the element.
+            if (element == null || !(depth == 0 ? Safe.Read(element, static e => e.IsVisible, false) : Safe.Read(element, static e => e.IsVisibleLocal, false)))
                 continue;
 
             var entity = Safe.Read(element, static e => e.Entity, null);
 
             if (entity != null)
             {
-                if (paths != null && Safe.Read(entity, static e => e.Metadata, null) is { Length: > 0 } path)
+                holders?.Add(element);
+
+                var path = Safe.Read(entity, static e => e.Metadata, null) ?? "";
+
+                if (paths != null && path.Length > 0)
                     paths.Add(path);
 
-                Add(found, entities, where, element, entity);
+                // The metadata as read here, so Add does not read it again.
+                Add(found, entities, where, element, entity, path, knownVisible: true);
+
+                // Not below a tablet's element, whose own elements carry it again. Only a tablet: the fragment tab's own
+                // element carries an entity too, and stopping at any entity stopped the walk at the tab (dump 2026-10-11
+                // 22:54:21).
+                if (!belowTablets && path.StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
             }
 
             if (depth >= DeepestElement)
@@ -744,16 +1081,20 @@ internal static partial class Tablets
             foreach (var child in Safe.Read(element, static e => e.Children, null) ?? [])
                 stack.Push((child, depth + 1));
         }
+
+        return visited;
     }
 
 
+    /// <param name="knownPath">The entity's metadata, where the caller has read it already.</param>
+    /// <param name="knownVisible">Whether the caller has already found the element visible.</param>
     private static void Add(List<TabletOnScreen> found, HashSet<long> entities, string where, Element element,
-        Entity entity)
+        Entity entity, string knownPath = null, bool knownVisible = false)
     {
-        if (entity == null || element == null || !Safe.Read(element, static e => e.IsVisible, false))
+        if (entity == null || element == null || !knownVisible && !Safe.Read(element, static e => e.IsVisible, false))
             return;
 
-        var path = Safe.Read(entity, static e => e.Metadata, "") ?? "";
+        var path = knownPath ?? Safe.Read(entity, static e => e.Metadata, "") ?? "";
 
         if (!path.StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase))
             return;
@@ -781,10 +1122,11 @@ internal static partial class Tablets
         lock (ModifierCache)
         {
             if (!ModifierCache.TryGetValue(address, out kept) || kept.Hash != hash || kept.Rarity != rarity ||
-                kept.Identified != identified || now - kept.At > ModifiersKeptFor ||
+                kept.Identified != identified || now - kept.At > kept.KeptFor ||
                 TabletsChanging.TryGetValue(address, out var until) && now < until)
             {
-                kept = new CachedModifiers(hash, rarity, identified, ModifiersOf(mods), UsesOf(mods), now);
+                kept = new CachedModifiers(hash, rarity, identified, ModifiersOf(mods), UsesOf(mods), now,
+                    ModifiersKeptFor + TimeSpan.FromMilliseconds(Random.Shared.NextDouble() * ModifiersKeptFor.TotalMilliseconds));
 
                 // A modifier read without its id or values is not kept, so the next read tries again rather than use the
                 // half-read tablet for five seconds. See FullyRead.
@@ -798,9 +1140,12 @@ internal static partial class Tablets
         found.Add(new TabletOnScreen(where, element, rect, rarity, kept.Modifiers, entity, kept.Uses, identified));
     }
 
-    /// <summary>A tablet's modifiers and uses as last read, with what says whether they may have changed since.</summary>
+    /// <summary>
+    /// A tablet's modifiers and uses as last read, with what says whether they may have changed since. KeptFor is how
+    /// long this entry is used before it is read again regardless, ModifiersKeptFor to twice that.
+    /// </summary>
     private sealed record CachedModifiers(long Hash, ItemRarity Rarity, bool Identified, TabletModifier[] Modifiers, int Uses,
-        DateTime At);
+        DateTime At, TimeSpan KeptFor);
 
     /// <summary>
     /// Each tablet's modifiers and uses by entity address, so a read of the screen does not build them again for every
@@ -808,12 +1153,17 @@ internal static partial class Tablets
     /// 22:03), and the frames it stalled made the cursor stutter during a run.
     ///
     /// Read again when the Mods component's hash, the rarity or the identified flag differ, when the entry is older than
-    /// ModifiersKeptFor, and while a run has just clicked the tablet (TabletsChanging). Whether the hash changes when a
+    /// its KeptFor, and while a run has just clicked the tablet (TabletsChanging). Whether the hash changes when a
     /// currency adds a modifier has not been checked, so it is not relied on alone.
     /// </summary>
     private static readonly Dictionary<long, CachedModifiers> ModifierCache = [];
 
-    /// <summary>How long a tablet's modifiers are used from ModifierCache before they are read again regardless.</summary>
+    /// <summary>
+    /// The least time a tablet's modifiers are used from ModifierCache before they are read again regardless; each entry
+    /// draws its own time from this to twice this, so a sub-tab's tablets, read together, do not all expire together and
+    /// get read again in one frame. A frame of 438ms spent 231ms reading modifiers (dump 2026-10-11 22:31:06); whether
+    /// that was entries expiring or a sub-tab read for the first time was not told apart.
+    /// </summary>
     private static readonly TimeSpan ModifiersKeptFor = TimeSpan.FromSeconds(5);
 
     /// <summary>Tablets a run has just used a currency on, by address, read fresh until the time given. See ModifierCache.</summary>
@@ -1080,7 +1430,11 @@ internal static partial class Tablets
         var seen = Read(gc, true, true);
 
         b.AppendLine($"  {seen.Count} Expedition Tablet(s) on screen (stash tab, its elements, and the inventory when open)");
-        b.AppendLine($"  cursor action: \"{CursorAction(gc)}\" - read as {HeldOnCursor(gc)}");
+        b.AppendLine($"  {FragmentTabReadSaid}");
+        b.AppendLine($"  {TabletsTotalSaid(gc)}");
+        b.AppendLine($"  {VisibleStashListSaid(gc)}");
+        b.Append(VisibleStashServerSaid(gc, seen));
+        b.AppendLine($"  cursor action: \"{CursorAction(gc)}\" - read as {HeldOnCursor(gc)}; item held: {Safe.Read(ItemHeldOnCursor(gc), static e => e.Metadata, null) ?? "none"}");
         b.AppendLine(CursorElement(gc));
 
         var mouse = ImGuiNET.ImGui.GetMousePos();

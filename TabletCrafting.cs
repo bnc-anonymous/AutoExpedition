@@ -201,12 +201,16 @@ internal static partial class Tablets
 
     /// <summary>
     /// "Transmutation: 0/0" and the rest under the pricing progress line, each green when the currency held covers what
-    /// the tablets need and red when not, shown as ShowMetCraftingRequirements and ShowUnmetCraftingRequirements ask. With
-    /// the currency tab not yet seen this session, a last line says its stacks are not counted.
+    /// the tablets need and red when not, shown as ShowMetCraftingRequirements and ShowUnmetCraftingRequirements ask. Only in a
+    /// hideout or a town, where tablets are crafted: in a map the inventory opened showed them over the gold (2026-10-11).
+    /// Not at all until the currency tab has been read this session: without its stacks every count is short, and the
+    /// lines read as currency missing that is in the stash.
     /// </summary>
     private static void DrawCraftingRequirements(Graphics graphics, GameController gc, TabletRerollingSettings settings)
     {
         if (!settings.CraftingByHand.ShowMetCraftingRequirements && !settings.CraftingByHand.ShowUnmetCraftingRequirements ||
+            _currencyTabHeld == null ||
+            !Safe.Read(gc, static g => g.Area.CurrentArea is { } area && (area.IsHideout || area.IsTown), false) ||
             ProgressAnchor(gc, settings) is not { } anchor)
             return;
 
@@ -223,9 +227,6 @@ internal static partial class Tablets
             if (met ? settings.CraftingByHand.ShowMetCraftingRequirements : settings.CraftingByHand.ShowUnmetCraftingRequirements)
                 lines.Add(($"{line}: {have}/{needed}", met ? RequirementMetColour : RequirementUnmetColour));
         }
-
-        if (lines.Count > 0 && _currencyTabHeld == null)
-            lines.Add(("Currency tab not seen yet: its stacks are not counted", Dim));
 
         // Under the pricing progress line, at its offsets: its row is kept whether it shows or not.
         var height = graphics.MeasureText("Hg").Y + 4f;

@@ -363,6 +363,50 @@ internal static class Minimap
     }
 
     /// <summary>
+    /// Each remnant's socket count, written just under it on whichever map is up, in the propagating rune colour on a dark
+    /// background SocketCountPaddingPx wider than the number either side, so it reads over the map. Remnants not yet spent, with a socket count read. See
+    /// RemnantRewardSettings.DrawSocketCountOnMinimap.
+    /// </summary>
+    public static void SocketCounts(Graphics graphics, GameController gc, AutoExpeditionSettings settings, List<Target> targets)
+    {
+        if (targets == null || !Showing(gc))
+            return;
+
+        using var clip = graphics.MapSurfaceClip();
+
+        var colour = (Color)settings.Display.Remnants.Propagation.PassColour;
+        var back = Color.FromArgb(170, 0, 0, 0);
+
+        foreach (var target in targets)
+        {
+            if (target.Kind != TargetKind.Remnant || target.Spent || target.Sockets <= 0)
+                continue;
+
+            var at = Safe.Read(() => graphics.GridToMap(target.Grid, target.Grid), Vector2.Zero);
+
+            if (at == Vector2.Zero)
+                continue;
+
+            var text = target.Sockets.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var size = graphics.MeasureText(text);
+
+            // Under the remnant's own map icon, which the game draws at its position. The background drawn here rather
+            // than by DrawTextWithBackground, which ends at the digit's edge; a space either side was a character too wide.
+            var corner = new Vector2(at.X - size.X / 2f, at.Y + SocketCountBelowPx);
+
+            graphics.DrawBox(new ExileCore2.Shared.RectangleF(corner.X - SocketCountPaddingPx, corner.Y,
+                size.X + 2f * SocketCountPaddingPx, size.Y), back);
+            graphics.DrawText(text, corner, colour);
+        }
+    }
+
+    /// <summary>How far under a remnant's place on the map its socket count is written, in pixels. Chosen.</summary>
+    private const float SocketCountBelowPx = 8f;
+
+    /// <summary>How far the socket count's background reaches past the number on the left and right, in pixels. Chosen.</summary>
+    private const float SocketCountPaddingPx = 2f;
+
+    /// <summary>
     /// A line from the player to the remnant worth rolling, on whichever map is up.
     ///
     /// Drawn under the same condition as the world line - only while the advice is about the chain on

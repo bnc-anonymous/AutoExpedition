@@ -63,12 +63,24 @@ internal static partial class Tablets
     /// <summary>
     /// A sub-tab's tablets as last seen, when that was within ContentsTrustedFor and the record kept them; else null,
     /// and the sub-tab is to be visited. The sub-tab showing is never answered from memory: it is read as it is.
+    ///
+    /// **An empty sub-tab is empty however long ago it was seen, while the records add up to the Expedition Tablets
+    /// button**, and so is one never seen: every tablet the button counts is in another. The tidy after a crafting run
+    /// went through sub-tabs 2 to 6, each recorded as empty, with the button and the records both at 16 (dump 2026-10-11
+    /// 23:58:47). A sub-tab holding tablets keeps the time limit: where in it each one sits is not covered by the count.
     /// </summary>
-    private static List<RememberedTablet> RememberedContents(GameController gc, int number) =>
-        SelectedSubTab(gc) != number && Book.SubTabs.TryGetValue(number, out var record) && record.Contents is { } contents &&
-        DateTime.UtcNow - record.When < ContentsTrustedFor
-            ? contents
-            : null;
+    private static List<RememberedTablet> RememberedContents(GameController gc, int number)
+    {
+        if (SelectedSubTab(gc) == number)
+            return null;
+
+        var recorded = Book.SubTabs.TryGetValue(number, out var record) ? record : null;
+
+        if ((recorded == null || recorded.Tablets == 0) && RecordsAccountForAll(gc) == true)
+            return [];
+
+        return recorded?.Contents is { } contents && DateTime.UtcNow - recorded.When < ContentsTrustedFor ? contents : null;
+    }
 
     /// <summary>The records, and when all six were last gone through, as saved.</summary>
     internal sealed class SubTabBook
@@ -135,10 +147,13 @@ internal static partial class Tablets
         }
     }
 
-    /// <summary>Records the sub-tab showing, when the fragment tab's Expedition tablets are up. Called on each read.</summary>
+    /// <summary>
+    /// Records the sub-tab the last read was taken from, when the fragment tab's Expedition tablets are up. Called on each
+    /// read, two frames after it; nothing is recorded when another sub-tab is showing by then. See _subTabAtRead.
+    /// </summary>
     private static void NoteSubTab(GameController gc, TabletRerollingSettings settings)
     {
-        if (_stashRect.Width <= 0f || SelectedSubTab(gc) is not (> 0 and var number))
+        if (_stashRect.Width <= 0f || _subTabAtRead is not (> 0 and var number) || SelectedSubTab(gc) != number)
             return;
 
         // Only the Expedition tablets' sub-tabs: the same numbered sub-tabs show every tablet type. Known by what the
@@ -227,9 +242,25 @@ internal static partial class Tablets
     /// deposit - or it is the first not full, where new tablets land. A sub-tab past that one, empty when last seen, is
     /// passed by.
     /// </summary>
-    private static bool SubTabWorthVisiting(int number, SubTabPurpose purpose)
+    private static bool SubTabWorthVisiting(GameController gc, int number, SubTabPurpose purpose)
     {
-        if (FullScanDue || !Book.SubTabs.TryGetValue(number, out var record) || DateTime.UtcNow - record.When > FullScanEvery)
+        // **The Expedition Tablets button's count says whether the records are whole.** Adding up to it, a sub-tab never
+        // seen holds none and an old record is still right, so neither is visited and no full scan is needed; not adding
+        // up, every sub-tab is visited until they do. Unreadable, the records are judged by age as before. Records right
+        // in total but not in which sub-tab holds what - tablets moved between sub-tabs with the plugin not running - are
+        // not caught.
+        var accounted = RecordsAccountForAll(gc);
+
+        if (accounted == false)
+            return true;
+
+        if (accounted != true && FullScanDue)
+            return true;
+
+        if (!Book.SubTabs.TryGetValue(number, out var record))
+            return accounted != true || purpose == SubTabPurpose.Room && number == FirstNotFull();
+
+        if (accounted != true && DateTime.UtcNow - record.When > FullScanEvery)
             return true;
 
         return purpose switch
@@ -240,4 +271,59 @@ internal static partial class Tablets
             _ => record.Tablets < SubTabHolds,
         };
     }
+
+    /// <summary>
+    /// The count on the fragment tab's Expedition Tablets button - the run clicks it to show Expedition tablets, content
+    /// child 2, 2 - or null when the stash does not show it or no number can be read on it. It counts every Expedition
+    /// tablet in the six sub-tabs: 46 with 44, 1 and 1 in sub-tabs 1, 2 and 3, by the player's account (2026-10-11).
+    /// </summary>
+    private static int? ExpeditionTabletsTotal(GameController gc)
+    {
+        var button = FragmentTabContent(gc) is { } content ? Safe.Read(content, static c => c.Children[2].Children[2], null) : null;
+
+        if (button == null)
+            return null;
+
+        foreach (var text in TextsUnder(button))
+        {
+            if (int.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var total))
+                return total;
+        }
+
+        return null;
+    }
+
+    /// <summary>The tablets the six sub-tab records hold between them.</summary>
+    private static int RecordedTabletsTotal() => Enumerable.Range(1, 6).Sum(n => Book.SubTabs.TryGetValue(n, out var r) ? r.Tablets : 0);
+
+    /// <summary>
+    /// Whether the sub-tab records hold every Expedition tablet the button counts: true when they add up to it, false
+    /// when they have not for MismatchHeldFor, null when the button cannot be read or a mismatch is newer than that. A
+    /// tablet withdrawn lowers the button at once and its sub-tab's record a read later, so a moment's mismatch is not
+    /// taken as stale records. See SubTabWorthVisiting.
+    /// </summary>
+    private static bool? RecordsAccountForAll(GameController gc)
+    {
+        if (ExpeditionTabletsTotal(gc) is not { } total)
+            return null;
+
+        if (RecordedTabletsTotal() == total)
+        {
+            _recordsMismatchSince = null;
+            return true;
+        }
+
+        _recordsMismatchSince ??= DateTime.UtcNow;
+        return DateTime.UtcNow - _recordsMismatchSince >= MismatchHeldFor ? false : null;
+    }
+
+    private static DateTime? _recordsMismatchSince;
+
+    /// <summary>How long the records and the button must disagree before the records are taken as stale. Chosen.</summary>
+    private static readonly TimeSpan MismatchHeldFor = TimeSpan.FromSeconds(1);
+
+    /// <summary>The button's count against the records', for the dump.</summary>
+    private static string TabletsTotalSaid(GameController gc) =>
+        $"Expedition Tablets button: {ExpeditionTabletsTotal(gc)?.ToString() ?? "unread"}; sub-tab records add up to " +
+        $"{RecordedTabletsTotal()} ({string.Join(", ", Enumerable.Range(1, 6).Select(n => Book.SubTabs.TryGetValue(n, out var r) ? $"{n}: {r.Tablets}" : $"{n}: never seen"))})";
 }

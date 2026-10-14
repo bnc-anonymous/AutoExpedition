@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Text;
 
 namespace AutoExpedition;
@@ -215,9 +216,104 @@ internal static class Spent
     /// does not draw at all.</param>
     /// <param name="AreaChanged">Whether the area changed during it, which is a loading screen.</param>
     /// <param name="Jobs">The background jobs running when it ended, by name. See BackgroundWork.RunningJobs.</param>
+    /// <param name="HostStages">The host's own timings that were longest when the gap ended: every plugin's Tick and
+    /// Render and the host's stages. See HostStagesSaid.</param>
+    /// <param name="HostStagesNext">The same, a frame later. See HostStagesSaid.</param>
     internal readonly record struct LongGap(DateTime When, double Ms, double CollectingMs,
         (int Gen0, int Gen1, int Gen2) Collections, int Solving, bool Enumerating, int PoolThreads, long PoolQueued,
-        long AllocatedKb, string Slow, bool OutOfFocus, bool AreaChanged, string Jobs, string LastCollection);
+        long AllocatedKb, string Slow, bool OutOfFocus, bool AreaChanged, string Jobs, string LastCollection,
+        string HostStages = "", string HostStagesNext = "", string Memory = "");
+
+    /// <summary>
+    /// The system's memory and this process's own at the moment a long gap ended: physical memory available and in use,
+    /// the commit charge against its limit, and the process's private bytes. Whether long gaps come when memory is
+    /// short is the question it answers: the overlay waited in Present for most of them, with the system at 86% of its
+    /// commit limit (2026-10-12 01:47), and memory pressure is one possible reason, not a shown one. See LongGap.
+    /// </summary>
+    private static string MemorySaid()
+    {
+        try
+        {
+            var status = new MemoryStatus { Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryStatus>() };
+
+            if (!GlobalMemoryStatusEx(ref status))
+                return "memory unreadable";
+
+            var privateMb = Process.GetCurrentProcess().PrivateMemorySize64 / 1048576d;
+
+            return $"memory: {status.AvailablePhysical / 1073741824d:N1}GB of {status.TotalPhysical / 1073741824d:N1}GB available " +
+                   $"({status.MemoryLoad}% in use), commit {(status.TotalPageFile - status.AvailablePageFile) / 1073741824d:N1} of " +
+                   $"{status.TotalPageFile / 1073741824d:N1}GB, this process {privateMb:N0}MB private";
+        }
+        catch (Exception e)
+        {
+            return $"memory unreadable ({e.GetType().Name})";
+        }
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MemoryStatus
+    {
+        public uint Length;
+        public uint MemoryLoad;
+        public ulong TotalPhysical;
+        public ulong AvailablePhysical;
+        public ulong TotalPageFile;
+        public ulong AvailablePageFile;
+        public ulong TotalVirtual;
+        public ulong AvailableVirtual;
+        public ulong AvailableExtendedVirtual;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
+
+    /// <summary>
+    /// The host's timings that were longest on their last frame, by name, longest first: ExileCore2 times every plugin's
+    /// Tick and Render, and its own stages, as DebugInformation in Core.DebugInformations, each with its last frame's
+    /// time as Tick. On a long gap this names who had the time - a plugin, the host, or nobody it times.
+    ///
+    /// **Read twice: when the gap is seen, and a frame later.** Plugins run in turn and this one runs early, so when it
+    /// sees a gap some plugins' last frame is the stalled one and others' is the frame before it.
+    /// </summary>
+    private static string HostStagesSaid()
+    {
+        try
+        {
+            var all = (ExileCore2.Core.DebugInformations?.ToArray() ?? []).Where(d => d != null).ToList();
+
+            // **The host's sums apart, and area-change timings left out.** A sum - Total, Core, All plugins - and an
+            // "[A]" timing, which is the last area change and not this frame, took places in the six named: a 585ms gap
+            // named ReAgent at 308ms of an All plugins 1,065ms and nobody for the rest (dump 2026-10-12 01:20:39).
+            var sums = all.Where(d => HostSums.Contains(d.Name)).Select(d => $"{d.Name} {d.Tick:N0}ms").ToList();
+            var longest = all
+                .Where(d => !HostSums.Contains(d.Name) && !(d.Name ?? "").EndsWith("[A]", StringComparison.Ordinal) &&
+                            d.Tick >= HostStageShownMs)
+                .OrderByDescending(d => d.Tick)
+                .Take(HostStagesShown)
+                .Select(d => $"{d.Name} {d.Tick:N0}ms")
+                .ToList();
+
+            return (longest.Count > 0 ? string.Join(", ", longest) : $"no host timing over {HostStageShownMs:N0}ms") +
+                   (sums.Count > 0 ? $" (sums: {string.Join(", ", sums)})" : "");
+        }
+        catch (Exception e)
+        {
+            return $"host timings unreadable ({e.GetType().Name})";
+        }
+    }
+
+    /// <summary>The shortest of the host's timings named on a long gap, and how many. Chosen.</summary>
+    private const double HostStageShownMs = 5d;
+
+    private const int HostStagesShown = 8;
+
+    /// <summary>The host's timings that sum others, named apart from them. See HostStagesSaid.</summary>
+    private static readonly HashSet<string> HostSums = new(StringComparer.Ordinal) { "Total", "Core", "All plugins" };
+
+    /// <summary>Whether the last long gap still wants the host's timings of the frame after it. See HostStagesSaid.</summary>
+    private static bool _hostStagesNextWanted;
 
     /// <summary>
     /// The most recent gen0 or gen1 collection as the runtime reports it: which generation, how long it stopped
@@ -339,6 +435,17 @@ internal static class Spent
 
     public static void Frame()
     {
+        if (_hostStagesNextWanted)
+        {
+            _hostStagesNextWanted = false;
+
+            lock (_longGaps)
+            {
+                if (_longGaps.Count > 0)
+                    _longGaps[^1] = _longGaps[^1] with { HostStagesNext = HostStagesSaid() };
+            }
+        }
+
         var pausedNow = GC.GetTotalPauseDuration();
         var allocatedNow = GC.GetTotalAllocatedBytes(false);
         var collectionsNow = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
@@ -373,7 +480,11 @@ internal static class Spent
                     WithinGap(System.Threading.Interlocked.Read(ref _lastOutOfFocusTicks), apart),
                     WithinGap(System.Threading.Interlocked.Read(ref _lastAreaChangeTicks), apart),
                     BackgroundWork.RunningJobs(),
-                    LastEphemeralCollection());
+                    LastEphemeralCollection(),
+                    HostStagesSaid(),
+                    Memory: MemorySaid());
+
+                _hostStagesNextWanted = true;
 
                 lock (_longGaps)
                 {

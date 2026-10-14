@@ -842,6 +842,45 @@ internal sealed class Planning
     /// </summary>
     public bool ProvenBest { get; private set; }
 
+    /// <summary>
+    /// Whether the last solve's plan has been exhausted: on a site simple enough to ask, every order of its stops
+    /// laid again over every spot catching each found nothing better. Continuous solving stops on it as on ProvenBest;
+    /// any solve clears it. Asked after each solve on its own thread, under Exhaustive search on simple sites. Not a
+    /// proof - see ExhaustiveSpotSearch.IsChainExhausted.
+    /// </summary>
+    public bool Exhausted => _exhausted is { IsCompletedSuccessfully: true, Result: true };
+
+    /// <summary>Whether that question is still being worked out, which the presolve waits on. See Exhausted.</summary>
+    public bool CheckingExhausted => _exhausted is { IsCompleted: false };
+
+    private Task<bool> _exhausted;
+
+    private CancellationTokenSource _exhaustedStop;
+
+    /// <summary>Drops the answer of Exhausted, and stops working one out. Called when a solve starts.</summary>
+    private void ForgetExhausted()
+    {
+        _exhaustedStop?.Cancel();
+        _exhaustedStop = null;
+        _exhausted = null;
+    }
+
+    /// <summary>Starts working out Exhausted for the plan just settled, when the site is simple enough to ask.</summary>
+    private void CheckExhausted()
+    {
+        ForgetExhausted();
+
+        if (_env is not { UseEnumeratedSolve: true } || Plan.Points.Count == 0 ||
+            (_env.Placed?.Count ?? 0) > 0 || !ExhaustiveSpotSearch.SimpleEnoughToExhaust(_env))
+            return;
+
+        var env = _env;
+        var chain = new List<Vector2>(Plan.Points);
+        var stop = _exhaustedStop = new CancellationTokenSource();
+
+        _exhausted = Task.Run(() => ExhaustiveSpotSearch.IsChainExhausted(env, chain, () => stop.IsCancellationRequested));
+    }
+
 
 
 
@@ -1408,6 +1447,7 @@ internal sealed class Planning
         // A spent remnant is scenery: it cannot be opened, it carries nothing forward and there is
         // nothing left to take from it. Leaving it in weighed a hundred points of remnant plus its
         // sockets on a thing the chain would gain nothing by reaching.
+        var buildStage = Spent.On("Build/Remaining");
         var (content, caught) = Remaining(scan.At(site),
             remaining ? Detonator.PlacedExplosiveGridPositions(gc) : null, radius.Value);
 
@@ -1429,12 +1469,18 @@ internal sealed class Planning
         var ceiling = Ceiling(content, settings);
 
 
-        List<PlanTarget> Project(List<Target> of) => of
+        // The remnant's pinned reward once per target and handed to every reading that wants it: it reads the game,
+        // and was asked nine times a target for the same answer, in the Build a press of the action key runs twice
+        // (Build/Project up to 47ms, dump 2026-10-11 16:35:59). See Pinned.
+        List<PlanTarget> Project(List<Target> of) =>
+            of.Select(t => ProjectOne(t, Pinned(t, settings, valuation))).ToList();
+
+        PlanTarget ProjectOne(Target t, string pinned) =>
             // The reward is NOT added into the weight here any more. It is one of a remnant's
             // choices now, and which choice wins depends on where the chain puts it - so the price
             // and the propagation are decided together, inside the search, rather than both being
             // counted in full before it starts.
-            .Select(t => new PlanTarget(t.Grid, Extents.Of(t),
+            new PlanTarget(t.Grid, Extents.Of(t),
                 // The player pointing at a marker is the same kind of statement as a remnant being
                 // rich enough to be required, so it is said the same way - and saying "not that one"
                 // is the same statement with the sign flipped. See Insisted.
@@ -1469,7 +1515,7 @@ internal sealed class Planning
                 // Weighing.Choices. Lost once already, in a repair that restored this method from an
                 // older commit; it is the difference between pricing what a remnant IS and pricing
                 // what it could have been.
-                Weighing.Choices(t, settings, Pinned(t, settings, valuation)),
+                Weighing.Choices(t, settings, pinned),
                 // The name of an effect that pays once however many are taken, or nothing. Only the
                 // unknown weights can say it - everything the plugin recognises is priced in code
                 // and stacks, which is what the shipped relics do. See PlanTarget.Once.
@@ -1503,30 +1549,30 @@ internal sealed class Planning
                 // What each combination is called, walked exactly as Choices is - the same Pinned
                 // argument, so a locked remnant's single entry is named by the same single name.
                 // Without this the objective's choice publishes as "(unnamed)". See Planner.Chosen.
-                Named: Weighing.Names(t, settings, Pinned(t, settings, valuation)),
+                Named: Weighing.Names(t, settings, pinned),
                 // What identifies each of those, same order, so the readouts can say which row the
                 // planner took without joining on what it yields. See Weighing.RecipeIdsOfTarget.
-                Recipes: Weighing.RecipeIdsOfTarget(t, settings, Pinned(t, settings, valuation)),
+                Recipes: Weighing.RecipeIdsOfTarget(t, settings, pinned),
                 // What each of those adds of magic and rare waves over the remnant's own recipe, same order, for
                 // Gaining Traction to scale. See Weighing.MagicAndRareWavesOfChoices.
                 MagicAndRareWavesOfChoices: Weighing.MagicAndRareWavesOfChoices(t, settings,
-                    Pinned(t, settings, valuation)),
+                    pinned),
                 // What each of those holds of runes whose effects reach this remnant's own waves, same order. See
                 // Weighing.OwnEffectsOfChoices.
-                OwnEffectsOfChoices: Weighing.OwnEffectsOfChoices(t, settings, Pinned(t, settings, valuation)),
+                OwnEffectsOfChoices: Weighing.OwnEffectsOfChoices(t, settings, pinned),
                 // And the empowering lift each holds, which empowers what it propagates. See PlanTarget.HeldLiftOfChoice.
-                HeldLiftOfChoices: Weighing.HeldLiftOfChoices(t, settings, Pinned(t, settings, valuation)),
+                HeldLiftOfChoices: Weighing.HeldLiftOfChoices(t, settings, pinned),
                 // And the share of its own waves each propagated rune is on. See PlanTarget.WaveShareOfCarried.
-                CarriedWaveSharesOfChoices: Weighing.CarriedWaveSharesOfChoices(t, Pinned(t, settings, valuation)),
-                SlotRunesOfChoices: Weighing.SlotRunesOfChoices(t, Pinned(t, settings, valuation)),
-                CreatedOfChoices: Weighing.CreatedOfChoices(t, Pinned(t, settings, valuation)),
+                CarriedWaveSharesOfChoices: Weighing.CarriedWaveSharesOfChoices(t, pinned),
+                SlotRunesOfChoices: Weighing.SlotRunesOfChoices(t, pinned),
+                CreatedOfChoices: Weighing.CreatedOfChoices(t, pinned),
                 // And what Gaining Traction does to its waves by its place in the chain. See Weighing.TractionByBeforeOfTarget.
                 TractionByBefore: Weighing.TractionByBeforeOfTarget(t,
                     Safe.Read(() => settings.Debug.GainingTraction.Value, true)),
                 // And how many waves it brings, for what a lift passed in reaches. See PlanTarget.ShareOfWavesPassedLift.
-                WaveCount: Weighing.WavesOfRemnant(t)))
-            .ToList();
+                WaveCount: Weighing.WavesOfRemnant(t));
 
+        buildStage.Dispose(); buildStage = Spent.On("Build/Project");
         var targets = Project(content);
 
         // The remnants a placed explosive already caught: never scored, never credited,
@@ -1540,6 +1586,7 @@ internal sealed class Planning
         // stand inside which barrel's radius, and which of those are barrels themselves. Nothing the
         // search does changes it, so it is settled here and read for free half a million times a
         // solve. See PlanTarget.Sets.
+        buildStage.Dispose(); buildStage = Spent.On("Build/Chained");
         Chained(targets, scan.At(site));
 
         // How many the chain is required to take, and what dropping one costs. Worked out once
@@ -1609,6 +1656,7 @@ internal sealed class Planning
         // migration.
         // Read here and carried, for the reason the numbering itself is: Combining runs inside this
 
+        buildStage.Dispose(); buildStage = Spent.On("Build/Groups");
         var (bands, groupCount, empowering, amplified, groupNames) = GroupsOfEffects(effects);
 
         // **The map's own increases as the start of the matching stat groups**, so a relic's "+50% increased number of
@@ -1646,6 +1694,7 @@ internal sealed class Planning
         // the terrain is a chain the game will refuse to place. It is off for one caller only, and
         // that caller is not solving: Scoring values a chain that already exists, which has no use
         // for a predicate about where one COULD go. See Terrain.
+        buildStage.Dispose(); buildStage = Spent.On("Build/Terrain");
         var terrain = withTerrain ? Terrain.Read(gc) : null;
 
         // **Whether this solve could route, recorded because its answer outlives it.**
@@ -1714,6 +1763,7 @@ internal sealed class Planning
 
         // Doodads standing in the dig site. Within a chain's worth of the detonator, because that
         // is as far as any link can be and the rest would be distance tests for nothing.
+        buildStage.Dispose(); buildStage = Spent.On("Build/Blocking");
         var blocking = withTerrain
             ? Obstacles.Read(gc, Detonator.DetonatorGridPosition(gc), range * Math.Max(1, Detonator.ExplosivesInHand(gc)))
             : null;
@@ -1724,6 +1774,7 @@ internal sealed class Planning
             ? Safe.Read(Weighing.GainingTractionRates, (0f, 0f))
             : (0f, 0f);
 
+        buildStage.Dispose(); buildStage = Spent.On("Build/Environment");
         var built = new PlanEnvironment(Detonator.LastExplosiveGridPosition(gc), range, radius.Value,
             Math.Max(1, Detonator.ExplosivesInHand(gc)), targets,
             Placeable(terrain, blocking),
@@ -1790,6 +1841,7 @@ internal sealed class Planning
         // **The whole site beside it, when explosives are down, which every score is then taken on.** The same site
         // with nothing taken out, from the detonator, holding the explosives down as well as those in hand - the
         // environment the score on screen is worked out in. See PlanEnvironment.Whole.
+        buildStage.Dispose();
         var down = remaining ? Detonator.PlacedExplosiveGridPositions(gc) : null;
 
         if (down is not { Length: > 0 })
@@ -2120,9 +2172,34 @@ internal sealed class Planning
     /// content already taken that way. One level only, as the planner's: these objects do not set each other off. See
     /// Chained.
     /// </summary>
-    public static bool Taken(Target target, Vector2[] placed, float radius, List<Target> content)
+    public static bool Taken(Target target, Vector2[] placed, float radius, List<Target> content) =>
+        placed is { Length: > 0 } && TakenAmong(target, placed, radius, ExplodablesOf(content));
+
+    /// <summary>
+    /// The content with a blast of its own and not spent, for Taken: worked out once per question rather than once per
+    /// target. Asked per target, Remaining read Sets and Spent - both reads of the game - for every pair of 384
+    /// markers, 115ms a Build and twice a press (dump 2026-10-11 16:33:52).
+    /// </summary>
+    private static List<Target> ExplodablesOf(List<Target> content)
     {
-        if (target == null)
+        var explodables = new List<Target>();
+
+        foreach (var target in content ?? [])
+        {
+            if (target.Sets > 0f && !target.Spent)
+                explodables.Add(target);
+        }
+
+        return explodables;
+    }
+
+    /// <summary>
+    /// Taken against explodables already found. With nothing placed nothing is taken - both ways need an explosive on
+    /// the ground - so that case asks nothing of the game. See Taken.
+    /// </summary>
+    private static bool TakenAmong(Target target, Vector2[] placed, float radius, List<Target> explodables)
+    {
+        if (target == null || placed is not { Length: > 0 })
             return false;
 
         var reach = radius + Extents.Of(target);
@@ -2133,9 +2210,9 @@ internal sealed class Planning
                 return true;
         }
 
-        foreach (var explodable in content ?? [])
+        foreach (var explodable in explodables)
         {
-            if (explodable.Sets <= 0f || ReferenceEquals(explodable, target) || explodable.Spent)
+            if (ReferenceEquals(explodable, target))
                 continue;
 
             var setOff = radius + Extents.Of(explodable);
@@ -2160,12 +2237,15 @@ internal sealed class Planning
         var left = new List<Target>();
         var caught = new List<Target>();
 
+        // The explodables once for the whole list, and none looked for with nothing placed. See ExplodablesOf.
+        var explodables = placed is { Length: > 0 } ? ExplodablesOf(content) : [];
+
         foreach (var target in content)
         {
             if (target.Spent)
                 continue;
 
-            if (Taken(target, placed, radius, content))
+            if (TakenAmong(target, placed, radius, explodables))
                 caught.Add(target);
             else
                 left.Add(target);
@@ -2607,6 +2687,7 @@ internal sealed class Planning
         Planner.Unfetch();
         Planner.ForgetEnumeratedSolve();
         Repair.Undetour();
+        ForgetExhausted();
 
         // A press takes over from a rehearsal rather than queueing behind it. Cancel below does the
         // work; this only has to record which kind of solve is now running, since the overlay shows
@@ -3836,6 +3917,8 @@ internal sealed class Planning
 
         _live = null;
 
+        CheckExhausted();
+
         Solves++;
 
         // **The route is written down here, whole, and this is the only solve-side place it is.**
@@ -4150,7 +4233,8 @@ internal sealed class Planning
 
         if (reached is { Count: > 0 })
         {
-            Plan = Planner.Describe(_env, reached);
+            using (Spent.On("Planning.Stop/Describe"))
+                Plan = Planner.Describe(_env, reached);
 
             // Written down whole, exactly as a solve that ran to the end does it. Stopping early is
             // still a solve producing a route, and a route half recorded is the state every reader
@@ -4166,7 +4250,8 @@ internal sealed class Planning
             Say("Stopped", "stopped before it had found anything");
         }
 
-        CloseRun($"stopped by {by}");
+        using (Spent.On("Planning.Stop/CloseRun"))
+            CloseRun($"stopped by {by}");
 
         _live = null;
 

@@ -237,7 +237,8 @@ internal static class ChainPanel
                                      "link now starts from somewhere else, so it cannot be scored or loaded as it stands");
 
                 ImGui.TableNextColumn();
-                ImGui.Text(startsHere && !double.IsNaN(currentNow) && currentNow > 0d
+                // Unformatted: ImGui.Text reads its text as a printf format, which swallows the % sign.
+                ImGui.TextUnformatted(startsHere && !double.IsNaN(currentNow) && currentNow > 0d
                     ? $"{100d * (now - currentNow) / currentNow:+0.0;-0.0;0}%"
                     : "-");
 

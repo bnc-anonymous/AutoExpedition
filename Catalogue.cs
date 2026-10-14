@@ -1732,7 +1732,7 @@ internal static class Catalogue
         {
             ImGui.SetTooltip(stored.Length > 0
                 ? "This row's own answer.\n\n" +
-                  "\"monster.weight *= +4%\" is four per cent more of everything tagged monster. A " +
+                  "\"monster.weight *= +4%%\" is four per cent more of everything tagged monster. A " +
                   "factor works too - \"rare_monster.weight *= 2\" - for an effect that is " +
                   "not an increase.\n\n" +
                   "The attribute says WHAT is scaled: weight is what a thing is worth, " +

@@ -182,8 +182,8 @@ internal static partial class Tablets
                     return;
                 }
 
-                // The most valuable still to take, alone, so the inventory fills in that order. Sent already, it is off
-                // the plan. See MoveNext.
+                // The most valuable still to take first, so the inventory fills in that order. Sent already, it is off the
+                // plan. See MoveNext.
                 var cell = WithdrawPlan[0].Cell;
                 var next = shown.FirstOrDefault(t => GridCellOf(t.Rect) == cell);
 
@@ -193,7 +193,15 @@ internal static partial class Tablets
                     return;
                 }
 
-                MoveNext(gc, [next], ValuableTablet, true);
+                // **With the rest of this sub-tab's in the plan, in the same order, as one batch**, so ExileInput2 plans and
+                // draws them ahead and the cursor goes straight on from one to the next, as every other withdraw does. Each
+                // was a batch of its own, planned and drawn alone. Only those before the plan next needs another sub-tab.
+                var batch = WithdrawPlan.TakeWhile(p => p.SubTab == subTab)
+                    .Select(p => shown.FirstOrDefault(t => GridCellOf(t.Rect) == p.Cell))
+                    .Where(t => t != null && !ReforgingSent.Contains(AddressOf(t)))
+                    .ToList();
+
+                MoveNext(gc, batch, ValuableTablet, true, inOrder: true);
                 return;
             }
         }

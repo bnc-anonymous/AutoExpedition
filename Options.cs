@@ -679,7 +679,7 @@ internal static class Options
     /// **It only ever removes candidates.** See the note in Offering: nothing here ranks by
     /// distance, and a remnant the fingerprint rejected is never promoted by being near.
     /// </summary>
-    private const float Reach = 60f;
+    internal const float Reach = 60f;
 
     /// <summary>
     /// How far a remnant is, by the game's own reckoning where it has one.
@@ -1624,12 +1624,30 @@ internal static class Options
         if (Detonator.LastExplosiveGridPosition(gc) is var last && last != Vector2.Zero)
         {
             var catches = Detonator.ExplosionRadius(gc) + 3f;
+
+            // **Or through an explodable the explosive reaches.** The game takes a remnant an oil derrick's blast covers
+            // when the explosive reaches the derrick, and opens its window as it would for one the explosive covers -
+            // from however far off. Left out, a window opened that way matched no remnant in the blast and the run
+            // stopped: "cannot tell which remnant it belongs to" (Stagnant Basin, 2026-10-11). One level, as
+            // Planning.Taken: these objects do not set each other off.
+            var setOff = new List<Target>();
+
+            foreach (var target in scan.At(site))
+            {
+                if (target.Sets > 0f && !target.Spent && Vector2.Distance(target.Grid, last) <= catches + Extents.Of(target))
+                    setOff.Add(target);
+            }
+
+            bool InBlast(Target target) =>
+                Vector2.Distance(target.Grid, last) <= catches ||
+                setOff.Exists(e => !ReferenceEquals(e, target) && Vector2.Distance(target.Grid, e.Grid) <= e.Sets + Extents.Of(target));
+
             Target blasted = null;
             var inBlast = 0;
 
             foreach (var target in here)
             {
-                if (Vector2.Distance(target.Grid, last) > catches ||
+                if (!InBlast(target) ||
                     !Safe.Read(() => Valuation.NothingChosen(target.Entity), false))
                     continue;
 

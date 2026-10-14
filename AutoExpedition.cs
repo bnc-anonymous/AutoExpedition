@@ -27,6 +27,26 @@ namespace AutoExpedition;
 /// </summary>
 public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 {
+    /// <summary>Whether the action key's own key was down at the last look. See ActionKeyWentDown.</summary>
+    private bool _actionKeyWasDown;
+
+    /// <summary>
+    /// Whether the action key's own key - F4, or a mouse button such as XButton1 - has gone down since the last look, read
+    /// from Windows with no regard to ctrl, shift or alt. Called every tick, so the down is seen once.
+    /// </summary>
+    private bool ActionKeyWentDown()
+    {
+        var key = Safe.Read(() => Settings.ActionHotkey.Value.Key, System.Windows.Forms.Keys.None) & System.Windows.Forms.Keys.KeyCode;
+        var down = key != System.Windows.Forms.Keys.None && (GetAsyncKeyState((int)key) & 0x8000) != 0;
+        var wentDown = down && !_actionKeyWasDown;
+
+        _actionKeyWasDown = down;
+        return wentDown;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int key);
+
     private ExileInput2Client _input;
 
     /// <summary>The boundary sweep, which puts the placement model to the game. See Frontier.</summary>
@@ -238,6 +258,109 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 $"({x.At.X:0},{x.At.Y:0}) {Detonator.ExplosivesEverPlacedHere(x.At)}/{x.Total}")), 20f);
     }
 
+    /// <summary>
+    /// Drops the router kept across solves once every expedition in the map has been set off, as nothing is left here to
+    /// plan. It held 3,597,491 paths, about 738MB, through the looting after a Grand site with the system at 86% of its
+    /// commit limit and Windows compressing memory (2026-10-12 01:45); kept, it was released only on leaving the area.
+    /// Set off, not started: a site with explosives down is still solved around, press by press, and dropping the router
+    /// then rebuilt it for the next press. A map with a site not yet set off keeps it. Asked every RoutingCheckEvery. See
+    /// Terrain.ForgetRouting.
+    /// </summary>
+    private void ReleaseRoutingWhenDone()
+    {
+        if (DateTime.UtcNow - _routingCheckedAt < RoutingCheckEvery || Terrain.KeptRouter == null || _planning.Searching)
+            return;
+
+        _routingCheckedAt = DateTime.UtcNow;
+
+        if (Safe.Read(() => Detonator.EverySiteSetOff(GameController), false))
+            Terrain.ForgetRouting();
+    }
+
+    private DateTime _routingCheckedAt;
+
+    private static readonly TimeSpan RoutingCheckEvery = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Says so at the cursor, for InputMissingWarningSeconds, when automation is on and ExileInput2 is not running: every
+    /// click, move and key of the automation goes through it, and without it the action key and the runs silently do
+    /// nothing. Once each time it goes missing, after InputMissingGrace from loading - ExileInput2 loads after this plugin
+    /// - and checked every InputMissingCheckEvery. See ExileInput2Running.
+    /// </summary>
+    private void WarnWhenInputMissing()
+    {
+        if (DateTime.UtcNow - _inputCheckedAt < InputMissingCheckEvery || DateTime.UtcNow - _loadedAt < InputMissingGrace)
+            return;
+
+        _inputCheckedAt = DateTime.UtcNow;
+
+        var missing = Settings.Automation.Enable.Value && !ExileInput2Running();
+
+        if (missing && !_inputMissingSaid)
+            CursorWarning.Show(InputMissingWord, InputMissingWarningSeconds);
+
+        _inputMissingSaid = missing;
+
+        // **Running but older than this plugin needs**: the methods it lacks degrade to doing nothing, so instant loot,
+        // loot plans and the tablet runs fail without a word. Asked once each time it is found running, so a reinstall
+        // is checked again. See ExileInput2VersionNeeded.
+        if (missing || !Settings.Automation.Enable.Value)
+        {
+            _inputVersionChecked = false;
+            return;
+        }
+
+        if (_inputVersionChecked)
+            return;
+
+        _inputVersionChecked = true;
+
+        if (_input?.Version() is { } version and >= 0 && version < ExileInput2VersionNeeded)
+        {
+            CursorWarning.Show(InputOutdatedWord, InputMissingWarningSeconds);
+            DebugWindow.LogMsg($"[AutoExpedition] ExileInput2 is out of date: bridge version {version}, this plugin needs " +
+                               $"{ExileInput2VersionNeeded} or later", 30f);
+        }
+    }
+
+    /// <summary>
+    /// The ExileInput2 bridge version this plugin needs (ExileInput2.BridgeVersion): 1 is the first with a version,
+    /// and has every method the client uses - instant loot's click on arrival, the planned clicks, the input blocks and
+    /// the reforging loiter among them. Raised with the client whenever it starts using a newer method.
+    /// </summary>
+    private const int ExileInput2VersionNeeded = 1;
+
+    private const string InputOutdatedWord = "AutoExpedition: ExileInput2 is out of date.\nUpdate it - automation will not work fully.";
+
+    /// <summary>Whether the running ExileInput2 has been checked for the methods this plugin needs. See WarnWhenInputMissing.</summary>
+    private bool _inputVersionChecked;
+
+    /// <summary>
+    /// Whether ExileInput2 is running: listed by the host as an enabled plugin, and its methods on the bridge. Both,
+    /// because a plugin turned off in the menu may leave what it put on the bridge there. Named by its folder, as the host
+    /// lists plugins; when no plugin of that name is listed, the bridge alone answers.
+    /// </summary>
+    private bool ExileInput2Running()
+    {
+        var listed = Safe.Read(() => PluginManager?.Plugins?.FirstOrDefault(p =>
+            string.Equals(p.Name, "ExileInput2", StringComparison.OrdinalIgnoreCase)), null);
+
+        return _input?.Available == true && (listed == null || Safe.Read(() => listed.IsEnable, true));
+    }
+
+    private const string InputMissingWord = "AutoExpedition: Automation is enabled\nbut ExileInput2 was not found.";
+
+    private const int InputMissingWarningSeconds = 30;
+
+    private static readonly TimeSpan InputMissingGrace = TimeSpan.FromSeconds(10);
+
+    private static readonly TimeSpan InputMissingCheckEvery = TimeSpan.FromSeconds(2);
+
+    private DateTime _inputCheckedAt;
+
+    /// <summary>Whether the warning has been shown for ExileInput2 going missing this time. See WarnWhenInputMissing.</summary>
+    private bool _inputMissingSaid;
+
     /// <summary>What has already been said about a broken read, so it is said once. See Offsets.</summary>
     private bool _broke;
 
@@ -274,6 +397,14 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         if (doubt == _priceless)
             return;
 
+        // **Not until prices built PriceWarningAfter the plugin loaded say there are none.** NinjaPricer loads its prices on a
+        // background task from Initialise, and downloads every category from poe.ninja first when its saved copy is older
+        // than its reload period (15 minutes by default); its bridge answers 0 for everything until that finishes (its
+        // DataDownloader.StartDataReload, read 2026-10-11). The prices are built every 5s, so it is the first build after
+        // the wait that counts, not the wait alone.
+        if (doubt is { Length: > 0 } && Safe.Read(() => _valuation.PricesBuiltAt, DateTime.MinValue) < _loadedAt + PriceWarningAfter)
+            return;
+
         if (doubt is { Length: > 0 })
         {
             // The counts go here rather than on the remnant: this is the line with room to read
@@ -289,8 +420,16 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     }
     private string _status = "";
 
+    /// <summary>When Initialise ran. See Told.</summary>
+    private DateTime _loadedAt = DateTime.UtcNow;
+
+    /// <summary>How long after loading the prices may be missing before Told says so.</summary>
+    private static readonly TimeSpan PriceWarningAfter = TimeSpan.FromSeconds(20);
+
     public override bool Initialise()
     {
+        _loadedAt = DateTime.UtcNow;
+
         // Whether the game is in front, polled off the frames so a long gap can say it was spent tabbed out. See
         // Spent.WatchFocus.
         Spent.WatchFocus(() => GameController.Window.IsForeground());
@@ -327,6 +466,8 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // Kept beside the settings, not in dumps: it is a working cache, not evidence. See TabletPricing.
         TabletPricing.CacheFile = Path.Combine(ConfigDirectory, "tablet_prices.json");
         Tablets.SubTabFile = Path.Combine(ConfigDirectory, "tablet_subtabs.json");
+        Tablets.BenchResultFile = Path.Combine(ConfigDirectory, "tablet_bench_result.json");
+        Detonator.SetOffFile = Path.Combine(ConfigDirectory, "sites_set_off.json");
         Wrt.Load();
 
         // Where the weights used to live. Named rather than derived inside Migrated so the one
@@ -353,6 +494,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         _input = new ExileInput2Client(GameController, "AutoExpedition");
         Tablets.Input = _input;
+        Autoloot.Initialise(GameController, DirectoryFullName);
         _scan = new Scan(GameController) { Home = ConfigDirectory };
         _scouted.Home = ConfigDirectory;
         Kept.Home = ConfigDirectory;
@@ -377,6 +519,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         _frontier = new Frontier(_input);
         Frontier.Where = ConfigDirectory;
         _valuation = new Valuation(GameController, Settings);
+        Autoloot.Valuation = _valuation;
         Dump.Valuation = _valuation;
         Dump.Scan = _scan;
         Dump.Reading = _blast;
@@ -411,6 +554,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         Settings.Solver.Reroll.Mode.SetListValues(RerollSettings.Modes.ToList());
         Settings.Automation.PostExpedition.LineFrom.SetListValues(
             PostExpeditionSettings.WhenToLine.ToList());
+        Settings.Automation.Autoloot.InstantLootSound.SetListValues(Autoloot.SoundNames());
+        Settings.Automation.Autoloot.InstantLootSuccessSound.SetListValues(Autoloot.SoundNames());
+        Settings.Automation.Autoloot.InstantLootFailureSound.SetListValues(Autoloot.SoundNames());
 
         Register(Settings.ActionHotkey);
         Register(Settings.TableHotkey);
@@ -464,10 +610,29 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         if (down > 0 || _placement.Busy || Detonator.ExplosivesInHand(GameController) <= 0 ||
             Detonator.DetonatorGridPosition(GameController) == Vector2.Zero)
+        {
+            SayMarks($"no solve: {(down > 0 ? $"{down} explosive(s) down" : _placement.Busy ? "a placement run is going" : Detonator.ExplosivesInHand(GameController) <= 0 ? "no explosives in hand" : "no detonator")}");
             return;
+        }
 
-        _planning.Start(GameController, Settings, _scan, _blast, _valuation, ZoneCancellationToken,
+        var said = _planning.Start(GameController, Settings, _scan, _blast, _valuation, ZoneCancellationToken,
             cause: Planning.MustTakeChangedCause);
+
+        SayMarks($"solve asked for: \"{said}\" - {_planning.Detail}; searching {_planning.Searching}");
+    }
+
+    /// <summary>
+    /// The must-take marks changed by the key and what the solve after them did, newest last: for the dump, so a mark
+    /// change the plan did not answer can be told from one it answered. See Insist and SolveAfterMarks.
+    /// </summary>
+    internal static readonly List<string> MarksSaid = [];
+
+    private static void SayMarks(string said)
+    {
+        MarksSaid.Add($"{DateTime.Now:HH:mm:ss.fff} {said}");
+
+        if (MarksSaid.Count > 30)
+            MarksSaid.RemoveAt(0);
     }
 
     private void Insist(Target target)
@@ -477,7 +642,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         if (target == null)
             return;
 
-        Insisted.Here.Cycle(target.Grid);
+        var now = Insisted.Here.Cycle(target.Grid);
+
+        SayMarks($"({target.Grid.X:0},{target.Grid.Y:0}) marked {now}; a solve follows once the marks stand {MarksSettle.TotalMilliseconds:0}ms");
 
         // A solve with the new marks once they stop changing. See MarksSettle.
         _marksChangedAt = DateTime.UtcNow;
@@ -621,6 +788,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // plugin twice and every stage timed until now was inside Render, so a table that
         // accounted for its own frame could still not account for the host's figure. See Spent.
         using var timing = Spent.On("Tick");
+
+        // What another player's site is planned for. See Detonator.AnotherPlayersSiteExplosives.
+        Detonator.AnotherPlayersSiteExplosives = Settings.Solver.Advanced.ExplosivesAtAnotherPlayersSite.Value;
+        Detonator.RemnantsAtSite = _scan?.At(Detonator.DetonatorGridPosition(GameController)).Count(t => t.Kind == TargetKind.Remnant) ?? 0;
+
+        Ground.NextFrame();
 
         // **The head and the tail, bracketed rather than picked apart.** Between them they are the
         // 0.31ms of Tick that no stage accounted for, and neither is one thing: the head clears
@@ -854,6 +1027,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         using (Spent.On("Tick/Banners"))
             Banners();
 
+        using (Spent.On("Tick/InputMissing"))
+            WarnWhenInputMissing();
+
+        using (Spent.On("Tick/ReleaseRouting"))
+            ReleaseRoutingWhenDone();
+
         // Whether the fight is probably finished, which is what the loot line waits for. Asked here
         // rather than where it is drawn, so the dump can report it on a frame that draws nothing.
         // See Ending.
@@ -988,6 +1167,17 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Tick/Placement.Tick"))
             _placement.Tick(GameController, Settings, _scan, _blast, _valuation);
+
+        using (Spent.On("Tick/Autoloot"))
+        {
+            Autoloot.Tick(GameController, Settings, _scan);
+
+            using (Spent.On("Tick/InventoryDeposit"))
+                InventoryDeposit.Tick(GameController, Settings);
+
+            using (Spent.On("Tick/Autoloot/Pickups"))
+                Autoloot.ObservePickups(GameController);
+        }
 
         var tail = Spent.On("Tick/Tail");
 
@@ -1544,7 +1734,20 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         SolveAfterMarks(down);
 
-        var actionPressed = Settings.ActionHotkey.PressedOnce();
+        // **During a hideout run, the action key read from Windows, modifiers ignored.** The runs hold ctrl or shift down
+        // through their clicks, and a press of the action key with one held was not taken for it, so it did not stop the
+        // run. The hotkey is read every tick all the same, so the press that stops a run is spent and cannot start
+        // one on the next. See ActionKeyWentDown.
+        var hotkeyPressed = Settings.ActionHotkey.PressedOnce();
+        var keyWentDown = ActionKeyWentDown();
+        var actionPressed = InventoryDeposit.Running || Tablets.RunHoldsCursor ? keyWentDown : hotkeyPressed;
+
+        // On the Deposit zone, or during a deposit run, the key is Autodeposit's, ahead of the tablets'. See InventoryDeposit.
+        if (actionPressed && InventoryDeposit.TakesActionKey(GameController, Settings))
+        {
+            InventoryDeposit.ActOnActionKey(GameController, Settings);
+            actionPressed = false;
+        }
 
         // **In a hideout or a town the key is the tablets'.** A tap prices them (Tablets.ActOnActionKey) when the key
         // comes up; held for the take last hold time over a priced tablet, it opens that tablet's search on the trade
@@ -1575,6 +1778,11 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         }
         else
             _tabletKeyDownAt = DateTime.MinValue;
+
+        // A press while a run waits on a job it clicked clicks it again, rather than being ignored. See
+        // Placement.PressWhileWaitingOnChore.
+        if (actionPressed && _placement.Busy && _placement.PressWhileWaitingOnChore(GameController, Settings))
+            actionPressed = false;
 
         if (actionPressed && !_placement.Busy)
         {
@@ -1617,7 +1825,13 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             // the press fell through to the start below and restarted the very solve it was meant to end -
             // after a reload mid-run, every press threw the search away and began it again. Stopping keeps
             // the best chain reached, so the next press places from it.
-            if ((down <= 0 || !_planning.Ready) && _planning.Searching && _planning.Stop())
+            // An item on the action key list that can be clicked now is picked up first, in place of whatever else the key
+            // would do - stopping a solve included, which carries on. See Placement.BeginLooting.
+            if (_placement.ListedItemReady(GameController, Settings))
+            {
+                _placement.BeginLooting(GameController, Settings);
+            }
+            else if ((down <= 0 || !_planning.Ready) && _planning.Searching && _planning.Stop())
             {
                 // Nothing else this press. Stopping IS the action - and it stops the continuous
                 // reroll mode too, or the presolve would start the next pass half a second later.
@@ -1652,6 +1866,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
                 // Asking for a plan undoes an earlier stop. See Rehearsal.ResumeContinuing.
                 _rehearsal.ResumeContinuing();
             }
+            // Another player's site: nothing of the player's to place, so the key loots. See Detonator.SiteIsAnotherPlayers.
+            else if (Detonator.SiteIsAnotherPlayers(GameController))
+                _placement.BeginLooting(GameController, Settings);
             else
                 _placement.Begin(GameController, Settings, _planning);
         }
@@ -1808,14 +2025,26 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     public override void EntityAdded(Entity entity)
     {
         using (Spent.On("EntityAdded"))
+        {
             Safe.Do(() => _scan.Arrived(entity));
+
+            // An item dropped: the ground labels are read again on the next ask. See Ground.Changed.
+            if (Safe.Read(entity, static e => e.Type, ExileCore2.Shared.Enums.EntityType.Error) == ExileCore2.Shared.Enums.EntityType.WorldItem)
+                Ground.Changed();
+        }
     }
 
     /// <summary>And told when one goes, which is what the walk's opening move was for.</summary>
     public override void EntityRemoved(Entity entity)
     {
         using (Spent.On("EntityRemoved"))
+        {
             Safe.Do(() => _scan.Departed(entity));
+
+            // An item went - picked up, or out of range: its label is not to be read from a stale list. See Ground.Changed.
+            if (Safe.Read(entity, static e => e.Type, ExileCore2.Shared.Enums.EntityType.Error) == ExileCore2.Shared.Enums.EntityType.WorldItem)
+                Ground.Changed();
+        }
     }
 
     public override void AreaChange(AreaInstance area)
@@ -1828,6 +2057,8 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         var hash = Safe.Read(() => area.Hash, 0u);
 
         SiteArrival.Entered();
+        Ground.Changed();
+        Autoloot.AreaChange();
         _scan.AreaChange(hash, real: true);
 
         // A different site is a different problem, and a median across two of them describes neither.
@@ -1889,6 +2120,8 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // measured. See Spent.LongGaps.
         var rendering = Spent.On("Render");
 
+        Ground.NextFrame();
+
         // **First, above every guard about being at a dig site.**
         //
         // It is a reference, and a reference you can only read while standing at a live expedition
@@ -1941,6 +2174,15 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         using (Spent.On("CursorWarning.Draw"))
             CursorWarning.Draw(Graphics, GameController, Settings);
 
+        using (Spent.On("Autoloot.DrawPickupNote"))
+            Autoloot.DrawPickupNote(Graphics, GameController, Settings);
+
+        using (Spent.On("AddListLineFromHover.Draw"))
+            AddListLineFromHover.Draw(Graphics, GameController, Settings);
+
+        using (Spent.On("InventoryDeposit.Draw"))
+            InventoryDeposit.Draw(Graphics, GameController, Settings);
+
         DrawTakeLastHold();
         DrawTabletKeyHold();
 
@@ -1951,6 +2193,13 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             using (Graphics.BeginRectClip(clearOfPanels, true))
                 BondTransfer.Draw(Graphics, GameController, Settings.Display.Remnants.Rewards.OverruledColour);
         }
+
+        // The autoloot line to listed items, where the dig site's loot line does not draw it. See Overlay.LootLineAtSite.
+        if ((Detonator.Info(GameController) == null || !Overlay.LootLineAtSite(GameController, Settings)) && !Panels.Hidden(GameController))
+            using (Spent.On("Autoloot.DrawLine"))
+            using (Graphics.BeginRectClip(clearOfPanels, true))
+                Autoloot.DrawLine(Graphics, GameController, Settings, Panels.Covered(GameController));
+
 
         // Nothing else to draw outside a dig site. The detonator element is the cheapest test for
         // that - it exists only where there is an encounter to detonate.

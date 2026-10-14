@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Drawing;
 using System.Linq;
 using System.Numerics;
@@ -7,6 +8,7 @@ using System.Text;
 using ExileCore2;
 using ExileCore2.PoEMemory;
 using ExileCore2.Shared.Enums;
+using Newtonsoft.Json;
 using Graphics = ExileCore2.Graphics;
 using RectangleF = ExileCore2.Shared.RectangleF;
 
@@ -37,11 +39,8 @@ internal static partial class Tablets
     /// <summary>The cursor, shared with placement. Set by the plugin as it starts.</summary>
     internal static ExileInput2Client Input { get; set; }
 
-    /// <summary>Picks where in a tablet's cell a click lands. See Send.</summary>
+    /// <summary>Picks where on a hideout object a click lands. See ItemClicks for clicks on items in a grid.</summary>
     private static readonly Random Aim = new();
-
-    /// <summary>Pixels kept clear of a cell's edge when aiming anywhere in it, so the click stays on the tablet.</summary>
-    private const float AnywhereMargin = 4f;
 
     /// <summary>How long a step's effect may take to show before the run stops.</summary>
     private static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(3);
@@ -110,6 +109,9 @@ internal static partial class Tablets
 
     private static bool _reforgingHasCursor;
 
+    /// <summary>Whether a tablet run holds the cursor now, for the action key to stop it. See AutoExpedition.ActionKeyWentDown.</summary>
+    internal static bool RunHoldsCursor => _reforgingHasCursor;
+
     /// <summary>Since when the run has been paused for the game taking typed input, or null. See StepReforging.</summary>
     private static DateTime? _reforgingPausedSince;
 
@@ -117,7 +119,7 @@ internal static partial class Tablets
     private static readonly TimeSpan PausedFor = TimeSpan.FromSeconds(10);
 
     /// <summary>The element the game has given input focus to, or null: what ExileInput2 stops for.</summary>
-    private static Element FocusedInput(GameController gc) =>
+    internal static Element FocusedInput(GameController gc) =>
         Safe.Read(gc, static g => g.IngameState.FocusedInputElement, null);
 
     /// <summary>Whether the reforging bench is open.</summary>
@@ -393,6 +395,7 @@ internal static partial class Tablets
         _reforgedPendingSince = null;
         _reforgedTakes = 0;
         _reforged = 0;
+        _putDowns = 0;
         Unloadable.Clear();
         ReforgingLog.Clear();
         MovesPending.Clear();
@@ -405,6 +408,7 @@ internal static partial class Tablets
         _depositNext = false;
         SubTabsDone.Clear();
         _stashEmptied = false;
+        _roomForBench = 0;
         Progressed();
         StartCrafting(gc);
         _rounds = 0;
@@ -460,6 +464,10 @@ internal static partial class Tablets
             Input?.Release();
         }
 
+        if (_focusAllowedUnder != 0L)
+            Input?.AllowFocusUnder([]);
+
+        _focusAllowedUnder = 0L;
         _shortestMoveApplied = null;
         _toleranceApplied = 0;
 
@@ -473,17 +481,67 @@ internal static partial class Tablets
         _reforgingHasCursor = false;
     }
 
+    /// <summary>
+    /// Tells ExileInput2 that focus inside the reforging bench, while it is open, is not typed input. The game reports the
+    /// box around the reforge button as taking typed input after each reforge (element at 724,1127 225x52, text "", with
+    /// the button at 790,1139 inside it; dump 2026-10-12 12:34:01), and ExileInput2 stopped the run for it every cycle:
+    /// the run paused, the plan drawn faded out, and it carried on a moment later. Told only when the bench changes.
+    /// </summary>
+    private static void AllowFocusInBench(GameController gc)
+    {
+        var bench = ReforgingBenchOpen(gc) ? Safe.Read(gc, static g => g.IngameState.IngameUi.ReforgingBench?.Address ?? 0L, 0L) : 0L;
+
+        if (bench == _focusAllowedUnder)
+            return;
+
+        if (Input?.AllowFocusUnder(bench != 0L ? [bench] : []) == true)
+            _focusAllowedUnder = bench;
+    }
+
+    /// <summary>Whether the element the game has given input focus lies inside the open reforging bench. For the log.</summary>
+    private static bool FocusUnderBench(GameController gc)
+    {
+        var bench = Safe.Read(gc, static g => g.IngameState.IngameUi.ReforgingBench?.Address ?? 0L, 0L);
+        var at = FocusedInput(gc);
+
+        for (var depth = 0; bench != 0L && at != null && depth < 64; depth++)
+        {
+            if (Safe.Read(at, static e => e.Address, 0L) == bench)
+                return true;
+
+            at = Safe.Read(at, static e => e.Parent, null);
+        }
+
+        return false;
+    }
+
+    /// <summary>The bench ExileInput2 was last told focus inside is not typed input, or 0. See AllowFocusInBench.</summary>
+    private static long _focusAllowedUnder;
+
     /// <summary>Steps the run once. Called every draw; returns at once when no run is going.</summary>
     private static void StepReforging(GameController gc, TabletRerollingSettings settings)
     {
         if (!_reforgingHasCursor)
+        {
+            _lastStepAt = default;
             return;
+        }
+
+        // A long gap between steps during a run, for the log: a stall the player may see as the cursor jumping.
+        var stepAt = DateTime.UtcNow;
+
+        if (_lastStepAt != default && stepAt - _lastStepAt >= LongStep)
+            LogReforging($"a frame took {(stepAt - _lastStepAt).TotalMilliseconds:0}ms, after {_previousSent}");
+
+        _lastStepAt = stepAt;
 
         if (!_automationOn)
         {
             StopReforging("automation was turned off");
             return;
         }
+
+        AllowFocusInBench(gc);
 
         // A full-auto run opens and closes these itself, and so does the crafting run's identification step, on its way to
         // Doryani and back - it checks the stash itself where it needs it. Every other run needs its own panel open
@@ -517,6 +575,10 @@ internal static partial class Tablets
         {
             if (stopped == "GameIsTakingInput")
             {
+                // Which element, for the dump: one came up for a moment around the bench, with no chat open, and paused
+                // the run (2026-10-12 12:27:11). See ExileInput2's FocusedSaid.
+                LogReforging($"paused: the game is taking typed input, {(FocusUnderBench(gc) ? "inside" : "not inside")} the " +
+                             $"reforging bench; ExileInput2: {Input.StopDetail()}");
                 Input.Release();
                 _reforgingPausedSince = DateTime.UtcNow;
                 _reforgingStep = ReforgingStep.Idle;
@@ -546,7 +608,13 @@ internal static partial class Tablets
                 return;
             }
 
-            StopReforging(stopped == "PlayerMovedTheMouse" ? "you moved the mouse" : $"stopped: {stopped}");
+            StopReforging(stopped switch
+            {
+                "PlayerMovedTheMouse" => "you moved the mouse",
+                "TakenOver" => "an instant loot pickup took the cursor - press again",
+                "PlayerPressedAKey" => "you pressed a key",
+                _ => $"stopped: {stopped}",
+            });
             return;
         }
 
@@ -578,7 +646,7 @@ internal static partial class Tablets
 
                 try
                 {
-                    Send(again.Target, again.Ctrl, again.Doing, again.Done, again.Pointed ? AnywhereIn(again.Target) : null, again.Timeout, again.Right,
+                    Send(again.Target, again.Ctrl, again.Doing, again.Done, again.Pointed ? ItemClicks.AnywhereIn(again.Target) : null, again.Timeout, again.Right,
                         again.BeforeClick);
                 }
                 finally
@@ -612,6 +680,8 @@ internal static partial class Tablets
                     if (now - _arrivedAt < HoverWait)
                         return;
 
+                    PlannedAhead.Clear();
+
                     if (++_hoverTries >= HoverTries || WorldPointOf(gc, _worldTarget) is not { } again || !Input.MoveTo(again, ctrl: _reforgingCtrl))
                     {
                         // **A panel may be over the model after all: Space once, then the same click again.** A second
@@ -641,6 +711,29 @@ internal static partial class Tablets
                     return;
                 }
 
+                // **Never a click with an item held on the cursor: it is put down first.** Every click of a run is a
+                // ctrl+click, a currency use or a button, none of which picks anything up; with a tablet held, each
+                // ctrl+click swapped it with the tablet clicked, and the junk withdraw went round the same cells eight
+                // times (dump 2026-10-13 21:36:13). The click it interrupts is dropped and the run chooses again; up to
+                // PutDownsPerRun times a run, then it stops.
+                if (_reforgingDoing != HeldItemPutDown && Tablets.ItemHeldOnCursor(gc) is { } held)
+                {
+                    var heldName = Safe.Read(held, static e => e.GetComponent<ExileCore2.PoEMemory.Components.Base>()?.Name, null) ?? "an item";
+                    var wide = Math.Max(1, Safe.Read(held, static e => e.GetComponent<ExileCore2.PoEMemory.Components.Base>()?.ItemCellsSizeX ?? 1, 1));
+                    var high = Math.Max(1, Safe.Read(held, static e => e.GetComponent<ExileCore2.PoEMemory.Components.Base>()?.ItemCellsSizeY ?? 1, 1));
+
+                    if (_putDowns >= PutDownsPerRun || InventorySpace.FreePlaceOnScreen(gc, wide, high) is not { } place)
+                    {
+                        StopReforging($"{heldName} is held on the cursor and could not be put down - put it down and start again");
+                        return;
+                    }
+
+                    _putDowns++;
+                    LogReforging($"{heldName} held on the cursor before {_reforgingDoing}: put down in the inventory at ({place.X:0},{place.Y:0})");
+                    Send(place, false, HeldItemPutDown, () => Tablets.ItemHeldOnCursor(gc) == null, ItemClicks.AnywhereIn(place));
+                    return;
+                }
+
                 // A refusal stops the run; an empty one lets this click go and the run choose again. See the crafting run's
                 // click on a tablet.
                 if (_beforeClick?.Invoke() is { } refused)
@@ -660,9 +753,11 @@ internal static partial class Tablets
                 // tolerance of a point near the cell's edge, the cursor sat over the tablet before it, which an Alchemy
                 // had just made rare, and the next Alchemy went on that: "Failed to apply item: Target is not Normal or
                 // Magic" (2026-10-09 23:36). Moved again once, then the run stops rather than click a neighbour.
-                if (_clickCell is { } cell && !CursorInside(gc, cell))
+                if (_clickCell is { } cell && !_sentPlanned && !ItemClicks.CursorInside(gc, cell))
                 {
-                    if (_reaimed || !Input.MoveTo(AnywhereIn(cell), ctrl: _reforgingCtrl))
+                    PlannedAhead.Clear();
+
+                    if (_reaimed || !Input.MoveTo(ItemClicks.AnywhereIn(cell), ctrl: _reforgingCtrl))
                     {
                         StopReforging($"the cursor did not reach {_reforgingDoing}'s cell");
                         return;
@@ -737,7 +832,8 @@ internal static partial class Tablets
                 {
                     // Where each move's time went, for the dump: the cursor's travel to the click, then the click to
                     // the screen read showing it, which waits for the next read of the tablets.
-                    LogReforging($"{_reforgingDoing}: {(_clickedAt - _sentAt).TotalMilliseconds:0}ms to the click at " +
+                    LogReforging($"{_reforgingDoing}: {(_clickedAt - _sentAt).TotalMilliseconds:0}ms to the click" +
+                                 (_sentMoveTimes is { } times ? ItemClicks.FlourishSaid(times) : "") + " at " +
                                  $"({_clickedPoint.X:0},{_clickedPoint.Y:0}) in {RectSaid(_sentTarget)}, " +
                                  $"{(now - _clickedAt).TotalMilliseconds:0}ms to show it");
 
@@ -822,7 +918,7 @@ internal static partial class Tablets
                 return;
 
             case TabletRun.Tidy:
-                StepTidy(gc);
+                StepTidy(gc, settings);
                 return;
 
             case TabletRun.WithdrawValuable:
@@ -875,8 +971,30 @@ internal static partial class Tablets
             return true;
         }
 
-        var made = bench.FirstOrDefault(t => !Read(t));
+        // **The reforged tablet is the one in the result slot**, once that is known: a load not yet read in a slot below
+        // must not be taken for it and taken back out, which matters now the reforged tablet is taken out while loads are
+        // still landing. Before the slot is known, any tablet not read, as before. See InResultSlot.
+        var made = _benchResultRect.Width > 0f
+            ? bench.FirstOrDefault(t => !Read(t) && InResultSlot(t))
+            : bench.FirstOrDefault(t => !Read(t));
         var loaded = bench.Where(Read).ToList();
+
+        // When each tablet in the bench was first seen there. See the wait on a load landing below.
+        foreach (var tablet in bench)
+            BenchFirstSeen.TryAdd(AddressOf(tablet), DateTime.UtcNow);
+
+        if (BenchFirstSeen.Count > BenchFirstSeenKept)
+            BenchFirstSeen.Clear();
+
+        if (made != null)
+        {
+            if (made.Rect != _benchResultRect)
+                RememberBenchResult(gc, made.Rect);
+
+            _benchResultRect = made.Rect;
+        }
+        else if (_benchResultRect.Width <= 0f && RememberedBenchResult(gc) is { Width: > 0f } remembered)
+            _benchResultRect = remembered;
 
         // Loads clicked and not yet read as gone from the inventory: settled first, as the moves between stash and
         // inventory are. See BenchLoadsPending.
@@ -884,6 +1002,16 @@ internal static partial class Tablets
             return true;
 
         var inFlight = BenchLoadsPending.Count;
+
+        // **A reforged tablet outside the slot remembered** - the slot moved since it was saved - is taken once nothing is
+        // loading and the last load landed a second ago, so no load can be mistaken for it, and the slot learnt again.
+        if (made == null && inFlight == 0 && _benchResultRect.Width > 0f && DateTime.UtcNow - _benchLoadLandedAt > TimeSpan.FromSeconds(1) &&
+            bench.FirstOrDefault(t => !Read(t) && !InResultSlot(t)) is { } elsewhere)
+        {
+            made = elsewhere;
+            RememberBenchResult(gc, made.Rect);
+            _benchResultRect = made.Rect;
+        }
         var junk = InventoryTablets().Where(t => IsJunk(gc, t, settings) && !ReforgingSent.Contains(AddressOf(t)) &&
                                                 !Unloadable.Contains(AddressOf(t))).ToList();
 
@@ -893,19 +1021,29 @@ internal static partial class Tablets
         {
             var count = loaded.Count + inFlight;
 
-            if (DateTime.UtcNow - _clickedAt < TimeSpan.FromMilliseconds(_pauseBetweenClicksMs))
-                return true;
-
             LogReforging($"load: {loaded.Count} in the bench, {inFlight} on the way, {(made != null ? "a reforged tablet there, " : "")}" +
                          $"{junk.Count} junk counted - " +
                          string.Join(", ", junk.Select(t => $"({t.Rect.X:0},{t.Rect.Y:0}) {JunkReasonOf(gc, t, settings)}")));
 
-            // The first of three one of the three cells nearest the cursor, at random, clicked anywhere in its cell - never
-            // the far side of the inventory with the cursor on this one. The other two are the nearest cells to the
-            // cursor, each clicked just inside the edge facing it, as a hand would reach for them.
+            // Each of the three by distance from the cursor, the first clicked anywhere in its cell and the other two just
+            // inside the edge facing it, as a hand would reach for them: a load starts where the cursor is, not from the
+            // top-left or bottom-left as a batch's first does. See ItemClicks.NextItemOf.
             var mouse = ImGuiNET.ImGui.GetMousePos();
-            var byDistance = junk.OrderBy(t => Vector2.DistanceSquared(mouse, NearestPointOf(t.Rect, mouse))).ToList();
-            var next = count == 0 ? byDistance[Aim.Next(Math.Min(3, byDistance.Count))] : byDistance[0];
+            // Each later three planned from the reforge button, where the cursor is when they are loaded, not from the last
+            // of the three before. See BatchNext's groupSize.
+            var buttonCentre = _reforgeButtonRect.Width > 0f
+                ? new Vector2(_reforgeButtonRect.X + _reforgeButtonRect.Width / 2f, _reforgeButtonRect.Y + _reforgeButtonRect.Height / 2f)
+                : (Vector2?)null;
+            var (next, point) = BatchNext(BenchLoadBatch, junk, AddressOf, static t => t.Rect, mouse, false, count == 0, ctrl: true,
+                restLimit: 2 - count, groupSize: 3, firstGroup: 3 - count, groupStart: buttonCentre);
+
+            // **The rest of the cycle planned with the loads that make it three, and the next cycle's loads after it**: the
+            // reforged tablet out when a reforge is going, the reforge button, then the next three. Each part was its own
+            // queue, planned only when its turn came, and the cursor stopped between them (2026-10-11). The clicks are
+            // still sent in turn, each when the bench is ready for it; what is already planned is added to rather than
+            // planned again (see PlanAhead), and a send that does not match it, as when the bench moved, plans afresh.
+            if (count + 1 + BatchRest.Count == 3)
+                BatchRest.AddRange(BenchCycleAfterLoads(gc, made != null || _reforgedPendingSince != null, BatchRest.Count));
 
             var loading = AddressOf(next);
 
@@ -918,23 +1056,30 @@ internal static partial class Tablets
             Send(next.Rect, true, JunkTablet, () =>
                 {
                     BenchLoadsPending[loading] = _clickedAt;
+                    _benchLoadClickedAt = _clickedAt;
                     return true;
                 },
-                count == 0 ? null : NearEdgeOf(next.Rect, mouse));
+                point);
             return true;
         }
 
-        // Nothing past here - taking a tablet out, unloading, calling it done, the reforge - while a load is on its way.
-        if (inFlight > 0)
+        // **While loads are on their way, only what does not turn on them**: the reforged tablet out once it is in its
+        // slot, or waiting over the slot for it. Everything stopped here until all three read in the bench, so the third
+        // load was followed by a sharp stop and then the move to the reforged tablet, where the plan had the cursor going
+        // straight on. Unloading, calling it done and the reforge still wait for the loads, below.
+        if (inFlight > 0 && made == null && _reforgedPendingSince == null)
         {
             Say("waiting for the bench");
             return true;
         }
 
         // **A tablet just loaded may read in the bench before its modifiers do**, and would be taken for the reforged one
-        // and taken back out. With no reforge pending, an unread tablet within a second of a load landing is waited on.
-        // Whether the bench's copy reads late has not been seen either way; loads used to wait for it to read.
-        if (made != null && _reforgedPendingSince == null && DateTime.UtcNow - _benchLoadLandedAt < TimeSpan.FromSeconds(1))
+        // and taken back out. With no reforge pending, an unread tablet within a second of a load landing is waited on -
+        // only one first seen in the bench since that load was clicked: a tablet there from before, as one left by an
+        // interrupted run is, was waited on for the second as well (2026-10-12 12:27:09). Whether the bench's copy reads
+        // late has not been seen either way; loads used to wait for it to read.
+        if (made != null && _reforgedPendingSince == null && DateTime.UtcNow - _benchLoadLandedAt < TimeSpan.FromSeconds(1) &&
+            BenchFirstSeen.TryGetValue(AddressOf(made), out var madeSeen) && madeSeen >= _benchLoadClickedAt)
         {
             Say("waiting for the bench");
             return true;
@@ -943,9 +1088,28 @@ internal static partial class Tablets
         // Then the reforged tablet out, before the next reforge or at the end.
         if (made != null)
         {
+            // **No room in the inventory for it**: a full-auto run goes to the stash for room and comes back. A bench left
+            // holding a tablet and three loads, with the stash's junk withdrawn to a full inventory, could neither take the
+            // tablet out nor load anything, and the run stuck (2026-10-12 12:21:14). See _roomForBench.
+            if (_run == TabletRun.FullAuto && InventoryFreeCells(gc) == 0)
+            {
+                _roomForBench = 1;
+                LogReforging("no room in the inventory for the tablet in the bench: to the stash to deposit one");
+                done = "no room for the tablet in the bench";
+                return false;
+            }
+
             var address = AddressOf(made);
 
             _reforgedTakes++;
+
+            // Then the reforge, and the next cycle's loads. See BenchCycleAfterLoads.
+            if (loaded.Count == 3)
+            {
+                BatchRest.Clear();
+                BatchRest.AddRange(BenchCycleAfterLoads(gc, false, 0));
+            }
+
             // Where on it is ExileInput2's choice, as for the reforge button.
             Send(made.Rect, true, ReforgedTablet, () => BenchTablets(gc).All(t => AddressOf(t) != address));
             return true;
@@ -959,8 +1123,24 @@ internal static partial class Tablets
             if (DateTime.UtcNow - since > ReforgedWait)
                 StopReforging("the reforged tablet did not appear");
             else
+            {
                 Say("waiting for the reforged tablet");
 
+                // **Not idle while the bench works**: the cursor goes over where the tablet will appear and moves round
+                // there, rather than resting on the reforge button until it does - ctrl down for the ctrl+click that
+                // takes it out, rather than let go and pressed again. Once each reforge. See ExileInput2's Loiter.
+                if (_loiteredFor != since && _benchResultRect.Width > 0f &&
+                    Input.Loiter(_benchResultRect, LoiterShare, (int)ReforgedWait.TotalMilliseconds, [System.Windows.Forms.Keys.LControlKey]))
+                    _loiteredFor = since;
+            }
+
+            return true;
+        }
+
+        // Unloading, calling it done and the reforge wait for every load to read in the bench. See above.
+        if (inFlight > 0)
+        {
+            Say("waiting for the bench");
             return true;
         }
 
@@ -997,7 +1177,26 @@ internal static partial class Tablets
 
         // Done once the three are taken: the new tablet may show only after a moment, and is collected later.
         // ExileInput2 chooses where on the button, scattering each press about a spot of the button's own (MousePointer.PointIn).
-        Send(Safe.Read(button, static x => x.GetClientRectCache, default), false, "the reforge",
+        _reforgeButtonRect = Safe.Read(button, static x => x.GetClientRectCache, default);
+
+        // Then the next cycle: its loads, the tablet this reforge makes, and the button again. See BenchCycleAfterLoads.
+        BatchRest.Clear();
+
+        if (NextBenchLoads(gc, 0) is { Count: 3 } coming)
+        {
+            BatchRest.AddRange(coming);
+
+            if (_benchResultRect.Width > 0f)
+            {
+                BatchRest.Add((_benchResultRect, null, false, true));
+                BatchRest.Add((_reforgeButtonRect, null, false, true));
+            }
+        }
+
+        // **Ctrl+clicked, as every other click of the bench is**: the button takes ctrl+click as a click, so ctrl stays down
+        // from the loads through the reforge, the wait over the reforged tablet's slot and the ctrl+click that takes it out,
+        // rather than coming up for the button and going down again after it.
+        Send(_reforgeButtonRect, true, "the reforge",
             () => BenchTablets(gc).All(t => !inputs.Contains(AddressOf(t))));
         _reforged++;
         RollsReforged(loaded);
@@ -1006,6 +1205,163 @@ internal static partial class Tablets
         ReforgingSent.Clear();
         return true;
     }
+
+    /// <summary>The move to the click in flight: its times, and whether it swooped or overshot. See Send.</summary>
+    private static (float WaitMs, float TravelMs, bool Swooped, float OvershotPx)? _sentMoveTimes;
+
+    /// <summary>
+    /// What a reforging cycle clicks after its three loads: the reforged tablet out, where one last appeared, when a
+    /// reforge is going; the reforge button; then the next cycle's three loads, after skip loads of this one still to
+    /// come. Stops short where it cannot say: a reforge going with no reforged tablet seen yet to say where it appears,
+    /// and the loads after it, are left for later. The button is found on the bench before it is first clicked.
+    /// </summary>
+    private static List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)> BenchCycleAfterLoads(GameController gc, bool reforging,
+        int skip)
+    {
+        var after = new List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)>();
+
+        if (reforging)
+        {
+            if (_benchResultRect.Width <= 0f)
+                return after;
+
+            after.Add((_benchResultRect, null, false, true));
+        }
+
+        if (_reforgeButtonRect.Width <= 0f && ReforgeButton(gc) is { } button)
+            _reforgeButtonRect = Safe.Read(button, static x => x.GetClientRectCache, default);
+
+        if (_reforgeButtonRect.Width <= 0f)
+            return after;
+
+        after.Add((_reforgeButtonRect, null, false, true));
+
+        if (NextBenchLoads(gc, skip) is { Count: 3 } coming)
+            after.AddRange(coming);
+
+        return after;
+    }
+
+    /// <summary>
+    /// The next three loads in the order planned for the bench, after skip of them, each with its point; fewer when fewer
+    /// are planned or still carried. See BatchNext.
+    /// </summary>
+    private static List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)> NextBenchLoads(GameController gc, int skip)
+    {
+        var loads = new List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)>();
+
+        if (_batchOf != BenchLoadBatch)
+            return loads;
+
+        var carried = InventoryTablets().ToDictionary(AddressOf, t => t.Rect);
+
+        foreach (var (address, point) in BatchOrder.Skip(skip).Take(3))
+        {
+            if (!carried.TryGetValue(address, out var rect))
+                break;
+
+            loads.Add((rect, point, false, true));
+        }
+
+        return loads;
+    }
+
+    /// <summary>The batch name the bench's loads are planned under. See BatchNext.</summary>
+    private const string BenchLoadBatch = "bench load";
+
+    /// <summary>Where the reforged tablet last appeared in the bench, and where the reforge button was last clicked. See the bench load.</summary>
+    private static RectangleF _benchResultRect, _reforgeButtonRect;
+
+    /// <summary>
+    /// Where the reforged tablet appears, as last seen, kept on disk with the bench panel's rectangle then, so it is known
+    /// from a run's first reforge rather than only once one has been seen since the plugin loaded: without it, a run of one
+    /// reforge after a reload neither drew the tablet's click ahead nor loitered over it (2026-10-12 12:47:17). Set by
+    /// the plugin from its config directory.
+    /// </summary>
+    internal static string BenchResultFile { get; set; } = "";
+
+    /// <summary>The bench panel and the reforged tablet's place, both as last seen and saved. See BenchResultFile.</summary>
+    private sealed class BenchResultRecord
+    {
+        public float[] Bench { get; set; } = [];
+        public float[] Result { get; set; } = [];
+    }
+
+    /// <summary>The bench panel's rectangle now, or empty when it is not open.</summary>
+    private static RectangleF BenchPanelRect(GameController gc) =>
+        ReforgingBenchOpen(gc) ? Safe.Read(gc, static g => g.IngameState.IngameUi.ReforgingBench.GetClientRectCache, default) : default;
+
+    /// <summary>Saves where the reforged tablet appeared, beside the bench panel's rectangle. See BenchResultFile.</summary>
+    private static void RememberBenchResult(GameController gc, RectangleF result)
+    {
+        var bench = BenchPanelRect(gc);
+
+        if (BenchResultFile.Length == 0 || bench.Width <= 0f || result.Width <= 0f)
+            return;
+
+        try
+        {
+            File.WriteAllText(BenchResultFile, JsonConvert.SerializeObject(new BenchResultRecord
+            {
+                Bench = [bench.X, bench.Y, bench.Width, bench.Height],
+                Result = [result.X, result.Y, result.Width, result.Height],
+            }));
+        }
+        catch (Exception)
+        {
+            // Learnt again from the next reforge.
+        }
+    }
+
+    /// <summary>
+    /// Where the reforged tablet will appear, from the saved record: as saved where the bench panel is where it was, else
+    /// moved and scaled with the panel. Empty with no record, or with the bench closed.
+    /// </summary>
+    private static RectangleF RememberedBenchResult(GameController gc)
+    {
+        var bench = BenchPanelRect(gc);
+
+        if (BenchResultFile.Length == 0 || bench.Width <= 0f || bench.Height <= 0f || !File.Exists(BenchResultFile))
+            return default;
+
+        try
+        {
+            var record = JsonConvert.DeserializeObject<BenchResultRecord>(File.ReadAllText(BenchResultFile));
+
+            if (record is not { Bench.Length: 4, Result.Length: 4 } || record.Bench[2] <= 0f || record.Bench[3] <= 0f)
+                return default;
+
+            var scaleX = bench.Width / record.Bench[2];
+            var scaleY = bench.Height / record.Bench[3];
+
+            return new RectangleF(bench.X + (record.Result[0] - record.Bench[0]) * scaleX, bench.Y + (record.Result[1] - record.Bench[1]) * scaleY,
+                record.Result[2] * scaleX, record.Result[3] * scaleY);
+        }
+        catch (Exception)
+        {
+            return default;
+        }
+    }
+
+    /// <summary>Whether a tablet in the bench sits in the result slot: its centre inside the slot's rectangle. See ReforgeNext.</summary>
+    private static bool InResultSlot(TabletOnScreen tablet)
+    {
+        var centre = new Vector2(tablet.Rect.X + tablet.Rect.Width / 2f, tablet.Rect.Y + tablet.Rect.Height / 2f);
+
+        return centre.X >= _benchResultRect.Left && centre.X <= _benchResultRect.Right &&
+               centre.Y >= _benchResultRect.Top && centre.Y <= _benchResultRect.Bottom;
+    }
+
+    /// <summary>The reforge whose wait the cursor was last sent to loiter through, by when it began. See ReforgeNext.</summary>
+    private static DateTime _loiteredFor;
+
+    /// <summary>How big the loiter over the reforged tablet's slot is, as a share of the slot's smaller side. Chosen.</summary>
+    private const float LoiterShare = 0.3f;
+
+    /// <summary>When the last step of a run went, and the gap past which the next is logged as a stall. See StepReforging.</summary>
+    private static DateTime _lastStepAt;
+
+    private static readonly TimeSpan LongStep = TimeSpan.FromMilliseconds(40);
 
     /// <summary>Items in the player's inventory by the game's own record of it, or -1 when it cannot be read.</summary>
     private static long InventoryItemCount(GameController gc)
@@ -1022,17 +1378,37 @@ internal static partial class Tablets
     /// <summary>What depositing a tablet is called. See JunkTablet.</summary>
     private const string DepositedTablet = "a tablet";
 
+    /// <summary>A junk tablet deposited to make room for a tablet the bench holds. See TabletFullAuto's _roomForBench.</summary>
+    private const string JunkForRoom = "a junk tablet, for room";
+
     /// <summary>Tablets clicked in the batch going and not yet read as gone, by entity address, with when. See MoveNext.</summary>
     private static readonly Dictionary<long, DateTime> MovesPending = [];
 
     /// <summary>Tablets clicked a second time after the first click did not move them. See MoveNext.</summary>
     private static readonly HashSet<long> MovesRetried = [];
 
-    /// <summary>How long after its click a tablet still read where it was counts as not moved.</summary>
-    private static readonly TimeSpan MoveSettle = TimeSpan.FromMilliseconds(600);
+    /// <summary>
+    /// How long after its click a tablet still read where it was - a move, a load into the bench, a currency use - counts
+    /// as not moved: the player's ping as the game reports it, plus MoveSettleMarginMs, and never under MoveSettleLeastMs,
+    /// so it is never shorter than the game can answer; MoveSettleUnknownMs with no ping read. It was 600ms, chosen and
+    /// never measured, while the run log shows a click that took on screen 6 to 28ms after it - loads, withdraws and Exalt
+    /// uses alike, dozens of each over the dumps of 2026-10-12 - so a missed load held the run more than half a second
+    /// before it was clicked again.
+    /// </summary>
+    private static TimeSpan MoveSettle => TimeSpan.FromMilliseconds(
+        _latencyMs > 0 ? Math.Max(MoveSettleLeastMs, _latencyMs + MoveSettleMarginMs) : MoveSettleUnknownMs);
 
-    /// <summary>Settings.TabletRerolling.PauseBetweenClicksMs, as last read. See Draw.</summary>
-    private static int _pauseBetweenClicksMs;
+    /// <summary>The ping as last read, in milliseconds, or -1. Read with each draw. See MoveSettle.</summary>
+    private static int _latencyMs = -1;
+
+    /// <summary>What MoveSettle adds to the ping. Chosen: half the loot run's margin, as a tablet click shows within 30ms.</summary>
+    private const int MoveSettleMarginMs = 75;
+
+    /// <summary>The least MoveSettle is, for the next read of the screen to have come. Chosen.</summary>
+    private const int MoveSettleLeastMs = 150;
+
+    /// <summary>MoveSettle with no ping read. Chosen.</summary>
+    private const int MoveSettleUnknownMs = 300;
 
     /// <summary>Settings.TabletRerolling.ShortestMoveWhenDepositingMs, as last read; 0 for ExileInput2's own. See Draw.</summary>
     private static int _shortestMoveDepositingMs;
@@ -1050,28 +1426,21 @@ internal static partial class Tablets
     /// ExileInput2's arrival tolerance for a tablet, in pixels: arrived within this of the point aimed at. Its default of
     /// 12 let a click aimed near a cell's edge land in the cell before it (2026-10-09 23:36). Chosen.
     /// </summary>
-    private const int TabletTolerancePx = 3;
+    internal const int TabletTolerancePx = 3;
 
     /// <summary>The tolerance for every other move, and what a run hands back: the 12 explosive placement sets itself.</summary>
-    private const int OtherTolerancePx = 12;
+    internal const int OtherTolerancePx = 12;
 
     /// <summary>The tolerance last given to ExileInput2, or 0 when not known. See UseTolerance.</summary>
     private static int _toleranceApplied;
 
     /// <summary>Gives ExileInput2 an arrival tolerance when it differs from the last given.</summary>
-    private static void UseTolerance(int px)
+    internal static void UseTolerance(int px)
     {
         if (_toleranceApplied != px && Input.SetTolerance(px))
             _toleranceApplied = px;
     }
 
-    /// <summary>Whether the game's cursor is inside a cell, 2 pixels in from its edges.</summary>
-    private static bool CursorInside(GameController gc, RectangleF cell)
-    {
-        var at = Safe.Read(() => new Vector2(gc.IngameState.MousePosX, gc.IngameState.MousePosY), Vector2.Zero);
-
-        return at.X >= cell.Left + 2f && at.X <= cell.Right - 2f && at.Y >= cell.Top + 2f && at.Y <= cell.Bottom - 2f;
-    }
 
     /// <summary>The shortest move last given to ExileInput2, -1 for its own, or null when not known. See UseShortestMove.</summary>
     private static int? _shortestMoveApplied;
@@ -1088,7 +1457,7 @@ internal static partial class Tablets
 
     /// <summary>Whether a click is on a tablet: moving one, loading one, using a currency on one.</summary>
     private static bool IsTabletClick(string doing) =>
-        doing is JunkTablet or DepositedTablet or UnidentifiedTablet or ReforgedTablet or TidyTablet or ValuableTablet or "a junk tablet back" ||
+        doing is JunkTablet or DepositedTablet or JunkForRoom or UnidentifiedTablet or ReforgedTablet or TidyTablet or ValuableTablet or "a junk tablet back" ||
         doing.EndsWith(" on a tablet", StringComparison.Ordinal);
 
     /// <summary>
@@ -1117,12 +1486,15 @@ internal static partial class Tablets
     /// stop after every tablet, of about 100ms or 290ms as the 150ms read of the screen caught it or missed it (dump
     /// 2026-10-09 21:59). So each click is pending until a read no longer shows it, and the batch is checked as it goes:
     /// a tablet still shown MoveSettle after its click is clicked once more, and after that the run stops. No more clicks
-    /// are pending than there is room for on the other side, so a full inventory or sub-tab is not clicked into.
+    /// are pending than there is room for on the other side, and none planned past it, so a full inventory or sub-tab is
+    /// not clicked into.
     /// </summary>
     /// <param name="toInventory">A withdraw, from the stash into the inventory; else a deposit, the other way.</param>
     /// <param name="room">Room on the other side in place of what the screen shows: the tidy's deposits go to the earliest
     /// sub-tab with room, not the one showing. See TabletTidy.</param>
-    private static bool MoveNext(GameController gc, IEnumerable<TabletOnScreen> movable, string what, bool toInventory, int? room = null)
+    /// <param name="inOrder">The tablets moved in the order given, not by the batch rule: the most valuable withdraw's. See BatchNext.</param>
+    private static bool MoveNext(GameController gc, IEnumerable<TabletOnScreen> movable, string what, bool toInventory, int? room = null,
+        bool inOrder = false)
     {
         var shown = (toInventory ? StashTablets() : InventoryTablets()).Select(AddressOf).ToHashSet();
         var now = DateTime.UtcNow;
@@ -1162,15 +1534,12 @@ internal static partial class Tablets
             return true;
         }
 
-        if (now - _clickedAt < TimeSpan.FromMilliseconds(_pauseBetweenClicksMs))
-            return true;
-
         var mouse = ImGuiNET.ImGui.GetMousePos();
         var first = _moved == 0;
-        var byDistance = left.OrderBy(t => Vector2.DistanceSquared(mouse, NearestPointOf(t.Rect, mouse))).ToList();
-
-        // The first one of the three nearest the cursor, at random; every later one the nearest.
-        var next = first ? byDistance[Aim.Next(Math.Min(3, byDistance.Count))] : byDistance[0];
+        // From the batch as planned. See BatchNext. Planned ahead no further than the room left after this click: the
+        // clicks themselves stopped at the room, and the plan drawn went on through every tablet to move.
+        var (next, point) = BatchNext(what, left, mouse, first, first, ctrl: true,
+            restLimit: space == int.MaxValue ? int.MaxValue : space - MovesPending.Count - 1, inOrder: inOrder);
         var chosen = AddressOf(next);
 
         // A junk tablet taken out says why it is junk, once. See JunkReasonOf.
@@ -1188,9 +1557,195 @@ internal static partial class Tablets
                 MovesPending[chosen] = _clickedAt;
                 return true;
             },
-            first ? null : NearEdgeOf(next.Rect, mouse));
+            point);
         return true;
     }
+
+    /// <summary>
+    /// A batch of tablet clicks in the order it was planned - by entity address, each with the point it lands on - and
+    /// which batch it is. See BatchNext.
+    /// </summary>
+    private static readonly List<(long Address, Vector2 Point)> BatchOrder = [];
+
+    private static string _batchOf = "";
+
+    /// <summary>
+    /// The next tablet of a batch, and its point, from the order planned for the batch: while the batch is the same one
+    /// and its next tablet is still there, the order is followed; otherwise it is planned again from the cursor, by the
+    /// rule every batch of clicks follows (ItemClicks.NextItemOf) - firstRule for the top-left and bottom-left start - with
+    /// each point just inside its tablet's edge facing the last, and the first anywhere in its cell where anywhereFirst.
+    /// A batch followed in a fixed order can be drawn ahead and made as drawn: the clicks after this one, restLimit at
+    /// most, go to Send for PlanAhead. firstPool, where given, is where the first comes from. See PlanAhead.
+    /// </summary>
+    private static (TabletOnScreen Next, Vector2 Point) BatchNext(string batch, IReadOnlyList<TabletOnScreen> items, Vector2 mouse,
+        bool firstRule, bool anywhereFirst, bool ctrl, int restLimit = int.MaxValue, IReadOnlyList<TabletOnScreen> firstPool = null,
+        bool inOrder = false) =>
+        BatchNext(batch, items, AddressOf, static t => t.Rect, mouse, firstRule, anywhereFirst, ctrl, restLimit, firstPool, inOrder);
+
+    /// <summary>
+    /// A batch of currency stacks, each known by its cell, in the order planned for it. See the tablets' BatchNext, which
+    /// this follows with the same rule.
+    /// </summary>
+    private static ((RectangleF Rect, string Name) Next, Vector2 Point) StackBatchNext(string batch,
+        IReadOnlyList<(RectangleF Rect, string Name)> stacks, Vector2 mouse, bool ctrl) =>
+        BatchNext(batch, stacks, static s => CellKeyOfRect(s.Rect), static s => s.Rect, mouse, false, true, ctrl);
+
+    /// <summary>A cell's place on screen as one key, for batches of things with no entity address. See StackBatchNext.</summary>
+    private static long CellKeyOfRect(RectangleF rect) => ((long)MathF.Round(rect.X) << 32) | (uint)MathF.Round(rect.Y);
+
+    /// <summary>BatchNext for any kind of item, known by keyOf and clicked in rectOf.</summary>
+    /// <param name="inOrder">
+    /// The items clicked in the order given rather than by ItemClicks.NextItemOf, each point still just inside its cell's
+    /// edge facing the last: for a batch whose order is its point, as the most valuable withdraw's is.
+    /// </param>
+    /// <param name="groupSize">
+    /// For a batch clicked in groups with a trip elsewhere between them, as the bench's loads are three at a time with the
+    /// reforge button between: after firstGroup items, and every groupSize after that, the next is planned from
+    /// groupStart rather than from the item before it. Without it, every three after the first were chosen by distance
+    /// from the last tablet loaded, though the cursor was at the reforge button (2026-10-13).
+    /// </param>
+    private static (T Next, Vector2 Point) BatchNext<T>(string batch, IReadOnlyList<T> items, Func<T, long> keyOf, Func<T, RectangleF> rectOf,
+        Vector2 mouse, bool firstRule, bool anywhereFirst, bool ctrl, int restLimit = int.MaxValue, IReadOnlyList<T> firstPool = null,
+        bool inOrder = false, int groupSize = 0, int firstGroup = 0, Vector2? groupStart = null)
+    {
+        var byAddress = new Dictionary<long, T>();
+
+        foreach (var item in items)
+            byAddress[keyOf(item)] = item;
+
+        var fits = _batchOf == batch && BatchOrder.Count > 0 && byAddress.ContainsKey(BatchOrder[0].Address) &&
+                   byAddress.Keys.All(address => BatchOrder.Any(o => o.Address == address));
+
+        if (!fits)
+        {
+            BatchOrder.Clear();
+            _batchOf = batch;
+
+            var remaining = items.ToList();
+            var from = mouse;
+            var firstOne = true;
+
+            while (remaining.Count > 0)
+            {
+                var planned = BatchOrder.Count;
+
+                if (groupSize > 0 && groupStart is { } start && planned >= firstGroup && (planned - firstGroup) % groupSize == 0 && planned > 0)
+                    from = start;
+
+                var pool = firstOne && firstPool is { Count: > 0 } ? firstPool.Where(remaining.Contains).ToList() : remaining;
+
+                if (pool.Count == 0)
+                    pool = remaining;
+
+                var next = inOrder ? remaining[0] : ItemClicks.NextItemOf(pool, rectOf, from, firstOne && firstRule);
+                var point = firstOne && anywhereFirst ? ItemClicks.AnywhereIn(rectOf(next)) : ItemClicks.NearEdgeOf(rectOf(next), from);
+
+                BatchOrder.Add((keyOf(next), point));
+                remaining.Remove(next);
+                from = point;
+                firstOne = false;
+            }
+        }
+
+        var (address, landing) = BatchOrder[0];
+
+        BatchOrder.RemoveAt(0);
+        BatchRest.Clear();
+
+        foreach (var (later, at) in BatchOrder.Take(Math.Max(0, restLimit)))
+        {
+            if (byAddress.TryGetValue(later, out var item))
+                BatchRest.Add((rectOf(item), at, false, ctrl));
+        }
+
+        return (byAddress[address], landing);
+    }
+
+    /// <summary>The clicks a batch has planned after the one being sent, for PlanAhead; set by BatchNext, used once.</summary>
+    private static readonly List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)> BatchRest = [];
+
+    /// <summary>What ExileInput2 was last given to plan and draw, still to come. See PlanAhead.</summary>
+    private static readonly List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)> PlannedAhead = [];
+
+    /// <summary>Settings.Automation.ShowPlannedAutomation, as last read. See Draw.</summary>
+    private static bool _showPlanned;
+
+    /// <summary>
+    /// Gives ExileInput2 the click being sent, and the batch's clicks after it, to plan, draw while Show planned automation
+    /// in hideout is on, and make as drawn - unless this click is the next of what it was last given, which it already
+    /// has. A click with no point is planned by its cell, where ExileInput2 would aim. Each move at the shortest move it
+    /// would have had: Shortest move between tablets (or when depositing) for a hop between tablets, ExileInput2's own
+    /// otherwise. See BatchNext and ExileInput2's PlanClicks.
+    /// </summary>
+    /// <summary>
+    /// Whether a planned move from one click to the next is a hop between tablets, at Shortest move between tablets (or when
+    /// depositing): both cells of one grid, so the same size - inventory to inventory, stash to stash. Every later click of
+    /// a plan was given the hop's shortest move, so the long ways - the inventory to the bench's reforged tablet, that to
+    /// the reforge button - took about 380ms where ExileInput2's own timing takes about 250 (dump 2026-10-12 14:00:49).
+    /// </summary>
+    private static bool IsHopBetweenCells(RectangleF from, RectangleF to) =>
+        from.Width > 0f && MathF.Abs(from.Width - to.Width) < 1f && MathF.Abs(from.Height - to.Height) < 1f;
+
+    private static bool PlanAhead(RectangleF target, Vector2? point, bool ctrl, bool right, bool hop)
+    {
+        var rest = BatchRest.ToList();
+
+        BatchRest.Clear();
+
+        if (PlannedAhead.Count > 0 && PlannedAhead[0].Rect == target && PlannedAhead[0].Point == point &&
+            PlannedAhead[0].Right == right && PlannedAhead[0].Ctrl == ctrl)
+        {
+            PlannedAhead.RemoveAt(0);
+
+            // **What comes after this click, where it goes on from what is planned, is added to the queue's end** rather
+            // than the queue planned again, so one run of the bench is one queue. See ExileInput2's ExtendPlan.
+            if (rest.Count > PlannedAhead.Count && rest.Take(PlannedAhead.Count).SequenceEqual(PlannedAhead))
+            {
+                var added = rest.Skip(PlannedAhead.Count).ToList();
+                var hopMsAdded = (_run == TabletRun.Deposit ? _shortestMoveDepositingMs : _shortestMoveMs) is > 0 and var ms ? ms : -1;
+                var before = PlannedAhead.Count > 0 ? PlannedAhead[^1].Rect : target;
+
+                if (Input.ExtendPlan(
+                        added.Select(p => p.Rect).ToArray(),
+                        added.Select(p => p.Point ?? new Vector2(float.NaN, float.NaN)).ToArray(),
+                        added.Select(p => p.Right).ToArray(),
+                        added.Select(p => p.Ctrl ? new[] { System.Windows.Forms.Keys.LControlKey } : []).ToArray(),
+                        added.Select((p, i) => IsHopBetweenCells(i == 0 ? before : added[i - 1].Rect, p.Rect) ? hopMsAdded : -1).ToArray()))
+                    PlannedAhead.AddRange(added);
+            }
+
+            return true;
+        }
+
+        PlannedAhead.Clear();
+        PlannedAhead.Add((target, point, right, ctrl));
+        PlannedAhead.AddRange(rest);
+
+        var shortest = _run == TabletRun.Deposit ? _shortestMoveDepositingMs : _shortestMoveMs;
+        var hopMs = shortest > 0 ? shortest : -1;
+
+        var planned = Input.PlanClicks(
+            PlannedAhead.Select(p => p.Rect).ToArray(),
+            PlannedAhead.Select(p => p.Point ?? new Vector2(float.NaN, float.NaN)).ToArray(),
+            PlannedAhead.Select(p => p.Right).ToArray(),
+            PlannedAhead.Select(p => p.Ctrl ? new[] { System.Windows.Forms.Keys.LControlKey } : []).ToArray(),
+            PlannedAhead.Select((p, i) => i == 0 ? (hop ? hopMs : -1) : IsHopBetweenCells(PlannedAhead[i - 1].Rect, p.Rect) ? hopMs : -1).ToArray(),
+            _showPlanned);
+
+        PlannedAhead.RemoveAt(0);
+
+        if (!planned)
+            PlannedAhead.Clear();
+
+        return planned;
+    }
+
+    /// <summary>
+    /// Whether the click in flight was planned by ExileInput2, which then counts it arrived once the cursor is on its
+    /// point - before the game reports it there - so the cell check, which reads that report, is skipped for it: its
+    /// point is inside its cell by construction. See PlanAhead.
+    /// </summary>
+    private static bool _sentPlanned;
 
     /// <summary>
     /// The run's loading decisions, newest last, each with what was counted when it was made: for the dump, so a decision
@@ -1209,6 +1764,15 @@ internal static partial class Tablets
 
     /// <summary>When a tablet in the bench was first read not yet fully read, or null. See ReforgeNext.</summary>
     private static DateTime? _benchHalfReadSince;
+
+    /// <summary>When each tablet read in the bench was first seen there, by entity address. See ReforgeNext.</summary>
+    private static readonly Dictionary<long, DateTime> BenchFirstSeen = [];
+
+    /// <summary>How many BenchFirstSeen holds before it starts again. Chosen: far more than a bench holds in a run.</summary>
+    private const int BenchFirstSeenKept = 200;
+
+    /// <summary>When a load was last clicked into the bench. See ReforgeNext's reforged tablet.</summary>
+    private static DateTime _benchLoadClickedAt;
 
     /// <summary>When a load was last read as gone from the inventory. See ReforgeNext's reforged tablet.</summary>
     private static DateTime _benchLoadLandedAt;
@@ -1334,6 +1898,15 @@ internal static partial class Tablets
     /// <summary>The tablet the load in flight is for.</summary>
     private static long _loadingAddress;
 
+    /// <summary>What putting down an item found held on the cursor is called. See the click on arrival.</summary>
+    private const string HeldItemPutDown = "the item held, put down";
+
+    /// <summary>How many items found held on the cursor a run puts down before it stops instead. Chosen.</summary>
+    private const int PutDownsPerRun = 3;
+
+    /// <summary>Items put down from the cursor this run. See PutDownsPerRun.</summary>
+    private static int _putDowns;
+
     /// <summary>What taking the reforged tablet out is called, in the status line and to tell its retries apart.</summary>
     private const string ReforgedTablet = "the reforged tablet";
 
@@ -1354,7 +1927,11 @@ internal static partial class Tablets
         }
 
         _sentTarget = target;
-        UseShortestMove(IsTabletHop(doing));
+
+        var hop = IsTabletHop(doing);
+
+        _sentPlanned = PlanAhead(target, point, ctrl, right, hop);
+        UseShortestMove(hop);
         _previousSent = doing;
 
         var tabletClick = IsTabletClick(doing);
@@ -1364,6 +1941,9 @@ internal static partial class Tablets
         _reaimed = false;
 
         var aimed = target.Width > 0f && (point is { } at ? Input.MoveTo(at, ctrl: ctrl) : Input.MoveTo(target, ctrl: ctrl));
+
+        // The move's own times and flourishes, set as it was asked for, for the log. See ExileInput2's LastMoveTimes.
+        _sentMoveTimes = aimed ? Input.LastMoveTimes() : null;
 
         if (!aimed)
         {
@@ -1383,65 +1963,6 @@ internal static partial class Tablets
         _reforgingDeadline = DateTime.UtcNow + StepTimeout;
         _sentAt = DateTime.UtcNow;
         Say($"{(ctrl ? "moving" : "clicking")} {doing}");
-    }
-
-    /// <summary>A cell less AnywhereMargin on every side, so a click aimed in it stays on the tablet.</summary>
-    private static RectangleF Inside(RectangleF cell) =>
-        cell.Width > 2f * AnywhereMargin && cell.Height > 2f * AnywhereMargin
-            ? new RectangleF(cell.Left + AnywhereMargin, cell.Top + AnywhereMargin, cell.Width - 2f * AnywhereMargin,
-                cell.Height - 2f * AnywhereMargin)
-            : new RectangleF(cell.Center.X, cell.Center.Y, 0f, 0f);
-
-    /// <summary>The point of a cell, less its margin, nearest to a point outside it, or the point itself when inside.</summary>
-    private static Vector2 NearestPointOf(RectangleF cell, Vector2 from)
-    {
-        var inside = Inside(cell);
-
-        return new Vector2(Math.Clamp(from.X, inside.Left, inside.Right), Math.Clamp(from.Y, inside.Top, inside.Bottom));
-    }
-
-    /// <summary>A point anywhere in a cell, uniformly: successive clicks do not cluster on its centre.</summary>
-    private static Vector2 AnywhereIn(RectangleF cell)
-    {
-        var inside = Inside(cell);
-
-        return new Vector2(inside.Left + (float)Aim.NextDouble() * inside.Width, inside.Top + (float)Aim.NextDouble() * inside.Height);
-    }
-
-    /// <summary>How deep into a cell, as a share of its size, a click aimed near the edge facing the cursor may land.</summary>
-    private const float NearEdgeDepth = 0.5f;
-
-    /// <summary>
-    /// How deep into a cell, as a share of its size, such a click lands at least: about 14 pixels of a 70 pixel cell,
-    /// where it was AnywhereMargin's 4 and a click landed in the cell before (2026-10-09 23:36). Chosen.
-    /// </summary>
-    private const float NearEdgeLeast = 0.2f;
-
-    /// <summary>How far along that edge, as a share of the cell's size either way, the click may stray.</summary>
-    private const float NearEdgeSpread = 0.2f;
-
-    /// <summary>
-    /// A point just inside a cell's edge facing the cursor: the cell's nearest point to it, taken a random depth inwards
-    /// on each axis the cursor lies outside, and a random way along it on each axis the cursor lies within.
-    /// </summary>
-    private static Vector2 NearEdgeOf(RectangleF cell, Vector2 from)
-    {
-        var inside = Inside(cell);
-        var nearest = NearestPointOf(cell, from);
-
-        float Along(float at, float point, float low, float high, float size)
-        {
-            if (point < low)
-                return at + (NearEdgeLeast + (float)Aim.NextDouble() * (NearEdgeDepth - NearEdgeLeast)) * size;
-
-            if (point > high)
-                return at - (NearEdgeLeast + (float)Aim.NextDouble() * (NearEdgeDepth - NearEdgeLeast)) * size;
-
-            return Math.Clamp(at + ((float)Aim.NextDouble() * 2f - 1f) * NearEdgeSpread * size, low, high);
-        }
-
-        return new Vector2(Along(nearest.X, from.X, inside.Left, inside.Right, inside.Width),
-            Along(nearest.Y, from.Y, inside.Top, inside.Bottom, inside.Height));
     }
 
     /// <summary>"Reforging: ..." above the bench while a run goes, and its last word for a moment after.</summary>
@@ -1533,6 +2054,15 @@ internal static partial class Tablets
         b.AppendLine($"    the run's last {ReforgingLog.Count} decisions and moves, newest last; {Unloadable.Count} tablet(s) set aside:");
 
         foreach (var line in ReforgingLog)
+            b.AppendLine($"      {line}");
+
+        // How ExileInput2's planned queues ended, for this plugin's name - which the loot runs share. See PlanAhead.
+        var ends = Input?.PlanEndsSaid() ?? [];
+
+        b.AppendLine($"    ExileInput2's plans for this plugin, how each ended, newest last ({ends.Length}):" +
+                     (ends.Length == 0 ? " none, or an ExileInput2 too old to say" : ""));
+
+        foreach (var line in ends)
             b.AppendLine($"      {line}");
 
         return b.ToString();

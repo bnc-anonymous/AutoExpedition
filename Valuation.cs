@@ -129,6 +129,9 @@ internal sealed class Valuation
     /// <summary>Whether NinjaPricer answered, so the UI can say why everything is worth nothing.</summary>
     public bool Priced { get; private set; }
 
+    /// <summary>When the recipe prices were last built from NinjaPricer. See AutoExpedition.Told.</summary>
+    public DateTime PricesBuiltAt { get; private set; }
+
     /// <summary>
     /// How many exalts one of the chosen currency is worth.
     ///
@@ -148,6 +151,37 @@ internal sealed class Valuation
         "Vaal" => _vaal > 0d ? _vaal : 1d,
         _ => 1d,
     };
+
+    /// <summary>
+    /// NinjaPricer's price for one item of a base type, in exalts: NinjaPrice.GetBaseItemTypeValue, the lookup the
+    /// rewards are priced with. 0 without NinjaPricer, before it has prices, or for a type it does not price. By base
+    /// type only, so two levels of one uncut gem, or a unique and its base, are one price. See Autoloot.PriceLine.
+    /// </summary>
+    public double ExaltsOfBaseItem(BaseItemType type)
+    {
+        _baseItemValue ??= Safe.Read(
+            () => _gc.PluginBridge.GetMethod<Func<BaseItemType, double>>("NinjaPrice.GetBaseItemTypeValue"), null);
+
+        return type == null || _baseItemValue == null ? 0d : Safe.Read(() => _baseItemValue(type), 0d);
+    }
+
+    private Func<BaseItemType, double> _baseItemValue;
+
+    /// <summary>
+    /// NinjaPricer's price for one item, stack included, in exalts: NinjaPrice.GetValue, given the item entity (a
+    /// WorldItem's ItemEntity, not the ground entity). Unlike ExaltsOfBaseItem it prices a unique by its name, or while
+    /// unidentified by the cheapest unique its art can be, a tablet by its rarity, and a shard by its whole orb. 0
+    /// without NinjaPricer, before it has prices, or for an item it does not price, which includes all magic and rare
+    /// gear (NinjaPricer.Methods.cs GetValue, read 2026-10-14).
+    /// </summary>
+    public double ExaltsOfItem(Entity item)
+    {
+        _itemValue ??= Safe.Read(() => _gc.PluginBridge.GetMethod<Func<Entity, double>>("NinjaPrice.GetValue"), null);
+
+        return item == null || _itemValue == null ? 0d : Safe.Read(() => _itemValue(item), 0d);
+    }
+
+    private Func<Entity, double> _itemValue;
 
     /// <summary>Whether the chosen unit has a known rate, so the UI can fall back honestly.</summary>
     public bool Converts(string unit) => unit switch
@@ -248,6 +282,8 @@ internal sealed class Valuation
 
     private Dictionary<Expedition2Recipe, double> BuildPrices()
     {
+        PricesBuiltAt = DateTime.UtcNow;
+
         // **Frozen where the setting says so - see DebugSettings.FreezePrices.**
         //
         // Held here rather than by stopping the cache from expiring, because the cache is what every

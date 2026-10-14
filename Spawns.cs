@@ -729,8 +729,11 @@ internal sealed class Spawns
 
         if (!_frozen)
         {
-            Snapshot(gc, scan, valuation, radius,
-                MathF.Max(1f, Safe.Read(() => settings.Recording.WaveRadius.Value, 120f)));
+            // Each part of a frame timed apart, for "where a frame goes": the whole averaged 7.6ms and 4.5MB a frame
+            // while looting after a run (dump 2026-10-12 00:55:33), and the whole said nothing about which part.
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/Snapshot"))
+                Snapshot(gc, scan, valuation, radius,
+                    MathF.Max(1f, Safe.Read(() => settings.Recording.WaveRadius.Value, 120f)));
 
             // The remnants say when the chain has gone off, and nothing else here is reliable.
             //
@@ -786,8 +789,11 @@ internal sealed class Spawns
                 !_finished.Contains(((int)_site.X, (int)_site.Y)))
                 FreezeRun(gc);
 
-            if (!_frozen && !_live && activated >= 1 && ArmAfterReturn(gc, monsters))
-                FreezeRun(gc);
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/ArmAfterReturn"))
+            {
+                if (!_frozen && !_live && activated >= 1 && ArmAfterReturn(gc, monsters))
+                    FreezeRun(gc);
+            }
 
             // What the plan credited the route with as it went off, once per run. See Planning.CreditOfRoute.
             if (_frozen && _routeCredit == null)
@@ -795,6 +801,8 @@ internal sealed class Spawns
 
             if (!_frozen)
             {
+                using var before = global::AutoExpedition.Spent.On("Tick/Spawns.Observe/Before");
+
                 foreach (var monster in monsters)
                 {
                     var id = Safe.Read(monster, static e => e.Id, 0u);
@@ -935,9 +943,14 @@ internal sealed class Spawns
             _last = DateTime.UtcNow;
         }
 
-        ModsNotYetRead();
-        RemnantStates(scan);
-        ControllerChanges(monsters);
+        using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/ModsNotYetRead"))
+            ModsNotYetRead();
+
+        using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/RemnantStates"))
+            RemnantStates(scan);
+
+        using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/ControllerChanges"))
+            ControllerChanges(monsters);
         // Each part behind its own Data collection switch. Deaths are watched whenever anything needs them - drops and
         // Bond gains are credited to deaths - and written only when their own switch is on. See Write.
         var deaths = Safe.Read(() => settings.Recording.CollectMonsterDeaths.Value, true);
@@ -946,19 +959,25 @@ internal sealed class Spawns
         var remnantDrops = Safe.Read(() => settings.Recording.CollectRemnantDrops.Value, false);
 
         if (deaths || drops || bond || remnantDrops)
-            Deaths(monsters);
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/Deaths"))
+                Deaths(monsters);
 
         if (deaths)
-            Strengthening(monsters);
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/Strengthening"))
+                Strengthening(monsters);
 
         if (bond)
-            BondTransfers(monsters,
-                TimeSpan.FromMilliseconds(Safe.Read(() => settings.Recording.BondTransferReadMs.Value, 60)));
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/BondTransfers"))
+                BondTransfers(monsters,
+                    TimeSpan.FromMilliseconds(Safe.Read(() => settings.Recording.BondTransferReadMs.Value, 60)));
 
         if (drops || remnantDrops)
         {
-            Drops(gc, settings, drops, remnantDrops);
-            ChestOpenings(gc);
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/Drops"))
+                Drops(gc, settings, drops, remnantDrops);
+
+            using (global::AutoExpedition.Spent.On("Tick/Spawns.Observe/ChestOpenings"))
+                ChestOpenings(gc);
         }
     }
 

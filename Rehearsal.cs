@@ -338,7 +338,7 @@ internal sealed class Rehearsal
     /// flight.
     ///
     /// True while the site has had at least one pass, or the action key has asked for a solve here, the last plan is not
-    /// proved optimal, no explosive is down, and the action key has not stopped it. The action key over the placement
+    /// proved optimal or exhausted (Planning.Exhausted), no explosive is down, and the action key has not stopped it. The action key over the placement
     /// button starts it again. Needs the presolve switched on, since this is the presolve continuing rather than a
     /// solver of its own.
     ///
@@ -776,8 +776,10 @@ internal sealed class Rehearsal
             _markersWaiting = false;
         }
 
-        // Ours is stopping, or theirs is running. Either way this frame does not start one.
-        if (planning.Searching)
+        // Ours is stopping, or theirs is running. Either way this frame does not start one. Nor while the last plan is
+        // being asked whether it is exhausted, which decides whether continuous solving goes on. See
+        // Planning.Exhausted.
+        if (planning.Searching || planning.CheckingExhausted)
             return;
 
         // Nor after a cold start, until the player asks: Start would refuse, and the pass would be counted as run.
@@ -794,7 +796,7 @@ internal sealed class Rehearsal
         // change to the site - a marker, a price, a roll - opens it again. Between rolls the player is
         // walking to the next remnant, and that time was spent solving nothing. See Continuing.
         _rerollsLeft = RerollsLeft(content);
-        Continuing = !_stoppedByPlayer && (_passes > 0 || _continueAsked) && !planning.ProvenBest &&
+        Continuing = !_stoppedByPlayer && (_passes > 0 || _continueAsked) && !planning.ProvenBest && !planning.Exhausted &&
                      Safe.Read(() => Detonator.Info(gc).PlacedExplosiveCount, 0) == 0;
 
         if (_done && Continuing)
@@ -913,6 +915,10 @@ internal sealed class Rehearsal
         // Verdict.Plain.
         var worth = planning.Ready ? planning.Plan.Plain : 0d;
 
+        // Before the settle tests, which return: a site settled after its first pass reported a best of nought.
+        if (worth > _best)
+            _best = worth;
+
         // Measured before the best is moved, which the first version of this got wrong: it compared
         // the pass against a high water mark it had already raised, so every pass reported that it
         // had moved the score and the readout said the opposite of the truth.
@@ -1004,9 +1010,6 @@ internal sealed class Rehearsal
             return;
         }
 
-        if (worth > _best)
-            _best = worth;
-
         // Proved optimal, so more passes cannot help however long the walk is - unless the router
         // was refusing to answer, in which case what was proved optimal is a site with walls across
         // it that are not there. See starved.
@@ -1016,7 +1019,8 @@ internal sealed class Rehearsal
         // pass publishes - so a re-opened rehearsal read a proof about a smaller site and concluded
         // again without running. It is also wrong on its own terms: optimal was proved against the
         // content that pass ran on, and a marker arriving means there is more of it. See _reopened.
-        if (planning.ProvenBest && !_reopened)
+        // Exhausted is the same conclusion on a simple site, though not a proof. See Planning.Exhausted.
+        if ((planning.ProvenBest || planning.Exhausted) && !_reopened)
         {
             _done = true;
             Settled = true;

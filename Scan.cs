@@ -943,7 +943,7 @@ internal sealed class Target
                          // half done. It was weighted at nothing and still drew a marker, because
                          // the drawing asks this and not the weights. See Target.Explodes.
                          Kind == TargetKind.Strongbox && !Explodes ||
-                         Kind == TargetKind.Remnant && State("activated") >= 6 ||
+                         Kind == TargetKind.Remnant && HighestActivated() >= 6 ||
                          Kind == TargetKind.Sentry && State("activated") >= 1 ||
                          Kind == TargetKind.Entrance && State("expedition_detonated") >= 1 ||
                          // Anything with a blast of its own that has already blown - a barrel, or
@@ -954,6 +954,23 @@ internal sealed class Target
                          Sets > 0f && State("expedition_detonated") >= 1 ||
                          Kind == TargetKind.Strongbox &&
                          (State("expedition_detonated") >= 1 || State("opened") >= 1);
+
+    /// <summary>
+    /// The highest activated state this remnant has ever been read at, kept: 6 is blown, 7 shattered, and neither is
+    /// undone. Read live it is -1 for a remnant out of loading range or one the game has taken away once shattered, so a
+    /// shattered remnant across the map read as not spent and its socket count was still drawn on the minimap. See Spent.
+    /// </summary>
+    private long HighestActivated()
+    {
+        var now = State("activated");
+
+        if (now > _highestActivated)
+            _highestActivated = now;
+
+        return _highestActivated;
+    }
+
+    private long _highestActivated = -1;
 
     /// <summary>
     /// Whether this remnant has been blown but not yet shattered - the only state worth walking to.
@@ -2835,12 +2852,28 @@ internal sealed class Scan
         if (_sites is not { Count: > 0 })
             return;
 
+        // A detonator seen for the first time can be nearer to markers already filed under another. Everything is filed
+        // again by nearest, except markers lit, which Confirm filed by proof.
+        var sitesChanged = _filedAgainst.Count != _sites.Count || _sites.Exists(s => !_filedAgainst.Contains(s));
+
         foreach (var known in _known.Values)
         {
-            if (known.Site == Vector2.Zero)
+            if (known.Site == Vector2.Zero || sitesChanged && !known.Glowing)
                 known.Site = Nearest(_sites, known.Grid);
         }
+
+        if (sitesChanged)
+        {
+            _filedAgainst.Clear();
+            _filedAgainst.AddRange(_sites);
+
+            // The per-site list is cached on the marker count, which refiling does not change. See Confirm.
+            _atCount = -1;
+        }
     }
+
+    /// <summary>The detonators every marker was last filed against. See Filing.</summary>
+    private readonly List<Vector2> _filedAgainst = [];
     /// <summary>
     /// How many times an entity was kept for the next walk rather than refused. See WaitFor.
     ///
@@ -3232,6 +3265,20 @@ internal sealed class Scan
 
             if (at.X != 0 || at.Y != 0)
                 found.Add(new Vector2(at.X, at.Y));
+        }
+
+        // **The detonator found by its entity when the panel names none**: in a party, at a site that is another player's,
+        // the panel's encounters read the detonator at (0,0) and nothing was filed under any site - socket counts, rewards
+        // and runes all went undrawn, with the detonator itself found on the map (dump 2026-10-12 16:16:37). See
+        // Detonator.DetonatorGridPosition, which falls back the same way.
+        //
+        // Every detonator seen in the area, not only the nearest: with one at a time, a map with two sites filed every
+        // marker under whichever detonator was nearest when it was first seen, and the site being stood at held no
+        // remnants and the plan routed to none (Hive, dump 2026-10-14 13:18:02: 19 remnants, 0 under this site).
+        if (found.Count == 0)
+        {
+            Detonator.DetonatorGridPositionFromEntity(gc);
+            found.AddRange(Detonator.DetonatorsSeenInArea);
         }
 
         return found;

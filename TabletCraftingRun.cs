@@ -175,10 +175,19 @@ internal static partial class Tablets
 
         // From whichever tab is showing: a ctrl+click sends a currency stack to the currency tab with the stash open,
         // by the player's account (2026-10-09).
-        var (rect, name) = stacks[0];
+        SendStackBack(gc, stacks);
+    }
+
+    /// <summary>
+    /// Ctrl+clicks the next of these inventory currency stacks back to the stash, in the order planned for them all, so
+    /// the clicks are planned and drawn ahead as one batch. See StackBatchNext.
+    /// </summary>
+    private static void SendStackBack(GameController gc, IReadOnlyList<(RectangleF Rect, string Name)> stacks)
+    {
+        var ((rect, name), point) = StackBatchNext("currency back", stacks, ImGuiNET.ImGui.GetMousePos(), ctrl: true);
         var before = InventoryCurrencyHeld(gc).GetValueOrDefault(name);
 
-        Send(rect, true, $"the {name} back", () => InventoryCurrencyHeld(gc).GetValueOrDefault(name) < before, null);
+        Send(rect, true, $"the {name} back", () => InventoryCurrencyHeld(gc).GetValueOrDefault(name) < before, point);
     }
 
     /// <summary>A currency use clicked and not yet read as made: the tablet as it was, its fingerprint, and when clicked.</summary>
@@ -241,8 +250,10 @@ internal static partial class Tablets
             }
 
             CurrencyUsesRetried[key] = retried + 1;
-            // Not made, so the orb was not spent. See _orbsLeft.
-            _orbsLeft++;
+            // **The orb is not counted back.** A use read late may have been made all the same, and counted back the last
+            // orb of a stack: the cursor still reads as holding the currency after its stack runs out with shift held, so
+            // the retry went out with nothing on the cursor and a shift+click picked the tablet up (dump 2026-10-13
+            // 21:36:13). Counted low, the stack is let go and picked up again, which reads its real size. See _orbsLeft.
             LogReforging($"a {line} use was not seen {MoveSettle.TotalMilliseconds:0}ms after its click: the tablet is taken again - {said}");
             ReforgingSent.Remove(AddressOf(pending.Before));
         }
@@ -449,18 +460,28 @@ internal static partial class Tablets
                 if (!OnStashTab(gc, CurrencyTabIcon, "the currency tab"))
                     return;
 
-                var (supplyLine, supplyName) = lacking[0];
-
-                CraftSupplied.Add(supplyName);
-
                 // None in the tab: the run goes on with what there is, and stops when it runs out.
-                if (CurrencyTabStackOf(gc, supplyName) is not { } supply)
+                var stacks = new List<(RectangleF Rect, string Name)>();
+
+                foreach (var (_, name) in lacking)
+                {
+                    if (CurrencyTabStackOf(gc, name) is { } tabStack)
+                        stacks.Add((tabStack.Rect, name));
+                    else
+                        CraftSupplied.Add(name);
+                }
+
+                if (stacks.Count == 0)
                     return;
 
+                // One batch of every stack wanted, so the clicks are planned and drawn ahead together. See StackBatchNext.
+                var ((supplyRect, supplyName), point) = StackBatchNext("currency supply", stacks, ImGuiNET.ImGui.GetMousePos(), ctrl: true);
+                var supplyLine = CraftingCurrencies.First(c => c.BaseName == supplyName).Line;
                 var before = held.GetValueOrDefault(supplyName);
 
-                Send(supply.Rect, true, $"a stack of {supplyLine}", () => InventoryCurrencyHeld(gc).GetValueOrDefault(supplyName) > before,
-                    null);
+                CraftSupplied.Add(supplyName);
+                Send(supplyRect, true, $"a stack of {supplyLine}", () => InventoryCurrencyHeld(gc).GetValueOrDefault(supplyName) > before,
+                    point);
                 return;
             }
 
@@ -475,7 +496,7 @@ internal static partial class Tablets
                 // Only those worth a look by what they held when last seen, even if not seen this session. See
                 // SubTabWorthVisiting.
                 var unseen = Enumerable.Range(1, 6)
-                    .Where(n => !SeenSubTabs.Contains($"{fragment}:{n}") && SubTabWorthVisiting(n, SubTabPurpose.Craftable)).ToList();
+                    .Where(n => !SeenSubTabs.Contains($"{fragment}:{n}") && SubTabWorthVisiting(gc, n, SubTabPurpose.Craftable)).ToList();
 
                 if (unseen.Count == 0)
                 {
@@ -566,8 +587,13 @@ internal static partial class Tablets
                 // The inventory's stack first, as it needs no change of tab; else the currency tab's.
                 if (InventoryStackOf(gc, baseName) is { } stack)
                 {
-                    _orbsLeft = stack.Count > 0 ? stack.Count : null;
-                    Send(stack.Rect, false, $"the {line} stack", () => HeldOnCursor(gc) == action, null, right: true);
+                    // **The currency tab's stack counts too.** With the stash open, an orb picked up from the inventory
+                    // goes on being used from the currency tab once the inventory's stack runs out, by the player's
+                    // account; counted from the inventory's stack alone, a run of 20 Alchemies went back to the currency
+                    // tab for more with one still on the cursor (2026-10-11 22:43:36). The tab's count is as last seen.
+                    _orbsLeft = stack.Count > 0 ? stack.Count + (_currencyTabHeld?.GetValueOrDefault(baseName) ?? 0) : null;
+                    LogReforging($"the {line} stack: {(_orbsLeft is { } inStack ? $"{inStack} orb(s)" : "count not read")}");
+                    Send(stack.Rect, false, $"the {line} stack",() => HeldOnCursor(gc) == action, null, right: true);
                     return;
                 }
 
@@ -588,6 +614,7 @@ internal static partial class Tablets
                 }
 
                 _orbsLeft = kept.Count > 0 ? kept.Count : null;
+                LogReforging($"the {line} stack in the currency tab: {(_orbsLeft is { } inTab ? $"{inTab} orb(s)" : "count not read")}");
                 Send(kept.Rect, false, $"the {line} stack in the currency tab", () => HeldOnCursor(gc) == action, null, right: true);
                 return;
 
@@ -676,15 +703,16 @@ internal static partial class Tablets
                     return;
                 }
 
-                if (DateTime.UtcNow - _shiftAt < ShiftSettle || DateTime.UtcNow - _clickedAt < TimeSpan.FromMilliseconds(_pauseBetweenClicksMs))
+                if (DateTime.UtcNow - _shiftAt < ShiftSettle)
                     return;
 
                 var mouse = ImGuiNET.ImGui.GetMousePos();
-                // The first one of the three nearest the cursor at random, stash tablets before the inventory's; every later
-                // one the nearest.
-                var byDistance = targets.OrderBy(t => Vector2.DistanceSquared(mouse, NearestPointOf(t.Rect, mouse))).ToList();
-                var pool = byDistance.Where(t => t.Where != "inventory").ToList() is { Count: > 0 } stashed ? stashed : byDistance;
-                var next = _crafted == 0 ? pool[Aim.Next(Math.Min(3, pool.Count))] : byDistance[0];
+                // The first by the batch rule among the stash's tablets, before the inventory's; every later one by
+                // distance from the cursor. See ItemClicks.NextItemOf.
+                var pool = targets.Where(t => t.Where != "inventory").ToList() is { Count: > 0 } stashed ? stashed : targets;
+                // From the batch as planned for this currency. See BatchNext.
+                var (next, point) = BatchNext($"craft {line}", targets, mouse, _crafted == 0, _crafted == 0, ctrl: false,
+                    firstPool: pool);
                 var before = FingerprintOf(next);
                 var cell = next.Rect;
 
@@ -709,7 +737,7 @@ internal static partial class Tablets
 
                         return true;
                     },
-                    _crafted == 1 ? null : NearEdgeOf(cell, mouse),
+                    point,
                     beforeClick: () =>
                     {
                         // **The stack ran out on the way here: this click is let go, not the run.** With clicks going

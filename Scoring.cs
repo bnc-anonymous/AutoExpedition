@@ -300,7 +300,13 @@ internal sealed class Scoring
         }
 
         var plan = planning.Plan;
-        var placed = Detonator.PlacedExplosiveGridPositions(gc);
+
+        // **Another player's site: the chain its owner has placed, read from the explosives standing**, in the order they
+        // went down; the panel lists none there. Scored as the player's own placed chain is, so the left figure is the
+        // host's chain against the plan. See Detonator.ExplosivesStandingInOrder.
+        _atAnotherPlayersSite = Detonator.SiteIsAnotherPlayers(gc);
+
+        var placed = _atAnotherPlayersSite ? Detonator.ExplosivesStandingInOrder(gc) : Detonator.PlacedExplosiveGridPositions(gc);
 
         // While a search is running the number tracks its best chain so far, which is what makes it
         // climb on screen rather than appear at the end. Recomputed when the search publishes a
@@ -716,7 +722,7 @@ internal sealed class Scoring
         // Grouped, because a dig site scores in the thousands once the weights are turned up and
         // "1234/5678" is two numbers nobody can compare at a glance. Invariant so it is always a
         // comma: the readout is not the place to discover what the machine's locale thinks.
-        return "Score: " + Yours.ToString("N0", CultureInfo.InvariantCulture) +
+        return (_atAnotherPlayersSite ? "Host: " : "Score: ") + Yours.ToString("N0", CultureInfo.InvariantCulture) +
                "/" + Planned.ToString("N0", CultureInfo.InvariantCulture);
     }
 
@@ -731,6 +737,12 @@ internal sealed class Scoring
     /// Empty head means there is nothing to colour and the caller should draw Line() plainly, which
     /// is the loot count and the blank case.
     /// </summary>
+    /// <summary>
+    /// Whether the last reading was taken at another player's site, where the left figure is the chain its owner placed.
+    /// See Update.
+    /// </summary>
+    private bool _atAnotherPlayersSite;
+
     public (string Head, string Yours, string Tail, int Against) Parts()
     {
         if (_total > 0 || !Known || (Planned <= 0d && Down == 0))
@@ -741,7 +753,7 @@ internal sealed class Scoring
         // below anything the readout shows and far above the arithmetic's noise.
         var against = Yours > Planned + 0.5d ? 1 : Yours < Planned - 0.5d ? -1 : 0;
 
-        return ("Score: ",
+        return (_atAnotherPlayersSite ? "Host: " : "Score: ",
             Yours.ToString("N0", CultureInfo.InvariantCulture),
             "/" + Planned.ToString("N0", CultureInfo.InvariantCulture),
             against);

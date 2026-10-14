@@ -139,8 +139,12 @@ internal static class ExhaustiveSpotSearch
     /// link before it (or the one before that, with freeBefore) to the link after its last stop, or null when nothing
     /// fits. The links the window replaces are the ones from the first free link to the link catching its last stop.
     /// </summary>
+    /// <param name="stopEachOrder">
+    /// Asked before each order; true gives up, returning null. Only IsChainExhausted passes it, whose single window holds
+    /// every stop of the site and so up to MostStopsToExhaust factorial orders.
+    /// </param>
     private static List<Vector2> RelayWindow(PlanEnvironment env, List<Vector2> chain, GroundView view,
-        List<(int Stop, int Link)> stopsInOrder, int first, int size, int freeBefore)
+        List<(int Stop, int Link)> stopsInOrder, int first, int size, int freeBefore, Func<bool> stopEachOrder = null)
     {
         var window = stopsInOrder.GetRange(first, Math.Min(size, stopsInOrder.Count - first));
 
@@ -169,6 +173,9 @@ internal static class ExhaustiveSpotSearch
 
         foreach (var order in Orders(stops))
         {
+            if (stopEachOrder?.Invoke() == true)
+                return null;
+
             foreach (var middle in Paths(env, view, anchor, anchorSpot, after, order, links, window.Min(x => x.Link) - from))
             {
                 var whole = new List<Vector2>(prefix.Count + middle.Count + suffix.Count);
@@ -404,9 +411,7 @@ internal static class ExhaustiveSpotSearch
     /// </summary>
     private static Dictionary<int, List<int>> CatchingOfStops(PlanEnvironment env, List<int>[] caughtBy)
     {
-        var stops = new HashSet<int>(Enumerable.Range(0, env.Targets.Count).Where(i =>
-            env.Targets[i].Kind == TargetKind.Remnant && !env.Targets[i].Shunned ||
-            RemnantOrder.Multiplies(env.Targets[i]) || env.Targets[i].Must));
+        var stops = new HashSet<int>(Enumerable.Range(0, env.Targets.Count).Where(i => IsStop(env.Targets[i])));
         var catching = new Dictionary<int, List<int>>();
 
         for (var s = 0; s < caughtBy.Length; s++)
@@ -441,6 +446,110 @@ internal static class ExhaustiveSpotSearch
 
         return caught;
     }
+
+    /// <summary>A target this search lays a chain through: a remnant not shunned, a multiplying relic, or a must-take.</summary>
+    private static bool IsStop(PlanTarget target) =>
+        target.Kind == TargetKind.Remnant && !target.Shunned || RemnantOrder.Multiplies(target) || target.Must;
+
+    /// <summary>
+    /// The most stops a site may hold for IsChainExhausted to be asked about it. Chosen, not measured: some city maps hold
+    /// more remnants than five, and a site whose only wanted markers are ten stops is otherwise rare. Ten stops are
+    /// 3,628,800 orders, far more than ExhaustBudget covers, so a site near the limit usually runs out of time
+    /// and is not exhausted.
+    /// </summary>
+    internal const int MostStopsToExhaust = 10;
+
+    /// <summary>
+    /// How long IsChainExhausted may take before it gives up and says the site is not exhausted. Chosen, not measured.
+    /// Continuous solving waits on it, so it is kept short of a pass.
+    /// </summary>
+    private static readonly TimeSpan ExhaustBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Whether a site is simple enough for IsChainExhausted: every marker the score wants is a stop, and there are at most
+    /// MostStopsToExhaust of them. Typically a site seen from afar, only its remnants loaded; once its monsters or
+    /// chests load it is not, since the search below lays no link for them.
+    /// </summary>
+    internal static bool SimpleEnoughToExhaust(PlanEnvironment env)
+    {
+        var stops = 0;
+
+        foreach (var target in env.Targets)
+        {
+            if (IsStop(target))
+                stops++;
+            else if (target.Wanted && !target.Shunned)
+                return false;
+        }
+
+        return stops is > 0 and <= MostStopsToExhaust;
+    }
+
+    /// <summary>
+    /// Whether one window holding every stop of a simple site, laid again from the detonator in every order over every
+    /// spot catching each, fails to better the chain. True means the site has been exhausted; continuous solving
+    /// stops on it. See SimpleEnoughToExhaust and Planning.Exhausted.
+    ///
+    /// Not a proof. The window keeps PathsPerSpot paths into each spot, takes spots from the shared ground only, and
+    /// lays no link between two stops other than the one catching the next, so a chain that bridges between stops is
+    /// outside it. False when the chain does not catch every stop, since a chain that adds one is not in the window.
+    /// What happened is kept in ExhaustedSaid.
+    /// </summary>
+    internal static bool IsChainExhausted(PlanEnvironment env, List<Vector2> chain, Func<bool> stop)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        try
+        {
+            var view = ViewOf(env);
+            var stops = env.Targets.Count(IsStop);
+            var inOrder = StopsInChainOrder(env, chain, view.Catching.Keys.ToHashSet());
+
+            if (inOrder.Count < stops)
+            {
+                ExhaustedSaid = $"not exhausted - the chain catches {inOrder.Count} of {stops} stops ({clock.ElapsedMilliseconds}ms)";
+                return false;
+            }
+
+            var relaid = RelayWindow(env, chain, view, inOrder, 0, inOrder.Count, chain.Count,
+                () => stop() || clock.Elapsed > ExhaustBudget);
+
+            if (stop())
+            {
+                ExhaustedSaid = $"stopped - a solve began ({clock.ElapsedMilliseconds}ms)";
+                return false;
+            }
+
+            if (clock.Elapsed > ExhaustBudget)
+            {
+                ExhaustedSaid = $"not exhausted - every order of {stops} stops is more than " +
+                                $"{ExhaustBudget.TotalMilliseconds:N0}ms of work ({clock.ElapsedMilliseconds}ms)";
+                return false;
+            }
+
+            if (relaid != null && Planner.Score(env, relaid) <= Planner.Score(env, chain) + 0.0001d)
+                relaid = null;
+
+            if (relaid != null)
+            {
+                ExhaustedSaid = $"not exhausted - every order of {stops} stops found {Planner.Score(env, relaid):N1} " +
+                                $"against the plan's {Planner.Score(env, chain):N1} ({clock.ElapsedMilliseconds}ms)";
+                return false;
+            }
+
+            ExhaustedSaid = $"exhausted - every order of {stops} stops found nothing above the plan's " +
+                            $"{Planner.Score(env, chain):N1} ({clock.ElapsedMilliseconds}ms)";
+            return true;
+        }
+        catch (Exception e)
+        {
+            ExhaustedSaid = $"failed - {e.GetType().Name}: {e.Message}";
+            return false;
+        }
+    }
+
+    /// <summary>What IsChainExhausted last concluded, for the dump.</summary>
+    internal static string ExhaustedSaid { get; set; } = "has not run";
 
     /// <summary>The stops the chain catches, each with the link that first catches it, in that order.</summary>
     private static List<(int Stop, int Link)> StopsInChainOrder(PlanEnvironment env, List<Vector2> chain,

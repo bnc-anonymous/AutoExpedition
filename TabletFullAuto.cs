@@ -66,6 +66,14 @@ internal static partial class Tablets
 
     private static FullAutoPhase _phase;
 
+    /// <summary>
+    /// Inventory cells the bench needs kept free for a tablet in it to come out - set when it held one and the inventory
+    /// was full - or 0. While set, the stash visit deposits junk until that many are free, Identify goes back to the
+    /// stash rather than straight to the bench, and the withdraw stops that many short of a full inventory. Cleared when
+    /// the bench next holds nothing to take out. See ReforgeNext.
+    /// </summary>
+    private static int _roomForBench;
+
     /// <summary>Where Navigate has got to: 0 the Tablets page, 1 the Expedition tablets, 2 done.</summary>
     private static int _navigateStep;
 
@@ -318,8 +326,10 @@ internal static partial class Tablets
                     return;
                 }
 
-                // A full inventory ends the withdraw at once, rather than after a tablet that cannot move times out.
-                if (InventoryFreeCells(gc) == 0 && StashTablets().Any(t => IsJunk(gc, t, settings)))
+                // A full inventory ends the withdraw at once, rather than after a tablet that cannot move times out - full
+                // short of the room the bench needs, where it needs some. See _roomForBench.
+                if (InventoryFreeCells(gc) is >= 0 and var free && free <= _roomForBench &&
+                    StashTablets().Any(t => IsJunk(gc, t, settings)))
                 {
                     _stashEmptied = false;
                     _closeStashThen = FullAutoPhase.OpenBench;
@@ -329,7 +339,8 @@ internal static partial class Tablets
                 }
 
                 if (EnoughJunkToWithdraw(gc, settings) &&
-                    MoveNext(gc, StashTablets().Where(t => IsJunk(gc, t, settings)), JunkTablet, true))
+                    MoveNext(gc, StashTablets().Where(t => IsJunk(gc, t, settings)), JunkTablet, true,
+                        room: _roomForBench > 0 && InventoryFreeCells(gc) is >= 0 and var cells ? cells - _roomForBench : null))
                     return;
 
                 if (NextSubTab(gc, SubTabPurpose.Junk) is { } next)
@@ -394,6 +405,11 @@ internal static partial class Tablets
                     return;
                 }
 
+                // The room the bench needed has been used: its tablet is out. See _roomForBench.
+                if (_roomForBench > 0 && DateTime.UtcNow - _benchOpenedAt >= BenchSettle &&
+                    BenchTablets(gc).All(t => t.Identified && (t.Rarity == ItemRarity.Normal || t.Modifiers.Length > 0)))
+                    _roomForBench = 0;
+
                 // **The inventory beside the bench is read before anything is decided from it.** Reforging was called done
                 // on an inventory not yet drawn, and the run went bench, Space, bench, round and round (2026-10-09). So:
                 // BenchSettle after the bench opens, and the inventory panel open.
@@ -447,7 +463,7 @@ internal static partial class Tablets
                     // the inventory there is another reforge to do, and a trip to the stash would only deposit and find
                     // nothing to withdraw. The deposit waits for the last round.
                     // Less those set aside, as the bench counts them. See ReforgeableJunkDrawn.
-                    if (_stashEmptied && CarriedTablets(gc).Count(t => IsJunk(gc, t, settings)) - Unloadable.Count >= 3)
+                    if (_stashEmptied && _roomForBench == 0 && CarriedTablets(gc).Count(t => IsJunk(gc, t, settings)) - Unloadable.Count >= 3)
                     {
                         _rounds++;
                         _phase = FullAutoPhase.OpenBench;
@@ -517,6 +533,13 @@ internal static partial class Tablets
                 }
 
                 if (MoveNext(gc, Depositable(gc, settings), DepositedTablet, false))
+                    return;
+
+                // **Junk out as well, as many as the bench needs room for**, when the inventory is still too full for it. Its
+                // own batch, so the deposit above is done with first. See _roomForBench.
+                if (_roomForBench > 0 && InventoryFreeCells(gc) is >= 0 and var freeCells &&
+                    MoveNext(gc, InventoryTablets().Where(t => IsJunk(gc, t, settings)), JunkForRoom, false,
+                        room: Math.Max(0, _roomForBench - freeCells)))
                     return;
 
                 // **In a craft and reforge run, tablets wanting a currency are crafted before more junk comes out.** Kept in
@@ -802,7 +825,7 @@ internal static partial class Tablets
                 continue;
 
             // Not worth a visit by what it held when last seen: passed by, and counted as done. See SubTabWorthVisiting.
-            if (!SubTabWorthVisiting(number, purpose))
+            if (!SubTabWorthVisiting(gc, number, purpose))
             {
                 SubTabsDone.Add(number);
                 continue;
@@ -1019,6 +1042,8 @@ internal static partial class Tablets
         _previousSent = doing;
         UseTolerance(OtherTolerancePx);
         _clickCell = null;
+
+        PlannedAhead.Clear();
 
         if (WorldPointOf(gc, entity) is not { } point || !Input.MoveTo(point, ctrl: ctrl))
         {

@@ -291,16 +291,6 @@ public class TabletAutomationSettings
     public ToggleNode TidyAfterCraftAndReforge { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// The least time between two ctrl+clicks moving tablets between the stash and the inventory. Each click is taken to
-    /// have gone through and the cursor moves straight on to the next tablet; this slows the batch if the game drops
-    /// clicks that come too fast. See Tablets.MoveNext.
-    /// </summary>
-    [Menu("Pause between clicks (ms)",
-        "The least time between clicks when moving tablets.\n" +
-        "Raise it if tablets get missed.")]
-    public RangeNode<int> PauseBetweenClicksMs { get; set; } = new RangeNode<int>(0, 0, 200);
-
-    /// <summary>
     /// ExileInput2's Shortest Move for a hop from one tablet to the next in a batch - a withdraw after a withdraw, a
     /// bench load after a load, a currency use after a use - in place of ExileInput2's own 40ms. ExileInput2 adds it to
     /// every move's time, so every other move of a run, the first to a tablet included, keeps ExileInput2's own. 0 uses

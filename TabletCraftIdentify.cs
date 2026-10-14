@@ -181,6 +181,15 @@ internal static partial class Tablets
 
                 var brought = TabletsBroughtOut(gc);
 
+                // **In a craft and reforge run, what the run works on next stays in the inventory**: junk, for the
+                // reforging pass to load from there, and a tablet wanting a currency, crafted where it is. Deposited, the
+                // identified tablets were withdrawn again a minute later for reforging (2026-10-12). The put-away at the
+                // end deposits whatever is left. Not after a round that stopped on a full inventory: the room is wanted
+                // for the next round's withdraw.
+                if (_craftAndReforge && !_identifyStoppedFull)
+                    brought = brought.Where(t => !IsJunk(gc, t, settings) &&
+                                                 !(t.Uses == FullUses && CraftingActions.Contains(ActionOf(t, settings)))).ToList();
+
                 // A full sub-tab showing: to one with room first, rather than waiting out a tablet that cannot go in.
                 if (StashTablets().Count >= SubTabHolds && brought.Count > 0 && NextSubTab(gc, SubTabPurpose.Room) is { } room)
                 {

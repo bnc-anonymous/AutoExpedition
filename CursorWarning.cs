@@ -25,22 +25,27 @@ internal static class CursorWarning
     /// </summary>
     private static readonly HashSet<string> Words = new(StringComparer.Ordinal)
     {
-        "Bad camera angle", "Too far", "Unclickable", "Too far from runes button", "Panel failure, choose manually",
-        "Failed to scroll", "Marker load failure", "Moving", "Deviated", "Placement failure", "Placement refused",
+        "Bad camera angle", "Too far from previous bomb", "Unclickable", "Too far from runes button", "Panel failure, choose manually",
+        "Failed to scroll", "Marker load failure", "Character moving", "Character moved", "Mouse moved", "Key pressed",
+        "Stopped", "Deviated", "Placement failure", "Placement refused",
         "Placement lands wrong", "Marker not lit", "Placement key not working", "Timeout", "Window did not open",
-        "Failed to click", "ExileInput2 input refused", "ExileInput2 not installed", "ExileInput2 busy", "No plan",
-        "Missing currency",
+        "Failed to click", "ExileInput2 input refused", "ExileInput2 not installed", "ExileInput2 busy",
+        "Missing currency", "AutoExpedition: Automation is enabled\nbut ExileInput2 was not found.", "Inventory full",
+        "AutoExpedition: ExileInput2 is out of date.\nUpdate it - automation will not work fully.", "Item held",
     };
 
     /// <summary>
     /// Placement status words shown nowhere: the progress of a run (Arming, Opening, Choosing and the rest, and
-    /// Placing n and Moving n), and Walk closer, which a run says when the next spot is off screen - the player can
-    /// see that. The score area shows the bomb count instead. See Overlay.Word.
+    /// Placing n and Moving n), Walk closer, which a run says when the next spot is off screen - the player can
+    /// see that - No plan, which an action key press with nothing to place or loot says, and which told the player
+    /// nothing they could act on, and Next spot covered, a press stopping after it placed something because the next
+    /// spot is under the interface: that spot is drawn yellow, not yet placeable, which already says so. The score area
+    /// shows the bomb count instead. See Overlay.Word and Placement.AfterPlacing.
     /// </summary>
     private static readonly HashSet<string> Unshown = new(StringComparer.Ordinal)
     {
         "Walk closer", "Arming", "Opening", "Choosing", "Scrolling", "Tidying", "Clearing", "Hiding labels",
-        "Aiming again",
+        "Aiming again", "No plan", "Next spot covered", "Cancelled",
     };
 
     /// <summary>Whether a placement status word is one nobody is shown. See Unshown.</summary>
@@ -48,9 +53,12 @@ internal static class CursorWarning
         word != null && (Unshown.Contains(word) || word.StartsWith("Placing ", StringComparison.Ordinal) ||
                          word.StartsWith("Moving ", StringComparison.Ordinal));
 
-    private static readonly Color Warning = Color.FromArgb(255, 235, 90, 90);
+    internal static readonly Color Warning = Color.FromArgb(255, 235, 90, 90);
 
     private static (string Word, DateTime At) _shown = ("", DateTime.MinValue);
+
+    /// <summary>How long the warning showing stays up, in seconds, when it set its own; null for the setting's.</summary>
+    private static int? _shownFor;
 
     /// <summary>Whether a placement status word is one this shows rather than the score area.</summary>
     public static bool IsWarning(string word) => word != null && Words.Contains(word);
@@ -59,7 +67,20 @@ internal static class CursorWarning
     public static void Show(string word)
     {
         if (IsWarning(word))
+        {
             _shown = (word, DateTime.UtcNow);
+            _shownFor = null;
+        }
+    }
+
+    /// <summary>Shows a warning for this many seconds, whatever Cursor warning seconds says. See Show.</summary>
+    public static void Show(string word, int seconds)
+    {
+        if (IsWarning(word))
+        {
+            _shown = (word, DateTime.UtcNow);
+            _shownFor = seconds;
+        }
     }
 
     /// <summary>Takes the warning down. Called when a placement run begins.</summary>
@@ -70,7 +91,7 @@ internal static class CursorWarning
         if (_shown.Word.Length == 0 || !Safe.Read(() => settings.Display.ScoreArea.CursorWarnings.Value, true))
             return;
 
-        var seconds = Math.Max(1, Safe.Read(() => settings.Display.ScoreArea.CursorWarningSeconds.Value, 4));
+        var seconds = Math.Max(1, _shownFor ?? Safe.Read(() => settings.Display.ScoreArea.CursorWarningSeconds.Value, 4));
         var age = (DateTime.UtcNow - _shown.At).TotalSeconds;
 
         if (age >= seconds)
