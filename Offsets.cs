@@ -96,17 +96,6 @@ internal static class Offsets
     /// <summary>That object + this is the session.</summary>
     public const int OwnerSession = 0x20F0;
 
-    /// <summary>
-    /// The session + this is the area object the reach and blast code test for a Grand Expedition. See
-    /// Detonator.GrandAreaFlag.
-    /// </summary>
-    public const int SessionArea = 0x98;
-
-    /// <summary>The area object + this is the dword that reads 0x1C or 0x27 on a Grand Expedition.</summary>
-    public const int AreaGrandKind = 0x1B4;
-
-    /// <summary>The area object + this is the word that reads 0x1C03 on a Grand Expedition.</summary>
-    public const int AreaGrandWord = 0x2A;
 
     /// <summary>And the session + this is TerrainStruct. See VtableTerrain.</summary>
     public const int SessionTerrain = 0x8D0;
@@ -259,6 +248,7 @@ internal static class Offsets
 
     /// <summary>The static type descriptor `0x14173071D` loads to find the volume component.</summary>
     public const long VolumeDescriptor = 0x1434D2E80 - 0x140000000;
+
 
     // ---- guards ------------------------------------------------------------------------------------
 

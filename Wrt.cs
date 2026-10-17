@@ -118,24 +118,6 @@ internal static class Wrt
         public string Matches;
 
         /// <summary>
-        /// How often a fresh socket comes up as this, as a fraction. Rune rows only.
-        ///
-        /// **The third store, closed.** These lived in an array in Rolls.cs - twenty-nine of them
-        /// against thirty-four rune rows in a live table - so the list of runes that exist was written
-        /// down twice and the two could disagree without anybody noticing.
-        ///
-        /// Measured rather than read from the game, which is settled rather than open:
-        /// Expedition2RunesWeight is named for the weights and exposes none - Id, SlotCount, RuneSlot,
-        /// Rune, Level, and no frequency. Which runes a LEVEL admits is readable, from that Level
-        /// field, so the pool is gated by the game and weighted by this.
-        ///
-        /// Used in exactly two places - the draw pool's total and the reroll advisor's enumeration -
-        /// and never in the score of a remnant whose runes are known, which is every remnant the
-        /// planner sees. See TableGrammar and reroll_plan.md.
-        /// </summary>
-        public float? Share;
-
-        /// <summary>
         /// Whether anybody has actually decided this row's weight, or it is still the default.
         ///
         /// **This is what "unset" means, and it had nowhere to live.** A row's Status was worked out
@@ -196,7 +178,6 @@ internal static class Wrt
             Alike(Children, other.Children) &&
             Alike(Effect, other.Effect) &&
             Alike(Matches, other.Matches) &&
-            Nearly(Share, other.Share) &&
             Decided(Set) == Decided(other.Set) &&
             Alike(Kind, other.Kind) &&
             Alike(NameInGame, other.NameInGame) &&
@@ -240,7 +221,7 @@ internal static class Wrt
         // nothing. See Name.
         public bool Empty =>
             Weight == null && Size == null && Stacks == null && Tags == null &&
-            Children == null && Effect == null && Matches == null && Share == null &&
+            Children == null && Effect == null && Matches == null &&
             Set == null && Kind == null && Granter == null && NameInGame == null;
 
         // Seen and First are left out on purpose. A row holding nothing but "I saw this once" has no
@@ -565,7 +546,6 @@ internal static class Wrt
                 Children = mine.Children ?? shipped?.Children,
                 Effect = mine.Effect ?? shipped?.Effect,
                 Matches = mine.Matches ?? shipped?.Matches,
-                Share = mine.Share ?? shipped?.Share,
                 Set = mine.Set ?? shipped?.Set,
                 Kind = mine.Kind ?? shipped?.Kind,
                 NameInGame = mine.NameInGame ?? shipped?.NameInGame,
@@ -1092,13 +1072,6 @@ internal static class Wrt
             moved = true;
         }
 
-        if (mine.Share != null && shipped.Share != null &&
-            MathF.Abs(mine.Share.Value - shipped.Share.Value) < 0.0005f)
-        {
-            mine.Share = null;
-            moved = true;
-        }
-
         return moved;
     }
 
@@ -1355,7 +1328,6 @@ internal static class Wrt
             // Field by field, the labelled row winning where both say something.
             already.Weight ??= mine.Weight;
             already.Size ??= mine.Size;
-            already.Share ??= mine.Share;
             already.Stacks ??= mine.Stacks;
             already.Name ??= mine.Name;
             already.Type ??= mine.Type;
@@ -1460,7 +1432,7 @@ internal static class Wrt
 
         return (row.Weight == null || MathF.Abs(row.Weight.Value - seed) < 0.0001f) &&
                row.Tags == null && row.Stacks == null && row.Children == null && row.Effect == null &&
-               row.Matches == null && row.Share == null && row.NameInGame == null && row.Granter == null &&
+               row.Matches == null && row.NameInGame == null && row.Granter == null &&
                row.Name == null && row.Type == null;
     }
 
@@ -1712,9 +1684,6 @@ internal static class Wrt
                 if (row.Matches != null)
                     text.Append(", \"matches\": \"").Append(Safely(row.Matches)).Append('"');
 
-                if (row.Share != null)
-                    text.Append(", \"share\": ").Append(Number(row.Share.Value));
-
                 if (row.Set != null)
                     text.Append(", \"set\": ").Append(row.Set.Value ? "true" : "false");
 
@@ -1810,9 +1779,8 @@ internal static class Wrt
                         NumberStyles.Float, CultureInfo.InvariantCulture, out var size))
                     row.Size = size;
 
-                if (float.TryParse(Between(line, "\"share\": ", ",").TrimEnd(' ', '}'),
-                        NumberStyles.Float, CultureInfo.InvariantCulture, out var share))
-                    row.Share = share;
+                // "share" is no longer read: a rune's chance of coming up in a fresh socket, unused since rerolling
+                // weighted outcomes by Rolls.ShareOfPin. A file still holding it loads, and loses it on its next save.
 
                 var stacks = Between(line, "\"stacks\": ", ",").TrimEnd(' ', '}').Trim();
 

@@ -335,8 +335,22 @@ internal sealed class Scoring
         // Only with nothing placed. Kept holds a whole route from the detonator and the line below
         // prepends the explosives already down, so using it mid-chain would count the front of the
         // route twice.
-        if (chain is not { Count: > 0 } && placed.Length == 0 && Kept.Chain is { Count: > 0 })
-            chain = Kept.Chain;
+        //
+        // Nor at a site already set off, whose filed route is the chain that went off: re-entering a finished site with
+        // nothing down showed that route's score as though it were still to be placed. With nothing to score, there is
+        // no figure. See Detonator.SetOffHere.
+        if (chain is not { Count: > 0 } && placed.Length == 0)
+        {
+            if (Detonator.SetOffHere(gc))
+            {
+                Known = false;
+
+                return;
+            }
+
+            if (Kept.Chain is { Count: > 0 })
+                chain = Kept.Chain;
+        }
 
         // **A short live chain is scored as it will be finished, and the finishing is done off the frame.** See
         // the note further down on why a live chain is scored completed. The completion is a greedy build over every

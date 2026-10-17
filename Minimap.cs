@@ -101,6 +101,7 @@ internal static class Minimap
         var from = queue == 0 ? Detonator.LastExplosiveGridPosition(gc) : Vector2.Zero;
         var behind = false;
         var thickness = MathF.Max(0.5f, settings.Display.ThePlan.PlanThickness.Value);
+        var headStillToDraw = Detonator.SetOffHere(gc);
 
         for (var i = 0; i < plan.Points.Count; i++)
         {
@@ -125,7 +126,11 @@ internal static class Minimap
             }
 
             if (from != Vector2.Zero && !gone && !behind)
-                graphics.DrawLineOnMap(from, at, thickness, colour);
+            {
+                graphics.DrawLineOnMap(from, at, thickness,
+                    headStillToDraw ? settings.Display.ThePlan.ChainHeadColour : colour);
+                headStillToDraw = false;
+            }
 
             from = at;
             behind = gone;
@@ -365,7 +370,7 @@ internal static class Minimap
     /// <summary>
     /// Each remnant's socket count, written just under it on whichever map is up, in the propagating rune colour on a dark
     /// background SocketCountPaddingPx wider than the number either side, so it reads over the map. Remnants not yet spent, with a socket count read. See
-    /// RemnantRewardSettings.DrawSocketCountOnMinimap.
+    /// RerollDisplaySettings.DrawSocketCountOnMinimap.
     /// </summary>
     public static void SocketCounts(Graphics graphics, GameController gc, AutoExpeditionSettings settings, List<Target> targets)
     {
@@ -393,6 +398,59 @@ internal static class Minimap
             // Under the remnant's own map icon, which the game draws at its position. The background drawn here rather
             // than by DrawTextWithBackground, which ends at the digit's edge; a space either side was a character too wide.
             var corner = new Vector2(at.X - size.X / 2f, at.Y + SocketCountBelowPx);
+
+            graphics.DrawBox(new ExileCore2.Shared.RectangleF(corner.X - SocketCountPaddingPx, corner.Y,
+                size.X + 2f * SocketCountPaddingPx, size.Y), back);
+            graphics.DrawText(text, corner, colour);
+        }
+    }
+
+    /// <summary>
+    /// Each remnant's reroll verdict, "+200 (30%)", written under it on whichever map is up, in the same colour and on
+    /// the same background as the socket count: on the line below the count where one is drawn, in its place where not. The remnants Overlay.ShowsRollFigures picks for the
+    /// figure beside the button, so the map and the world never disagree about which remnants have one. See
+    /// Overlay.RollFigureText and RerollDisplaySettings.RollFiguresOnMinimap.
+    ///
+    /// Not under a lone remnant, one attached to no dig site: no chain reaches it, so its verdict is a keep at 0 for lying past the chain's reach (dump 2026-10-17 13:18:07)
+    /// and the figure under it said nothing. See Scan.Loose and Target.Lone.
+    /// </summary>
+    public static void RollFigures(Graphics graphics, GameController gc, AutoExpeditionSettings settings, Scan scan,
+        List<Target> targets)
+    {
+        if (targets == null || !Showing(gc))
+            return;
+
+        using var clip = graphics.MapSurfaceClip();
+
+        var colour = Overlay.RollFigureColour(settings);
+        var back = Color.FromArgb(170, 0, 0, 0);
+        var counting = settings.Display.Remnants.Rerolls.DrawSocketCountOnMinimap;
+
+        foreach (var target in targets)
+        {
+            if (target.Kind != TargetKind.Remnant || target.Spent || !Overlay.ShowsRollFigures(settings, target) ||
+                target.Lone == true || scan != null && scan.Loose(gc, target.Grid))
+                continue;
+
+            var said = Rolling.Here.Of(target.Grid);
+
+            if (said == null)
+                continue;
+
+            var at = Safe.Read(() => graphics.GridToMap(target.Grid, target.Grid), Vector2.Zero);
+
+            if (at == Vector2.Zero)
+                continue;
+
+            var text = Overlay.RollFigureText(said);
+            var size = graphics.MeasureText(text);
+
+            // Under the remnant's map icon, a line lower when its socket count is drawn there - SocketCounts skips the
+            // same remnants this does, so the test matches it.
+            var countLine = counting && target.Sockets > 0
+                ? graphics.MeasureText(target.Sockets.ToString(System.Globalization.CultureInfo.InvariantCulture)).Y
+                : 0f;
+            var corner = new Vector2(at.X - size.X / 2f, at.Y + SocketCountBelowPx + countLine);
 
             graphics.DrawBox(new ExileCore2.Shared.RectangleF(corner.X - SocketCountPaddingPx, corner.Y,
                 size.X + 2f * SocketCountPaddingPx, size.Y), back);

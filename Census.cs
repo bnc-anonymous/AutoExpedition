@@ -252,7 +252,13 @@ internal sealed class Census
                 remnantWithPowerRune.ToString(CultureInfo.InvariantCulture),
                 luckyRolls.ToString(CultureInfo.InvariantCulture),
                 luckyRollChance.ToString(CultureInfo.InvariantCulture),
-                grand ? "1" : "0"));
+                grand ? "1" : "0",
+
+                // **The recipe behind `selected`, by id**, because a name can cover two recipes ("Leylines" is two of
+                // them). On a rolled remnant this is the recipe the roll locked it to, which is what the reroll model's
+                // outcomes have to be checked against - see Rolling.ShapesARollCouldProduce. Blank while nothing is set,
+                // and in the moments after a roll before the game sets it, when the remnant still lists every option.
+                Clean(Safe.Read(() => valuation.ChosenRecipeId(target.Entity), null) ?? "")));
         }
 
         if (rows.Count > 0)
@@ -355,7 +361,7 @@ internal sealed class Census
         "dedupe,activated,selected,reachable,admittedPins," +
         "mapSlotFloor," +
         "mapRemnantWithAtLeastSlots,mapRemnantWithPowerRune,mapLuckyRolls,mapLuckyRollChancePct," +
-        "grand";
+        "grand,selectedRecipe";
 
     /// <summary>
     /// Brings an existing file up to the current header, once, leaving its rows alone.

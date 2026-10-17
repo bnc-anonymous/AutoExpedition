@@ -873,8 +873,13 @@ internal static class Detonator
     /// Whether this is a Grand site and it has been set off, so there is nothing left to plan or draw on it. Grand
     /// only: a Grand map has one detonator, while an ordinary map can hold several expeditions, and the latch was not
     /// trusted to tell one of those from another when the site in front of the player changes. See SetOffHere.
+    ///
+    /// Grand by the game's own flag where it can be read, and by the explosive count only where it cannot. The count
+    /// comes from the panel, which reads 0 of 0 on a site re-entered after it was set off, and its latch is lost with the
+    /// plugin or a new area hash, so the count fell back to the assumed five and a finished Grand site was solved and
+    /// planned afresh (dump 2026-10-16 04:14:17: AreaKind 0x1C, count 5, set off). See GrandAreaFlag.
     /// </summary>
-    public static bool GrandSiteSetOff(GameController gc) => Grand(gc) && SetOffHere(gc);
+    public static bool GrandSiteSetOff(GameController gc) => (GrandAreaFlag(gc) ?? Grand(gc)) && SetOffHere(gc);
 
     /// <summary>
     /// When each site was latched as set off and what was read, for the dump. Cleared with the latch. A latch written
@@ -1045,6 +1050,12 @@ internal static class Detonator
     /// problem the plugin knows, and being wrong the other way is much cheaper: a five link answer
     /// on a fifteen link site is a usable prefix, while a fifteen link answer on a five link site
     /// is a chain that cannot be placed.
+    ///
+    /// Where the game's Grand flag says Grand, that is not an assumption, so the Grand count is used,
+    /// scaled by the map's MapExpeditionExplosivesPct as at another player's site. Not latched: the panel's
+    /// own count replaces it once read, whether higher or lower. Without it a Grand site read as ordinary
+    /// until its panel filled, and again after it was set off, when the panel reads 0 of 0 (dump
+    /// 2026-10-16 04:14:17). See GrandAreaFlag.
     /// </summary>
     public static int ExplosivesToPlanFor(GameController gc)
     {
@@ -1116,6 +1127,9 @@ internal static class Detonator
         if (_counted <= 0 && SiteIsAnotherPlayers(gc))
             return ExplosivesAtAnotherPlayersSite(gc);
 
+        if (_counted <= 0 && GrandAreaFlag(gc) == true)
+            return (int)MathF.Round(GrandExplosives * ExplosivesFactorOfMap(gc));
+
         return _counted > 0 ? _counted : Assumed;
     }
 
@@ -1171,39 +1185,29 @@ internal static class Detonator
     /// <summary>
     /// The game's own test for a Grand Expedition, or null when it cannot be read. The reach code at `0x141F5ABB8` and
     /// the blast code at `0x1417350B0` take the Grand figures when the area object at `[session+0x98]` reads 0x1C or
-    /// 0x27 at +0x1B4, or 0x1C03 in the word at +0x2A (read from the binary; see NOTES, "The reach"). The session is
-    /// `[[ClientExpedition+0x48]+0x20F0]`, which is there at another player's site, where the panel gives no count.
+    /// 0x27 at +0x1B4, or 0x1C03 in the word at +0x2A (read from the binary; see NOTES, "The reach"). That object is
+    /// ExileCore2's IngameData.CurrentArea, a WorldArea: +0x1B4 is its AreaKind and the word at +0x2A the low half of its
+    /// WorldAreaId. Read raw until ExileCore2 named them; on a Grand site at Grazed Prairie (dump 2026-10-16 04:14:17) the
+    /// walk to [session+0x98] reached the same object, AreaKind read 0x1C as +0x1B4 did, and +0x2A read 0x7B6E against a
+    /// WorldAreaId of 0x17B6E. Works at another player's site, where the panel gives no count.
     /// </summary>
     public static bool? GrandAreaFlag(GameController gc) =>
-        GrandAreaFields(gc) is { } fields ? fields.Kind is 0x1C or 0x27 || fields.Word == 0x1C03 : null;
+        GrandAreaFields(gc) is { } fields ? fields.Kind is 0x1C or 0x27 || (ushort)fields.WorldAreaId == 0x1C03 : null;
 
-    /// <summary>The two fields GrandAreaFlag tests, raw, or null when the walk to them breaks. Also printed by the dump.</summary>
-    public static (int Kind, ushort Word)? GrandAreaFields(GameController gc)
+    /// <summary>
+    /// The two fields GrandAreaFlag tests, WorldArea.AreaKind and WorldArea.WorldAreaId of IngameData.CurrentArea, or null
+    /// when the current area cannot be read. Also printed by the dump.
+    /// </summary>
+    public static (int Kind, int WorldAreaId)? GrandAreaFields(GameController gc)
     {
-        var expedition = Safe.Read(Info(gc), static i => i.Address, 0L);
-        var owner = expedition == 0 ? 0 : Pointer(gc, expedition + Offsets.ExpeditionOwner);
-        var session = owner == 0 ? 0 : Pointer(gc, owner + Offsets.OwnerSession);
-        var area = session == 0 ? 0 : Pointer(gc, session + Offsets.SessionArea);
+        var area = Safe.Read(gc, static g => g.IngameState.Data.CurrentArea, (WorldArea)null);
 
-        if (area == 0)
+        if (Safe.Read(area, static a => a.Address, 0L) < Offsets.Lowest)
             return null;
 
-        var kind = Safe.Read(() => gc.Memory.ReadBytes(area + Offsets.AreaGrandKind, 4), null);
-        var word = Safe.Read(() => gc.Memory.ReadBytes(area + Offsets.AreaGrandWord, 2), null);
-
-        return kind is { Length: 4 } && word is { Length: 2 }
-            ? (BitConverter.ToInt32(kind, 0), BitConverter.ToUInt16(word, 0))
-            : null;
+        return (Safe.Read(area, static a => a.AreaKind, 0), Safe.Read(area, static a => a.WorldAreaId, 0));
     }
 
-    /// <summary>The qword at an address when it looks like a pointer, else 0.</summary>
-    private static long Pointer(GameController gc, long at)
-    {
-        var raw = Safe.Read(() => gc.Memory.ReadBytes(at, 8), null);
-        var value = raw is { Length: 8 } ? BitConverter.ToInt64(raw, 0) : 0L;
-
-        return value > Offsets.Lowest && (value & 7) == 0 ? value : 0L;
-    }
 
     /// <summary>
     /// The explosives another player's site is planned for: Explosives at another player's site where set; else Grand's
@@ -1226,15 +1230,24 @@ internal static class Detonator
         return _anotherPlayersCount;
     }
 
+    /// <summary>
+    /// What the map's MapExpeditionExplosivesPct multiplies a site's explosives by: 1 plus the increase. The game's
+    /// rounding is not known; a run with +29% laid 20 links on 15 (spawns census).
+    /// </summary>
+    private static float ExplosivesFactorOfMap(GameController gc)
+    {
+        var increase = Safe.Read(() => gc.IngameState.Data.MapStatsVisible, null) is { } stats &&
+                       stats.TryGetValue(GameStat.MapExpeditionExplosivesPct, out var pct) ? pct : 0;
+
+        return 1f + increase / 100f;
+    }
+
     private static int _anotherPlayersCount;
     private static DateTime _anotherPlayersCountAt;
 
     private static int ExplosivesAtAnotherPlayersSiteNow(GameController gc)
     {
-
-        var increase = Safe.Read(() => gc.IngameState.Data.MapStatsVisible, null) is { } stats &&
-                       stats.TryGetValue(GameStat.MapExpeditionExplosivesPct, out var pct) ? pct : 0;
-        var factor = 1f + increase / 100f;
+        var factor = ExplosivesFactorOfMap(gc);
         var placed = ExplosivesStandingInOrder(gc).Length;
         var grand = GrandAreaFlag(gc) ?? (placed > MathF.Round(Assumed * factor) || RemnantsAtSite >= GrandRemnantsAtLeast);
 
@@ -1310,10 +1323,14 @@ internal static class Detonator
     /// So the total is what says whether the panel knows anything. Below one it knows nothing and
     /// the assumed set stands; at one or more it is stating the site's size and the remaining count
     /// beside it means what it says. See Expected, which latches that same total.
+    ///
+    /// The assumed set is a Grand set where the game's Grand flag says so, so a Grand site is planned at its full
+    /// length on the approach rather than as five links. See ExplosivesToPlanFor.
     /// </summary>
     public static int ExplosivesInHand(GameController gc) =>
         PanelReady(gc) ? Safe.Read(Info(gc), static i => i.RemainingExplosiveCount, 0)
         : SiteIsAnotherPlayers(gc) ? ExplosivesAtAnotherPlayersSite(gc)
+        : GrandAreaFlag(gc) == true ? (int)MathF.Round(GrandExplosives * ExplosivesFactorOfMap(gc))
         : Assumed;
 
     /// <summary>

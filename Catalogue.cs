@@ -1009,21 +1009,20 @@ internal static class Catalogue
             7 => rows.OrderBy(r => Celled(r, x => x.Matches), StringComparer.OrdinalIgnoreCase),
             8 => rows.OrderBy(r => r.Type, StringComparer.OrdinalIgnoreCase),
             9 => rows.OrderBy(r => r.Size ?? float.MinValue),
-            10 => rows.OrderBy(r => Safe.Read(() => Wrt.Of(r.Filed)?.Share, null) ?? float.MinValue),
-            11 => rows.OrderBy(r => r.Stacks == null ? 2 : r.Stacks.Value ? 1 : 0),
-            12 => rows.OrderBy(r => r.Seen),
+            10 => rows.OrderBy(r => r.Stacks == null ? 2 : r.Stacks.Value ? 1 : 0),
+            11 => rows.OrderBy(r => r.Seen),
 
             // Blank last whichever way it points, like the other columns that can be empty: a
             // built-in with no first sighting is not the oldest thing in the game.
-            13 => rows.OrderBy(r => r.First ?? DateTime.MinValue),
-            14 => rows.OrderBy(r => r.Filed, StringComparer.OrdinalIgnoreCase),
+            12 => rows.OrderBy(r => r.First ?? DateTime.MinValue),
+            13 => rows.OrderBy(r => r.Filed, StringComparer.OrdinalIgnoreCase),
 
             // The six that had no column until they were given one. Without these, clicking their
             // headers fell through to the default and sorted by Name - which is the fault the note
             // above this switch describes, arriving the moment a column was added and not wired up.
-            15 => rows.OrderBy(r => Celled(r, x => x.NameInGame), StringComparer.OrdinalIgnoreCase),
-            16 => rows.OrderBy(r => Celled(r, x => x.Granter), StringComparer.OrdinalIgnoreCase),
-            17 => rows.OrderBy(r => Celled(r, x => x.Kind), StringComparer.OrdinalIgnoreCase),
+            14 => rows.OrderBy(r => Celled(r, x => x.NameInGame), StringComparer.OrdinalIgnoreCase),
+            15 => rows.OrderBy(r => Celled(r, x => x.Granter), StringComparer.OrdinalIgnoreCase),
+            16 => rows.OrderBy(r => Celled(r, x => x.Kind), StringComparer.OrdinalIgnoreCase),
             _ => rows.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase),
         };
 
@@ -1119,27 +1118,24 @@ internal static class Catalogue
             Number(row, row.Size, 4f, 200f, 2, "s", (r, v) => r.Size = v);
 
             ImGui.TableSetColumnIndex(10);
-            Drawn(row);
-
-            ImGui.TableSetColumnIndex(11);
             Stacking(row);
 
-            ImGui.TableSetColumnIndex(12);
+            ImGui.TableSetColumnIndex(11);
             Tallied(row);
 
-            ImGui.TableSetColumnIndex(13);
+            ImGui.TableSetColumnIndex(12);
             First(row);
 
-            ImGui.TableSetColumnIndex(14);
+            ImGui.TableSetColumnIndex(13);
             Called(row);
 
-            ImGui.TableSetColumnIndex(15);
+            ImGui.TableSetColumnIndex(14);
             Cell(row, "name_in_game", x => x.NameInGame, (r, v) => r.NameInGame = v);
 
-            ImGui.TableSetColumnIndex(16);
+            ImGui.TableSetColumnIndex(15);
             Cell(row, "granter", x => x.Granter, (r, v) => r.Granter = v);
 
-            ImGui.TableSetColumnIndex(17);
+            ImGui.TableSetColumnIndex(16);
             Cell(row, "kind", x => x.Kind, (r, v) => r.Kind = v);
         }
         finally
@@ -1332,9 +1328,6 @@ internal static class Catalogue
         // is there - unconditionally, since a cell that shows itself only when somebody already
         // suspects it is the fault this line exists to end.
         Line(said, "granted by", row.Filed.Length > 0 ? Wrt.Of(row.Filed)?.Granter : null);
-        Line(said, "share", row.Filed.Length > 0
-            ? Wrt.Of(row.Filed)?.Share?.ToString("0.####", CultureInfo.InvariantCulture)
-            : null);
         Line(said, "stacks", row.Stacks == null ? null : row.Stacks.Value ? "yes" : "no");
         Line(said, "seen", row.Seen > 0 ? row.Seen.ToString() : null);
         Line(said, "first seen", row.First?.ToLocalTime().ToString("dd MMM HH:mm",
@@ -1397,7 +1390,6 @@ internal static class Catalogue
         ("Matches", ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultHide, 2.2f),
         ("Type", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide, 90f),
         ("Size", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide, 70f),
-        ("Share", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide, 70f),
         ("Stacks", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide, 0f),
         ("Seen", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide, 0f),
         ("First seen", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide, 110f),
@@ -1427,7 +1419,6 @@ internal static class Catalogue
         ("Children", "Children", "column, hover, editor"),
         ("Effect", "Effect", "column, editor, and its own tooltip"),
         ("Matches", "Matches", "column, hover, editor"),
-        ("Share", "Share", "column, hover, editor"),
         // It claimed the Status column while that column printed which FILE the row was in, so
         // the cell was on disk, load bearing, and nowhere on screen - the fault this list exists to
         // catch, surviving inside the list itself because the check only verifies that the named
@@ -1514,7 +1505,6 @@ internal static class Catalogue
             Field("Matches", () => Binding(row));
             Field("Type", () => Typing(row));
             Field("Size", () => Number(row, row.Size, 4f, 200f, 2, "s", (r, v) => r.Size = v));
-            Field("Share", () => Drawn(row));
             Field("Stacks", () => Stacking(row));
             Field("Seen", () => Tallied(row));
             Field("First seen", () => First(row));
@@ -1817,29 +1807,6 @@ internal static class Catalogue
     /// Expedition2RunesWeight is named for the weights and exposes none. Which runes a level admits is
     /// readable from its Level field; how often each comes up is not.
     /// </summary>
-    private static void Drawn(Row row)
-    {
-        if (row.Filed.Length == 0 || !row.Filed.StartsWith("rune:", StringComparison.Ordinal))
-        {
-            Blank("Only a rune is drawn from a pool, so only a rune has a share of it.");
-
-            return;
-        }
-
-        Number(row, Wrt.Of(row.Filed)?.Share, 0f, 1f, 4, "share",
-            (r, v) => r.Share = v);
-
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip(
-                "How often a fresh socket comes up as this rune, as a fraction - Adaptive is about " +
-                "0.095, Tempest about 0.002.\n\nUsed when pricing a REROLL and nowhere else: a " +
-                "remnant whose runes you can already read is scored from those runes, not from this." +
-                "\n\nMeasured, not read from the game - Expedition2RunesWeight is named for the " +
-                "weights and carries none.");
-        }
-    }
-
     /// <summary>
     /// What binds this row to something in the world.
     ///
@@ -2228,23 +2195,13 @@ internal static class Catalogue
 
             if (ImGui.IsItemHovered())
             {
-                // **Three cells share this control and a blank means something different in each.**
-                // Share had the weight sentence, which talks about Total weight and children and is
-                // simply not about this column. Worse, a blank share is not neutral: the reroll
-                // pricing drops a rune with no share out of the draw pool, so the cell had to say
-                // what leaving it empty costs. See Rolls.Runes.
+                // **Two cells share this control and a blank means something different in each.**
                 ImGui.SetTooltip(id switch
                 {
                     "s" => "Nothing stored, so this is measured at the ordinary size - the " +
                            "smallest an entity can be. The cell stays empty because nothing is " +
                            "written here, not because the size is nought. Type one to disagree, " +
                            "and clear it to go back to the default.\n\n" + Extents.MeasuredSizes(),
-                    "share" => "Nothing stored, and blank is not neutral here: a rune with no " +
-                               "share is left out of the draw pool entirely, so the reroll " +
-                               "pricing treats it as one that never comes up.\n\nThe shares " +
-                               "that are written already sum to one, so giving this one a number " +
-                               "without lowering the others would make the pool add up to more " +
-                               "than everything.",
                     _ => "Nothing stored, which is worth nought - a weight is a number somebody " +
                          "typed and an empty cell is nobody having typed one. What the row is " +
                          "worth all told is in Total weight beside it, rolled up from its children " +

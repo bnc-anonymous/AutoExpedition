@@ -359,6 +359,9 @@ internal static partial class Tablets
     /// </summary>
     private static void ToggleReforging(GameController gc, TabletRerollingSettings settings, TabletRun run = TabletRun.Reforge)
     {
+        if (run is TabletRun.Craft or TabletRun.Reforge or TabletRun.FullAuto)
+            CraftingAskedInArea = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
         if (_reforgingHasCursor)
         {
             StopReforging("stopped by the key");

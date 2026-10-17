@@ -51,19 +51,21 @@ internal static class Weighing
     ///
     /// </summary>
     /// <summary>
-    /// A price in exalts as weight, through the one exchange rate. Internal so the reroll advisor
-    /// prices a sampled reward exactly as the objective prices a real one - two conversions would
-    /// eventually disagree, and the comparison between them is the whole decision. See Rolling.
+    /// A price in exalts as weight, through the one exchange rate. The reroll advice scores the remnant as it stands on
+    /// the plan's own combinations, so it charges a roll for the reward it replaces through this too, and the plan and
+    /// the advice agree on which rewards count for nothing. See Rolling.ScoreRollOutcomes.
     /// </summary>
     internal static float Money(double exalts, AutoExpeditionSettings settings)
     {
-        var rate = Safe.Read(() => settings.Rewards.PointWorth.Value, 0f);
+        var rate = ExaltsPerPoint(settings);
+        var above = Safe.Read(() => settings.Rewards.RewardsCountAboveDivines.Value, 0f) * (float)Valuation.DivineInExalts;
 
-        // Small rewards count for nothing, so the choice is made on runes. See RewardSettings.IgnoreRewardsBelow.
-        if (rate <= 0f || exalts <= 0d || exalts < Safe.Read(() => settings.Rewards.IgnoreRewardsBelow.Value, 0f))
+        // Only the part above the line counts, so the choice is made on runes until a reward is well clear of it, and
+        // a reward just over it is not worth more than one just under. See RewardSettings.RewardsCountAboveDivines.
+        if (rate <= 0f || exalts <= above)
             return 0f;
 
-        var worth = (float)exalts / rate;
+        var worth = ((float)exalts - above) / rate;
 
         return worth;
     }
@@ -200,6 +202,46 @@ internal static class Weighing
 
         return (magic, rare);
     }
+
+    /// <summary>
+    /// What one point of monster content is worth in exalts: Divines per 1,000 points at NinjaPricer's divine price,
+    /// times the party's loot factor. 0 with no divine price, which prices every reward at nothing. Every conversion
+    /// between points and reward money goes through this, so the plan, the reward choice and the reroll advice agree.
+    /// See RewardSettings.DivinesPerThousandPoints and PartySize.
+    /// </summary>
+    internal static float ExaltsPerPoint(AutoExpeditionSettings settings) =>
+        Safe.Read(() => settings.Rewards.DivinesPerThousandPoints.Value, 0f) / 1000f * (float)Valuation.DivineInExalts *
+        PartyLootFactor(settings);
+
+    /// <summary>
+    /// How much monster loot the party gets against one player alone: 1 + (players - 1) x the party/extra_player row's
+    /// weight as a percentage. 1 alone, or with the row unset. See PlayersCounted.
+    /// </summary>
+    internal static float PartyLootFactor(AutoExpeditionSettings settings)
+    {
+        var share = (Wrt.Of(PartyRow)?.Weight ?? 0f) / 100f;
+
+        return 1f + MathF.Max(0f, share) * (PlayersCounted(settings) - 1);
+    }
+
+    /// <summary>The players Party size says to count, 1 to 6. See RewardSettings.PartySize.</summary>
+    internal static int PlayersCounted(AutoExpeditionSettings settings)
+    {
+        var chosen = Safe.Read(() => settings.Rewards.PartySize.Value, RewardSettings.PartyInParty) ?? RewardSettings.PartyInParty;
+        var players = chosen switch
+        {
+            RewardSettings.PartyInParty => Autoloot.PlayersInParty,
+            RewardSettings.PartyInArea => Autoloot.PlayersInArea,
+            _ => int.TryParse(chosen, out var given) ? given : Autoloot.PlayersInParty,
+        };
+
+        return Math.Clamp(players, 1, 6);
+    }
+
+    /// <summary>
+    /// The row giving how much each player past the first adds to monster loot, as a percentage. See PartyLootFactor.
+    /// </summary>
+    public const string PartyRow = "party/extra_player";
 
     /// <summary>The row holding Gaining Traction's rates. See GainingTractionRates.</summary>
     public const string GainingTractionRow = "atlas:gaining_traction";

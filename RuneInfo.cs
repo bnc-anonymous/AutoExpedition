@@ -6,6 +6,7 @@ using System;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace AutoExpedition;
 
@@ -287,6 +288,15 @@ internal static class RuneInfo
 
         return string.IsNullOrWhiteSpace(text)
             ? $"{Safe.Read(() => mod.Key, "?")}: {string.Join(", ", values.Select(x => $"{x.Key}={x.Value}"))}"
-            : text.Replace("\n", " / ");
+            : ReadableTranslation(text);
     }
+
+    /// <summary>
+    /// A translated stat line made fit to print on one line. Where a stat has a description but none of its sections
+    /// covers the value - a 0% movement speed, say - ExileCore2 returns "&lt;unknownSection " followed by the description
+    /// record's type dump and then the stats; that is cut to "&lt;no wording for " and the stats. A stat with no
+    /// description at all comes back as "&lt;unknown " and the stats, and is left as it is.
+    /// </summary>
+    public static string ReadableTranslation(string text) =>
+        Regex.Replace(text, @"<unknownSection CachedStatDescription \{[^}]*\} ", "<no wording for ").Replace("\n", " / ");
 }

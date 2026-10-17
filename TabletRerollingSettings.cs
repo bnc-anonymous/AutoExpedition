@@ -526,13 +526,15 @@ public class TabletCraftingByHandSettings
     /// </summary>
     [Menu("Show met currency requirements for crafting tablets",
         "Lists each crafting currency you have enough of, as have/need,\n" +
-        "under the pricing progress line.")]
+        "under the pricing progress line, once a craft or reforge run\n" +
+        "has been started in this area.")]
     public ToggleNode ShowMetCraftingRequirements { get; set; } = new ToggleNode(false);
 
     /// <summary>The same for each crafting currency short of what the tablets need, in red.</summary>
     [Menu("Show unmet currency requirements for crafting tablets",
         "Lists each crafting currency you don't have enough of, as have/need,\n" +
-        "under the pricing progress line.")]
+        "under the pricing progress line, once a craft or reforge run\n" +
+        "has been started in this area.")]
     public ToggleNode ShowUnmetCraftingRequirements { get; set; } = new ToggleNode(true);
 }
 /// <summary>

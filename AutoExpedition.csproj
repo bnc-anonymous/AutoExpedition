@@ -27,6 +27,12 @@
       into the plugin. Excluded by folder rather than by file, so a second harness source needs no change here.
     -->
     <Compile Remove="tools\**\*.cs" />
+    <!--
+      And the harness's build output: the SDK's glob makes every file under the project a None item, and the reference
+      resolver takes a matching DLL among those before the HintPath, so the plugin compiled against the copy of
+      ExileCore2.dll in tools/offline/bin - which is only as new as the harness's last build - rather than the package's.
+    -->
+    <None Remove="tools\**" />
   </ItemGroup>
 
   <ItemGroup>

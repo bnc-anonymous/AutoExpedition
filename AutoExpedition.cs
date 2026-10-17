@@ -463,6 +463,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // wants both from one folder. See Layout.
         Layout.Folder = Path.Combine(ConfigDirectory, "dumps", "layouts");
 
+        // Beside the dumps too: evidence for the reroll rules, read by tools/roll_rules.py. See Rolling.VerdictsFile.
+        Rolling.VerdictsFile = Path.Combine(ConfigDirectory, "dumps", "roll_verdicts.csv");
+
         // Kept beside the settings, not in dumps: it is a working cache, not evidence. See TabletPricing.
         TabletPricing.CacheFile = Path.Combine(ConfigDirectory, "tablet_prices.json");
         Tablets.SubTabFile = Path.Combine(ConfigDirectory, "tablet_subtabs.json");
@@ -552,6 +555,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Settings.Solver.Advanced.Strategy.Value = SolverSettings.DestroyRepair;
         Settings.Display.PlacementCircle.Unreachable.SetListValues(PlacementCircleSettings.WhenUnreachable.ToList());
         Settings.Solver.Reroll.Mode.SetListValues(RerollSettings.Modes.ToList());
+        Settings.Rewards.PartySize.SetListValues(RewardSettings.PartySizes.ToList());
         Settings.Automation.PostExpedition.LineFrom.SetListValues(
             PostExpeditionSettings.WhenToLine.ToList());
         Settings.Automation.Autoloot.InstantLootSound.SetListValues(Autoloot.SoundNames());
@@ -794,6 +798,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         Detonator.RemnantsAtSite = _scan?.At(Detonator.DetonatorGridPosition(GameController)).Count(t => t.Kind == TargetKind.Remnant) ?? 0;
 
         Ground.NextFrame();
+
+        // Read at most once a second, for the solver threads to weigh rewards by. See Weighing.ExaltsPerPoint.
+        Autoloot.PartyInArea(GameController);
 
         // **The head and the tail, bracketed rather than picked apart.** Between them they are the
         // 0.31ms of Tick that no stage accounted for, and neither is one thing: the head clears

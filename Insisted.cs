@@ -265,7 +265,7 @@ internal sealed class Insisted
     }
 
     /// <summary>
-    /// Marks the rich remnants must take, once each. See RewardSettings.MustTakeAbove.
+    /// Marks the rich remnants must take, once each. See RewardSettings.MustTakeAboveDivines.
     ///
     /// **The threshold and the key now write to the same place, which is the whole change.** The
     /// plan used to hold two sorts of requirement - the markers somebody pointed at, and a live
@@ -282,9 +282,11 @@ internal sealed class Insisted
     /// </summary>
     public void Automatic(Scan scan, AutoExpeditionSettings settings, Valuation valuation)
     {
-        var above = Safe.Read(() => settings.Rewards.MustTakeAbove.Value, 0f);
+        // In exalts, through the divine price; with none read yet, nothing is marked, since a threshold of nought would
+        // mark every remnant with a reward.
+        var above = Safe.Read(() => settings.Rewards.MustTakeAboveDivines.Value, 0f) * Valuation.DivineInExalts;
 
-        if (above <= 0f || scan?.Targets == null)
+        if (above <= 0d || scan?.Targets == null)
             return;
 
         foreach (var target in scan.Targets)

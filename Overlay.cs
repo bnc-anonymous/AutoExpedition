@@ -137,9 +137,12 @@ internal static class Overlay
         // Planning.ShownAt.
         // Asked for, or offered up front because the presolve was switched on and told to show its
         // working. See SolverSettings.ShowPresolve.
-        // And not on a Grand site already set off, where a plan left from before the detonation is out of date. See
-        // Detonator.GrandSiteSetOff.
-        var here = Vector2.Distance(planning.Site, site) < 1f && !Detonator.GrandSiteSetOff(gc) &&
+        // **Drawn on a Grand site after it is set off, as on any other.** The chain going off is drawn link by link until
+        // each has gone off (see Cleared), which is the path the fight follows. This also refused a Grand site already
+        // set off, to keep a fresh plan off a finished site after leaving and coming back; that took the chain away
+        // the moment a Grand site was set off. Solving and the presolve refuse a Grand site set off (see
+        // Detonator.GrandSiteSetOff), so the plan here is the chain that was set off.
+        var here = Vector2.Distance(planning.Site, site) < 1f &&
                    (Planning.Showing(site) ||
                     (settings.Solver.Presolve.Enable.Value && settings.Solver.Presolve.ShowPresolve.Value));
         var live = here && settings.Display.ThePlan.ShowProgress && planning.Searching ? planning.Live : null;
@@ -330,10 +333,14 @@ internal static class Overlay
 
         // **Each remnant's socket count on the map, over the reward and reroll lines**, which are all drawn by now: a
         // line through a number made it hard to read. See Minimap.SocketCounts.
-        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rewards.DrawSocketCountOnMinimap)
+        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.DrawSocketCountOnMinimap)
             using (Spent.On("Minimap.SocketCounts"))
                 Minimap.SocketCounts(graphics, gc, settings, targets);
 
+        // The reroll verdicts on the map, over the lines for the same reason. See Minimap.RollFigures.
+        if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.RollFiguresOnMinimap)
+            using (Spent.On("Minimap.RollFigures"))
+                Minimap.RollFigures(graphics, gc, settings, scan, targets);
 
         // Outside that switch on purpose: it has nothing to do with wanting a line towards loot.
         using (Spent.On("Baited"))
@@ -1238,6 +1245,10 @@ internal static class Overlay
         var standing = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
         var scale = Scale(gc, camera, standing != Vector2.Zero ? standing : plan.Points[0]);
 
+        // Once set off, the first link still drawn is the chain's head and takes its own colour. See
+        // PlanDisplaySettings.ChainHeadColour.
+        var headStillToDraw = Detonator.SetOffHere(gc);
+
         for (var i = 0; i < plan.Points.Count; i++)
         {
             var world = Where(gc, plan.Points[i]);
@@ -1341,14 +1352,18 @@ internal static class Overlay
             // been fought out rather than whether its explosive went down. See Cleared.
             if (from != Vector3.Zero && !gone && !behind)
             {
-                var a = Safe.Read((camera, from), static x => x.camera.WorldToScreen(x.from), Vector2.Zero);
+                var lineColour = headStillToDraw ? settings.Display.ThePlan.ChainHeadColour : colour;
+
+                headStillToDraw = false;
+
+                var a =Safe.Read((camera, from), static x => x.camera.WorldToScreen(x.from), Vector2.Zero);
                 var b = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
 
                 if (a != Vector2.Zero && b != Vector2.Zero && !Panels.Covers(covered, a) &&
                     !Panels.Covers(covered, b) &&
                     Plausible(scale, Vector2.Distance(fromGrid, plan.Points[i]),
                         Vector2.Distance(a, b)))
-                    graphics.DrawLine(a, b, thickness, colour);
+                    graphics.DrawLine(a, b, thickness, lineColour);
             }
 
             from = world;
@@ -2061,7 +2076,7 @@ internal static class Overlay
 
     /// <summary>
     /// Whether some link of the current chain catches the target standing on this grid position, by the planner's own
-    /// reach test. False with no chain or no environment. See Planner.Catches.
+    /// reach test, explodables included. False with no chain or no environment. See Planner.ChainTakesTarget.
     /// </summary>
     private static bool ChainCatches(Planning planning, Vector2 grid)
     {
@@ -2071,18 +2086,10 @@ internal static class Overlay
         if (env == null || chain is not { Count: > 0 })
             return false;
 
-        foreach (var target in env.Targets)
+        for (var i = 0; i < env.Targets.Count; i++)
         {
-            if (Vector2.Distance(target.Grid, grid) >= 1f)
-                continue;
-
-            foreach (var spot in chain)
-            {
-                if (Planner.Catches(env, spot, target))
-                    return true;
-            }
-
-            return false;
+            if (Vector2.Distance(env.Targets[i].Grid, grid) < 1f)
+                return Planner.ChainTakesTarget(env, chain, i);
         }
 
         return false;
@@ -2668,6 +2675,12 @@ internal static class Overlay
         // over. The detonator says how many are left, and that survives a reload because it is the
         // game's number rather than ours.
         if (Detonator.ExplosivesInHand(gc) <= 0)
+            return;
+
+        // Nor at a site already set off. Its panel reads 0 of 0 once the player has left and come back, and the count
+        // then falls back to an assumed five, so the explosives test above passes on a finished site. The detonator
+        // this is drawn at is loaded, so SetOffHere reads its state live.
+        if (Detonator.SetOffHere(gc))
             return;
 
         var key = Safe.Read(() => settings.ActionHotkey.Value.Key.ToString(), "");
@@ -4423,14 +4436,14 @@ internal static class Overlay
     /// <summary>
     /// What a roll here is worth, as one figure beside the Verisium button.
     ///
-    /// **In the propagating yellow, because runes are all it measures.** The reroll comparison
-    /// scores both sides with the reward set aside - see Rolling.ScoreRollOutcomes - so the number is what
-    /// the roll does to the runes the chain carries, and the yellow the game borders a propagating
-    /// slot in is the colour it is already about.
+    /// **In the propagating yellow, because runes are most of what it measures.** The reroll comparison
+    /// prices no reward a roll might bring, and charges the one it replaces when that is over Ignore rewards
+    /// below - see Rolling.ScoreRollOutcomes - so the number is what the roll does to the runes the chain
+    /// carries, less that reward.
     ///
     /// It was three figures: a total, the rune half and the reward half, split apart because they
-    /// rested on different evidence. With the reward out of the comparison there is one thing left
-    /// to say and a stack of three said it three times.
+    /// rested on different evidence. Since the rolled side's reward left the comparison there is one
+    /// figure to show.
     ///
     /// On the remnant being recommended by default, and on every remnant with a verdict when asked
     /// for - a dig site with a number over every label is one nobody can read, so the second is a
@@ -4453,9 +4466,14 @@ internal static class Overlay
     /// expected value is usually negative, which is the half of the argument the advice never shows.
     /// See DisplaySettings.RollFigures and RollFiguresAll.
     /// </summary>
-    private static bool ShowsRollFigures(AutoExpeditionSettings settings, Target target)
+    internal static bool ShowsRollFigures(AutoExpeditionSettings settings, Target target)
     {
-        if (!Rolling.Here.Fresh)
+        if (!Rolling.Here.FiguresShowable)
+            return false;
+
+        // A remnant takes one roll, so a rolled one has no roll to put a figure on. Without this it shows the pre-roll
+        // figure until a pass catches up, and then the figure of the refused verdict the pass gives it.
+        if (target.Rerolled)
             return false;
 
         var planned = Rolling.Here.Advised is { } best &&
@@ -4482,18 +4500,35 @@ internal static class Overlay
         var height = graphics.MeasureText("+0").Y;
         var at = new Vector2(button.Right + 4f, button.Center.Y - height / 2f);
 
-        // The whole gain, which is the number the verdict is made on. Its two halves - what a roll
-        // is worth with the chain held still, and what re-solving adds - are in the dump.
-        Figure(graphics, settings, ref at, said.Gain, settings.Display.Remnants.Propagation.PassColour);
+        Figure(graphics, ref at, RollFigureText(said), RollFigureColour(settings));
     }
 
-    /// <summary>One of those figures, signed, on the same dark ground the reward lines use.</summary>
-    private static void Figure(Graphics graphics, AutoExpeditionSettings settings, ref Vector2 at,
-        double worth, Color colour)
+    /// <summary>
+    /// The colour a reroll figure is written in: the propagating rune colour, at half strength while the figures are a
+    /// step behind the chain and contents on screen. See Rolling.FiguresShowable.
+    /// </summary>
+    internal static Color RollFigureColour(AutoExpeditionSettings settings)
     {
-        // Thousands separated, because the figure beside a remnant runs to five digits on a big chain
-        // and "+32220" is not a number anybody reads at a glance.
-        var said = worth.ToString("+#,##0;-#,##0;0");
+        var colour = (Color)settings.Display.Remnants.Propagation.PassColour;
+
+        return Rolling.Here.Fresh ? colour : Color.FromArgb(colour.A / 2, colour);
+    }
+
+    /// <summary>
+    /// A roll's verdict as it is printed beside a remnant, in the world and on the map: the expected gain, then the
+    /// chance that a roll scores the chain above how it stands, both to no decimals - "+200 (30%)". The gain is what
+    /// the verdict is made on; the chance says how often a roll actually comes out ahead, since a positive average
+    /// can rest on a few large outcomes. Thousands separated, because the gain runs to five digits on a big chain.
+    /// Led by "~" while the figures are a step behind the screen, being worked out again. See Rolling.RollAdvice and
+    /// Rolling.FiguresShowable.
+    /// </summary>
+    internal static string RollFigureText(Rolling.RollAdvice said) =>
+        string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{(Rolling.Here.Fresh ? "" : "~")}{said.Gain.ToString("+#,##0;-#,##0;0", System.Globalization.CultureInfo.InvariantCulture)} ({said.ChanceAbove * 100d:0}%)");
+
+    /// <summary>One of those figures on the same dark ground the reward lines use.</summary>
+    private static void Figure(Graphics graphics, ref Vector2 at, string said, Color colour)
+    {
         var size = graphics.MeasureText(said);
 
         graphics.DrawBox(new RectangleF(at.X - 2f, at.Y, size.X + 4f, size.Y),

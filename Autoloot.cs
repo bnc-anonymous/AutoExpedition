@@ -540,8 +540,10 @@ internal static class Autoloot
         var others = Math.Max(0, players - 1);
 
         _partyInArea = here > 0 || others > 0;
+        PlayersInParty = (members?.Count ?? 0) + 1;
+        PlayersInArea = Math.Max(here, others) + 1;
         _partySaid = $"area \"{area}\"; party panel: {here} member(s) here, {elsewhere} elsewhere (by the portal icon); " +
-                     $"{others} other player(s) in the entity list; party in area: {_partyInArea}";
+                     $"{others} other player(s) in the entity list; party in area: {_partyInArea}; players in party {PlayersInParty}, in area {PlayersInArea}";
 
         return _partyInArea;
     }
@@ -567,6 +569,15 @@ internal static class Autoloot
 
         return false;
     }
+
+    /// <summary>The party panel's members and the player, wherever they are; 1 alone. Set by PartyInArea.</summary>
+    internal static volatile int PlayersInParty = 1;
+
+    /// <summary>
+    /// The players in this area, the player included: the more of the party panel's members here (no portal icon) and
+    /// the other players in the entity list. Set by PartyInArea.
+    /// </summary>
+    internal static volatile int PlayersInArea = 1;
 
     private static DateTime _partyReadAt = DateTime.MinValue;
     private static bool _partyInArea;
@@ -871,7 +882,7 @@ internal static class Autoloot
         {
             // Not one another player has, which cannot be picked up: clicked, the character walked to it for nothing.
             // See AllocatedToSomeoneElse.
-            if (AllocatedToSomeoneElse(label, item))
+            if (AllocatedToSomeoneElse(gc, item))
                 continue;
 
             var (rank, name) = RankOfItem(gc, item, ranks);
@@ -892,9 +903,36 @@ internal static class Autoloot
     /// Key bound to another player read allocated to someone else True, permanently True, to player 3919706517, can pick
     /// up True, against False and 0 on two free items beside it (dump 2026-10-12 16:08:52). The dump lists every reading
     /// for the items in view. See AllocationSaid.
+    ///
+    /// **Not that flag alone either.** A remnant's reward allocated to the local player read allocated to someone else
+    /// True, permanently True, to player 3429014651, which the player said was their own (dump 2026-10-16 00:51:09). So an
+    /// item whose WorldItem.AllocatedToPlayer equals the local player's own allocation id (OwnLootId) is the player's own,
+    /// whatever the flag says. With no id readable, the flag decides.
     /// </summary>
-    internal static bool AllocatedToSomeoneElse(LabelOnGround label, Entity item) =>
-        Safe.Read(item, static e => e.GetComponent<WorldItem>()?.AllocatedToSomeoneElse ?? false, false);
+    internal static bool AllocatedToSomeoneElse(GameController gc, Entity item)
+    {
+        var world = Safe.Read(item, static e => e.GetComponent<WorldItem>(), null);
+
+        if (world == null || !Safe.Read(world, static w => w.AllocatedToSomeoneElse, false))
+            return false;
+
+        var own = OwnLootId(gc);
+
+        return own == 0u || Safe.Read(world, static w => w.AllocatedToPlayer, 0u) != own;
+    }
+
+    /// <summary>
+    /// The id the game allocates the local player's loot to, as WorldItem.AllocatedToPlayer holds it: ExileCore2's
+    /// Player.AllocatedLootId, an int holding the same bits as the uint. 0 when unreadable. A wrong reading after a patch
+    /// matches no item's allocation and leaves the game's flag to decide. See AllocatedToSomeoneElse.
+    ///
+    /// Until ExileCore2's 2026-10-16 build that property read too few bytes (123 for 3429014651), and the id was read raw
+    /// at Player+0x1D0, which agreed with the fixed property (dump 2026-10-16 04:14:17). The id differs between sessions:
+    /// 3429014651 and 2039392453 on the same day.
+    /// </summary>
+    internal static uint OwnLootId(GameController gc) =>
+        Safe.Read(gc, static g => g.Player?.GetComponent<Player>() is { } player ? unchecked((uint)player.AllocatedLootId) : 0u,
+            0u);
 
     /// <summary>
     /// For the dump: each item in view, up to AllocationShown, with what ExileCore2 reads of who may pick it up. See
@@ -913,8 +951,85 @@ internal static class Autoloot
                          $"permanently {Safe.Read(world, static w => w.IsPermanentlyAllocated, false)}, " +
                          $"to player {Safe.Read(world, static w => w.AllocatedToPlayer.ToString(), "?")}, " +
                          $"to other time {Safe.Read(world, static w => w.AllocatedToOtherTime.ToString(), "?")}" +
-                         (AllocatedToSomeoneElse(label, item) ? " - LEFT ALONE" : "");
+                         (AllocatedToSomeoneElse(gc, item) ? " - LEFT ALONE" : "");
         }
+    }
+
+    /// <summary>
+    /// For the dump: where the allocation id of an item in view allocated to a player appears in memory about the local
+    /// player - the Player component, the player entity, ServerData and its PlayerInformation, and 1KB behind each pointer
+    /// the Player component and the entity hold. Reads only. Written when Player.AllocatedLootId read 123 where the
+    /// player's own items read allocated to 3429014651 (dump 2026-10-16 00:56:10); with the player's own item in view, an
+    /// offset listed here is where the id sits. See AllocatedToSomeoneElse.
+    /// </summary>
+    private static string AllocationIdFound(GameController gc)
+    {
+        var wanted = new HashSet<uint>();
+
+        foreach (var (_, item) in Ground.VisibleItems(gc))
+        {
+            var id = Safe.Read(item, static e => e.GetComponent<WorldItem>()?.AllocatedToPlayer ?? 0u, 0u);
+
+            if (id != 0u)
+                wanted.Add(id);
+        }
+
+        if (wanted.Count == 0)
+            return "no item in view is allocated to anybody";
+
+        var memory = gc.Memory;
+        var player = gc.Player;
+        var blocks = new List<(string Name, long Address, int Size)>
+        {
+            ("Player component", Safe.Read(player, static e => e.GetComponent<Player>()?.Address ?? 0L, 0L), 0x1000),
+            ("player entity", Safe.Read(player, static e => e.Address, 0L), 0x1000),
+            ("ServerData", Safe.Read(gc, static g => g.IngameState.ServerData.Address, 0L), 0x20000),
+            ("ServerData.PlayerInformation", Safe.Read(gc, static g => g.IngameState.ServerData.PlayerInformation.Address, 0L), 0x1000),
+        };
+
+        var found = new List<string>();
+
+        void Search(string name, long address, int size)
+        {
+            if (address == 0L)
+                return;
+
+            var bytes = Safe.Read(() => memory.ReadBytes(address, size), null);
+
+            if (bytes == null)
+                return;
+
+            for (var at = 0; at + 4 <= bytes.Length; at += 4)
+            {
+                var value = BitConverter.ToUInt32(bytes, at);
+
+                if (wanted.Contains(value))
+                    found.Add($"{name}+0x{at:X} = {value}");
+            }
+        }
+
+        foreach (var (name, address, size) in blocks)
+            Search(name, address, size);
+
+        // One pointer deep from the two small blocks: the id may sit in a structure they point to.
+        foreach (var (name, address, _) in blocks.Take(2))
+        {
+            if (address == 0L)
+                continue;
+
+            var bytes = Safe.Read(() => memory.ReadBytes(address, 0x1000), null);
+
+            for (var at = 0; bytes != null && at + 8 <= bytes.Length; at += 8)
+            {
+                var pointer = BitConverter.ToInt64(bytes, at);
+
+                if (pointer is > 0x10000L and < 0x7FFFFFFFFFFFL)
+                    Search($"[{name}+0x{at:X}]", pointer, 0x400);
+            }
+        }
+
+        return $"looking for {string.Join(", ", wanted)}: " +
+               (found.Count == 0 ? "nowhere searched" : string.Join("; ", found.Distinct().Take(40)));
     }
 
     /// <summary>How many items in view the dump reads allocation for.</summary>
@@ -1781,10 +1896,13 @@ internal static class Autoloot
                      $"{HeldAfterClickWithin.TotalSeconds:0}s: " +
                      string.Join(", ", ClickedMetadata.Where(x => DateTime.UtcNow - x.Value <= HeldAfterClickWithin)
                          .Select(x => x.Key[(x.Key.LastIndexOf('/') + 1)..])));
-        b.AppendLine("  items in view, who may pick each up (ExileCore2's label and WorldItem):");
+        b.AppendLine($"  items in view, who may pick each up (ExileCore2's label and WorldItem); the local player's loot id " +
+                     $"{OwnLootId(gc)} (Player.AllocatedLootId):");
 
         foreach (var line in AllocationSaid(gc))
             b.AppendLine($"    {line}");
+
+        b.AppendLine($"  where an item's allocation id appears in the local player's memory: {AllocationIdFound(gc)}");
 
         b.AppendLine($"  pickup reach used: {PickupReachGrid:0} grid; measured after clicks: " +
                      (PickupsMeasured.Count == 0

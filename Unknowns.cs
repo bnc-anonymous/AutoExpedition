@@ -553,6 +553,12 @@ internal static class Unknowns
         if (target == null)
             return false;
 
+        // A strongbox no blast can touch has nothing for its row to price: it is Spent, weighed at nothing and never
+        // planned around. Every strongbox carries glow_epk, so the ordinary walk-up boxes found in any map were filed
+        // and marked unset in red, and drew the unexpected-object line too, away from any expedition. See Target.Explodes.
+        if (target.Kind == TargetKind.Strongbox && !target.Explodes)
+            return false;
+
         // **Worked out once per table revision, because the overlay asks it of every marker every
         // frame.** Everything below builds the key this object is filed under, looks it up, and
         // does the same for each thing it grants - a string built from eight fields, hashed twice,
@@ -927,6 +933,11 @@ internal static class Unknowns
             return key;
 
         if (!target.Settled || target.StateNames().Length == 0)
+            return key;
+
+        // A strongbox no blast can touch is not filed: nothing scores it, and every art of every walk-up box in any map
+        // was filed as an unset row - 22 of the 25 rows in one custom table (2026-10-17). See Unread and Target.Explodes.
+        if (target.Kind == TargetKind.Strongbox && !target.Explodes)
             return key;
 
         // **Not before the art and the minimap icon have arrived, unless they never do.** Filed without one, an

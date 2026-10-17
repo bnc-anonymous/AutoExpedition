@@ -51,7 +51,7 @@ namespace AutoExpedition;
 internal static class Migrated
 {
     /// <summary>Raise this and add a case below whenever a shipped value must reach saved files.</summary>
-    public const int Current = 35;
+    public const int Current = 36;
 
     /// <summary>
     /// The weights whose number the plan actually took from the settings file, and the table row
@@ -346,17 +346,8 @@ internal static class Migrated
                 said.Add("reordered the thread roles to the new default");
             }
 
-            if (settings?.Rewards?.MustTakeAbove is { } mustTake && Math.Abs(mustTake.Value - 400f) < 0.01f)
-            {
-                mustTake.Value = 2000f;
-                said.Add("raised must take above from the old default 400 to 2000 exalts");
-            }
-
-            if (settings?.Rewards?.PointWorth is { } pointWorth && Math.Abs(pointWorth.Value - 0.5f) < 0.001f)
-            {
-                pointWorth.Value = 0.67f;
-                said.Add("raised the point worth from the old default 0.5 to 0.67");
-            }
+            // Must take above's 400 to 2000 and the point worth's 0.5 to 0.67 are applied by step 36, which reads them
+            // from the file, as both settings have since been replaced.
 
             if (settings?.Rewards?.Overrides is { } overrides &&
                 string.Equals(overrides.Value?.Trim(), "Unique Belt=1", StringComparison.Ordinal))
@@ -455,9 +446,76 @@ internal static class Migrated
         if (was < 35 && settings?.Automation?.Autoloot is { } looted && ChoresIntoActionKeyList(saved, looted) is { Length: > 0 } listed)
             said.Add(listed);
 
+        // **36 - the point worth and both reward thresholds in divines.** Read from the file, as the exalt settings are
+        // gone, and converted at 715.3 exalts to the divine, NinjaPricer's price the day this changed (2026-10-16), so
+        // nothing chooses differently until the divine moves. A file from before step 19 still at an old default gets
+        // that step's new one first. See RewardSettings.DivinesPerThousandPoints.
+        if (was < 36 && settings?.Rewards is { } rewards36)
+            said.AddRange(RewardsInDivines(saved, rewards36, was));
+
         settings.ConfigVersion = Current;
 
         return said.Count == 0 ? "" : string.Join("; ", said);
+    }
+
+    /// <summary>The divine price, in exalts, step 36 converts the reward settings at. See RewardsInDivines.</summary>
+    private const float DivineInExaltsAtStep36 = 715.3f;
+
+    /// <summary>
+    /// Step 36: Rewards.PointWorth (exalts per point), IgnoreRewardsBelow and MustTakeAbove (exalts) as saved, set as
+    /// DivinesPerThousandPoints, RewardsCountAboveDivines and MustTakeAboveDivines at DivineInExaltsAtStep36. One the
+    /// file does not hold keeps the new default.
+    /// </summary>
+    internal static IEnumerable<string> RewardsInDivines(string saved, RewardSettings rewards, int was)
+    {
+        var said = new List<string>();
+
+        if (string.IsNullOrEmpty(saved) || !File.Exists(saved))
+            return said;
+
+        try
+        {
+            using var file = JsonDocument.Parse(File.ReadAllText(saved));
+
+            if (!file.RootElement.TryGetProperty("Rewards", out var section) || section.ValueKind != JsonValueKind.Object)
+                return said;
+
+            float? Saved(string name) =>
+                section.TryGetProperty(name, out var node) && node.ValueKind == JsonValueKind.Object &&
+                node.TryGetProperty("Value", out var value) && value.TryGetDouble(out var number)
+                    ? (float)number
+                    : null;
+
+            if (Saved("PointWorth") is { } worth)
+            {
+                if (was < 19 && Math.Abs(worth - 0.5f) < 0.001f)
+                    worth = 0.67f;
+
+                rewards.DivinesPerThousandPoints.Value = MathF.Round(worth * 1000f / DivineInExaltsAtStep36, 3);
+                said.Add($"point worth {worth} exalts as {rewards.DivinesPerThousandPoints.Value} divines per 1,000 points");
+            }
+
+            if (Saved("IgnoreRewardsBelow") is { } below)
+            {
+                rewards.RewardsCountAboveDivines.Value = MathF.Round(below / DivineInExaltsAtStep36, 3);
+                said.Add($"ignore rewards below {below} exalts as count rewards only above {rewards.RewardsCountAboveDivines.Value} divines");
+            }
+
+            if (Saved("MustTakeAbove") is { } mustTake)
+            {
+                if (was < 19 && Math.Abs(mustTake - 400f) < 0.01f)
+                    mustTake = 2000f;
+
+                rewards.MustTakeAboveDivines.Value = MathF.Round(mustTake / DivineInExaltsAtStep36, 3);
+                said.Add($"must take above {mustTake} exalts as {rewards.MustTakeAboveDivines.Value} divines");
+            }
+        }
+        catch (Exception)
+        {
+            // A file that cannot be read keeps the new defaults, as at every other step.
+        }
+
+        return said;
     }
 
     /// <summary>
@@ -3244,14 +3302,14 @@ public class AutolootSettings
     /// ExileInput2's Shortest Move for the action key's autoloot run, in place of ExileInput2's own 40ms: a move takes
     /// this plus Move Time Per Root Pixel times the square root of its length in pixels, so this is the term that sets
     /// the pace of short hops between labels, as Shortest move between tablets does for tablets. 0 uses ExileInput2's
-    /// own. 150 is a starting value, not a measured one. Set when the run starts and handed back when it ends, as
+    /// own. 67 by default, chosen in play, not measured. Set when the run starts and handed back when it ends, as
     /// explosive placement and the tablet runs share the caller name. Instant autoloot has its own speed. Needs an
     /// ExileInput2 with SetShortestMove. See Placement.BeginLooting.
     /// </summary>
     [Menu("Shortest move when autolooting (ms)",
         "The least time the mouse takes to move to each thing the action key loots.\n" +
         "Raise it if short hops click too quickly. 0 uses ExileInput2's own setting.")]
-    public RangeNode<int> ShortestMoveWhenAutolootingMs { get; set; } = new RangeNode<int>(150, 0, 400);
+    public RangeNode<int> ShortestMoveWhenAutolootingMs { get; set; } = new RangeNode<int>(67, 0, 400);
     [JsonIgnore]
     public CustomNode InstantAutolootGroup { get; set; } = Section.Of("Instant Autoloot");
 
@@ -3801,6 +3859,15 @@ public class PlanDisplaySettings
     public ColorNode LaterColour { get; set; } = new ColorNode(Color.FromArgb(255, 255, 210, 80));
 
     /// <summary>
+    /// The colour of the chain's head once the site has been set off: the first link still drawn, which is the part
+    /// of the chain going off next. The links behind it stop being drawn as they go off (see Cleared), so the head
+    /// moves along the chain. Drawn in the world and on the minimap.
+    /// </summary>
+    [Menu("Chain head", "The first link still drawn after the site has been set off,\n" +
+                        "which is the part of the chain going off next.")]
+    public ColorNode ChainHeadColour { get; set; } = new ColorNode(Color.FromArgb(255, 90, 255, 120));
+
+    /// <summary>
     /// Whether the blast radius of an exploding barrel is drawn.
     ///
     /// A barrel the chain sets off covers ground of its own, and the circle says how much. It is
@@ -4148,15 +4215,6 @@ public class RemnantRewardSettings
     public ColorNode RewardColour { get; set; } = new ColorNode(Color.FromArgb(255, 190, 120, 255));
 
     /// <summary>
-    /// Each remnant's socket count written just under it on the minimap and the large map, in the propagating rune
-    /// colour, so the big remnants can be picked out across the map. Remnants not yet spent; needs Draw plan on minimap.
-    /// See Minimap.SocketCounts.
-    /// </summary>
-    [Menu("Draw socket count on minimap", "Writes each remnant's socket count just under it on the minimap\n" +
-                                          "and the large map. Needs Draw plan on minimap on.")]
-    public ToggleNode DrawSocketCountOnMinimap { get; set; } = new ToggleNode(true);
-
-    /// <summary>
     /// Draws a line towards any remnant worth more than this, in the unit chosen above.
     ///
     /// Gated on value because a line to every remnant is five lines across the screen saying
@@ -4337,11 +4395,12 @@ public class RerollDisplaySettings
     /// The reroll expected value - what a roll is worth, as one figure beside the Liquid Verisium button
     /// of the remnant the advice picks.
     ///
-    /// In the yellow the game borders a propagating slot in, because runes are all the comparison
-    /// measures: both sides of it are scored with the reward set aside. See Rolling.ScoreRollOutcomes.
+    /// In the yellow the game borders a propagating slot in, because runes are most of what the
+    /// comparison measures: a roll's own reward is not priced, and the reward it replaces is charged
+    /// for the part of its price over Count rewards only above. See Rolling.ScoreRollOutcomes.
     ///
-    /// It was three figures - a total, a rune half and a reward half - which said one thing three
-    /// times once the reward left the comparison.
+    /// It was three figures - a total, a rune half and a reward half - and is one since the rolled
+    /// side's reward left the comparison.
     ///
     /// A display setting rather than a debug one. It was under Debug behind "Explain reroll
     /// decisions" when it was a sentence, and it stayed there after it became a number - so it was
@@ -4366,6 +4425,23 @@ public class RerollDisplaySettings
     /// </summary>
     [Menu("Show reroll expected value on all remnants")]
     public ToggleNode RollFiguresAll { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Each remnant's socket count written just under it on the minimap and the large map, in the propagating rune
+    /// colour, so the big remnants can be picked out across the map. Remnants not yet spent; needs Draw plan on minimap.
+    /// In Rerolls beside the minimap reroll figure, which is drawn on the line below it. See Minimap.SocketCounts.
+    /// </summary>
+    [Menu("Draw socket count on minimap", "Writes each remnant's socket count just under it on the minimap\n" +
+                                          "and the large map. Needs Draw plan on minimap on.")]
+    public ToggleNode DrawSocketCountOnMinimap { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// The reroll expected value on the map as well, under each remnant's map icon - on the line below the socket
+    /// count when that is drawn, in its place when not. The same remnants as beside the buttons: the advised one under Show reroll expected value, the rest
+    /// under Show reroll expected value on all remnants. Needs Draw on minimap. See Minimap.RollFigures.
+    /// </summary>
+    [Menu("Show reroll expected value on minimap")]
+    public ToggleNode RollFiguresOnMinimap { get; set; } = new ToggleNode(true);
 }
 
 /// <summary>
@@ -4699,53 +4775,62 @@ public class RewardSettings
     public ToggleNode Overrule { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// What one point of weight is worth in currency. The exchange rate between the two halves of
-    /// this plugin.
+    /// What 1,000 points of monster content are worth, in divines: the balance between the plan's points and a remnant
+    /// reward's price. Picking a reward for a remnant, and judging a roll, trade one against the other - an option
+    /// paying a little less but carrying Opulent to three more remnants is the better option, and saying so needs a
+    /// number for how much better. Nought prices rewards at nothing.
     ///
-    /// Everything about a route is in weight - a magic chest is 5.5, a rare monster 33.7, and a
-    /// propagating rune a percentage of the monsters after it - and a reward is in the unit
-    /// chosen under Display. Those never had to be compared until the plugin started picking
-    /// rewards for you, and then it did: an option paying two exalts less but carrying Opulent
-    /// forward to three more remnants is the better option, and saying so out loud requires a
-    /// number for how much better.
+    /// In divines because the monsters' loot is: a chain's drops are mostly divines and other currency, whose worth
+    /// against a reward priced in exalts moves with the divine through a league - perhaps 100 to 300 exalts early on and
+    /// 720 late. Held in exalts, the same reward weighed several times as much against the monsters late in a league as
+    /// early. NinjaPricer's divine price converts (Valuation.DivineInExalts); with no divine price, rewards count for
+    /// nothing.
     ///
-    /// **A balance, not an exchange rate, and the old label claimed otherwise.** It shipped as
-    /// "approximate exalts per weight point" with a calibration behind it - a chain's content comes to
-    /// about 850 points, an expedition pays something like a divine and a half, so a point is worth
-    /// half an exalt. That arithmetic does not survive contact with the game, and reading the number as
-    /// a market value makes it look badly wrong when the choices it produces are fine.
-    ///
-    /// What it is is the factor that lets two things with no common unit be compared. One is worth
-    /// setting by whether the rewards it picks look right, which is how it was actually arrived at, and
-    /// that is a legitimate way to choose a number - it is simply not a price.
-    ///
-    /// Renamed from WeightWorth, which shipped at zero: a default of nought meant the propagation
-    /// half of the reward choice did nothing at all, and a saved nought would have kept it that way
-    /// silently. Zero still switches it off for anybody who wants price alone.
-    ///
-    /// **In exalts, whatever Price in says, and that is the fix rather than an inconsistency.**
-    /// Every other number under Rewards is a threshold you type next to a price on screen, so those
-    /// follow the display unit and should. This one is not a threshold - it is the exchange rate
-    /// between weight and money, which the planner reads on every decision. It used to be converted
-    /// through the display unit like the rest, so switching the readout to Divine made a weight
-    /// point worth 0.55 DIVINE, around two hundred times more, and quietly rewrote what the chain
-    /// was optimising for. A display setting must not change what the plugin chooses.
+    /// 0.9 is chosen, close to the earlier 0.67 exalts per point at the divine price of the day it changed, 715.3 exalts
+    /// (2026-10-16). The 0.67 was chosen by whether the rewards it picked looked right, not measured. See
+    /// Weighing.ExaltsPerPoint.
     /// </summary>
-    [Menu("Weight-to-price balance when choosing rewards")]
-    public RangeNode<float> PointWorth { get; set; } = new RangeNode<float>(0.67f, 0f, 5f);
+    [Menu("Divines per 1,000 points")]
+    public RangeNode<float> DivinesPerThousandPoints { get; set; } = new RangeNode<float>(0.9f, 0f, 7f);
 
     /// <summary>
-    /// A remnant reward worth less than this counts for nothing in the plan, the reward choice and the reroll advice,
-    /// so those choices are made on runes and the chain alone.
+    /// A remnant reward counts, in the plan, the reward choice and the reroll advice, for the part of its price above
+    /// this, so small rewards count for nothing and the choice is made on runes and the chain alone.
     ///
-    /// Most of an expedition's value is in what the monsters drop: chains on Grand sites drop several divines, at
-    /// about 700 exalts each, against rewards of a few exalts that decided between two recipes with the same
-    /// propagating rune - Ancient Rune of Retaliation at 14.8ex was taken over Ancient Rune of Dueling at 6.7ex, which
-    /// put one more distinct rune on the remnant's waves. A reward worth building the chain around is above this and
-    /// usually a must take as well. In exalts. 100 is chosen, not measured; nought counts every reward.
+    /// The part above rather than the whole once over: with the whole, a reward a little over the line counted in full
+    /// and one a little under counted nothing - a 451 exalt reward was charged against a roll at 451 where a 399 one
+    /// would have been free, and the advice turned on 52 exalts. In divines, the price converted by NinjaPricer's
+    /// divine price. 0.5 is chosen, not measured; nought counts every reward in full.
     /// </summary>
-    [Menu("Ignore rewards below (exalts)")]
-    public RangeNode<float> IgnoreRewardsBelow { get; set; } = new RangeNode<float>(100f, 0f, 2000f);
+    [Menu("Count rewards only above (divines)")]
+    public RangeNode<float> RewardsCountAboveDivines { get; set; } = new RangeNode<float>(0.5f, 0f, 3f);
+
+    /// <summary>
+    /// How many players the plan counts as sharing the map, for weighing remnant rewards against monster loot. Monster
+    /// drops grow with each extra player and a remnant's reward does not, so the bigger the party the more a monster
+    /// point is worth in exalts: Divines per 1,000 points times 1 + (players - 1) x the table's party/extra_player row.
+    /// See Weighing.ExaltsPerPoint.
+    ///
+    /// Automatic (players in party) counts the party panel's members and the player, wherever they are. Automatic
+    /// (players in area) counts those the party panel or the entity list places in this area, and the player; the
+    /// entity list only holds players near enough to load. A number is used as given.
+    ///
+    /// The party panel is the default although the game scales loot by the players near a kill, because the plan is
+    /// made while the host sets the site up and the others are often still on their way: it is for the players who
+    /// will be there when the chain goes off, not those there now. Players in area undercounts until everyone has
+    /// arrived. A host carrying a full party can set 6.
+    /// </summary>
+    [Menu("Party size")]
+    public ListNode PartySize { get; set; } = new ListNode { Value = PartyInParty };
+
+    /// <summary>Party size counted from the party panel. See PartySize.</summary>
+    public const string PartyInParty = "Automatic (players in party)";
+
+    /// <summary>Party size counted from the players in this area. See PartySize.</summary>
+    public const string PartyInArea = "Automatic (players in area)";
+
+    /// <summary>Every choice Party size offers, in order. See PartySize.</summary>
+    public static readonly string[] PartySizes = { PartyInParty, PartyInArea, "6", "5", "4", "3", "2", "1" };
 
     /// <summary>
     /// Marks a rich remnant must take for you, exactly as the key would, and then leaves it alone.
@@ -4762,23 +4847,11 @@ public class RewardSettings
     /// does not mark it again on the next sweep. Marking something the plugin proposed and then
     /// having it reinstated is the behaviour that makes an automatic setting feel like an argument.
     ///
-    /// In exalts; 2000 by default. Nought switches it off, and the key still works.
+    /// In divines, the reward's price converted by NinjaPricer's divine price, and nothing is marked without one; 2.5 by
+    /// default, chosen. Nought switches it off, and the key still works.
     /// </summary>
-    [Menu("Automatically set Must Take on rewards >= (exalts)")]
-    public RangeNode<float> MustTakeAbove { get; set; } = new RangeNode<float>(2000f, 0f, 5000f);
-
-    /// <summary>
-    /// What a Liquid Verisium costs you, in exalts.
-    ///
-    /// A roll is not free and the advice is worthless if it pretends otherwise: the currency is
-    /// traded six hundred Verisium to one, so the real price is the gold and the Verisium that went
-    /// into it rather than what the orb lists for. Ten exalts is a reasonable stand-in; put your own
-    /// number in, because this is the figure every ROLL and KEEP below turns on.
-    ///
-    /// Set it to zero to be told what the rolls are worth ignoring what they cost.
-    /// </summary>
-    [Menu("A roll costs (exalts)")]
-    public RangeNode<float> RollCost { get; set; } = new RangeNode<float>(10f, 0f, 500f);
+    [Menu("Automatically set Must Take on rewards >= (divines)")]
+    public RangeNode<float> MustTakeAboveDivines { get; set; } = new RangeNode<float>(2.5f, 0f, 10f);
 
     /// <summary>
     /// How far from the chain a remnant may sit and still be advised on, in reaches.

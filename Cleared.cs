@@ -25,12 +25,26 @@ namespace AutoExpedition;
 /// **History.** Until 2026-09-28 a link was dropped once no live monster stood inside its blast, which kept lines up
 /// through the fight; from then every link was dropped the moment the site was set off, which left no line at all.
 ///
+/// **A miss must repeat, and a standing explosive overrules it.** One look that found no explosive at a link in range
+/// used to drop that link and every one before it for good. On a Grand site at Lush Isle (dump 2026-10-16 20:54:18)
+/// 18 of 20 links were dropped while the explosives of links 9 to 20 all stood, so the line was gone for the part of
+/// the chain still to go off. What made the one look miss was not caught; an entity read failing for a frame gives
+/// no position and matches no link. So a link counts as gone off only after MissesToGoneOff looks in a row find
+/// nothing there, and since the chain goes off in order, a link whose explosive is standing has not gone off and nor
+/// has any after it: those are drawn again whatever was marked before.
+///
 /// **Set off by either signal, and remembered.** The live read of the detonator needs its entity loaded, and it
 /// unloads as you walk into the site, reading -1. See Detonator.SetOffHere.
 /// </summary>
 internal sealed class Cleared
 {
     private readonly HashSet<int> _done = new();
+
+    /// <summary>How many looks in a row have found no explosive at each link while it was in range. See MissesToGoneOff.</summary>
+    private readonly Dictionary<int, int> _missesInARow = new();
+
+    /// <summary>Looks in a row, LookEvery apart, that must find a link's explosive missing before it counts as gone off.</summary>
+    private const int MissesToGoneOff = 3;
     private uint _area;
     private int _links;
     private DateTime _looked;
@@ -67,17 +81,21 @@ internal sealed class Cleared
         if (points.Count != _links)
         {
             _done.Clear();
+            _missesInARow.Clear();
             _links = points.Count;
         }
 
         if (!Detonator.SetOffHere(gc))
         {
             _done.Clear();
+            _missesInARow.Clear();
+            Said = $"not set off, so all {points.Count} link(s) are drawn and no explosive is looked for";
 
             return;
         }
 
-        if (_done.Count == points.Count || DateTime.UtcNow - _looked < LookEvery)
+        // Looked at even once every link is marked, so a mark the explosives contradict is taken back.
+        if (DateTime.UtcNow - _looked < LookEvery)
             return;
 
         _looked = DateTime.UtcNow;
@@ -106,6 +124,7 @@ internal sealed class Cleared
         var placed = Detonator.PlacedExplosiveGridPositions(gc);
         var said = new StringBuilder();
         var lastGoneOff = -1;
+        var firstStanding = points.Count;
 
         for (var i = 0; i < points.Count; i++)
         {
@@ -120,20 +139,29 @@ internal sealed class Cleared
             }
 
             var inRange = Vector2.Distance(player, at) <= loadedWithin;
-            var goneOff = found < 0 && inRange;
+            var misses = found < 0 && inRange ? _missesInARow.GetValueOrDefault(i) + 1 : 0;
+
+            _missesInARow[i] = misses;
+
+            var goneOff = misses >= MissesToGoneOff;
 
             if (goneOff)
                 lastGoneOff = i;
+
+            if (found >= 0 && i < firstStanding)
+                firstStanding = i;
 
             said.Append(i == 0 ? "" : "; ").Append($"{i + 1} ({at.X:0},{at.Y:0}) ");
             said.Append(found >= 0
                 ? $"explosive activated={explosives[found].Activated} exploded={explosives[found].Exploded}"
                 : inRange ? "no explosive, in range" : "no explosive, out of range");
-            said.Append(goneOff ? " - gone off" : "");
+            said.Append(goneOff ? " - gone off" : misses > 0 ? $" - missing {misses} look(s) in a row" : "");
         }
 
-        for (var i = 0; i <= lastGoneOff; i++)
+        for (var i = 0; i <= lastGoneOff && i < firstStanding; i++)
             _done.Add(i);
+
+        _done.RemoveWhere(i => i >= firstStanding);
 
         Said = $"{explosives.Count} explosive(s) loaded, {_done.Count} of {points.Count} link(s) not drawn: {said}";
     }
@@ -143,7 +171,9 @@ internal sealed class Cleared
         if (areaHash != _area)
         {
             _done.Clear();
+            _missesInARow.Clear();
             _links = 0;
+            Said = "not looked yet in this area";
         }
 
         _area = areaHash;

@@ -328,7 +328,7 @@ internal static class Options
     public static double Carried(AutoExpeditionSettings settings, Valuation valuation, Target remnant,
         GameController gc, Scan scan, Plan plan)
     {
-        var rate = Safe.Read(() => settings.Rewards.PointWorth.Value, 0f);
+        var rate = Weighing.ExaltsPerPoint(settings);
 
         if (rate <= 0f || remnant?.Passing is not { Count: > 0 })
             return 0d;
@@ -336,7 +336,7 @@ internal static class Options
         var downstream = Reroll.Downstream(remnant, settings, gc, scan, plan);
 
         // No conversion. The rate is in exalts and everything internal is in exalts, so the
-        // display unit has no business here - see PointWorth for why that was worth fixing.
+        // display unit has no business here. See Weighing.ExaltsPerPoint.
         return downstream <= 0f ? 0d : rate / 100d * downstream;
     }
 
@@ -357,7 +357,7 @@ internal static class Options
     public static double Locally(AutoExpeditionSettings settings, Valuation valuation, Target remnant,
         GameController gc, Scan scan, Plan plan)
     {
-        var rate = Safe.Read(() => settings.Rewards.PointWorth.Value, 0f);
+        var rate = Weighing.ExaltsPerPoint(settings);
 
         if (rate <= 0f || remnant == null)
             return 0d;
@@ -518,12 +518,19 @@ internal static class Options
         // Viewport.
         var view = Viewport(gc, Element(options));
 
+        // The game's description of whatever the cursor is on in this window - a rune, most often. Nothing here is
+        // drawn over it. See TooltipInWindow.
+        var tooltip = TooltipInWindow(gc, window, out var hideForTooltip);
+
+        if (hideForTooltip)
+            return;
+
         foreach (var (rect, value, waves, _) in rows)
         {
             // Per row, and against the row rather than the text, so a row half over the edge is
             // treated as hidden. Half a price at the panel's lip reads as a rendering fault, and the
             // row it belongs to cannot be clicked either - see Reachable, which draws the same line.
-            if (!Within(view, rect))
+            if (!Within(view, rect) || Overlaps(tooltip, rect))
                 continue;
 
             // Top left of the row, in the world line's colours: amber, as the game borders the propagating slots in
@@ -581,7 +588,7 @@ internal static class Options
         // drawn in the warning colour and the richest border is left off.
         var rolled = (mine ?? Whose(gc, scan))?.Rerolled == true;
 
-        if (!rolled && richestAt >= 0 && richestAt != wantedAt)
+        if (!rolled && richestAt >= 0 && richestAt != wantedAt && !Overlaps(tooltip, richest))
         {
             graphics.DrawFrame(richest, settings.Display.Remnants.RuneshapeCombinationsWindow.RichestColour,
                 settings.Display.Remnants.RuneshapeCombinationsWindow.BestOptionThickness.Value);
@@ -602,7 +609,7 @@ internal static class Options
                 ? WantedRect
                 : default;
 
-        if (pick.Width > 0f)
+        if (pick.Width > 0f && !Overlaps(tooltip, pick))
             graphics.DrawFrame(pick,
                 rolled
                     ? settings.Display.Remnants.Rewards.OverruledColour
@@ -1408,6 +1415,81 @@ internal static class Options
 
 
 
+
+    /// <summary>
+    /// Where the game is showing a description for the element under the cursor in this window, or an empty rect.
+    ///
+    /// Read from the hovered element's own Tooltip when the client gives one. When it does not, and the cursor is on a
+    /// rune's icon - a small square with no text, inside the window - hideAll is set and the window's overlay is left
+    /// off until the cursor moves: the description opens beside the icon, where the rune line, the price and both
+    /// borders are drawn, and where exactly it opens is not known without the tooltip's own rect.
+    /// </summary>
+    private static RectangleF TooltipInWindow(GameController gc, ExileCore2.PoEMemory.Element window, out bool hideAll)
+    {
+        hideAll = false;
+
+        var hover = Safe.Read(gc, static g => g.IngameState.UIHover, null);
+
+        if (hover == null || Safe.Read(hover, static h => h.Address, 0L) == 0 || !InsideOf(hover, window))
+            return default;
+
+        var tip = Safe.Read(hover, static h => h.Tooltip, null);
+
+        if (tip != null && Safe.Read(tip, static t => t.Address, 0L) != 0 && Safe.Read(tip, static t => t.IsVisible, false))
+        {
+            var area = Safe.Read(tip, static t => t.GetClientRectCache, default(RectangleF));
+
+            if (area.Width > 0f && area.Height > 0f)
+                return area;
+        }
+
+        var at = Safe.Read(hover, static h => h.GetClientRectCache, default(RectangleF));
+        var text = Safe.Read(hover, static h => h.Text, "") ?? "";
+
+        hideAll = text.Length == 0 && at.Width is > 0f and <= RuneIconMostPx && at.Height is > 0f and <= RuneIconMostPx &&
+                  MathF.Abs(at.Width - at.Height) <= 4f;
+
+        return default;
+    }
+
+    /// <summary>What TooltipInWindow finds for the dump: the tooltip's rect, the icon fallback, or nothing.</summary>
+    public static string DescribeTooltipInWindow(GameController gc, ExileCore2.PoEMemory.Element window)
+    {
+        var area = TooltipInWindow(gc, window, out var hideAll);
+
+        return area.Width > 0f
+            ? $"the hovered element's Tooltip at ({area.X:0},{area.Y:0} {area.Width:0}x{area.Height:0}) - rows, prices and borders over it are skipped"
+            : hideAll
+                ? "a rune icon with no readable Tooltip - the whole window overlay is off while the cursor is on it"
+                : "none - the cursor is not on an element of this window with a description";
+    }
+
+    /// <summary>
+    /// The widest a rune icon in the combinations window is taken to be, in pixels. Read: 45x45 at 2560x1440
+    /// (dump 2026-10-15 21:33); set above that for other resolutions.
+    /// </summary>
+    private const float RuneIconMostPx = 80f;
+
+    private static bool InsideOf(ExileCore2.PoEMemory.Element element, ExileCore2.PoEMemory.Element container)
+    {
+        var target = Safe.Read(container, static c => c.Address, 0L);
+
+        if (target == 0)
+            return false;
+
+        // Bounded, as a guard against a parent chain read mid-change looping. The rune icon sat seven levels deep.
+        for (var (at, depth) = (element, 0); at != null && depth < 24; at = Safe.Read(at, static e => e.Parent, null), depth++)
+        {
+            if (Safe.Read(at, static e => e.Address, 0L) == target)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool Overlaps(RectangleF a, RectangleF b) =>
+        a.Width > 0f && a.Height > 0f && b.Width > 0f && b.Height > 0f &&
+        a.Left < b.Right && b.Left < a.Right && a.Top < b.Bottom && b.Top < a.Bottom;
 
     private static bool Within(RectangleF view, RectangleF at) =>
         view.Width <= 0f || view.Height <= 0f ||

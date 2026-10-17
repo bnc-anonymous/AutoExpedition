@@ -310,10 +310,6 @@ internal static class Scorecard
                          $"average {target.Spread.Mean:0.##}ex (unweighted - the game does not expose the odds)");
             }
 
-            // What a roll would have to return to pay for itself. Zero on a remnant that cannot be
-            // rolled again, and then there is nothing to say about it.
-            if (Reroll.Bar(target, settings, valuation, plan) is var bar and > 0d)
-                text.Add($"              a roll must beat {bar:0.##}ex to pay for itself");
         }
 
         if (found == 0)

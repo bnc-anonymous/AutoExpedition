@@ -60,12 +60,11 @@ internal enum Advice
 /// nothing but carrying Opulent forward is not a remnant to reroll, because the roll changes which
 /// combinations exist and the rune may not survive it.
 ///
-/// **A roll costs a Liquid Verisium, and replaces the whole remnant.** Both halves matter. The cost
-/// means nothing here is a comparison against zero; the replacement being a whole new remnant -
+/// **A roll replaces the whole remnant.** Its Liquid Verisium is treated as costing nothing, which
+/// it nearly does next to what a chain is worth. The replacement being a whole new remnant -
 /// new rune layout, new sockets, a different set of options - means the value of a roll is a
-/// question about what the site generates rather than about the remnant in front of you. That
-/// number is not available yet, so <see cref="Bar"/> reports what a roll must beat instead of
-/// pretending to know what it will return.
+/// question about what the site generates rather than about the remnant in front of you. Rolling
+/// works that out from the shapes a roll can produce.
 ///
 /// **How much that is worth depends on how many remnants come after it, and that is knowable.** The
 /// rune weight is defined per remnant it carries forward TO, so the value of keeping it is the
@@ -140,43 +139,6 @@ internal static class Reroll
 
         return said == null ? Advice.None
             : Rolling.Here.Advising(target.Grid) ? Advice.Roll : Advice.Keep;
-    }
-
-    /// <summary>
-    /// What a roll has to return to pay for itself, in exalts. Not a verdict - a bar.
-    ///
-    /// **The expected value of a roll cannot be computed yet, and the reason is worth recording.**
-    /// A roll replaces the WHOLE remnant: new rune layout, new socket count, therefore a different
-    /// set of options entirely. So the question "what will I get" is a question about every remnant
-    /// the site could have generated, not about the one in front of you - and the table that would
-    /// answer it, Expedition2RunesWeight, exposes no weights.
-    ///
-    /// This was briefly modelled as an average over the current remnant's own other options, which
-    /// is a confident answer to the wrong question: those options belong to a rune layout the roll
-    /// is about to throw away. Removed rather than left in, because advice computed off the wrong
-    /// population is worse than no advice - it cannot be sanity-checked by eye.
-    ///
-    /// What CAN be said without any distribution is what the roll must beat: whatever you are
-    /// holding, plus the cost of the orb. Nothing on this side of the trade is a guess.
-    ///
-    /// Note this bar is in currency and covers the reward only. A roll also changes the socket
-    /// count, which is worth something to the ROUTE rather than to your stash - so a low bar on a
-    /// three socket remnant is a better roll than the same bar on a six, and that part is not in
-    /// the number.
-    ///
-    /// Census is what closes the gap - enough observed remnants and the distribution is measured
-    /// rather than assumed.
-    /// </summary>
-    public static double Bar(Target target, AutoExpeditionSettings settings, Valuation valuation,
-        Plan plan)
-    {
-        // Nothing to beat on a remnant that cannot be rolled again.
-        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0 || target.Rerolled)
-            return 0d;
-
-        var have = Missed(target, plan) ? 0d : target.Rewards[0].Value;
-
-        return have + settings.Rewards.RollCost.Value;
     }
 
     /// <summary>
@@ -300,30 +262,6 @@ internal static class Reroll
         }
 
         return explosives <= 0 ? 0f : loose / 2f;
-    }
-
-    /// <summary>
-    /// Whether there is a plan and it goes somewhere else.
-    ///
-    /// False when there is no plan at all, because then nothing is known about where the chain
-    /// will go and every remnant is still a candidate. Only a plan that exists and leaves this
-    /// remnant out says anything.
-    /// </summary>
-    private static bool Missed(Target target, Plan plan)
-    {
-        if (plan == null || plan.Points.Count == 0 || plan.Catches == null)
-            return false;
-
-        for (var i = 0; i < plan.Points.Count; i++)
-        {
-            foreach (var caught in plan.CaughtBy(i))
-            {
-                if (Vector2.Distance(caught, target.Grid) < 1f)
-                    return false;
-            }
-        }
-
-        return true;
     }
 
     /// <summary>The weight of the monster at this spot, or zero when what is there is not one.</summary>

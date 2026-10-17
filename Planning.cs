@@ -870,9 +870,24 @@ internal sealed class Planning
     {
         ForgetExhausted();
 
-        if (_env is not { UseEnumeratedSolve: true } || Plan.Points.Count == 0 ||
-            (_env.Placed?.Count ?? 0) > 0 || !ExhaustiveSpotSearch.SimpleEnoughToExhaust(_env))
+        // Said whenever the question is not asked, so the dump never reports an answer about an earlier plan.
+        if (_env is not { UseEnumeratedSolve: true } || Plan.Points.Count == 0)
+        {
+            ExhaustiveSpotSearch.ExhaustedSaid = "not asked for this plan - the enumerated solve is off or there is no plan";
             return;
+        }
+
+        if ((_env.Placed?.Count ?? 0) > 0)
+        {
+            ExhaustiveSpotSearch.ExhaustedSaid = "not asked for this plan - explosives are down";
+            return;
+        }
+
+        if (!ExhaustiveSpotSearch.SimpleEnoughToExhaust(_env))
+        {
+            ExhaustiveSpotSearch.ExhaustedSaid = "not asked for this plan - the site is not simple enough to exhaust";
+            return;
+        }
 
         var env = _env;
         var chain = new List<Vector2>(Plan.Points);
@@ -1475,102 +1490,7 @@ internal sealed class Planning
         List<PlanTarget> Project(List<Target> of) =>
             of.Select(t => ProjectOne(t, Pinned(t, settings, valuation))).ToList();
 
-        PlanTarget ProjectOne(Target t, string pinned) =>
-            // The reward is NOT added into the weight here any more. It is one of a remnant's
-            // choices now, and which choice wins depends on where the chain puts it - so the price
-            // and the propagation are decided together, inside the search, rather than both being
-            // counted in full before it starts.
-            new PlanTarget(t.Grid, Extents.Of(t),
-                // The player pointing at a marker is the same kind of statement as a remnant being
-                // rich enough to be required, so it is said the same way - and saying "not that one"
-                // is the same statement with the sign flipped. See Insisted.
-                //
-                // A negative weight is a real term in the objective rather than a filter: the chain
-                // may still take an avoided marker when the ground leaves it no choice, and it will
-                // cost it the same as insisting gains. Refusing outright would produce no plan at
-                // all on a site where the only route runs past it, which is the failure the
-                // requirement count avoids in the other direction. See Verdict.Held.
-                // **Or a modifier the character cannot fight**, which is the same statement
-                // made once in the settings instead of once per marker. See MustAvoidMods.
-                // **Taking is a rule, avoiding is a price, and only one of them is a weight.**
-                //
-                // A required marker keeps its own worth and carries a flag, so the chain that drops
-                // it is refused rather than outscored - see PlanTarget.Must. An avoided one is
-                // charged more than any chain can earn, which is not the same statement and should
-                // not be: a chain whose only route out runs past an avoided marker should still be
-                // offered, at a cost, rather than refused outright. See Insisted.Said.Avoid.
-                Insisted.Here.Avoids(t.Grid) || MustAvoidMods.Bans(t)
-                    ? Weighing.WeightOfTarget(t, settings) - (float)ceiling
-                    : Weighing.WeightOfTarget(t, settings),
-                t.Kind, Weighing.Carries(t),
-                // The bounded guess, for a remnant whose rewards have not been read and so has no
-                // chosen recipe. See Planner.WeightsOfChosenRunes.
-                Weighing.StrongestRunePerPropagatingSlot(t),
-                Weighing.Waves(t),
-
-                // And the lookup that weighs whatever the chosen recipe names. Nothing chooses from
-                // it - see Weighing.PropagatingRuneWeights.
-                Weighing.PropagatingRuneWeights(t),
-                // The locked combination for a rolled remnant, which cannot be changed again - see
-                // Weighing.Choices. Lost once already, in a repair that restored this method from an
-                // older commit; it is the difference between pricing what a remnant IS and pricing
-                // what it could have been.
-                Weighing.Choices(t, settings, pinned),
-                // The name of an effect that pays once however many are taken, or nothing. Only the
-                // unknown weights can say it - everything the plugin recognises is priced in code
-                // and stacks, which is what the shipped relics do. See PlanTarget.Once.
-                Weighing.Once(t),
-                // The switches it grants, priced one at a time. See PlanTarget.NonStacking.
-                Weighing.NonStacking(t),
-                // **One kind of requirement, from one place.** This used to be two: the markers
-                // somebody pointed at, and a live re-reading of the reward threshold beside them.
-                // They behaved identically, so the plan could not say which was which, and the
-                // second could not be argued with - un-marking a remnant the threshold liked did
-                // nothing, because nothing had been marked. The threshold now writes into the same
-                // store the key does, once per remnant, and this reads only that. See
-                // Insisted.Automatic.
-                //
-                // A site can still hold more requirements than any chain could string together, and
-                // that is fine by construction: chains are ranked by how many they HOLD, so ten
-                // requirements with room for four still produces the best chain there is and says it
-                // dropped six. It degrades to the old preference ordering rather than to no answer.
-                // See Verdict.Held.
-                Must: Insisted.Here.Wants(t.Grid),
-                // What it IS, as bits, and what it passes on to particular kinds of thing. Worked
-                // out here, once per environment, rather than in the search - see Tags.
-                Mask: Tags.Mask(t),
-                Spread: Weighing.ScopedEffectsOfTarget(t),
-                // What this object is made of, as tagged amounts - a monstermarker's weight shared
-                // between the tiers it could turn out to be, a cage's rares, a remnant's waves. Each
-                // part carries the tags of the ROW THAT EARNED IT, which is what lets a modifier
-                // aimed at rare monsters reach the rares inside something that is not itself one.
-                // See Weighing.PartsOfTarget and PlanTarget.Contributions.
-                Parts: Weighing.PartsOfTarget(t),
-                // What each combination is called, walked exactly as Choices is - the same Pinned
-                // argument, so a locked remnant's single entry is named by the same single name.
-                // Without this the objective's choice publishes as "(unnamed)". See Planner.Chosen.
-                Named: Weighing.Names(t, settings, pinned),
-                // What identifies each of those, same order, so the readouts can say which row the
-                // planner took without joining on what it yields. See Weighing.RecipeIdsOfTarget.
-                Recipes: Weighing.RecipeIdsOfTarget(t, settings, pinned),
-                // What each of those adds of magic and rare waves over the remnant's own recipe, same order, for
-                // Gaining Traction to scale. See Weighing.MagicAndRareWavesOfChoices.
-                MagicAndRareWavesOfChoices: Weighing.MagicAndRareWavesOfChoices(t, settings,
-                    pinned),
-                // What each of those holds of runes whose effects reach this remnant's own waves, same order. See
-                // Weighing.OwnEffectsOfChoices.
-                OwnEffectsOfChoices: Weighing.OwnEffectsOfChoices(t, settings, pinned),
-                // And the empowering lift each holds, which empowers what it propagates. See PlanTarget.HeldLiftOfChoice.
-                HeldLiftOfChoices: Weighing.HeldLiftOfChoices(t, settings, pinned),
-                // And the share of its own waves each propagated rune is on. See PlanTarget.WaveShareOfCarried.
-                CarriedWaveSharesOfChoices: Weighing.CarriedWaveSharesOfChoices(t, pinned),
-                SlotRunesOfChoices: Weighing.SlotRunesOfChoices(t, pinned),
-                CreatedOfChoices: Weighing.CreatedOfChoices(t, pinned),
-                // And what Gaining Traction does to its waves by its place in the chain. See Weighing.TractionByBeforeOfTarget.
-                TractionByBefore: Weighing.TractionByBeforeOfTarget(t,
-                    Safe.Read(() => settings.Debug.GainingTraction.Value, true)),
-                // And how many waves it brings, for what a lift passed in reaches. See PlanTarget.ShareOfWavesPassedLift.
-                WaveCount: Weighing.WavesOfRemnant(t));
+        PlanTarget ProjectOne(Target t, string pinned) => PlanTargetOf(t, pinned, ceiling, settings);
 
         buildStage.Dispose(); buildStage = Spent.On("Build/Project");
         var targets = Project(content);
@@ -2011,6 +1931,114 @@ internal sealed class Planning
                 amplifiedBy, runeClass, reachOfGroup),
             named);
     }
+    /// <summary>
+    /// A scanned target as the search scores it: its weight, choices and every list kept in step with them. Also how the
+    /// reroll advice builds a remnant a roll could produce, from the same Target a scanned one would be, so the two are
+    /// valued alike. See Rolling.RolledRemnant.
+    /// </summary>
+    /// <param name="ceiling">More than any chain here can be worth, charged to a marker the player said to avoid. See Ceiling.</param>
+    /// <param name="readInsisted">
+    /// Whether to read the marks the player set. Off for a caller off the frame - the reroll advice's pass - since the
+    /// frame writes those marks and a dictionary read while it is written can throw; that caller sets Must itself.
+    /// </param>
+    internal static PlanTarget PlanTargetOf(Target t, string pinned, double ceiling, AutoExpeditionSettings settings,
+        bool readInsisted = true) =>
+            // The reward is NOT added into the weight here any more. It is one of a remnant's
+            // choices now, and which choice wins depends on where the chain puts it - so the price
+            // and the propagation are decided together, inside the search, rather than both being
+            // counted in full before it starts.
+            new PlanTarget(t.Grid, Extents.Of(t),
+                // The player pointing at a marker is the same kind of statement as a remnant being
+                // rich enough to be required, so it is said the same way - and saying "not that one"
+                // is the same statement with the sign flipped. See Insisted.
+                //
+                // A negative weight is a real term in the objective rather than a filter: the chain
+                // may still take an avoided marker when the ground leaves it no choice, and it will
+                // cost it the same as insisting gains. Refusing outright would produce no plan at
+                // all on a site where the only route runs past it, which is the failure the
+                // requirement count avoids in the other direction. See Verdict.Held.
+                // **Or a modifier the character cannot fight**, which is the same statement
+                // made once in the settings instead of once per marker. See MustAvoidMods.
+                // **Taking is a rule, avoiding is a price, and only one of them is a weight.**
+                //
+                // A required marker keeps its own worth and carries a flag, so the chain that drops
+                // it is refused rather than outscored - see PlanTarget.Must. An avoided one is
+                // charged more than any chain can earn, which is not the same statement and should
+                // not be: a chain whose only route out runs past an avoided marker should still be
+                // offered, at a cost, rather than refused outright. See Insisted.Said.Avoid.
+                readInsisted && (Insisted.Here.Avoids(t.Grid) || MustAvoidMods.Bans(t))
+                    ? Weighing.WeightOfTarget(t, settings) - (float)ceiling
+                    : Weighing.WeightOfTarget(t, settings),
+                t.Kind, Weighing.Carries(t),
+                // The bounded guess, for a remnant whose rewards have not been read and so has no
+                // chosen recipe. See Planner.WeightsOfChosenRunes.
+                Weighing.StrongestRunePerPropagatingSlot(t),
+                Weighing.Waves(t),
+
+                // And the lookup that weighs whatever the chosen recipe names. Nothing chooses from
+                // it - see Weighing.PropagatingRuneWeights.
+                Weighing.PropagatingRuneWeights(t),
+                // The locked combination for a rolled remnant, which cannot be changed again - see
+                // Weighing.Choices. Lost once already, in a repair that restored this method from an
+                // older commit; it is the difference between pricing what a remnant IS and pricing
+                // what it could have been.
+                Weighing.Choices(t, settings, pinned),
+                // The name of an effect that pays once however many are taken, or nothing. Only the
+                // unknown weights can say it - everything the plugin recognises is priced in code
+                // and stacks, which is what the shipped relics do. See PlanTarget.Once.
+                Weighing.Once(t),
+                // The switches it grants, priced one at a time. See PlanTarget.NonStacking.
+                Weighing.NonStacking(t),
+                // **One kind of requirement, from one place.** This used to be two: the markers
+                // somebody pointed at, and a live re-reading of the reward threshold beside them.
+                // They behaved identically, so the plan could not say which was which, and the
+                // second could not be argued with - un-marking a remnant the threshold liked did
+                // nothing, because nothing had been marked. The threshold now writes into the same
+                // store the key does, once per remnant, and this reads only that. See
+                // Insisted.Automatic.
+                //
+                // A site can still hold more requirements than any chain could string together, and
+                // that is fine by construction: chains are ranked by how many they HOLD, so ten
+                // requirements with room for four still produces the best chain there is and says it
+                // dropped six. It degrades to the old preference ordering rather than to no answer.
+                // See Verdict.Held.
+                Must: readInsisted && Insisted.Here.Wants(t.Grid),
+                // What it IS, as bits, and what it passes on to particular kinds of thing. Worked
+                // out here, once per environment, rather than in the search - see Tags.
+                Mask: Tags.Mask(t),
+                Spread: Weighing.ScopedEffectsOfTarget(t),
+                // What this object is made of, as tagged amounts - a monstermarker's weight shared
+                // between the tiers it could turn out to be, a cage's rares, a remnant's waves. Each
+                // part carries the tags of the ROW THAT EARNED IT, which is what lets a modifier
+                // aimed at rare monsters reach the rares inside something that is not itself one.
+                // See Weighing.PartsOfTarget and PlanTarget.Contributions.
+                Parts: Weighing.PartsOfTarget(t),
+                // What each combination is called, walked exactly as Choices is - the same Pinned
+                // argument, so a locked remnant's single entry is named by the same single name.
+                // Without this the objective's choice publishes as "(unnamed)". See Planner.Chosen.
+                Named: Weighing.Names(t, settings, pinned),
+                // What identifies each of those, same order, so the readouts can say which row the
+                // planner took without joining on what it yields. See Weighing.RecipeIdsOfTarget.
+                Recipes: Weighing.RecipeIdsOfTarget(t, settings, pinned),
+                // What each of those adds of magic and rare waves over the remnant's own recipe, same order, for
+                // Gaining Traction to scale. See Weighing.MagicAndRareWavesOfChoices.
+                MagicAndRareWavesOfChoices: Weighing.MagicAndRareWavesOfChoices(t, settings,
+                    pinned),
+                // What each of those holds of runes whose effects reach this remnant's own waves, same order. See
+                // Weighing.OwnEffectsOfChoices.
+                OwnEffectsOfChoices: Weighing.OwnEffectsOfChoices(t, settings, pinned),
+                // And the empowering lift each holds, which empowers what it propagates. See PlanTarget.HeldLiftOfChoice.
+                HeldLiftOfChoices: Weighing.HeldLiftOfChoices(t, settings, pinned),
+                // And the share of its own waves each propagated rune is on. See PlanTarget.WaveShareOfCarried.
+                CarriedWaveSharesOfChoices: Weighing.CarriedWaveSharesOfChoices(t, pinned),
+                SlotRunesOfChoices: Weighing.SlotRunesOfChoices(t, pinned),
+                CreatedOfChoices: Weighing.CreatedOfChoices(t, pinned),
+                // And what Gaining Traction does to its waves by its place in the chain. See Weighing.TractionByBeforeOfTarget.
+                TractionByBefore: Weighing.TractionByBeforeOfTarget(t,
+                    Safe.Read(() => settings.Debug.GainingTraction.Value, true)),
+                // And how many waves it brings, for what a lift passed in reaches. See PlanTarget.ShareOfWavesPassedLift.
+                WaveCount: Weighing.WavesOfRemnant(t));
+
     /// <summary>
     /// Each group's starting increase as a fraction: the map's increased number of rare monsters for the group whose
     /// rows name increased_number_of_rare_monsters, magic likewise, their amplified twins the same; nought for every

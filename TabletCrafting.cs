@@ -193,6 +193,12 @@ internal static partial class Tablets
         return held;
     }
 
+    /// <summary>
+    /// The area a tablet crafting or reforging run was last asked for in, by an action zone or the action key at the
+    /// reforging bench; 0 before any. The crafting requirement lines show only in that area. See DrawCraftingRequirements.
+    /// </summary>
+    private static uint CraftingAskedInArea;
+
     /// <summary>A crafting currency held in enough for the tablets seen. Fixed: the price tier colours mean something else.</summary>
     private static readonly Color RequirementMetColour = Color.FromArgb(255, 90, 255, 120);
 
@@ -204,12 +210,15 @@ internal static partial class Tablets
     /// the tablets need and red when not, shown as ShowMetCraftingRequirements and ShowUnmetCraftingRequirements ask. Only in a
     /// hideout or a town, where tablets are crafted: in a map the inventory opened showed them over the gold (2026-10-11).
     /// Not at all until the currency tab has been read this session: without its stacks every count is short, and the
-    /// lines read as currency missing that is in the stash.
+    /// lines read as currency missing that is in the stash. And only after a crafting or reforging run has been asked
+    /// for in this area: opening the inventory for anything else showed red lines about crafting nobody meant to do.
+    /// See CraftingAskedInArea.
     /// </summary>
     private static void DrawCraftingRequirements(Graphics graphics, GameController gc, TabletRerollingSettings settings)
     {
         if (!settings.CraftingByHand.ShowMetCraftingRequirements && !settings.CraftingByHand.ShowUnmetCraftingRequirements ||
             _currencyTabHeld == null ||
+            CraftingAskedInArea == 0u || CraftingAskedInArea != Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u) ||
             !Safe.Read(gc, static g => g.Area.CurrentArea is { } area && (area.IsHideout || area.IsTown), false) ||
             ProgressAnchor(gc, settings) is not { } anchor)
             return;

@@ -415,6 +415,7 @@ internal sealed class Valuation
         var stored = StoredRates();
 
         _divine = liveDivine > 0d ? liveDivine : stored.Divine;
+        DivineInExalts = _divine;
         _chaos = liveChaos > 0d ? liveChaos : stored.Chaos;
         _vaal = liveVaal > 0d ? liveVaal : stored.Vaal;
 
@@ -434,6 +435,12 @@ internal sealed class Valuation
                   $"chaos {(liveChaos > 0d ? "read" : "missing")}, vaal {(liveVaal > 0d ? "read" : "missing")})"
                 : "none: no live rates and none stored";
     }
+
+    /// <summary>
+    /// The divine price in exalts that the reward settings convert at, live or as last stored; 0 before any is read. Set
+    /// by UseRates, read by the solver threads. See Weighing.ExaltsPerPoint.
+    /// </summary>
+    public static double DivineInExalts { get; set; }
 
     /// <summary>Where the last rates read are stored. See UseRates.</summary>
     private static string RatesFile => Path.Combine(Kept.Home, "last_rates.tsv");
@@ -707,7 +714,6 @@ internal sealed class Valuation
                 continue;
 
             var needs = Safe.Read(() => recipe.RuneCountRequired, 0);
-            var carries = Propagation.Carried(recipe, passing);
 
             // Its own id, falling back to the name only where the game states none - two recipes
             // with no id and one name are indistinguishable to anything, and collapsing them is
@@ -719,12 +725,8 @@ internal sealed class Valuation
 
             if (!best.TryGetValue(id, out var already) || value > already.Value)
             {
-                var local = Propagation.Locally(recipe, passing);
-
-                best[id] = new Reward(name, value, needs, carries,
-                    Propagation.Ids(recipe, passing), local.Total, local.Runes, id, Propagation.HeldRunes(recipe),
-                    Propagation.WaveSharesOfIds(recipe, passing), Propagation.HeldRuneWaveShares(recipe),
-                    Propagation.SlotRunes(recipe));
+                best[id] = RewardOfSlots(name, value, needs, id, Propagation.SlotRunes(recipe),
+                    passing?.Select(x => x.Slot).ToArray());
             }
         }
 
@@ -738,6 +740,22 @@ internal sealed class Valuation
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .Take(keep)
             .ToList();
+    }
+
+    /// <summary>
+    /// A reward as a remnant offering this recipe holds it: what it carries forward and what stays local, from the rune
+    /// id in each slot and the slots that pass on. The one place a Reward is assembled, so a remnant on the ground and a
+    /// remnant the reroll advice imagines are built alike. See Rolling.RolledRemnant.
+    /// </summary>
+    internal static Reward RewardOfSlots(string name, double value, int runeCount, string id, IReadOnlyList<string> slots,
+        IReadOnlyList<int> passing)
+    {
+        var local = Propagation.LocallyOfSlots(slots, passing);
+
+        return new Reward(name, value, runeCount, Propagation.CarriedOfSlots(slots, passing),
+            Propagation.IdsOfSlots(slots, passing), local.Total, local.Runes, id, Propagation.HeldRunesOfSlots(slots),
+            Propagation.WaveSharesOfIdsOfSlots(slots, passing), Propagation.HeldRuneWaveSharesOfSlots(slots),
+            slots?.ToArray());
     }
 
     /// <summary>
@@ -1033,7 +1051,7 @@ internal sealed class Valuation
     /// **Support only - the table states no odds.** Expedition2RunesWeight carries Id, SlotCount,
     /// RuneSlot, Rune and Level and nothing else, despite the name, and neither of the other two
     /// plugins reading it finds a weight either. How LIKELY each of these is has to come from
-    /// somewhere else; see Rolls.Runes, whose shares are chosen rather than measured.
+    /// somewhere else; see Rolls.ShareOfPin, which counts the pins seen.
     /// </summary>
     public List<(Expedition2Rune Rune, int Slot)> FixedRunesPossibleAt(int sockets)
     {

@@ -413,8 +413,12 @@ internal static class ChainPanel
         return $"plugin {assembly.GetName().Version} built {built}; " +
                (settings == null
                    ? "settings not read"
-                   : $"PointWorth={settings.Rewards.PointWorth.Value}; IgnoreRewardsBelow={settings.Rewards.IgnoreRewardsBelow.Value}; " +
-                     $"MustTakeAbove={settings.Rewards.MustTakeAbove.Value}; MapMonsterIncreases={settings.Debug.MapMonsterIncreases.Value}");
+                   : $"DivinesPerThousandPoints={settings.Rewards.DivinesPerThousandPoints.Value}; " +
+                     $"RewardsCountAboveDivines={settings.Rewards.RewardsCountAboveDivines.Value}; " +
+                     $"MustTakeAboveDivines={settings.Rewards.MustTakeAboveDivines.Value}; DivineInExalts={Valuation.DivineInExalts:0.#}; " +
+                     $"ExaltsPerPoint={Weighing.ExaltsPerPoint(settings):0.####}; MapMonsterIncreases={settings.Debug.MapMonsterIncreases.Value}; " +
+                     $"PartySize={settings.Rewards.PartySize.Value}; PlayersCounted={Weighing.PlayersCounted(settings)}; " +
+                     $"PartyLootFactor={Weighing.PartyLootFactor(settings):0.##}");
     }
 
     private static List<(double Scored, List<Vector2> Route)> KnownChainsOfSite(Planning planning)

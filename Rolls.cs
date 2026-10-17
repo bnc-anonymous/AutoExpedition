@@ -148,52 +148,6 @@ internal static class Rolls
     private const float Stated = 0.25f;
 
     /// <summary>
-    /// How often a fresh socket comes up as each rune, read off the table.
-    ///
-    /// **It was an array here, and that made the list of runes that exist a second store.** Twenty-nine
-    /// entries against thirty-four rune rows in a live table: the two could disagree, and nothing would
-    /// have said which was right. A rune a patch adds had to be typed in twice.
-    ///
-    /// Still measured rather than read from the game, which is settled rather than open -
-    /// Expedition2RunesWeight is named for the weights and exposes none. What moved is where the
-    /// measurement lives: a share column on the rune's own row, editable, beside the effect it belongs
-    /// to. See Wrt.Row.Share.
-    ///
-    /// Normalised on use rather than here, because the shares are a measurement and will not sum to
-    /// exactly one - Rolling.ScoreRollOutcomes divides by the weight it accumulated for that reason, and
-    /// anything else added later should do the same.
-    /// </summary>
-    public static (string Rune, float Share)[] Runes
-    {
-        get
-        {
-            if (_runes != null && _at == Wrt.Revision)
-                return _runes;
-
-            var found = new List<(string, float)>(34);
-
-            foreach (var (id, _) in Wrt.Standing.Concat(Wrt.Yours))
-            {
-                if (!id.StartsWith("rune:", StringComparison.Ordinal))
-                    continue;
-
-                var share = Wrt.Of(id)?.Share;
-
-                if (share is > 0f)
-                    found.Add((id[5..], share.Value));
-            }
-
-            _at = Wrt.Revision;
-
-            return _runes = found.ToArray();
-        }
-    }
-
-    private static (string Rune, float Share)[] _runes;
-    private static int _at = -1;
-
-
-    /// <summary>
     /// What the reward on the far side of a roll is worth, in exalts.
     ///
     /// **A roll LOCKS the combination, which is the whole reason this is not the fresh table.** A

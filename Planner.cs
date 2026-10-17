@@ -11923,6 +11923,36 @@ internal static class Planner
         !Missed.Here.Misses(at, target.Grid);
 
     /// <summary>
+    /// Whether the chain takes the target at this index as Evaluate counts it: some link catches it directly, or a link
+    /// catches a wanted explodable whose own blast covers it (PlanTarget.Sets, one level, as in Describe). Catches alone
+    /// misses the second kind, and a remnant taken only through an explodable then read as unreached.
+    /// </summary>
+    internal static bool ChainTakesTarget(PlanEnvironment env, IReadOnlyList<Vector2> chain, int index)
+    {
+        var target = env.Targets[index];
+
+        foreach (var at in chain)
+        {
+            if (Catches(env, at, target))
+                return true;
+        }
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            if (!env.Targets[i].Wanted || env.Targets[i].Sets is not { Length: > 0 } sets || Array.IndexOf(sets, index) < 0)
+                continue;
+
+            foreach (var at in chain)
+            {
+                if (Catches(env, at, env.Targets[i]))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Turns a chain into a plan, recording what each link is for.
     ///
     /// The per-link content is worked out the same way the score was - first link to catch a piece

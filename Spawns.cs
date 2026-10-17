@@ -111,6 +111,19 @@ internal sealed class Spawns
         /// </summary>
         public string AtlasStats = "";
 
+        /// <summary>
+        /// Site row only: the most players in the party, the local player included, seen from the chain going off to the
+        /// run's end; 0 on other rows. Monster loot grows with each player near the monsters, so runs of different party
+        /// sizes are not comparable without it. See Autoloot.PlayersInParty and the table's party/extra_player row.
+        /// </summary>
+        public int PlayersInParty;
+
+        /// <summary>Site row only: the most players in the area over the same span, the local player included. See Autoloot.PlayersInArea.</summary>
+        public int PlayersInArea;
+
+        /// <summary>Site row only: the players the plan weighed rewards for when the chain went off. See Weighing.PlayersCounted.</summary>
+        public int PlayersCounted;
+
         public int Caged;
 
         public int Hatches;
@@ -618,10 +631,20 @@ internal sealed class Spawns
     /// <summary>The atlas's stats on rare and magic monsters when the run froze. See Blast.AtlasStats.</summary>
     private string _atlasStats = "";
 
+    /// <summary>The most players in the party and in the area seen during the run, and those counted at its start. See Blast.PlayersInParty.</summary>
+    private int _mostPlayersInParty;
+
+    private int _mostPlayersInArea;
+
+    private int _playersCounted;
+
     private void Reset()
     {
         _mapStats = "";
         _atlasStats = "";
+        _mostPlayersInParty = 0;
+        _mostPlayersInArea = 0;
+        _playersCounted = 0;
         _blasts.Clear();
         _waves.Clear();
         _markers.Clear();
@@ -706,6 +729,17 @@ internal sealed class Spawns
                 _done = Ending("next-site");
             else if (DateTime.UtcNow - _first > Patience)
                 _done = Ending("timeout");
+        }
+
+        // Sampled through the whole run rather than once, because party members are often still arriving when the chain
+        // goes off. Autoloot refreshes both counts each tick.
+        if (_frozen && !_done)
+        {
+            _mostPlayersInParty = Math.Max(_mostPlayersInParty, Autoloot.PlayersInParty);
+            _mostPlayersInArea = Math.Max(_mostPlayersInArea, Autoloot.PlayersInArea);
+
+            if (_playersCounted == 0)
+                _playersCounted = Weighing.PlayersCounted(settings);
         }
 
         // Finished with this one: write it out and start over, rather than sitting done for the
@@ -2946,6 +2980,9 @@ internal sealed class Spawns
 
         site.MapStats = _mapStats;
         site.AtlasStats = _atlasStats;
+        site.PlayersInParty = _mostPlayersInParty;
+        site.PlayersInArea = _mostPlayersInArea;
+        site.PlayersCounted = _playersCounted;
 
         rows.Add(Row(when, "site", -1, site));
 
@@ -3242,7 +3279,7 @@ internal sealed class Spawns
         "runeWaves,highestRuneWave,names,atlasStats,arrivingSeen,firstWaveSeconds," +
         "planContent,planPropagation,linkContent,linkPropagation," +
         "predictedNormal,predictedMagic,predictedRare,predictedNormalWithoutOwn,predictedMagicWithoutOwn," +
-        "predictedRareWithoutOwn,predictedTable,predictedEachWave";
+        "predictedRareWithoutOwn,predictedTable,predictedEachWave,playersInParty,playersInArea,playersCounted";
 
     /// <summary>Counts one marker into a composition, by kind and tier.</summary>
     private static void Add(Blast into, Target marker)
@@ -3394,7 +3431,13 @@ internal sealed class Spawns
         ExpectedCount(blast.Predicted?.MagicWithoutOwn),
         ExpectedCount(blast.Predicted?.RareWithoutOwn),
         Clean(blast.PredictedTable),
-        Clean(blast.Predicted?.EachWave ?? ""));
+        Clean(blast.Predicted?.EachWave ?? ""),
+        Players(blast.PlayersInParty),
+        Players(blast.PlayersInArea),
+        Players(blast.PlayersCounted));
+
+    /// <summary>A player count, or empty where none was taken - every row but the site's. See Blast.PlayersInParty.</summary>
+    private static string Players(int count) => count > 0 ? count.ToString(CultureInfo.InvariantCulture) : "";
 
     /// <summary>An expected count to two places, or empty when there is none. See Blast.Predicted.</summary>
     private static string ExpectedCount(float? expected) =>

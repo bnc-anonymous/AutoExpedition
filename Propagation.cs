@@ -124,17 +124,27 @@ internal static class Propagation
     /// forward really is carrying both - but counted once per rune, because carrying the same rune
     /// in two slots is still one rune active. It used to sum blindly and pay twice for that.
     /// </summary>
-    public static float Carried(Expedition2Recipe recipe, List<Passes> passing)
+    public static float Carried(Expedition2Recipe recipe, List<Passes> passing) =>
+        recipe == null || passing == null ? 0f : CarriedOfSlots(SlotRunes(recipe), SlotsOf(passing));
+
+    /// <summary>The passing slots' numbers, in the order given. See the id-based cores below.</summary>
+    private static int[] SlotsOf(List<Passes> passing) => passing?.Select(x => x.Slot).ToArray();
+
+    /// <summary>
+    /// Carried, from the rune id in each slot and the passing slots: the core every caller shares, the reroll advice's
+    /// rolled remnants included, so a remnant on the ground and one a roll could produce are weighed alike.
+    /// </summary>
+    public static float CarriedOfSlots(IReadOnlyList<string> slots, IReadOnlyList<int> passing)
     {
-        if (recipe == null || passing == null)
+        if (slots == null || passing == null)
             return 0f;
 
         var seen = new List<string>();
         var total = 0f;
 
-        foreach (var slot in passing)
+        foreach (var at in passing)
         {
-            var id = Safe.Read(() => recipe.Runes.ElementAtOrDefault(slot.Slot)?.Id, null);
+            var id = at >= 0 && at < slots.Count ? slots[at] : null;
 
             if (string.IsNullOrWhiteSpace(id) || seen.Contains(id, StringComparer.OrdinalIgnoreCase))
                 continue;
@@ -192,11 +202,14 @@ internal static class Propagation
     /// those waves, which is the rule the propagating half already follows.
     /// </summary>
     public static (float Total, (string Id, float Worth)[] Runes) Locally(Expedition2Recipe recipe,
-        List<Passes> passing)
-    {
-        var runes = Safe.Read(() => recipe?.Runes, null);
+        List<Passes> passing) =>
+        recipe == null ? (0f, System.Array.Empty<(string, float)>()) : LocallyOfSlots(SlotRunes(recipe), SlotsOf(passing));
 
-        if (runes == null)
+    /// <summary>Locally, from the rune id in each slot and the passing slots. See CarriedOfSlots.</summary>
+    public static (float Total, (string Id, float Worth)[] Runes) LocallyOfSlots(IReadOnlyList<string> slots,
+        IReadOnlyList<int> passing)
+    {
+        if (slots == null)
             return (0f, System.Array.Empty<(string, float)>());
 
         // **The identities, not just the total, because only the chain knows what is wasted.**
@@ -212,12 +225,12 @@ internal static class Propagation
         var found = new List<(string, float)>();
         var total = 0f;
 
-        for (var slot = 0; slot < runes.Count; slot++)
+        for (var slot = 0; slot < slots.Count; slot++)
         {
-            if (passing != null && passing.Any(x => x.Slot == slot))
+            if (passing != null && passing.Contains(slot))
                 continue;
 
-            var id = Safe.Read(() => runes.ElementAtOrDefault(slot)?.Id, null);
+            var id = slots[slot];
 
             if (string.IsNullOrWhiteSpace(id) || seen.Contains(id, StringComparer.OrdinalIgnoreCase))
                 continue;
@@ -228,7 +241,7 @@ internal static class Propagation
             // lifts - Power - still brings the item quantity it carries beside its lift. See Weighing.SplitShareKeyOf.
             foreach (var split in Weighing.SplitShareKeysOfRune(id))
             {
-                var splitWorth = Locally(split) * WaveShareOfSlot(slot, runes.Count);
+                var splitWorth = Locally(split) * WaveShareOfSlot(slot, slots.Count);
 
                 if (splitWorth <= 0f)
                     continue;
@@ -263,7 +276,7 @@ internal static class Propagation
                 // **Under its lift key, worth the share of these waves its slot reaches**, in per cent; the lift itself
                 // is read off the rune where it is paid, per class. Its own key so a rune that also adds - Rebirth's
                 // monster weight beside its lift - is both. See Weighing.LiftKeyOf and Planner.LocalSharesOfMarker.
-                found.Add((Weighing.LiftKeyOf(id), 100f * WaveShareOfSlot(slot, runes.Count)));
+                found.Add((Weighing.LiftKeyOf(id), 100f * WaveShareOfSlot(slot, slots.Count)));
 
                 // Deliberately NOT added to the total. That is what the ordinary slots are worth on
                 // these waves, and an amplifier's lift is worth none of it on its own - it multiplies
@@ -274,7 +287,7 @@ internal static class Propagation
             }
 
             // Only on the waves it is in force for. See WaveShareOfSlot.
-            var worth = Locally(id) * WaveShareOfSlot(slot, runes.Count);
+            var worth = Locally(id) * WaveShareOfSlot(slot, slots.Count);
 
             // Counted only when it is worth something on these waves. A rune scoped entirely to
             // chests sits in an ordinary slot and reaches none of the monsters there, so it is not
@@ -440,19 +453,15 @@ internal static class Propagation
     /// Every rune a recipe puts in a slot, by id, each once, in slot order - priced or not. What its own effects are read
     /// from: a rune worth nothing on these waves can still change what they spawn. See Weighing.OwnEffectsOfChoices.
     /// </summary>
-    public static string[] HeldRunes(Expedition2Recipe recipe)
+    public static string[] HeldRunes(Expedition2Recipe recipe) => HeldRunesOfSlots(SlotRunes(recipe));
+
+    /// <summary>HeldRunes, from the rune id in each slot. See CarriedOfSlots.</summary>
+    public static string[] HeldRunesOfSlots(IReadOnlyList<string> slots)
     {
-        var runes = Safe.Read(() => recipe?.Runes, null);
-
-        if (runes == null)
-            return [];
-
         var held = new List<string>();
 
-        for (var slot = 0; slot < runes.Count; slot++)
+        foreach (var id in slots ?? [])
         {
-            var id = Safe.Read(() => runes.ElementAtOrDefault(slot)?.Id, null);
-
             if (!string.IsNullOrWhiteSpace(id) && !held.Contains(id, StringComparer.OrdinalIgnoreCase))
                 held.Add(id);
         }
@@ -464,25 +473,26 @@ internal static class Propagation
     /// The share of the remnant's waves each rune of HeldRunes acts on, in the same order: its first slot's share. See
     /// WaveShareOfSlot and Weighing.OwnEffectsOfRunes.
     /// </summary>
-    public static float[] HeldRuneWaveShares(Expedition2Recipe recipe)
-    {
-        var runes = Safe.Read(() => recipe?.Runes, null);
+    public static float[] HeldRuneWaveShares(Expedition2Recipe recipe) => HeldRuneWaveSharesOfSlots(SlotRunes(recipe));
 
-        if (runes == null)
+    /// <summary>HeldRuneWaveShares, from the rune id in each slot. See CarriedOfSlots.</summary>
+    public static float[] HeldRuneWaveSharesOfSlots(IReadOnlyList<string> slots)
+    {
+        if (slots == null)
             return [];
 
         var held = new List<string>();
         var shares = new List<float>();
 
-        for (var slot = 0; slot < runes.Count; slot++)
+        for (var slot = 0; slot < slots.Count; slot++)
         {
-            var id = Safe.Read(() => runes.ElementAtOrDefault(slot)?.Id, null);
+            var id = slots[slot];
 
             if (string.IsNullOrWhiteSpace(id) || held.Contains(id, StringComparer.OrdinalIgnoreCase))
                 continue;
 
             held.Add(id);
-            shares.Add(WaveShareOfSlot(slot, runes.Count));
+            shares.Add(WaveShareOfSlot(slot, slots.Count));
         }
 
         return shares.ToArray();
@@ -496,16 +506,20 @@ internal static class Propagation
     /// they are not - and the names have to belong to the SAME combination as the total, or the
     /// planner is again pricing one option and propagating another.
     /// </summary>
-    public static string[] Ids(Expedition2Recipe recipe, List<Passes> passing)
+    public static string[] Ids(Expedition2Recipe recipe, List<Passes> passing) =>
+        recipe == null || passing == null ? [] : IdsOfSlots(SlotRunes(recipe), SlotsOf(passing));
+
+    /// <summary>Ids, from the rune id in each slot and the passing slots. See CarriedOfSlots.</summary>
+    public static string[] IdsOfSlots(IReadOnlyList<string> slots, IReadOnlyList<int> passing)
     {
-        if (recipe == null || passing == null)
+        if (slots == null || passing == null)
             return [];
 
         var found = new List<string>();
 
-        foreach (var slot in passing)
+        foreach (var at in passing)
         {
-            var id = Safe.Read(() => recipe.Runes.ElementAtOrDefault(slot.Slot)?.Id, null);
+            var id = at >= 0 && at < slots.Count ? slots[at] : null;
 
             if (!string.IsNullOrWhiteSpace(id) && !found.Contains(id, StringComparer.OrdinalIgnoreCase))
                 found.Add(id);
@@ -520,28 +534,31 @@ internal static class Propagation
     /// own remnant's waves from its slot onward. See Planner.Settle, which takes the rest of those waves out of the
     /// rune's reach.
     /// </summary>
-    public static float[] WaveSharesOfIds(Expedition2Recipe recipe, List<Passes> passing)
+    public static float[] WaveSharesOfIds(Expedition2Recipe recipe, List<Passes> passing) =>
+        recipe == null || passing == null ? [] : WaveSharesOfIdsOfSlots(SlotRunes(recipe), SlotsOf(passing));
+
+    /// <summary>WaveSharesOfIds, from the rune id in each slot and the passing slots. See CarriedOfSlots.</summary>
+    public static float[] WaveSharesOfIdsOfSlots(IReadOnlyList<string> slots, IReadOnlyList<int> passing)
     {
-        if (recipe == null || passing == null)
+        if (slots == null || passing == null)
             return [];
 
-        var count = Safe.Read(() => recipe.Runes?.Count ?? 0, 0);
         var found = new List<string>();
         var shares = new List<float>();
 
-        foreach (var slot in passing.OrderBy(x => x.Slot))
+        foreach (var at in passing.OrderBy(x => x))
         {
-            var id = Safe.Read(() => recipe.Runes.ElementAtOrDefault(slot.Slot)?.Id, null);
+            var id = at >= 0 && at < slots.Count ? slots[at] : null;
 
             if (string.IsNullOrWhiteSpace(id) || found.Contains(id, StringComparer.OrdinalIgnoreCase))
                 continue;
 
             found.Add(id);
-            shares.Add(WaveShareOfSlot(slot.Slot, count));
+            shares.Add(WaveShareOfSlot(at, slots.Count));
         }
 
-        // Back into Ids' order, which follows the passing list as given.
-        return Ids(recipe, passing)
+        // Back into IdsOfSlots' order, which follows the passing list as given.
+        return IdsOfSlots(slots, passing)
             .Select(id => shares[found.FindIndex(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))])
             .ToArray();
     }

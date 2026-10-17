@@ -135,7 +135,8 @@ internal static class Dump
         // place and the screen is still bare because a solve or a reroll pass is in flight. See
         // Rolling.Fresh.
         if (!Rolling.Here.Fresh)
-            return "the advice is stale - a solve or a reroll pass is running, so nothing is drawn";
+            return "the advice is stale - it was weighed against another chain or contents than the one on screen, " +
+                   "or a solve or reroll pass is running, so nothing is drawn until a pass weighs this one";
 
         Target remnant = null;
 
@@ -638,7 +639,7 @@ internal static class Dump
     /// The game, for the few describers that are reached without it.
     ///
     /// Describe takes an entity and nothing else - it is called from Section, which is called per
-    /// bucket - and threading a GameController through both to read one terrain height would touch
+    /// bucket - and threading a GameController through both to read a terrain height and the stat descriptions would touch
     /// every caller. Set where the dump starts and read nowhere else.
     /// </summary>
     private static GameController _dumping;
@@ -795,6 +796,7 @@ internal static class Dump
         MapStats(b, gc);
         MonsterRarityStats(b, gc);
         RuneTable(b, gc);
+        DropModifiers(b, gc);
         WeightTable(b);
         Guards(b);
         Relics(b);
@@ -1375,6 +1377,7 @@ internal static class Dump
         b.AppendLine($"  scroll panel: {Options.Walk(gc)}");
         b.AppendLine($"  scrolling to the pick: {Options.Scroll(gc)}");
         b.AppendLine($"  what the cursor is over: {Panels.Describe(gc)}");
+        b.AppendLine($"  tooltip the overlay keeps clear of: {Options.DescribeTooltipInWindow(gc, window)}");
         b.AppendLine("  (park the cursor on the scroll thumb and dump again - the drag refuses " +
                      "unless the game names something covering the point it aims at)");
         b.AppendLine($"  options: {Safe.Read(() => window.Options?.Count ?? 0, 0)}");
@@ -2196,10 +2199,10 @@ internal static class Dump
         b.AppendLine($"  base is {(Detonator.Grand(gc) ? "GRAND" : "ordinary")} because the count is " +
                      $"{Detonator.ExplosivesToPlanFor(gc)} against {Detonator.GrandExplosives} - " +
                      $"{Detonator.Counting}");
-        b.AppendLine("  the game's Grand flag, [session+0x98]: " + (Detonator.GrandAreaFields(gc) is { } fields
-            ? $"+0x1B4 = 0x{fields.Kind:X} (Grand at 0x1C or 0x27), +0x2A = 0x{fields.Word:X4} (Grand at 0x1C03) - " +
-              (Detonator.GrandAreaFlag(gc) == true ? "GRAND" : "ordinary")
-            : "unreadable - the walk from ClientExpedition broke") +
+        b.AppendLine("  the game's Grand flag, IngameData.CurrentArea: " + (Detonator.GrandAreaFields(gc) is { } fields
+            ? $"AreaKind = 0x{fields.Kind:X} (Grand at 0x1C or 0x27), WorldAreaId = 0x{fields.WorldAreaId:X8} " +
+              "(Grand with 0x1C03 in its low half) - " + (Detonator.GrandAreaFlag(gc) == true ? "GRAND" : "ordinary")
+            : "unreadable") +
             $"; remnants filed under this site {Detonator.RemnantsAtSite}");
         b.AppendLine("  (the game's own arithmetic, in integers, so it is the limit rather than " +
                      "an estimate of it - nothing measures it any more)");
@@ -2295,6 +2298,11 @@ internal static class Dump
         // What a Liquid Verisium is worth on each remnant, and on which one. The advice is built on
         // forty two observed outcomes, so the working matters more than the answer. See Rolling.
         b.AppendLine($"  rolling: {Rolling.Here.Telling}");
+        b.AppendLine($"    figures a step behind, until a pass caught up: {Rolling.Here.CatchUpsSaid}");
+        b.AppendLine($"    rewards weighed for {Weighing.PlayersCounted(Settings)} player(s) (Party size {Settings.Rewards.PartySize.Value}): " +
+                     $"monster loot x{Weighing.PartyLootFactor(Settings):0.##}, a point worth {Weighing.ExaltsPerPoint(Settings):0.###}ex " +
+                     $"at {Valuation.DivineInExalts:0.#}ex to the divine ({Valuation.RatesSaid}); rewards count above " +
+                     $"{Settings.Rewards.RewardsCountAboveDivines.Value * Valuation.DivineInExalts:0}ex");
         b.AppendLine($"    mode {Rolling.Mode(Settings)}" +
                      // Nothing walked is not progress to report, and the STALLED warning below is
                      // about the bound and the walk disagreeing - not about a pass that had nothing
@@ -2371,7 +2379,12 @@ internal static class Dump
         b.AppendLine($"    a roll's shapes by socket count, before rescaling each count to its share: {Rolling.ShapeSharesSaid}");
 
         // The outcomes behind each remnant's figure, which the figure alone does not show. See Rolling.OutcomesOfRemnant.
-        foreach (var (cell, said) in Rolling.OutcomesOfRemnant.OrderBy(x => x.Key.X).ThenBy(x => x.Key.Y))
+        // Only this site's remnants: a pass still running when the site changed can file one from the last site.
+        var remnantCells = (Scan?.Targets ?? []).Where(t => t?.Kind == TargetKind.Remnant)
+            .Select(t => ((int)t.Grid.X, (int)t.Grid.Y)).ToHashSet();
+
+        foreach (var (cell, said) in Rolling.OutcomesOfRemnant.Where(x => remnantCells.Contains(x.Key))
+                     .OrderBy(x => x.Key.X).ThenBy(x => x.Key.Y))
             b.AppendLine($"    a roll of ({cell.X},{cell.Y}), {said}");
         SectionPartTiming("rolling verdicts");
         // **Printed as a share, because the absolute number says nothing about whether it is
@@ -3140,7 +3153,7 @@ internal static class Dump
                      $"at a kick, restart if no progress for {Settings?.Solver.Advanced.DestroyAndRepair.StallRestartMs.Value ?? -1}ms (0 = off), " +
                      $"opening choices {Settings?.Solver.Advanced.DestroyAndRepair.OpeningChoices.Value ?? -1}, " +
                      $"random draw {Planning.Draws}, " +
-                     $"must take above {Settings?.Rewards.MustTakeAbove.Value ?? -1f:0.#}, " +
+                     $"must take above {Settings?.Rewards.MustTakeAboveDivines.Value ?? -1f:0.##} divines, " +
                      (Settings?.Solver.Advanced.DestroyAndRepair.RoundsPerWorker.Value is > 0 and var budget
                          ? $"MEASURING: {budget} rounds per worker rather than the clock, "
                          : "") +
@@ -4129,11 +4142,7 @@ internal static class Dump
             body.AppendLine($"  {id}   [{Wrt.Status(id)}]");
             // One line now that the v1 cells are gone: there is no second notation to print the
             // row in, and no translation to mark, because a row is what its effect says.
-            // Share is on the line because it is the one stored number the row line did not
-            // print, and a cell that reads blank in the table with a value on disk is a
-            // disagreement nothing here could show. See Catalogue.Drawn.
             body.AppendLine($"      weight={Said(row.Weight)} size={Said(row.Size)} " +
-                         $"share={Said(row.Share)} " +
                          $"stacks={(row.Stacks?.ToString() ?? "-")} " +
                          $"children={Quoted(row.Children)} total={rolled} " +
                          $"effect={Quoted(effect)}");
@@ -4180,42 +4189,6 @@ internal static class Dump
         {
             complaints++;
             body.AppendLine($"  !!   {differs}");
-        }
-
-        // **A rune with no share is a rune the reroll pricing says can never be drawn.**
-        //
-        // Rolls.Runes keeps only the rows whose share is above nought, and Rolling normalises what
-        // it kept - so a blank is not "unknown, treated fairly", it is "this never comes up". Four
-        // of the five blanks are runes that plainly do come up, one of them Opulent.
-        //
-        // The shares that exist already sum to one, so the shortfall cannot be handed to the blanks
-        // without renormalising the rest, and there is no measurement to renormalise them against.
-        // Hence a complaint rather than a number: the hole is real and inventing five figures to
-        // hide it would be worse than reporting it.
-        var shared = 0f;
-        var blank = new List<string>();
-
-        foreach (var id in ids)
-        {
-            if (Wrt.Id.RuneNamed(id) == null)
-                continue;
-
-            var share = Safe.Read(() => Wrt.Of(id)?.Share, null);
-
-            if (share is > 0f)
-                shared += share.Value;
-            else
-                blank.Add(id);
-        }
-
-        if (blank.Count > 0)
-        {
-            complaints++;
-            body.AppendLine($"  !!   {blank.Count} rune(s) have no Share and are therefore absent " +
-                            $"from the reroll draw pool - {string.Join(", ", blank)}. The " +
-                            $"{ids.Count(x => Wrt.Id.RuneNamed(x) != null) - blank.Count} that do " +
-                            $"have one sum to {shared:0.###}, so there is no room left to give " +
-                            "these a share without remeasuring the others. See Rolls.Runes");
         }
 
         b.AppendLine($"  {ids.Count} rows ({Wrt.Known} shipped, {Wrt.Changed} yours), " +
@@ -4425,6 +4398,80 @@ internal static class Dump
     /// gets checked at all, and the dump could previously say only that something was hovered - it
     /// caught the path and the rectangle and none of the words.
     /// </summary>
+    /// <summary>
+    /// Every modifier in the game's Mods file with a stat that changes what a monster drops: its stat names with the
+    /// rolled ranges, its group and the game's description. Read from the file rather than from monsters met, so it
+    /// answers what else grants a stat such as BaseMonsterTotalDropsPlus without having to find a monster carrying it.
+    /// The live stat list on a monster is no help here: a spirit-possessed monster whose modifier grants
+    /// BaseMonsterTotalDropsPlus 2 does not show that stat in its Stats component.
+    /// </summary>
+    private static void DropModifiers(StringBuilder b, GameController gc)
+    {
+        b.AppendLine();
+        SectionHeader(b, "=== modifiers in the game that change monster drops ===");
+
+        var records = Safe.Read(() => gc.Files.Mods.records, null);
+
+        if (records == null)
+        {
+            b.AppendLine("  the Mods file is unreadable");
+            return;
+        }
+
+        var lines = new List<string>();
+
+        foreach (var mod in records.Values)
+        {
+            var names = Safe.Read(() => mod.StatNames, null);
+            var ranges = Safe.Read(() => mod.StatRange, null);
+
+            if (names == null || names.Length == 0)
+                continue;
+
+            var listed = new List<string>();
+            var rolled = new Dictionary<GameStat, int>();
+            var dropping = false;
+
+            for (var i = 0; i < names.Length; i++)
+            {
+                var stat = Safe.Read(() => names[i]?.MatchingStat, null);
+
+                if (stat == null)
+                    continue;
+
+                var name = stat.Value.ToString();
+                var low = ranges != null && i < ranges.Length && ranges[i] != null ? ranges[i].Min : 0;
+                var high = ranges != null && i < ranges.Length && ranges[i] != null ? ranges[i].Max : 0;
+
+                dropping |= IsDropStatName(name);
+                rolled[stat.Value] = high;
+                listed.Add(low == high ? $"{name}={high}" : $"{name}={low}..{high}");
+            }
+
+            if (!dropping)
+                continue;
+
+            var text = Safe.Read(() => _dumping?.Files.StatDescriptions?.TranslateMod(rolled), null);
+
+            lines.Add($"  {Safe.Read(() => mod.Key, "?")}  group={Safe.Read(() => mod.Group, "")}  " +
+                      $"{string.Join(", ", listed)}" +
+                      (string.IsNullOrWhiteSpace(text) ? "" : $" | \"{RuneInfo.ReadableTranslation(text)}\""));
+        }
+
+        lines.Sort(StringComparer.Ordinal);
+
+        b.AppendLine($"  {lines.Count} of {records.Count} modifiers; a stat counts when its name mentions drops, dropped " +
+                     "items, item rarity or item quantity");
+
+        foreach (var line in lines)
+            b.AppendLine(line);
+    }
+
+    private static bool IsDropStatName(string name) =>
+        name.Contains("Drop", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("ItemRarity", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("ItemQuantity", StringComparison.OrdinalIgnoreCase);
+
     private static void AtlasPassives(StringBuilder b, GameController gc)
     {
         b.AppendLine();
@@ -4522,7 +4569,7 @@ internal static class Dump
     ///
     /// **The row is 57 bytes and five fields cannot fill it**, so something in there is not being
     /// read - and the one thing the reroll advisor most wants is a weight, which this table is named
-    /// for and does not expose. See Rolls.Runes, whose shares are chosen because of that.
+    /// for and does not expose. Rerolling weights outcomes by observed pin counts instead - see Rolls.ShareOfPin.
     ///
     /// Printed with the known values so the columns can be located: find SlotCount, RuneSlot and
     /// Level in the bytes, and whatever moves in the gaps is a column nobody is reading. A column
@@ -4546,10 +4593,7 @@ internal static class Dump
         // row, it is independent of Level, and it is larger for runes the table admits often than
         // for ones it admits rarely - which is what a weight is.
         //
-        // Summed per rune so it can be put against Rolls.Runes, whose shares were chosen because
-        // this was believed absent. If the two orderings agree, the chosen numbers can be replaced
-        // by read ones - including the four runes that have no share at all and are currently
-        // dropped from the reroll enumeration entirely.
+        // Summed per rune, so it can be set against how often each rune is seen pinned. See Rolls.ShareOfPin.
         var weights = new SortedDictionary<string, (long Total, int Rows, int Least, int Most)>(
             StringComparer.OrdinalIgnoreCase);
 
@@ -4576,16 +4620,13 @@ internal static class Dump
 
             b.AppendLine($"     the unread int at offset 36, summed per rune over {rows.Count} rows " +
                          $"(total {whole}):");
-            b.AppendLine("       rune             rows   total    share   range        chosen share");
+            b.AppendLine("       rune             rows   total    share   range");
 
             foreach (var (id, what) in weights.OrderByDescending(x => x.Value.Total))
             {
-                var chosen = Safe.Read(() => Wrt.Of(Wrt.Id.Rune(id))?.Share, null);
-
                 b.AppendLine($"       {id,-16} {what.Rows,4} {what.Total,7} " +
                              $"{(whole > 0 ? what.Total * 100d / whole : 0d),7:0.00}% " +
-                             $"{what.Least,5}-{what.Most,-6} " +
-                             $"{(chosen is { } c ? (c * 100f).ToString("0.00") + "%" : "none")}");
+                             $"{what.Least,5}-{what.Most,-6}");
             }
         }
 
@@ -4992,6 +5033,33 @@ internal static class Dump
                $"{Safe.Read(() => Of("NumberOfRecords"), null) ?? (object)"?"} rows";
     }
 
+    /// <summary>
+    /// Writes the roll recipe tables to the config folder and says what was written. Only a snapshot with recipes in it
+    /// is written, so a dump taken before the game's tables load cannot overwrite a good file with an empty one.
+    /// </summary>
+    private static string SaveRollTables(RollRecipeTables tables)
+    {
+        if (tables == null || tables.PinsBySockets.Sum(x => x.Value.Sum(p => p.Recipes.Count)) == 0)
+            return "roll recipe tables: nothing to save - the recipe or weights table is not readable yet";
+
+        if (tables.AreaLevel < RollRecipeTables.LowestSavedLevel)
+            return $"roll recipe tables: not saved at area level {tables.AreaLevel} - only map levels, " +
+                   $"{RollRecipeTables.LowestSavedLevel} and up, are kept";
+
+        try
+        {
+            var path = Path.Combine(Wrt.Home, RollRecipeTables.FileNameAt(tables.AreaLevel));
+
+            tables.Save(path);
+
+            return $"roll recipe tables saved to {path}: {tables.Said()}";
+        }
+        catch (Exception e)
+        {
+            return $"roll recipe tables: could not save - {e.Message}";
+        }
+    }
+
     private static void RuneSlots(StringBuilder b, GameController gc)
     {
         b.AppendLine();
@@ -5112,13 +5180,21 @@ internal static class Dump
 
                 b.AppendLine($"     {sockets} sockets, {pairs.Count}: {string.Join(", ", named)}");
             }
-            b.AppendLine("     " + Safe.Read(() => Rolling.EnumerationWidth(Valuation, Settings), "unreadable"));
+            var tables = Safe.Read(() => RollRecipeTables.FromValuation(Valuation,
+                Safe.Read(() => gc.IngameState.Data.CurrentAreaLevel, 0),
+                Safe.Read(() => gc.IngameState.ServerData.League, "") ?? ""), null);
+
+            b.AppendLine("     " + Safe.Read(() => Rolling.EnumerationWidth(tables, Settings), "unreadable"));
+
+            // **Saved beside the dump, so a saved layout's rolls can be scored without the game.** The offline tool
+            // reads this file and builds the same shapes the reroll advice builds here. See RollRecipeTables.
+            b.AppendLine("     " + SaveRollTables(tables));
 
             // **Is there a column in the table that ExileCore2 does not read?**
             //
             // The file is called Weights and exposes none: Id, SlotCount, RuneSlot, Rune and Level
             // and nothing else. That matters because the reroll advisor has to invent the odds it
-            // would otherwise read here - see Rolls.Runes, whose shares are chosen.
+            // would otherwise read here - see Rolls.ShareOfPin, which counts pins seen instead.
             //
             // RecordLength is the row stride the client parsed the file at, so a stride wider than
             // those five fields need is a column going unread. Printed beside the recipe table for
@@ -5621,7 +5697,50 @@ internal static class Dump
                          $"level={Safe.Read(() => mod.Level.ToString(), "?")} " +
                          $"group={Safe.Read(() => mod.Group, "?")} " +
                          $"name={Safe.Read(() => mod.Name, "?")}");
+
+            // **What each value is, by the game's own stat name, and what the game says it does.** The values above
+            // are positional: a modifier with no group, such as a rare monster's MonsterRare12, could not be told
+            // apart from any other. The record names the stat behind each value, and the stat descriptions turn the
+            // set into the game's own words, as the rune table's lines are made. See RuneInfo.Describe.
+            var said = StatsOfMod(mod, values);
+
+            if (said.Length > 0)
+                b.AppendLine($"    {"",-12}  stats {said}");
         }
+    }
+
+    /// <summary>
+    /// A monster modifier's stats by name with the values it rolled, then the game's description of them, or empty when
+    /// the record names none. The description is from the general stat descriptions, so a stat they do not cover reads
+    /// as the game's own unknown marker.
+    /// </summary>
+    private static string StatsOfMod(ItemMod mod, List<int> values)
+    {
+        var record = Safe.Read(() => mod.ModRecord, null);
+        var names = Safe.Read(() => record?.StatNames, null);
+
+        if (names == null || names.Length == 0)
+            return "";
+
+        var rolled = new Dictionary<GameStat, int>();
+        var listed = new List<string>();
+
+        for (var i = 0; i < names.Length; i++)
+        {
+            var stat = Safe.Read(() => names[i]?.MatchingStat, null);
+
+            if (stat == null)
+                continue;
+
+            var value = values != null && i < values.Count ? values[i] : 0;
+
+            rolled[stat.Value] = value;
+            listed.Add($"{stat.Value}={value}");
+        }
+
+        var text = Safe.Read(() => _dumping?.Files.StatDescriptions?.TranslateMod(rolled), null);
+
+        return string.Join(", ", listed) + (string.IsNullOrWhiteSpace(text) ? "" : " | \"" + RuneInfo.ReadableTranslation(text) + "\"");
     }
 
     private static string States(Entity entity)

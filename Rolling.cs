@@ -62,7 +62,7 @@ internal sealed class Rolling
     /// RecipeTakenAt and Divert.
     /// </param>
     internal sealed record RollAdvice(Vector2 Grid, double Gain, string Why, bool Refused = false,
-        string TakenWhenWeighed = null);
+        string TakenWhenWeighed = null, double ChanceAbove = 0d);
 
     /// <summary>
     /// The advice as it stands, keyed by the remnant's cell so the overlay can find it.
@@ -146,6 +146,34 @@ internal sealed class Rolling
     /// one case where being a second late costs nothing and being wrong costs a Verisium.
     /// </summary>
     public bool Fresh { get; private set; }
+
+    /// <summary>
+    /// Whether each remnant's figure may be drawn: while Fresh, and in the continuous mode also while a newer pass is
+    /// being worked out, with the last pass's figures. Fresh still decides the border, the line to the remnant and the
+    /// score area's verdict, which are acted on; a figure drawn while not Fresh is drawn dimmed and marked as a step
+    /// behind. Before this, every figure went blank after each roll and each chain the solver published until a pass
+    /// weighed the new one, which on a Grand site in the continuous mode was most of the time between rolls.
+    /// Never while explosives are down, the mode is off, or there are no verdicts. See Overlay.ShowsRollFigures.
+    /// </summary>
+    public bool FiguresShowable { get; private set; }
+
+    /// <summary>
+    /// How long the figures were a step behind after each time they stopped being Fresh, newest last - from the moment
+    /// the screen moved on from the last pass to the moment a pass caught up. For the dump. See FiguresShowable.
+    /// </summary>
+    public string CatchUpsSaid =>
+        _catchUps.Count == 0
+            ? "none timed yet"
+            : string.Join(", ", _catchUps.Select(x => x.ToString("0", CultureInfo.InvariantCulture) + "ms")) +
+              string.Create(CultureInfo.InvariantCulture,
+                  $" - median {_catchUps.OrderBy(x => x).ElementAt(_catchUps.Count / 2):0}ms, longest {_catchUps.Max():0}ms") +
+              (_behindSince != DateTime.MinValue
+                  ? string.Create(CultureInfo.InvariantCulture, $"; behind now for {(DateTime.UtcNow - _behindSince).TotalMilliseconds:0}ms")
+                  : "");
+
+    private readonly Queue<double> _catchUps = new();
+    private DateTime _behindSince = DateTime.MinValue;
+    private bool _wasFresh;
 
     /// <summary>
     /// Whether advice was abandoned because the placing started, rather than answered.
@@ -391,7 +419,7 @@ internal sealed class Rolling
         _for = Vector2.Zero;
 
         // The totals are scores of a chain, and there is no longer a chain. See Gathering.
-        _gathered = new Dictionary<(int X, int Y), (double Total, double Weight, int Round, bool More)>();
+        _gathered = new Dictionary<(int X, int Y), (double Total, double Weight, int Round, bool More, double WeightAbove)>();
         _gatheredFor = "";
     }
 
@@ -414,95 +442,13 @@ internal sealed class Rolling
 
         _failure = "";
         _failed = default;
-    }
 
-    /// <summary>
-    /// A local rune list with no names: the expected worth spread over the expected distinct count.
-    ///
-    /// The scoring loop strikes out local runes the chain already propagates, which needs names it
-    /// does not have here. A null id says "cannot be struck" rather than leaving the array empty,
-    /// which would lose the count that concentration depends on.
-    /// </summary>
-
-    /// <summary>The lifts each rolled combination holds, per amplifier class, in order, or null for none. See RolledRemnant.</summary>
-    private static float[][] HeldLiftOfRolledChoices(
-        IReadOnlyList<(float Reward, float Carries, float Local, (string Id, float Worth)[] Locals, string[] Runes,
-            (string Id, int Tag, float Percent, bool Flat)[] Spread)> choices)
-    {
-        var found = new float[choices.Count][];
-        var any = false;
-
-        for (var c = 0; c < choices.Count; c++)
+        lock (OutcomesGate)
         {
-            var held = new List<string>(choices[c].Runes ?? []);
-
-            foreach (var (id, _) in choices[c].Locals ?? [])
-                held.Add(id);
-
-            found[c] = Weighing.HeldLiftsOfRunes(held);
-            any |= found[c] != null;
+            OutcomesAcrossRounds.Clear();
+            OutcomesOfRemnant.Clear();
         }
-
-        return any ? found : null;
     }
-
-    private static (string Id, float Worth)[] Anonymous(int count, float total)
-    {
-        if (count <= 0)
-            return System.Array.Empty<(string, float)>();
-
-        var each = total / count;
-        var found = new (string, float)[count];
-
-        for (var i = 0; i < count; i++)
-            found[i] = (null, each);
-
-        return found;
-    }
-
-    /// <summary>
-    /// What one ordinary slot is worth on average, over the whole rune table.
-    ///
-    /// Exact for the purpose it is put to: the ordinary slots contribute by being added up, and the
-    /// expectation of a sum is the sum of the expectations however the draws land.
-    /// </summary>
-    private static float Locally(Dictionary<string, (float Weight, string Scope, float Local)> known)
-    {
-        var total = 0f;
-
-        foreach (var (rune, share) in Rolls.Runes)
-        {
-            if (known.TryGetValue(rune, out var said))
-                total += share * said.Local;
-        }
-
-        return total;
-    }
-
-    /// <summary>
-    /// How many DIFFERENT runes fill that many ordinary slots, on average.
-    ///
-    /// Concentration counts distinct runes rather than adding their values, so the count is the
-    /// figure it needs and the count is not the slot total - runes do not stack, and the same one
-    /// twice is one modifier. A rune is missing from k draws with probability (1-p) to the k, so the
-    /// expected number present is the sum over the table of one minus that.
-    ///
-    /// Rounded, because a slot count has to be a whole number for the layering to use it, and the
-    /// fraction it discards is worth less than the approximation it replaces.
-    /// </summary>
-    private static int Distinct(int slots)
-    {
-        if (slots <= 1)
-            return slots;
-
-        var total = 0d;
-
-        foreach (var (_, share) in Rolls.Runes)
-            total += 1d - Math.Pow(1d - share, slots);
-
-        return Math.Max(1, (int)Math.Round(total));
-    }
-
 
     /// <summary>The least a roll must be worth before it is advised at all. See where it is used.</summary>
     private const double MinimumAdvisedGain = 1d;
@@ -514,6 +460,40 @@ internal sealed class Rolling
 
     /// <summary>How many remnants on this site had been rolled when the last pass was dispatched.</summary>
     private int _rolledWhen = -1;
+
+    /// <summary>
+    /// The recipes the plan took at its remnants when the last pass was dispatched, as RecipesTakenKey. See Consider.
+    /// </summary>
+    private int _takenWhen;
+
+    /// <summary>The Gathering key of the chain and contents the published verdicts were weighed under. See Fresh.</summary>
+    private volatile string _publishedFor = "";
+
+    /// <summary>The Gathering key of the chain and contents the last pass was dispatched for. See Consider.</summary>
+    private string _dispatchedFor = "";
+
+    /// <summary>The last OnScreenKey worked out, and the plan and environment it was worked out from.</summary>
+    private (Plan Plan, PlanEnvironment Env, string Key) _onScreen;
+
+    /// <summary>
+    /// The Gathering key of the chain and contents on screen, worked out again only when the plan or the environment is a
+    /// different object - every frame asks, and a solve hands over a new one of either only when something changed.
+    /// Empty without both.
+    /// </summary>
+    private string OnScreenKey(PlanEnvironment env, Plan plan)
+    {
+        if (env == null || plan?.Points is not { Count: > 0 } points)
+            return "";
+
+        if (ReferenceEquals(_onScreen.Plan, plan) && ReferenceEquals(_onScreen.Env, env))
+            return _onScreen.Key;
+
+        var key = Safe.Read(() => Gathering(env, points), "");
+
+        _onScreen = (plan, env, key);
+
+        return key;
+    }
 
     /// <summary>
     /// Works out what to advise, once per solved plan.
@@ -549,9 +529,24 @@ internal sealed class Rolling
         if (mode == RerollSettings.Off)
         {
             Fresh = false;
+            FiguresShowable = false;
             Stale = false;
             Diverted = "";
             Nothing("rolling advice is off");
+
+            return;
+        }
+
+        // **Nothing to advise at a site that has been set off.** A roll is bought before the chain goes off, and at
+        // another player's site the panel reads 0 placed throughout, so the explosives-down gate below never closes
+        // there: the advice went on being worked out and drawn after the host set the site off (dump 2026-10-16
+        // 14:21:05, detonator activated, ROLL still named). Emptied every frame, so a pass finishing afterwards is not
+        // drawn either. See Detonator.SetOffHere.
+        if (Detonator.SetOffHere(gc))
+        {
+            Stale = false;
+            Diverted = "";
+            Nothing("the site has been set off");
 
             return;
         }
@@ -575,10 +570,34 @@ internal sealed class Rolling
         // What it does need is an answer to show at all, which is why _adviceByCell rather than _plan: _plan
         // is set when a pass is DISPATCHED, so it is non-null before the first one has produced
         // anything.
+        // **And only while the verdicts are about the chain and contents on screen.** Keeping the last answer through a
+        // solve is this mode's point, but a verdict weighed against another chain is not an old answer to this
+        // question, it is an answer to a different one: a mid-solve improvement took Ancient Rune of Witchcraft at
+        // (644,1104), making it the only Opulent source, and the border kept saying roll it - a roll its own pass put
+        // at -3,312 on that chain (2026-10-14). So a verdict is drawn only while the Gathering key it was weighed under
+        // matches the one on screen; when they differ the next pass is dispatched at once - see the gate below.
         Fresh = mode == RerollSettings.Continuous
-            ? _adviceByCell.Count > 0
+            ? _adviceByCell.Count > 0 && _publishedFor.Length > 0 && _publishedFor == OnScreenKey(env, planning?.Plan)
             : planning is { Searching: false } && !Working && _plan != null &&
               ReferenceEquals(_plan, planning.Plan);
+
+        FiguresShowable = Fresh || (mode == RerollSettings.Continuous && _adviceByCell.Count > 0);
+
+        // Timed from the first frame the figures are a step behind to the first frame a pass has caught up.
+        if (_wasFresh && !Fresh && _adviceByCell.Count > 0)
+            _behindSince = DateTime.UtcNow;
+
+        if (Fresh && _behindSince != DateTime.MinValue)
+        {
+            _catchUps.Enqueue((DateTime.UtcNow - _behindSince).TotalMilliseconds);
+
+            while (_catchUps.Count > 20)
+                _catchUps.Dequeue();
+
+            _behindSince = DateTime.MinValue;
+        }
+
+        _wasFresh = Fresh;
 
         if (env == null || chain is not { Count: > 0 })
         {
@@ -630,6 +649,9 @@ internal sealed class Rolling
         // basis has gone.
         if (down > 0)
         {
+            // Placing is acting on the advice, so nothing a step behind is shown. See FiguresShowable.
+            FiguresShowable = Fresh;
+
             // Captured on the way in, once, while there is still something to read. A finished pass
             // that advised nothing is the one answer placing cannot invalidate - a placed blast only
             // takes content out of what is left to win, so a roll that was not worth buying then is
@@ -657,6 +679,7 @@ internal sealed class Rolling
                 // back to clear ground restores advice that is once again exactly about the chain on
                 // screen, which is the same chain it was computed from.
                 Fresh = false;
+                FiguresShowable = false;
 
                 NoAdviceReason = "explosives are already down - rolls are worth advising before placing, " +
                         "so this one was left unanswered";
@@ -727,8 +750,22 @@ internal sealed class Rolling
         // the call site - so they have nothing to refresh.
         var rolled = mode == RerollSettings.Continuous ? Rolled(scan, site) : 0;
 
+        // **A change of recipe at any remnant asks again, without waiting for the solve to finish.** The solver
+        // publishes each better chain as it finds it, and a continuous pass on a Grand site runs 24 s, so gated on
+        // Planning.Solves alone the verdicts could describe a chain the screen had moved on from for most of that.
+        // Seen 2026-10-14: a mid-pass improvement took Ancient Rune of Witchcraft at (644,1104), making it the only
+        // Opulent source, while "roll it" stood. Divert passes over such a remnant; this re-weighs it. A recipe change
+        // and not every new chain, because a chain moving its explosives while every remnant keeps its recipe leaves
+        // what each roll destroys alone. A pass in flight is not stopped for it - a stream of improvements early in a
+        // solve would stop every pass before it finished - so the gap is at most the length of one pass.
+        var taken = RecipesTakenKey();
+
+        // And whenever the chain or contents on screen are not what the last dispatched pass weighed, which is what
+        // keeps Fresh from staying false. Continuous only, like the deepening: the other modes ask once per solve.
+        var onScreen = mode == RerollSettings.Continuous ? OnScreenKey(env, planning.Plan) : _dispatchedFor;
+
         if (!deepening && rolled == _rolledWhen && Vector2.Distance(_for, site) < 1f &&
-            _after == Planning.Solves)
+            _after == Planning.Solves && taken == _takenWhen && onScreen == _dispatchedFor)
             return;
 
         // **Not while the ground is still moving.**
@@ -773,15 +810,24 @@ internal sealed class Rolling
         _plan = planning.Plan;
         _after = Planning.Solves;
         _rolledWhen = rolled;
+        _takenWhen = taken;
+        _dispatchedFor = onScreen;
+
+        // Read once, here, so every verdict of this pass records the recipes of the chain it was weighed against
+        // rather than whatever the solver has published by the time the verdict is written. See Divert.
+        var takenAtDispatch = RecipesTakenNow();
+
+        // What the verdicts file records beside each gain, read here for the same reason. See WriteVerdictsForRules.
+        var verdictContext = VerdictContextNow(gc, planning.Plan);
 
         var asking = Interlocked.Increment(ref _asked);
         _floored = "";
 
-        // **Everything the pass needs, read here on the frame, and that is a rule rather than a
-        // tidiness.** What follows runs on a background thread, and two of the things it wants are
-        // plain dictionaries the frame writes to: Insisted, which the must-take marker and the
-        // hotkey both edit, and the weight reference table behind every rune's weight. A dictionary
-        // being read while it is rehashed throws, or worse does not.
+        // **The player's marks read here on the frame.** What follows runs on a background thread, and Insisted - which
+        // the must-take marker and the hotkey both edit - is a plain dictionary; one read while it is rehashed throws, or
+        // worse does not. The pass builds rolled remnants with Planning.PlanTargetOf told not to read it. It does read
+        // the weight reference table from that thread, through the plan's own Weighing functions: the table changes
+        // only when edited in the settings, and a pass running across an edit is answering about the old one.
         // **This dig site's content, not the map's.**
         //
         // The planner has always built its environment from At(site), which is what keeps one
@@ -797,7 +843,6 @@ internal sealed class Rolling
         var links = new List<Vector2>(chain);
         var marked = Marked(env);
         var markedForReward = MarkedForRewardValue(env);
-        var known = Known(settings);
 
         // Only for the line that reports it. The environment has already accounted for these -
         // their content is out of the target list and their propagation is banked in Secured - so
@@ -807,7 +852,10 @@ internal sealed class Rolling
         // **Read here, on the thread that owns the reads.** Valuation goes to game memory and two
         // TimeCaches, and the advice runs on a task; gathering the shapes up front means the task
         // walks an immutable list instead. See ShapesARollCouldProduce.
-        var shapes = ShapesARollCouldProduce(valuation, Rolls.MapSlotFloor(gc), Detonator.Grand(gc));
+        var tables = RollRecipeTables.FromValuation(valuation,
+            Safe.Read(() => gc.IngameState.Data.CurrentAreaLevel, 0),
+            Safe.Read(() => gc.IngameState.ServerData.League, "") ?? "");
+        var shapes = ShapesARollCouldProduce(tables, Rolls.MapSlotFloor(gc), Detonator.Grand(gc));
 
         // **Its own thread, at normal priority - ahead of the solver's workers.** A pass is usually asked for when the
         // chain has reached a strong point and the player is deciding what to roll, so it is what they are waiting on.
@@ -818,7 +866,8 @@ internal sealed class Rolling
         {
             try
             {
-                WeighRemnants(settings, targets, env, links, settled, marked, markedForReward, known, asking, shapes);
+                WeighRemnants(settings, targets, env, links, settled, marked, markedForReward, asking, shapes,
+                    takenAtDispatch, verdictContext);
             }
             catch (Exception ex)
             {
@@ -853,7 +902,7 @@ internal sealed class Rolling
     /// whole move into the gain. Measured: two remnants read +45,884 and +41,912 on one pass and
     /// -2,977 and -6,956 on the next, both shifted by the same 48,860.
     /// </summary>
-    private Dictionary<(int X, int Y), (double Total, double Weight, int Round, bool More)> _gathered = new();
+    private Dictionary<(int X, int Y), (double Total, double Weight, int Round, bool More, double WeightAbove)> _gathered = new();
 
     /// <summary>
     /// Which chain and content the totals in _gathered are about.
@@ -906,6 +955,7 @@ internal sealed class Rolling
     private void Nothing(string why)
     {
         Fresh = false;
+        FiguresShowable = false;
         // Swapped rather than cleared: the frame may be walking it to draw the labels.
         _adviceByCell = new Dictionary<(int X, int Y), RollAdvice>();
         Advised = null;
@@ -973,31 +1023,6 @@ internal sealed class Rolling
     }
 
     /// <summary>
-    /// Every rune this pass might draw, with what it is worth and what it reaches, read on the frame.
-    ///
-    /// The whole table rather than the ones actually drawn, because which are drawn is decided by a
-    /// random number on the other thread - and reading one more row than needed costs nothing next
-    /// to reading any of them from the wrong thread.
-    /// </summary>
-    private static Dictionary<string, (float Weight, string Scope, float Local)> Known(
-        AutoExpeditionSettings settings)
-    {
-        var found = new Dictionary<string, (float, string, float)>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var (rune, _) in Rolls.Runes)
-        {
-            // Local worth with any split-off share added, since a local slot pays both on the same waves. See
-            // Weighing.SplitShareKeyOf.
-            found[rune] = (Safe.Read(() => Runes.Weight(rune), 0f),
-                Safe.Read(() => Runes.Scope(rune), "") ?? "",
-                Safe.Read(() => Propagation.Locally(rune) +
-                                Weighing.SplitShareKeysOfRune(rune).Sum(Propagation.Locally), 0f));
-        }
-
-        return found;
-    }
-
-    /// <summary>
     /// One shape a roll could produce, with everything it could then become.
     ///
     /// A roll randomises everything, so what comes out is a socket count, a rune, and the slot that
@@ -1005,9 +1030,8 @@ internal sealed class Rolling
     /// separately and is not part of the shape; see where these are walked.
     /// </summary>
     /// <param name="Share">
-    /// How likely this shape is: the socket count's share times the rune's. Chosen numbers, not
-    /// measured ones - the game's table states which shapes are legal and nothing about how often.
-    /// See Rolls.Runes.
+    /// How likely this shape is: the socket count's share times the pinned rune's, the second counted from pins
+    /// seen - the game's table states which shapes are legal and nothing about how often. See Rolls.ShareOfPin.
     /// </param>
     /// <param name="Recipes">
     /// Every recipe this shape can produce, with the rune it puts in each slot and what its reward
@@ -1032,8 +1056,9 @@ internal sealed class Rolling
     /// can be filled, which is what a lazily built cache needs. See OutcomesOf.
     /// </param>
     private readonly record struct RolledShape(int Sockets, double Share,
-        List<KeyValuePair<Expedition2Recipe, double>> Recipes,
-        List<(int[] Positions, int Stands)>[] Kept);
+        List<KeyValuePair<RollRecipeTables.RollRecipe, double>> Recipes,
+        List<(int[] Positions, int Stands)>[] Kept,
+        Dictionary<string, PlanTarget> Built);
 
     /// <summary>
     /// Every shape a roll of this site could produce, read BEFORE the advice goes to a background
@@ -1056,11 +1081,11 @@ internal sealed class Rolling
     /// Whether the site is a Grand Expedition, whose rolls come up seven sockets far more often than any other site's.
     /// See Rolls.SocketsFor.
     /// </param>
-    private static List<RolledShape> ShapesARollCouldProduce(Valuation valuation, int floor = 0, bool grand = true)
+    private static List<RolledShape> ShapesARollCouldProduce(RollRecipeTables tables, int floor = 0, bool grand = true)
     {
         var shapes = new List<RolledShape>();
 
-        if (valuation == null)
+        if (tables == null)
             return shapes;
 
         var socketShares = Rolls.SocketsFor(grand);
@@ -1076,20 +1101,20 @@ internal sealed class Rolling
             // against the readings at that socket count, smoothed by one imagined observation per
             // admitted pin - so the divisor is a property of this level's admitted set rather than
             // of the census. See Rolls.ShareOfPin.
-            var pins = Safe.Read(() => valuation.FixedRunesPossibleAt(sockets), null)
-                       ?? new List<(Expedition2Rune Rune, int Slot)>();
+            var pins = tables.PinsBySockets.GetValueOrDefault(sockets) ?? [];
 
-            foreach (var (rune, slot) in pins)
+            foreach (var pin in pins)
             {
-                var id = Safe.Read(() => rune.Id, null);
+                var id = pin.RuneId;
+                var slot = pin.Slot;
 
                 if (string.IsNullOrWhiteSpace(id))
                     continue;
 
                 // **Per socket count, not one share for the rune everywhere.**
                 //
-                // This took the rune's global share out of Rolls.Runes, which is its share of every
-                // fresh remnant at any size. Power is 1.75% of all of them and seven of the ten pins
+                // This took the rune's global share from a per-rune column in the weight table (since removed),
+                // which was its share of every fresh remnant at any size. Power is 1.75% of all of them and seven of the ten pins
                 // a nine socket remnant admits, so a marginal number misprices the large shapes by
                 // an order of magnitude - and the large shapes are the ones holding the nine rune
                 // recipes. It also counted a rune once per admitted slot, so a rune pinnable in two
@@ -1099,14 +1124,20 @@ internal sealed class Rolling
                 if (runeShare <= 0f)
                     continue;
 
-                var recipes = Safe.Read(() => valuation.RecipesForShape(sockets, rune, slot), null);
+                // **Only recipes that fill every socket.** A roll never leaves a socket empty: a remnant rolled into four
+                // sockets holds a four-rune recipe. A pin's list also holds shorter recipes, which a fresh remnant can
+                // offer beside its full ones, and dealing them as outcomes put 11-43% of a roll at four to nine sockets
+                // on recipes it cannot land on (level 81 tables, 2026-10-15).
+                var recipes = pin.Recipes
+                    .Where(x => x.Recipe.RuneCount == sockets)
+                    .Select(x => new KeyValuePair<RollRecipeTables.RollRecipe, double>(x.Recipe, x.Price)).ToList();
 
-                if (recipes is not { Count: > 0 })
+                if (recipes.Count == 0)
                     continue;
 
                 // Three, so slot counts of one and two index straight in.
                 shapes.Add(new RolledShape(sockets, socketShare * runeShare, recipes,
-                    new List<(int[] Positions, int Stands)>[3]));
+                    new List<(int[] Positions, int Stands)>[3], new Dictionary<string, PlanTarget>(StringComparer.Ordinal)));
             }
         }
 
@@ -1162,9 +1193,9 @@ internal sealed class Rolling
     ///
     /// For the dump. Nothing routes or scores by it.
     /// </summary>
-    internal static string EnumerationWidth(Valuation valuation, AutoExpeditionSettings settings)
+    internal static string EnumerationWidth(RollRecipeTables tables, AutoExpeditionSettings settings)
     {
-        var shapes = ShapesARollCouldProduce(valuation);
+        var shapes = ShapesARollCouldProduce(tables);
 
         if (shapes.Count == 0)
             return "no shapes - the recipe table or the weights table is not readable yet";
@@ -1176,7 +1207,7 @@ internal sealed class Rolling
             var ids = new List<string>(shape.Recipes.Count);
 
             foreach (var (recipe, _) in shape.Recipes)
-                ids.Add(Safe.Read(() => recipe.Id, null) ?? "?");
+                ids.Add(recipe.Id ?? "?");
 
             ids.Sort(StringComparer.Ordinal);
 
@@ -1234,7 +1265,7 @@ internal sealed class Rolling
 
                     foreach (var (recipe, _) in shape.Recipes)
                     {
-                        var needs = Safe.Read(() => recipe.RuneCountRequired, 0);
+                        var needs = recipe.RuneCount;
 
                         key.Append('|');
 
@@ -1245,7 +1276,7 @@ internal sealed class Rolling
 
                             var at = slot;
 
-                            key.Append(Safe.Read(() => recipe.Runes.ElementAtOrDefault(at)?.Id, null) ?? "-")
+                            key.Append(recipe.Runes.ElementAtOrDefault(at) ?? "-")
                                .Append(',');
                         }
                     }
@@ -1282,12 +1313,12 @@ internal sealed class Rolling
 
             foreach (var (recipe, _) in shape.Recipes)
             {
-                var needs = Safe.Read(() => recipe.RuneCountRequired, 0);
+                var needs = recipe.RuneCount;
 
                 for (var slot = 0; slot < needs && !strong; slot++)
                 {
                     var at = slot;
-                    var id = Safe.Read(() => recipe.Runes.ElementAtOrDefault(at)?.Id, null);
+                    var id = recipe.Runes.ElementAtOrDefault(at);
 
                     if (!string.IsNullOrWhiteSpace(id) && Runes.Weight(id) > 10f)
                         strong = true;
@@ -1357,10 +1388,199 @@ internal sealed class Rolling
     private static int PositionSets(int sockets) =>
         sockets <= 0 ? 0 : sockets + sockets * (sockets - 1) / 2;
 
+    /// <summary>
+    /// The pass's figures after each round, with the time each round took over every remnant, for the offline tool's
+    /// --roll-timing: how soon a first verdict is ready and how far it is from the exact one. A round here is what one
+    /// in-game pass adds - one ScoreRollOutcomes per remnant still holding arrangements - so the time to the first
+    /// round is the time to the first advice. Single threaded and with nothing beside it, unlike the game, where the
+    /// pass runs at below-normal priority next to the solver's workers.
+    /// </summary>
+    internal static List<(int Round, double Milliseconds, (int Index, double Gain, double ShareAbove, bool More, double Milliseconds)[] Remnants)>
+        RollGainsByRound(PlanEnvironment env, List<Vector2> chain, AutoExpeditionSettings settings,
+            RollRecipeTables tables, int floor, bool grand, int mostRounds = 64)
+    {
+        var shapes = ShapesARollCouldProduce(tables, floor, grand);
+        var indices = Enumerable.Range(0, env.Targets.Count).Where(i => env.Targets[i].Kind == TargetKind.Remnant).ToArray();
+        var sums = new (double Total, double Weight, double WeightAbove, bool More)[indices.Length];
+        var rounds = new List<(int, double, (int, double, double, bool, double)[])>();
+        var spentOn = new double[indices.Length];
+
+        for (var k = 0; k < sums.Length; k++)
+            sums[k].More = true;
+
+        for (var round = 0; round < mostRounds && sums.Any(x => x.More); round++)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+
+            for (var k = 0; k < indices.Length; k++)
+            {
+                if (!sums[k].More)
+                    continue;
+
+                var started = clock.Elapsed.TotalMilliseconds;
+                var walked = ScoreRollOutcomes(env, chain, indices[k], settings, shapes, round);
+
+                spentOn[k] = clock.Elapsed.TotalMilliseconds - started;
+
+                sums[k] = (sums[k].Total + walked.Total - walked.Weight * walked.Standing, sums[k].Weight + walked.Weight,
+                    sums[k].WeightAbove + walked.WeightAbove, walked.More);
+            }
+
+            var elapsed = clock.Elapsed.TotalMilliseconds;
+            var snapshot = new (int, double, double, bool, double)[indices.Length];
+
+            for (var k = 0; k < indices.Length; k++)
+            {
+                var gain = sums[k].Weight > 0d ? sums[k].Total / sums[k].Weight : 0d;
+
+                if (!ChainCatches(env, chain, indices[k]) && gain < 0d)
+                    gain = 0d;
+
+                snapshot[k] = (indices[k], gain, sums[k].Weight > 0d ? sums[k].WeightAbove / sums[k].Weight : 0d, sums[k].More,
+                    spentOn[k]);
+                spentOn[k] = 0d;
+            }
+
+            rounds.Add((round, elapsed, snapshot));
+        }
+
+        return rounds;
+    }
+
+    /// <summary>
+    /// The exact expected gain of rolling each remnant on this chain, every round walked: what a full advice pass would
+    /// settle on, with no game. For the offline tool, which scores a saved layout's rolls from RollRecipeTables. The
+    /// same ScoreRollOutcomes the pass runs, summed the same way; refusals (rolled, must take, out of reach) are left to
+    /// the caller, and an unreached remnant is floored at nought as the pass floors it.
+    /// </summary>
+    internal static List<(int Index, double Gain, double ShareAbove, bool Reached)> ExactRollGains(PlanEnvironment env,
+        List<Vector2> chain, AutoExpeditionSettings settings, RollRecipeTables tables, int floor, bool grand,
+        int mostRounds = 64)
+    {
+        var shapes = ShapesARollCouldProduce(tables, floor, grand);
+        var found = new List<(int, double, double, bool)>();
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            if (env.Targets[i].Kind != TargetKind.Remnant)
+                continue;
+
+            var total = 0d;
+            var weight = 0d;
+            var weightAbove = 0d;
+
+            for (var round = 0; round < mostRounds; round++)
+            {
+                var walked = ScoreRollOutcomes(env, chain, i, settings, shapes, round);
+
+                total += walked.Total - walked.Weight * walked.Standing;
+                weight += walked.Weight;
+                weightAbove += walked.WeightAbove;
+
+                if (!walked.More)
+                    break;
+            }
+
+            var gain = weight > 0d ? total / weight : 0d;
+            var reached = ChainCatches(env, chain, i);
+
+            if (!reached && gain < 0d)
+                gain = 0d;
+
+            // The share of the chance that scores above the remnant as it stands, from every round's outcomes.
+            var above = weight > 0d ? weightAbove / weight : 0d;
+
+            found.Add((i, gain, above, reached));
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// Where each finished pass's exact gains are appended for the reroll rules, or empty for nowhere. Set at load. See
+    /// WriteVerdictsForRules.
+    /// </summary>
+    internal static string VerdictsFile { get; set; } = "";
+
+    /// <summary>What the verdicts file needs from the frame: the area, the plan's picks and each remnant's first link.</summary>
+    internal sealed record VerdictContext(string Area, int Level, Dictionary<(int X, int Y), Planner.Picked> Picked,
+        Dictionary<(int X, int Y), int> FirstLink, int Links);
+
+    /// <summary>Read on the frame at dispatch, where Planner.Chosen and the plan are. Null when either cannot be read.</summary>
+    private static VerdictContext VerdictContextNow(GameController gc, Plan plan)
+    {
+        if (plan?.Points is not { Count: > 0 } points || Planner.RuneTallyOutOfDate)
+            return null;
+
+        try
+        {
+            var picked = new Dictionary<(int X, int Y), Planner.Picked>(Planner.Chosen);
+            var first = new Dictionary<(int X, int Y), int>();
+
+            for (var k = 0; k < points.Count; k++)
+            {
+                foreach (var caught in plan.CaughtBy(k))
+                    first.TryAdd(((int)MathF.Round(caught.X), (int)MathF.Round(caught.Y)), k + 1);
+            }
+
+            return new VerdictContext(Safe.Read(gc, static g => g.Area.CurrentArea.Name, "") ?? "",
+                Safe.Read(gc, static g => g.Area.CurrentArea.RealLevel, 0), picked, first, points.Count);
+        }
+        catch (InvalidOperationException)
+        {
+            // Planner.Chosen written mid-copy. This pass records nothing; the next one will.
+            return null;
+        }
+    }
+
+    /// <summary>The chain and contents the verdicts file last recorded, so one question is written once. See Gathering.</summary>
+    private string _verdictsWrittenFor = "";
+
+    /// <summary>
+    /// Appends one row per remnant of a pass whose every figure is exact - each arrangement walked - with what the draft
+    /// reroll rules read beside the gain: runes used, what it passes before and after duplicates, the pool it passes
+    /// into, its reward term, own effects and local worth, and its first link. The same columns as the offline tool's
+    /// --rolls output, so tools/roll_rules.py reads both. Once per chain and contents: deepening passes over a settled
+    /// answer write nothing.
+    /// </summary>
+    private void WriteVerdictsForRules(PlanEnvironment env, List<(int Index, double Gain, bool Reached, double Above)> worth,
+        int unfinished, VerdictContext context, AutoExpeditionSettings settings)
+    {
+        if (unfinished > 0 || context == null || string.IsNullOrEmpty(VerdictsFile) || _gatheredFor == _verdictsWrittenFor)
+            return;
+
+        _verdictsWrittenFor = _gatheredFor;
+
+        var grand = env.Explosives >= Detonator.GrandExplosives;
+        var source = string.Create(CultureInfo.InvariantCulture,
+            $"game {DateTime.Now:yyyy-MM-dd HH:mm:ss} {context.Area.Replace(',', ' ')} {context.Level}");
+        var lines = new List<string>();
+
+        foreach (var (index, gain, reached, above) in worth)
+        {
+            var target = env.Targets[index];
+            var cell = ((int)MathF.Round(target.Grid.X), (int)MathF.Round(target.Grid.Y));
+            var has = context.Picked.TryGetValue(cell, out var picked);
+
+            lines.Add(string.Create(CultureInfo.InvariantCulture,
+                $"{source},{cell.Item1};{cell.Item2},{(grand ? 1 : 0)},{context.Links},{context.FirstLink.GetValueOrDefault(cell, -1)}," +
+                $"{(reached ? 1 : 0)},{(has ? picked.Sockets : target.WaveCount)},{target.Choices?.Length ?? 0},{(target.Must ? 1 : 0)}," +
+                $"{(has ? string.Join(" ", picked.Carrying ?? []) : "")},{(has ? picked.Carries : 0):0.##},{(has ? picked.Kept : 0):0.##}," +
+                $"{(has ? picked.Downstream : 0):0},{(has ? picked.Worth : 0):0.#},{(has ? picked.Own : 0):0.#},{(has ? picked.Held : 0):0.##}," +
+                $"{gain:0.#},{above:0.000}"));
+        }
+
+        if (!System.IO.File.Exists(VerdictsFile))
+            System.IO.File.WriteAllText(VerdictsFile, "layout,cell,grand,links,link,reached,runes,choices,must,passes,carries,kept," +
+                                            "pool,reward,own,local,gain,above" + Environment.NewLine);
+
+        System.IO.File.AppendAllLines(VerdictsFile, lines);
+    }
+
     private void WeighRemnants(AutoExpeditionSettings settings, List<Target> scan, PlanEnvironment env,
         List<Vector2> chain, int settled, Insisted.Said[] marked, bool[] markedForReward,
-        Dictionary<string, (float Weight, string Scope, float Local)> known, int asking,
-        List<RolledShape> shapes)
+        int asking,
+        List<RolledShape> shapes, Dictionary<(int X, int Y), string> taken, VerdictContext verdictContext = null)
     {
         var began = DateTime.UtcNow;
 
@@ -1375,7 +1595,7 @@ internal sealed class Rolling
 
         if (gathering != _gatheredFor)
         {
-            _gathered = new Dictionary<(int X, int Y), (double Total, double Weight, int Round, bool More)>();
+            _gathered = new Dictionary<(int X, int Y), (double Total, double Weight, int Round, bool More, double WeightAbove)>();
             _gatheredFor = gathering;
             RoundsWalked = 0;
             Stalled = false;
@@ -1390,13 +1610,7 @@ internal sealed class Rolling
         _progressWalked = walkedBefore;
         _progressNeeded = RoundsToExhaust(shapes, settings);
 
-        // **Plain worth, never Total, on every side of every roll comparison.** Total carries the synthetic weight for
-        // holding a must take, which is not loot, and a roll is about loot. When a remnant's must take was removed with
-        // the key, the two sides of one comparison disagreed about that weight and the whole of it - about 21,900 on a
-        // Craggy Peninsula site, 2026-10-03 - was advised as a roll worth 21,987. See Planner.Plainly.
-        var baseline = Planner.Plainly(env, chain);
-
-        var worth = new List<(int Index, double Gain, bool Reached)>();
+        var worth = new List<(int Index, double Gain, bool Reached, double Above)>();
 
         // What else was running when this pass began, for the line that reports it: the passes run on one thread at
         // below-normal priority beside the solver's workers and the remnant order search. See _telling.
@@ -1431,7 +1645,7 @@ internal sealed class Rolling
 
             if (why != null)
             {
-                RecordAdvice(said, target.Grid, 0d, why, refused: true);
+                RecordAdvice(said, target.Grid, 0d, why, taken, refused: true);
 
                 continue;
             }
@@ -1469,10 +1683,10 @@ internal sealed class Rolling
                 var at = i;
                 var round = had.Round;
                 var walked = ResultOfStage($"screening the remnant at ({target.Grid.X:0},{target.Grid.Y:0})",
-                    () => ScoreRollOutcomes(env, chain, at, settings, known, shapes, round));
+                    () => ScoreRollOutcomes(env, chain, at, settings, shapes, round));
 
                 _gathered[cell] = (had.Total + walked.Total - walked.Weight * walked.Standing,
-                    had.Weight + walked.Weight, had.Round + 1, walked.More);
+                    had.Weight + walked.Weight, had.Round + 1, walked.More, had.WeightAbove + walked.WeightAbove);
 
                 rounds += had.Round + 1;
                 unfinished += walked.More ? 1 : 0;
@@ -1505,7 +1719,9 @@ internal sealed class Rolling
                 gain = 0d;
             }
 
-            worth.Add((i, gain, reached));
+            var sofar = _gathered.GetValueOrDefault(cell);
+
+            worth.Add((i, gain, reached, sofar.Weight > 0d ? sofar.WeightAbove / sofar.Weight : 0d));
         }
 
         if (worth.Count == 0)
@@ -1514,6 +1730,7 @@ internal sealed class Rolling
                 return;
 
             _adviceByCell = said;
+            _publishedFor = gathering;
             Advised = null;
             NoAdviceReason = "no remnant on this chain can be rolled";
 
@@ -1542,13 +1759,13 @@ internal sealed class Rolling
 
         // Everything screening looked at gets a line, so the overlay can explain a remnant it is
         // advising against as readily as one it is advising for.
-        foreach (var (i, gain, _) in worth)
+        foreach (var (i, gain, _, above) in worth)
         {
             var at = i;
 
             RecordAdvice(said, env.Targets[i].Grid, gain,
                 ResultOfStage($"explaining the remnant at ({env.Targets[i].Grid.X:0},{env.Targets[i].Grid.Y:0})",
-                    () => AdviceReason(env, chain, at, gain, settings)));
+                    () => AdviceReason(env, chain, at, gain, settings)), taken, chanceAbove: above);
         }
 
         // Dropped if the question has moved on - a zone change, or another solve - because
@@ -1566,6 +1783,9 @@ internal sealed class Rolling
 
         // Published as one finished object, so the frame never sees a half-built answer.
         _adviceByCell = said;
+        _publishedFor = gathering;
+
+        Safe.Try(() => WriteVerdictsForRules(env, worth, unfinished, verdictContext, settings));
 
         // Measured beside the answer rather than instead of it. See RankingWithoutScoring.
         _withoutScoring = RankedWithoutScoring(env, worth);
@@ -1740,14 +1960,14 @@ internal sealed class Rolling
 
     /// <summary>See RankingWithoutScoring.</summary>
     private static string RankedWithoutScoring(PlanEnvironment env,
-        List<(int Index, double Gain, bool Reached)> worth)
+        List<(int Index, double Gain, bool Reached, double Above)> worth)
     {
         if (worth is not { Count: > 0 })
             return "nothing screened, so nothing to compare";
 
         var rows = new List<(int Index, double Gain, float Destroyed)>(worth.Count);
 
-        foreach (var (i, gain, _) in worth)
+        foreach (var (i, gain, _, _) in worth)
             rows.Add((i, gain, SolelySourcedWeight(env, i)));
 
         var byGain = new List<(int Index, double Gain, float Destroyed)>(rows);
@@ -2077,9 +2297,62 @@ internal sealed class Rolling
     }
 
     private static void RecordAdvice(Dictionary<(int X, int Y), RollAdvice> said, Vector2 grid, double gain,
-        string why, bool refused = false) =>
-        said[((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y))] =
-            new RollAdvice(grid, gain, why, refused, RecipeTakenAt(grid));
+        string why, Dictionary<(int X, int Y), string> taken, bool refused = false, double chanceAbove = 0d)
+    {
+        var cell = ((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y));
+
+        said[cell] = new RollAdvice(grid, gain, why, refused, taken?.GetValueOrDefault(cell), chanceAbove);
+    }
+
+    /// <summary>
+    /// The recipe the last detailed pass took at every remnant, by cell, as RecipeTakenAt names it. Empty when the
+    /// record is out of date after a roll. Planner.Chosen is written by every Planner.Describe, the solver's workers
+    /// included, so a read can meet a write; that read gives an empty record.
+    /// </summary>
+    private static Dictionary<(int X, int Y), string> RecipesTakenNow()
+    {
+        var taken = new Dictionary<(int X, int Y), string>();
+
+        if (Planner.RuneTallyOutOfDate)
+            return taken;
+
+        try
+        {
+            foreach (var (cell, picked) in Planner.Chosen)
+                taken[cell] = string.IsNullOrEmpty(picked.Recipe) ? picked.Reward : picked.Recipe;
+        }
+        catch (InvalidOperationException)
+        {
+            // Written to mid-walk. A partial record would pass over remnants whose recipe never changed, so none.
+            taken.Clear();
+        }
+
+        return taken;
+    }
+
+    /// <summary>
+    /// One number for the recipes the plan takes at its remnants, which moves when any of them changes. Summed so the
+    /// order the dictionary lists them in does not matter. Every frame, so it allocates nothing; a read that meets a
+    /// write answers nought, which at worst dispatches one pass early.
+    /// </summary>
+    private static int RecipesTakenKey()
+    {
+        if (Planner.RuneTallyOutOfDate)
+            return 0;
+
+        return Safe.Read(() =>
+        {
+            var key = 0;
+
+            foreach (var (cell, picked) in Planner.Chosen)
+            {
+                key = unchecked(key + HashCode.Combine(cell,
+                    string.IsNullOrEmpty(picked.Recipe) ? picked.Reward : picked.Recipe));
+            }
+
+            return key;
+        }, 0);
+    }
 
     /// <summary>
     /// The recipe the last detailed pass took at the remnant on this cell - its id, or its reward name where it has
@@ -2165,27 +2438,12 @@ internal sealed class Rolling
     }
 
     /// <summary>
-    /// Whether any link of the chain catches this marker.
-    ///
-    /// **Through Planner.Catches rather than a distance test written again here.** The copy this
-    /// replaced compared squared distances against blast plus radius and stopped there - which is
-    /// most of the rule and not all of it. Catches also consults Missed, the record of markers the
-    /// game was watched NOT to catch from a spot, so a marker the plugin has learnt is out of reach
-    /// counted as reached here and as unreached everywhere else.
-    ///
-    /// The same mistake as the blast circles: a second copy of a rule that had already drifted from
-    /// the first. There is one coverage test and this is not it.
+    /// Whether the chain takes this marker, directly or through an explodable a link sets off: Planner.ChainTakesTarget,
+    /// the rule Evaluate scores by. A copy that asked only whether a link's blast covers the marker read a remnant taken
+    /// through an explodable as unreached, while the scoring credited the runes it passes on.
     /// </summary>
-    private static bool ChainCatches(PlanEnvironment env, List<Vector2> chain, int index)
-    {
-        foreach (var at in chain)
-        {
-            if (Planner.Catches(env, at, env.Targets[index]))
-                return true;
-        }
-
-        return false;
-    }
+    private static bool ChainCatches(PlanEnvironment env, List<Vector2> chain, int index) =>
+        Planner.ChainTakesTarget(env, chain, index);
 
     /// <summary>
     /// How many of this site's remnants have been rolled, which is the cheap signal that a roll has
@@ -2221,6 +2479,12 @@ internal sealed class Rolling
     }
 
     /// <summary>
+    /// Whether ScoreRollOutcomes scores a repeated recipe at a socket count and set of passing slots once. On; off only
+    /// to check the reuse changes nothing, which the offline tool's --no-outcome-reuse does.
+    /// </summary>
+    internal static bool OutcomeReuse { get; set; } = true;
+
+    /// <summary>
     /// What a roll here is worth, holding the chain still: an exact expectation, not an average.
     ///
     /// **The rune is enumerated rather than drawn, and that is where the noise was.** A rune already
@@ -2250,10 +2514,9 @@ internal sealed class Rolling
     ///
     /// No reward enters this at all, on either side of the comparison - see RolledRemnant.
     /// </summary>
-    private static (double Total, double Weight, bool More, double Standing) ScoreRollOutcomes(
+    private static (double Total, double Weight, bool More, double Standing, double WeightAbove) ScoreRollOutcomes(
         PlanEnvironment env, List<Vector2> chain, int index,
         AutoExpeditionSettings settings,
-        Dictionary<string, (float Weight, string Scope, float Local)> known,
         List<RolledShape> shapes, int round)
     {
         var targets = new List<PlanTarget>(env.Targets);
@@ -2265,6 +2528,7 @@ internal sealed class Rolling
         // thousands of those a pass. See the walk below.
         var scoring = env with { Targets = targets };
         var was = env.Targets[index];
+        var scoredOutcomes = new Dictionary<string, double>(StringComparer.Ordinal);
         var total = 0d;
 
         // Every outcome this pass scored, for the dump's breakdown. See OutcomesSaid.
@@ -2334,7 +2598,8 @@ internal sealed class Rolling
                 // recipe exposes nothing, so on a shape whose recipes are shorter than its socket
                 // count many sets ask an identical question. Collapsing them is exact - each
                 // survivor carries the weight of every set that folded into it - and measured at
-                // 21% of the whole enumeration.
+                // 21% of the whole enumeration while shorter recipes were dealt as outcomes; with full recipes
+                // only, sets differ only where recipes repeat runes. See ShapesARollCouldProduce.
                 var sets = OutcomesOf(shape, slots);
 
                 if (sets.Count == 0)
@@ -2405,14 +2670,43 @@ internal sealed class Rolling
                     // scaling would do.
                     var each = shape.Share * slotShare * stands / whole;
 
-                    var rolled = RolledRemnant(was, settings, known, shape, positions);
+                    // **Built once per shape and set of passing slots, for every remnant of the pass.** What a roll
+                    // produces does not depend on the remnant rolled, only on the shape and the slots; the remnant
+                    // gives it its place, which PlacedAs puts on. Building it through the plan's construction is the
+                    // expensive part of an outcome. Checked against building it per remnant on four layouts (2026-10-15):
+                    // every gain identical, 1.7-2x faster. tools/offline --rolls --revalue.
+                    var builtKey = string.Join(",", positions);
+
+                    if (!shape.Built.TryGetValue(builtKey, out var unplaced))
+                        shape.Built[builtKey] = unplaced = RolledRemnant(was, settings, shape, positions);
+
+                    var rolled = PlacedAs(unplaced, was);
                     var offers = rolled.Choices ?? [];
 
                     foreach (var (first, alike) in RecipeGroupsWithSameRunes(offers))
                     {
+                        // **One recipe at one socket count and one set of passing slots scores the same from any pin.**
+                        // A recipe holds a rune in each of its slots, so it is reachable from each of those runes as
+                        // the fixed one, and about a quarter of the recipe entries at a socket count repeat (level 81:
+                        // 78 entries, 61 recipes at four sockets). The locked remnant is built from the recipe, the
+                        // socket count and the slots alone - the shape's other recipes reach scoring only as a rune
+                        // weight lookup that always holds this recipe's runes - so the score is taken once and reused.
+                        // Checked against scoring every one on five layouts (2026-10-15): gains identical to 0.1 and 12-15% faster. OutcomeReuse off, tools/offline --rolls.
+                        var reuseKey = OutcomeReuse
+                            ? string.Concat(shape.Sockets.ToString(CultureInfo.InvariantCulture), "|",
+                                string.Join(",", positions), "|", rolled.Recipes?.ElementAtOrDefault(first))
+                            : null;
+
                         targets[index] = LockedToRecipe(rolled, first);
 
-                        var scored = Planner.Plainly(scoring, chain);
+                        if (reuseKey == null || !scoredOutcomes.TryGetValue(reuseKey, out var scored))
+                        {
+                            scored = Planner.Plainly(scoring, chain);
+
+                            if (reuseKey != null)
+                                scoredOutcomes[reuseKey] = scored;
+                        }
+
                         var share = each * alike / offers.Length;
 
                         total += share * scored;
@@ -2424,18 +2718,20 @@ internal sealed class Rolling
             }
         }
 
-        // **The remnant as it stands, scored without its reward too.**
+        // **The remnant as it stands, scored exactly as the plan scores it.**
         //
-        // The rolled side prices every recipe at nought - see RolledRemnant - so comparing it against
-        // the plan's ordinary score would charge the roll for a reward it was never credited with,
-        // and every remnant holding anything at all would read as a keep. Both sides are scored on
-        // runes and sockets, and the reward is decided elsewhere, by the must-take threshold.
+        // Its combinations keep their whole reward term: the reward's money, through Weighing.Money - the part of its
+        // price over Count rewards only above, as in the plan - and the waves its recipe's rune count adds or loses
+        // (Weighing.WavesOfRecipe). The rolled side prices no reward and does count its recipes' waves - see
+        // RolledRemnant - so a roll is charged the reward it replaces and credited nothing for the one it brings. That
+        // leans against rolling, deliberately: with the standing reward set aside, a remnant holding 3x Greater Chaos
+        // Orb at 624ex was advised for a roll worth +875 that threw the reward away (2026-10-14).
         //
         // Every combination is kept rather than locked to the richest one, matching the rolled side
         // again: there the planner picks between the recipes a roll could produce, so here it picks
         // between the ones the remnant already offers. Holding it to one would charge the roll for
         // a choice it did not take away.
-        targets[index] = was with { Choices = ChoicesWithoutReward(was) };
+        targets[index] = was;
 
         var standing = Planner.Plainly(scoring, chain);
 
@@ -2453,7 +2749,10 @@ internal sealed class Rolling
             OutcomesOfRemnant[cell] = OutcomesSaid(all, standing, round);
         }
 
-        return (total, weight, more, standing);
+        // This round's outcomes only, each round against its own standing, for the reason Total is. See _gathered.
+        var weightAbove = outcomes.Where(x => x.Score > standing).Sum(x => x.Each);
+
+        return (total, weight, more, standing, weightAbove);
     }
 
     /// <summary>
@@ -2532,6 +2831,21 @@ internal sealed class Rolling
             said.Append(string.Create(CultureInfo.InvariantCulture,
                 $"\n            {x.Score - standing:+#,##0.0;-#,##0.0;0} at {x.Each / Math.Max(1e-12, weight):P2}: {x.Sockets} sockets, passing slot(s) {string.Join(",", x.Positions)}, passing {string.Join("/", (x.Choices ?? []).Select(c => c.Runes is { Length: > 0 } r ? string.Join("+", r) : "-").Distinct().Take(6))}"));
 
+        // **And the lowest, with what the recipe taken holds**, because an average below what stands is read as a
+        // fault until the outcomes that pull it down can be seen: each one's passed runes and the runes it keeps.
+        said.Append("\n            lowest - the recipe taken, passed runes then kept ones:");
+
+        foreach (var x in outcomes.OrderBy(x => x.Score).Take(6))
+        {
+            var taken = x.Choices is { Length: > 0 } held ? held[0] : default;
+            var passes = string.Join("+", taken.Runes ?? []);
+            var keeps = string.Join(" ", (taken.Locals ?? []).Select(l => Weighing.RuneOfKey(l.Id))
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+
+            said.Append(string.Create(CultureInfo.InvariantCulture,
+                $"\n            {x.Score - standing:+#,##0.0;-#,##0.0;0} at {x.Each / Math.Max(1e-12, weight):P2}: {x.Sockets} sockets, passing slot(s) {string.Join(",", x.Positions)}, passes {passes}, keeps {keeps}"));
+        }
+
         return said.ToString();
     }
 
@@ -2580,43 +2894,12 @@ internal sealed class Rolling
     /// A rolled remnant locked to one of its recipes, as a roll leaves it: that recipe the only choice, and its own
     /// effects and held lift with it. See ScoreRollOutcomes.
     /// </summary>
-    private static PlanTarget LockedToRecipe(PlanTarget rolled, int c)
-    {
-        static T[] Only<T>(T[] all, int at) => all is { Length: > 0 } && at < all.Length ? [all[at]] : null;
-
-        return rolled with
-        {
-            Choices = Only(rolled.Choices, c),
-            OwnEffectsOfChoices = Only(rolled.OwnEffectsOfChoices, c),
-            HeldLiftOfChoices = Only(rolled.HeldLiftOfChoices, c),
-        };
-    }
-
-    /// <summary>
-    /// The remnant's own combinations with every reward set to nought and nothing else touched.
-    ///
-    /// The runes, the local worth and the modifiers each combination spreads are left as they are,
-    /// so what the planner sees is the same remnant valued on its contents alone.
-    /// </summary>
-    private static (float Reward, float Carries, float Local, (string Id, float Worth)[] Locals,
-        string[] Runes, (string Id, int Tag, float Percent, bool Flat)[] Spread)[]
-        ChoicesWithoutReward(PlanTarget was)
-    {
-        if (was.Choices is not { Length: > 0 })
-            return was.Choices;
-
-        var bare = new (float Reward, float Carries, float Local, (string Id, float Worth)[] Locals,
-            string[] Runes, (string Id, int Tag, float Percent, bool Flat)[] Spread)[was.Choices.Length];
-
-        for (var n = 0; n < was.Choices.Length; n++)
-        {
-            var choice = was.Choices[n];
-
-            bare[n] = (0f, choice.Carries, choice.Local, choice.Locals, choice.Runes, choice.Spread);
-        }
-
-        return bare;
-    }
+    /// <remarks>
+    /// Through PlanTarget.WithOnlyChoice, which narrows every list kept in step with Choices. This narrowed three of
+    /// them, so a rolled remnant locked to recipe c read CreatedOfChoices and MagicAndRareWavesOfChoices at entry 0 -
+    /// the first recipe's monsters and waves rather than its own.
+    /// </remarks>
+    private static PlanTarget LockedToRecipe(PlanTarget rolled, int c) => rolled.WithOnlyChoice(c);
 
     /// <summary>
     /// The socket count up to which every arrangement is walked rather than sampled.
@@ -2669,7 +2952,7 @@ internal sealed class Rolling
 
             foreach (var (recipe, _) in shape.Recipes)
             {
-                var needs = Safe.Read(() => recipe.RuneCountRequired, 0);
+                var needs = recipe.RuneCount;
 
                 key.Append('|');
 
@@ -2680,7 +2963,7 @@ internal sealed class Rolling
 
                     var at = slot;
 
-                    key.Append(Safe.Read(() => recipe.Runes.ElementAtOrDefault(at)?.Id, null) ?? "-")
+                    key.Append(recipe.Runes.ElementAtOrDefault(at) ?? "-")
                        .Append(',');
                 }
             }
@@ -2731,158 +3014,108 @@ internal sealed class Rolling
     }
 
     /// <summary>
-    /// A remnant of this shape, carrying every recipe it could become as a choice.
+    /// A real remnant rebuilt from what identifies it - its recipes, socket count and passing slots - by the builder the
+    /// rolled side uses, with each recipe's reward money added through Weighing.Money as the plan adds it.
     ///
-    /// **One choice per recipe, each scored on its own by ScoreRollOutcomes**, since a roll lands on one and the player cannot
-    /// pick between them. See LockedToRecipe.
-    /// A recipe fixes every slot together, so the rune pairs a remnant can hold are the pairs some
-    /// recipe lists and no others. The older draw took runes from a global table independently and
-    /// priced pairs that cannot exist.
+    /// **For the offline tool, which revalues saved layouts with today's code.** A layout keeps every remnant as the
+    /// plugin valued it on the day, and a roll compares a remnant built now against that: 37-136% apart on layouts of
+    /// 2026-10-03 to 10-06. Rebuilt here, both sides of a roll come from one builder. Compared field by field against a
+    /// layout saved by the current code, it is also the check that the rolled builder values a remnant as the plan does.
+    /// </summary>
+    internal static PlanTarget RemnantFromRecipes(PlanTarget was, AutoExpeditionSettings settings, int sockets,
+        List<KeyValuePair<RollRecipeTables.RollRecipe, double>> recipes, int[] positions)
+    {
+        var shape = new RolledShape(sockets, 1d, recipes, new List<(int[] Positions, int Stands)>[3],
+            new Dictionary<string, PlanTarget>(StringComparer.Ordinal));
+
+        return RolledRemnant(was, settings, shape, positions, withRewardMoney: true);
+    }
+
+    /// <summary>
+    /// A remnant of this shape, carrying every recipe it could become as a choice, valued exactly as a remnant on the
+    /// ground offering those recipes would be.
     ///
-    /// The propagating runes are the recipe's runes at the drawn positions; everything else it
-    /// holds is local. Slots past the recipe's length hold nothing, which is why a two rune recipe
-    /// on a six socket remnant propagates nothing when the drawn positions fall past it.
+    /// **Built as a scanned remnant and handed to the plan's own construction.** Each recipe becomes a Reward through
+    /// Valuation.RewardOfSlots and the remnant a PlanTarget through Planning.PlanTargetOf - the same two the plan uses
+    /// for a remnant it has read. This was a builder of its own, and a remnant rebuilt through it from a layout saved by
+    /// the current code (2026-10-15, Frigid Bluffs) showed how far it had drifted: every local rune at the table's
+    /// average worth of 3.22 instead of its own scaled to the waves its slot reaches, no carried total, and no scoped
+    /// effects - so a Bond rolled into a passing slot was worth nothing while a Bond already passed on kept its +15% on
+    /// rares, a 4,293 difference on one chain.
     ///
-    /// Every choice carries a reward of nought - see the comment on the loop for why.
+    /// **One choice per recipe, each scored on its own by ScoreRollOutcomes**, since a roll lands on one and the player
+    /// cannot pick between them. See LockedToRecipe. The passing slots are the drawn positions; a slot past a recipe's
+    /// length passes nothing.
     /// </summary>
     /// <param name="positions">Which slots propagate, drawn by the caller. See PositionSetsOf.</param>
-    private static PlanTarget RolledRemnant(PlanTarget was, AutoExpeditionSettings settings,
-        Dictionary<string, (float Weight, string Scope, float Local)> known,
-        RolledShape shape, int[] positions)
+    /// <param name="withRewardMoney">
+    /// Whether the choices keep their rewards' money. Off for a roll's outcomes, whose rewards are not priced - see
+    /// ScoreRollOutcomes; on for a real remnant rebuilt from its recipes. Each choice keeps its waves term either way.
+    /// </param>
+    private static PlanTarget RolledRemnant(PlanTarget was, AutoExpeditionSettings settings, RolledShape shape,
+        int[] positions, bool withRewardMoney = false)
     {
-        var choices = new List<(float Reward, float Carries, float Local, (string Id, float Worth)[] Locals,
-            string[] Runes, (string Id, int Tag, float Percent, bool Flat)[] Spread)>(shape.Recipes.Count);
+        var rewards = new List<Reward>(shape.Recipes.Count);
 
-        var weights = new List<(string Id, float Weight)>();
+        foreach (var (recipe, price) in shape.Recipes)
+            rewards.Add(Valuation.RewardOfSlots(recipe.Id, price, recipe.RuneCount, recipe.Id, recipe.Runes, positions));
 
-        // Each recipe's own effects, its held runes on their slots' waves. See Weighing.OwnEffectsOfRunes.
-        var ownOfRecipes = new List<(int Tag, bool Count, float Factor, float WaveShare)[]>(shape.Recipes.Count);
-        var createdOfRecipes = new List<(int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[]>(shape.Recipes.Count);
+        // In the order Valuation lists a real remnant's rewards, priciest first, because the first decides the waves the
+        // remnant is weighed with. See Weighing.WavesOfRemnant.
+        rewards = rewards.OrderByDescending(x => x.Value).ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
 
-        foreach (var (recipe, _) in shape.Recipes)
+        // What each passing slot could hold, as Valuation.Passing reads it for a real remnant: the runes its recipes put
+        // there. What the plan's rune lookups are built from. See Weighing.PropagatingRuneWeights.
+        var passing = new List<Passes>();
+
+        foreach (var at in positions)
         {
-            var needs = Safe.Read(() => recipe.RuneCountRequired, 0);
-            var propagating = new List<string>(positions.Length);
-            var locals = new List<(string Id, float Worth)>();
+            var candidates = shape.Recipes
+                .Select(x => at < x.Key.Runes.Length ? x.Key.Runes[at] : null)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-            // Every rune the recipe holds, each once at its first slot, with that slot's share of the waves, for its own
-            // effects. See Weighing.OwnEffectsOfRunes.
-            var heldIds = new List<string>();
-            var heldShares = new List<float>();
-
-            for (var slot = 0; slot < needs && slot < shape.Sockets; slot++)
-            {
-                var at = slot;
-                var id = Safe.Read(() => recipe.Runes.ElementAtOrDefault(at)?.Id, null);
-
-                if (string.IsNullOrWhiteSpace(id))
-                    continue;
-
-                if (!heldIds.Contains(id, StringComparer.OrdinalIgnoreCase))
-                {
-                    heldIds.Add(id);
-                    heldShares.Add(Propagation.WaveShareOfSlot(slot, needs));
-                }
-
-                if (positions.Contains(slot))
-                {
-                    propagating.Add(id);
-
-                    var known2 = false;
-
-                    foreach (var (had, _) in weights)
-                    {
-                        if (string.Equals(had, id, StringComparison.OrdinalIgnoreCase))
-                        {
-                            known2 = true;
-
-                            break;
-                        }
-                    }
-
-                    if (!known2)
-                    {
-                        weights.Add((id, Runes.UnscopedWeight(id)));
-
-                        // Its split-off shares with it, as Weighing.PropagatingRuneWeights lists them.
-                        foreach (var split in Weighing.SplitShareKeysOfRune(id))
-                            weights.Add((split, Runes.UnscopedWeight(split)));
-                    }
-                }
-                else
-                {
-                    locals.Add((Id: id, Worth: Locally(known)));
-                }
-            }
-
-            // **No reward on either side, because this question is about runes.**
-            //
-            // Pricing the reward a roll might return drags in an odds problem the client cannot
-            // answer: its tables say which recipes a shape can reach and nothing about how often
-            // each is offered, so a Mirror of Kalandra was priced as freely available as a
-            // Glassblower's Bauble. Measured, 60% of the expected reward came from shapes that can
-            // reach something dear - the advice was a bet on numbers nobody has.
-            //
-            // It is also unnecessary. A remnant holding a reward worth more than a roll could
-            // return is already a must-take, and a must-take is never advised for rolling. The
-            // reward side is guarded there, where it can be decided on a price rather than on a
-            // distribution.
-            //
-            // So both sides are scored with the reward set aside and what remains is the runes,
-            // which is what the advice was ever useful for. Three faults went with it: the flat
-            // Rolls.Average constant, the floor that applied to one side only, and the jackpot.
-            choices.Add((0f, 0f, locals.Sum(x => x.Worth),
-                locals.ToArray(), propagating.ToArray(), null));
-            ownOfRecipes.Add(Weighing.OwnEffectsOfRunes(heldIds, heldShares));
-            createdOfRecipes.Add(Weighing.CreatedOfRunes(heldIds, heldShares));
+            passing.Add(new Passes(at, candidates));
         }
 
-        var rolled = new Target
+        var scanned = new Target
         {
             Kind = TargetKind.Remnant,
+            Grid = was.Grid,
             Sockets = shape.Sockets,
+            Rewards = rewards,
+            Passing = passing,
         };
-        var own = Safe.Read(() => Weighing.WeightOfTarget(rolled, settings), 0f);
 
-        return was with
+        var built = Planning.PlanTargetOf(scanned, null, 0d, settings, readInsisted: false);
+
+        if (!withRewardMoney && built.Choices is { Length: > 0 } choices)
         {
-            Weight = own,
+            for (var c = 0; c < choices.Length && c < rewards.Count; c++)
+                choices[c] = choices[c] with { Reward = choices[c].Reward - Weighing.Money(rewards[c].Value, settings) };
+        }
 
-            // **The rolled remnant's waves, not the one it replaces.** Built as Planning builds a remnant's, from the
-            // rolled socket count. Inherited, a three socket outcome was paid as a seven socket remnant on everything
-            // that lands on its own waves - the runes reaching them, its own effects, the monsters Time and Death
-            // add, Gaining Traction - and only its Weight shrank, so on a Craggy Peninsula site (2026-10-05) rolling
-            // a seven socket remnant at the chain's end came out better than keeping it in 49% of outcomes, where
-            // 4.4% of rolls reach seven sockets or more. See Weighing.PartsOfTarget and TractionByBeforeOfTarget.
-            Waves = Safe.Read(() => Weighing.Waves(rolled), 0f),
-            Parts = Safe.Read(() => Weighing.PartsOfTarget(rolled), null),
-            TractionByBefore = Safe.Read(() => Weighing.TractionByBeforeOfTarget(rolled,
-                Safe.Read(() => settings.Debug.GainingTraction.Value, true)), null),
-            WaveCount = shape.Sockets,
-            Runes = weights.ToArray(),
-            PropagatingRuneWeights = weights.ToArray(),
-            Choices = choices.ToArray(),
-
-            // Per combination, so it belongs to the real remnant's combinations and not to these. Left inherited it
-            // indexed another recipe's wave change for each of these. Nought here: the rolled side prices no reward,
-            // which is where a recipe's extra waves are counted. See PlanTarget.TractionOfChoice.
-            MagicAndRareWavesOfChoices = null,
-
-            // These recipes' own runes, which a roll can land on as well as away from. See PlanTarget.OwnOfChoice.
-            OwnEffectsOfChoices = ownOfRecipes.Any(x => x != null) ? ownOfRecipes.ToArray() : null,
-
-            // And the empowering lift each holds. See PlanTarget.HeldLiftOfChoice.
-            HeldLiftOfChoices = HeldLiftOfRolledChoices(choices),
-
-            // Per combination as well, and the real remnant's: inherited, it gave each of these the wave shares of
-            // another recipe's runes. Null reads as every wave. See PlanTarget.WaveShareOfCarried.
-            CarriedWaveSharesOfChoices = null,
-            SlotRunesOfChoices = null,
-
-            // And the monsters each adds, as its own effects. See PlanTarget.CreatedByOwnEffects.
-            CreatedOfChoices = createdOfRecipes.Any(x => x != null) ? createdOfRecipes.ToArray() : null,
-        };
+        return PlacedAs(built, was);
     }
+
+    /// <summary>
+    /// A built remnant given the real one's place: what belongs to the place and the player rather than to the offers
+    /// stays the real remnant's. See RolledRemnant.
+    /// </summary>
+    private static PlanTarget PlacedAs(PlanTarget built, PlanTarget was) =>
+        built with
+        {
+            Grid = was.Grid,
+            Radius = was.Radius,
+            Must = was.Must,
+            Mask = was.Mask,
+            Spread = was.Spread,
+            Once = was.Once,
+            NonStacking = was.NonStacking,
+            Sets = was.Sets,
+            Group = was.Group,
+        };
 
     /// <summary>
     /// The reasoning, in the words a person deciding at the remnant would want.
@@ -2971,36 +3204,42 @@ internal sealed class Rolling
         // read "already carried elsewhere" - which sounds like a reason to roll - beside a number
         // saying a roll costs 269. Both were true and neither explained the other: what the roll
         // gives up is the reward and the ordinary slots, and neither was mentioned.
-        var reward = 0f;
-
-        foreach (var choice in target.Choices ?? [])
-            reward = MathF.Max(reward, choice.Reward);
-
-        // **In exalts, which a choice's Reward is not.** It is in WEIGHT - the price divided by
-        // exalts per weight point - and printing it as exalts once set sixty weight against sixty
-        // five exalts and read as a near tie, when the remnant was holding 33ex.
         //
-        // **Stated rather than charged.** Neither side of the comparison is priced on a reward any
-        // more - see ScoreRollOutcomes - so this is not a term in the number beside it. It is here because
-        // a reader deciding whether to follow the advice wants to know what is being replaced, and
-        // because the threshold that does guard the reward is a separate setting. See
-        // RewardSettings.MustTakeAbove.
-        if (reward > 0f)
+        // **Of the combination the plan takes, not the most over every combination.** Taking the most
+        // said a remnant planned on a five-rune recipe held the six ordinary slots of a seven-rune one
+        // it does not take, and printed that recipe's Reward as money - but a choice's Reward also holds
+        // the waves its recipe has over the remnant's own count (Weighing.WavesOfRecipe), so two waves
+        // of monsters read as 775ex of a reward priced at 7ex (2026-10-16).
+        var taken = TakenChoiceOf(target);
+
+        if (taken >= 0)
         {
-            var worth = reward * MathF.Max(0.0001f,
-                Safe.Read(() => settings.Rewards.PointWorth.Value, 1f));
+            var choice = target.Choices[taken];
+            var ordinary = Planner.RunesInLocals(choice.Locals);
+            var runes = ordinary + (choice.Runes?.Length ?? 0);
+            var waves = runes > 0 && target.WaveCount > 0
+                ? Weighing.WorthOfWaves(runes) - Weighing.WorthOfWaves(target.WaveCount)
+                : 0f;
 
-            said.Add($"holds {worth:N0}ex of reward, which a roll replaces and the figure beside " +
-                     "this does not count");
+            // **In exalts, which a choice's Reward is not.** It is in WEIGHT - the price divided by
+            // exalts per weight point - and printing it as exalts once set sixty weight against sixty
+            // five exalts and read as a near tie, when the remnant was holding 33ex.
+            //
+            // **Charged as well as stated.** The standing side of the comparison keeps the money of the
+            // remnant's rewards and the rolled side prices none - see ScoreRollOutcomes - so the figure
+            // beside this already counts the part of the reward over Count rewards only above against the
+            // roll. Named anyway, because a reader deciding whether to follow the advice wants to know
+            // what is being replaced.
+            var worth = MathF.Max(0f, choice.Reward - waves) * MathF.Max(0.0001f, Weighing.ExaltsPerPoint(settings));
+
+            if (runes > 0)
+                said.Add($"takes {runes} rune{(runes == 1 ? "" : "s")}, so {runes} wave{(runes == 1 ? "" : "s")}, " +
+                         $"{ordinary} of them in ordinary slots");
+
+            if (worth >= 1f)
+                said.Add($"its reward counts {worth:N0}ex above the line Count rewards only above draws, which a " +
+                         "roll replaces and the figure beside this counts against it");
         }
-
-        var ordinary = 0;
-
-        foreach (var choice in target.Choices ?? [])
-            ordinary = Math.Max(ordinary, Planner.RunesInLocals(choice.Locals));
-
-        if (ordinary > 0)
-            said.Add($"{ordinary} ordinary slot{(ordinary == 1 ? "" : "s")} on its own waves");
 
         // The chain gets nothing from this remnant as it stands, and the figure holds the chain still.
         if (!ChainCatches(env, chain, index))
@@ -3022,6 +3261,31 @@ internal sealed class Rolling
             : $"a roll here costs about {-gain:N0}. {why}";
     }
 
+    /// <summary>
+    /// The index in Choices of the combination the last detailed pass took at this remnant, or -1 when there is no such
+    /// pass to read and more than one to choose from. See Planner.Chosen.
+    /// </summary>
+    private static int TakenChoiceOf(PlanTarget target)
+    {
+        if (target.Choices is not { Length: > 0 } choices)
+            return -1;
+
+        if (choices.Length == 1)
+            return 0;
+
+        if (Planner.RuneTallyOutOfDate || target.Named is not { } named ||
+            !Planner.Chosen.TryGetValue(((int)MathF.Round(target.Grid.X), (int)MathF.Round(target.Grid.Y)), out var picked))
+            return -1;
+
+        for (var c = 0; c < choices.Length && c < named.Length; c++)
+        {
+            if (string.Equals(named[c], picked.Reward, StringComparison.Ordinal))
+                return c;
+        }
+
+        return -1;
+    }
+
     /// <summary>How many remnants the sole-source claim was tested against. See AdviceReason.</summary>
     private static int Remnants(PlanEnvironment env)
     {
@@ -3041,8 +3305,15 @@ internal sealed class Rolling
     {
         var said = new List<string>(ids.Count);
 
+        // A rune with a split-off share is booked under two keys, the rune and the rune with its stat; both name the
+        // one rune. See Weighing.RuneOfKey.
         foreach (var id in ids)
-            said.Add(RuneInfo.Called(id));
+        {
+            var name = RuneInfo.Called(Weighing.RuneOfKey(id));
+
+            if (!said.Contains(name, StringComparer.OrdinalIgnoreCase))
+                said.Add(name);
+        }
 
         return string.Join(", ", said);
     }
