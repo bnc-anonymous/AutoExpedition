@@ -115,7 +115,7 @@ internal static partial class Tablets
                     return;
                 }
 
-                if (MoveNext(gc, unidentified, UnidentifiedTablet, true))
+                if (MoveNext(gc, unidentified, UnidentifiedTablet, true, thenClicks: (roomLeft, from) => PlannedSubTabsAfter(gc, SubTabPurpose.Unidentified, roomLeft, from)))
                     return;
 
                 if (NextSubTab(gc, SubTabPurpose.Unidentified) is { } next)

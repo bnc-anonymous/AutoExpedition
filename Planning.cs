@@ -2200,6 +2200,34 @@ internal sealed class Planning
     /// content already taken that way. One level only, as the planner's: these objects do not set each other off. See
     /// Chained.
     /// </summary>
+    /// <summary>
+    /// Whether the explosive under the placement cursor would take this target: the game lighting it up, or for a relic,
+    /// within its catch reach of the placement indicator. **The game does not light a relic it captures past about 30
+    /// grid**: captured to 31.000 grid from single explosives, read off the detonator's captured-modifiers list, while
+    /// never lit (2026-10-18, see STATE.md) - so the fill under the cursor and placement's check of what a spot catches
+    /// read relics in that band as missed. The reach is the blast and the relic's row size, as Taken reads them.
+    /// </summary>
+    internal static bool LitUnderCursor(GameController gc, AutoExpeditionSettings settings, Target target)
+    {
+        if (target == null)
+            return false;
+
+        if (target.Glowing)
+            return true;
+
+        if (target.Kind != TargetKind.Relic || !target.Live)
+            return false;
+
+        var at = Detonator.PlacementIndicatorGridPosition(gc);
+
+        if (at == Vector2.Zero)
+            return false;
+
+        var reach = MathF.Max(1f, Detonator.ExplosionRadius(gc) + settings.Debug.CircleCorrection.Value) + Extents.Of(target);
+
+        return Vector2.DistanceSquared(at, target.Grid) <= reach * reach;
+    }
+
     public static bool Taken(Target target, Vector2[] placed, float radius, List<Target> content) =>
         placed is { Length: > 0 } && TakenAmong(target, placed, radius, ExplodablesOf(content));
 
@@ -2722,6 +2750,7 @@ internal sealed class Planning
         // one and not the other.
         Rehearsing = rehearsing;
         RunningContinuous = continuous;
+        KeptFromBeforeLeaving = false;
 
         // **Nothing here records an ask, because eight of the nine things that start a search are
         // not one.**
@@ -4094,10 +4123,20 @@ internal sealed class Planning
         return true;
     }
 
-    public void AreaChange(uint areaHash)
+    /// <param name="hideoutOrTown">Whether the area entered is a hideout or a town. See PlanOfLastMap.</param>
+    public void AreaChange(uint areaHash, bool hideoutOrTown)
     {
+        var restored = false;
+
         if (areaHash != _area)
         {
+            // The map being left, kept with its plan, unless the area being left is a hideout or town. A
+            // map left with no plan drops the plan kept for an earlier one.
+            if (!_inHideoutOrTown && _area != 0u)
+                _planOfLastMap = Plan.Points.Count > 0 && Site != Vector2.Zero
+                    ? new PlanOfMap(_area, Plan, [.._chain], _laid, Site, Showing(Site), _env)
+                    : null;
+
             Forget();
 
             // **And the climb, which is a statement about ONE site's floor.**
@@ -4107,11 +4146,53 @@ internal sealed class Planning
             // 16,824, ... 56: 2,914", four sites' presses in one list with nothing saying where one
             // ended. A series whose entries describe different questions is worse than no series.
             Forgetting();
+
+            if (!hideoutOrTown)
+            {
+                if (_planOfLastMap is { } kept && kept.Area == areaHash)
+                {
+                    Plan = kept.Plan;
+                    _chain = kept.Chain;
+                    _laid = kept.Laid;
+                    Site = kept.Site;
+                    _env = kept.Environment;
+
+                    // Breakdown keeps its last answer by the plan's identity, and Forget emptied the tables that answer
+                    // published, so the restored plan must be broken down again.
+                    _split = null;
+                    KeptFromBeforeLeaving = true;
+                    Detail = "the plan kept from before leaving this map";
+                    restored = kept.Shown;
+                }
+
+                _planOfLastMap = null;
+            }
         }
 
+        _inHideoutOrTown = hideoutOrTown;
         _area = areaHash;
-        ShownAt = Vector2.Zero;
+        ShownAt = restored ? Site : Vector2.Zero;
     }
+
+    /// <summary>
+    /// The plan of the last map left, kept while the player is in a hideout or town and put back on returning to the
+    /// same map, so a chain left part placed is drawn as it was. Dropped on entering any other map. A map instance keeps
+    /// its area hash across a portal, and a new instance gets a new one.
+    /// </summary>
+    private PlanOfMap _planOfLastMap;
+
+    /// <summary>
+    /// Whether the plan in hand was put back on returning to its map and no solve has run since. The presolve waits
+    /// for the detonator panel while it is set. See Rehearsal.
+    /// </summary>
+    public bool KeptFromBeforeLeaving { get; private set; }
+
+    /// <summary>Whether the current area is a hideout or a town. See PlanOfLastMap.</summary>
+    private bool _inHideoutOrTown;
+
+    /// <summary>A plan as it stood when its map was left: the route, how far along it, its site, and whether it was asked for.</summary>
+    private sealed record PlanOfMap(uint Area, Plan Plan, List<Vector2> Chain, int Laid, Vector2 Site, bool Shown,
+        PlanEnvironment Environment);
 
     /// <summary>
     /// The site score each time a solve at this site published a better chain, across solves, for asking how fast it
@@ -4178,6 +4259,7 @@ internal sealed class Planning
         Plan = Plan.Empty;
         _chain = [];
         _laid = 0;
+        KeptFromBeforeLeaving = false;
         Site = Vector2.Zero;
         Status = "";
         Detail = "";

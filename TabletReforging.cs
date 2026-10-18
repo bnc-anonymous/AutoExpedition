@@ -1496,8 +1496,15 @@ internal static partial class Tablets
     /// <param name="room">Room on the other side in place of what the screen shows: the tidy's deposits go to the earliest
     /// sub-tab with room, not the one showing. See TabletTidy.</param>
     /// <param name="inOrder">The tablets moved in the order given, not by the batch rule: the most valuable withdraw's. See BatchNext.</param>
+    /// <param name="thenClicks">
+    /// The clicks planned after the batch's last tablet, given the room left and where the cursor will be: a withdraw's
+    /// next sub-tabs and the tablets remembered in them (see PlannedSubTabsAfter), so the whole withdraw is one path rather
+    /// than a stop at each sub-tab. Asked only when every tablet left is planned. Each click is still sent only by whoever
+    /// decides on it, a tablet once read where it was planned, and a send that does not match the plan plans afresh. See
+    /// PlanAhead.
+    /// </param>
     private static bool MoveNext(GameController gc, IEnumerable<TabletOnScreen> movable, string what, bool toInventory, int? room = null,
-        bool inOrder = false)
+        bool inOrder = false, Func<int, Vector2, List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)>> thenClicks = null)
     {
         var shown = (toInventory ? StashTablets() : InventoryTablets()).Select(AddressOf).ToHashSet();
         var now = DateTime.UtcNow;
@@ -1539,10 +1546,41 @@ internal static partial class Tablets
 
         var mouse = ImGuiNET.ImGui.GetMousePos();
         var first = _moved == 0;
-        // From the batch as planned. See BatchNext. Planned ahead no further than the room left after this click: the
-        // clicks themselves stopped at the room, and the plan drawn went on through every tablet to move.
-        var (next, point) = BatchNext(what, left, mouse, first, first, ctrl: true,
-            restLimit: space == int.MaxValue ? int.MaxValue : space - MovesPending.Count - 1, inOrder: inOrder);
+        TabletOnScreen next;
+        Vector2 point;
+        // The plan's own rectangle when following it, so PlanAhead matches it exactly rather than planning afresh.
+        RectangleF? plannedRect = null;
+
+        // **The tablet the plan already has next, where a later sub-tab's was planned from its record**: taken as planned,
+        // with the plan's point and the rest of the plan after it, so the path made is the one drawn. BatchNext would plan
+        // the sub-tab afresh from the cursor, and a different first point would plan the whole path again. See
+        // PlannedSubTabsAfter.
+        if (thenClicks != null && PlannedAhead.Count > 0 && PlannedAhead[0] is { Ctrl: true, Right: false } ahead &&
+            left.FirstOrDefault(t => MathF.Abs(t.Rect.X - ahead.Rect.X) < 1f && MathF.Abs(t.Rect.Y - ahead.Rect.Y) < 1f) is { } planned)
+        {
+            next = planned;
+            plannedRect = ahead.Rect;
+            point = ahead.Point ?? ItemClicks.NearEdgeOf(planned.Rect, mouse);
+            BatchOrder.Clear();
+            _batchOf = "";
+            BatchRest.Clear();
+            BatchRest.AddRange(PlannedAhead.Skip(1));
+        }
+        else
+        {
+            // From the batch as planned. See BatchNext. Planned ahead no further than the room left after this click: the
+            // clicks themselves stopped at the room, and the plan drawn went on through every tablet to move.
+            (next, point) = BatchNext(what, left, mouse, first, first, ctrl: true,
+                restLimit: space == int.MaxValue ? int.MaxValue : space - MovesPending.Count - 1, inOrder: inOrder);
+
+            if (thenClicks != null && BatchRest.Count == left.Count - 1)
+            {
+                var roomLeft = space == int.MaxValue ? int.MaxValue : space - MovesPending.Count - left.Count;
+
+                BatchRest.AddRange(thenClicks(roomLeft, BatchRest.Count > 0 && BatchRest[^1].Point is { } last ? last : point));
+            }
+        }
+
         var chosen = AddressOf(next);
 
         // A junk tablet taken out says why it is junk, once. See JunkReasonOf.
@@ -1555,7 +1593,7 @@ internal static partial class Tablets
         _moved++;
 
         // Done at the click. The time it was clicked replaces the placeholder above once the click goes. See Clicked.
-        Send(next.Rect, true, what, () =>
+        Send(plannedRect ?? next.Rect, true, what, () =>
             {
                 MovesPending[chosen] = _clickedAt;
                 return true;
@@ -2051,6 +2089,10 @@ internal static partial class Tablets
                          $"junk {IsJunk(gc, tablet, settings)}" +
                          $"{(MostChaosOf(gc, tablet, settings) is { } most ? $", worth at most {most:0.##}c" : "")}");
 
+        b.AppendLine($"    result slot remembered: {(_benchResultRect.Width > 0f ? RectSaid(_benchResultRect) : "none")}; " +
+                     $"reforged tablet {(_reforgedPendingSince is { } pending ? $"awaited for {(DateTime.UtcNow - pending).TotalMilliseconds:0}ms" : "not awaited")}");
+        BenchElementsSaid(b, gc);
+
         var inventory = Seen.Where(t => t.Where == "inventory").ToList();
 
         b.AppendLine($"    inventory: {inventory.Count} tablet(s), {inventory.Count(t => IsJunk(gc, t, settings))} junk");
@@ -2069,5 +2111,58 @@ internal static partial class Tablets
             b.AppendLine($"      {line}");
 
         return b.ToString();
+    }
+
+    /// <summary>
+    /// The bench's elements that carry an entity or overlap the remembered result slot, each with both visibility flags,
+    /// its entity and that entity's metadata, for the dump. BenchTablets skips an element that is not visible locally,
+    /// has no entity, carries something other than a tablet or is 4px or smaller, and says nothing about which. A run
+    /// stopped on "the reforged tablet did not appear" with the tablet showing in the slot (dump 2026-10-17 19:33:42),
+    /// the slot's element visible and no tablet read in it, and this says which of those it was.
+    /// </summary>
+    private static void BenchElementsSaid(StringBuilder b, GameController gc)
+    {
+        var bench = Safe.Read(gc, static g => g.IngameState.IngameUi.ReforgingBench, null);
+        var stack = new Stack<(Element Element, string Path, int Depth)>();
+        var visited = 0;
+        var said = 0;
+
+        if (bench == null)
+            return;
+
+        stack.Push((bench, "", 0));
+        b.AppendLine("    bench elements carrying an entity or over the result slot (path from the bench):");
+
+        while (stack.Count > 0 && visited++ < MostElements && said < 40)
+        {
+            var (element, path, depth) = stack.Pop();
+            var rect = Safe.Read(element, static e => e.GetClientRectCache, default);
+            var entity = Safe.Read(element, static e => e.Entity, null);
+            var overSlot = _benchResultRect.Width > 0f && rect.Width > 0f &&
+                           rect.Left < _benchResultRect.Right && rect.Right > _benchResultRect.Left &&
+                           rect.Top < _benchResultRect.Bottom && rect.Bottom > _benchResultRect.Top;
+
+            if (depth > 0 && (entity != null || overSlot))
+            {
+                said++;
+                b.AppendLine($"      [{path}] {RectSaid(rect)} visible {Safe.Read(element, static e => e.IsVisible, false)}, " +
+                             $"visible locally {Safe.Read(element, static e => e.IsVisibleLocal, false)}, " +
+                             (entity == null
+                                 ? "no entity"
+                                 : $"entity {Safe.Read(entity, static e => e.Address, 0L):X}, " +
+                                   $"metadata \"{Safe.Read(entity, static e => e.Metadata, null) ?? "unreadable"}\""));
+            }
+
+            if (depth >= DeepestElement)
+                continue;
+
+            var kids = Safe.Read(element, static e => e.Children, null) ?? [];
+
+            for (var i = kids.Count - 1; i >= 0; i--)
+                stack.Push((kids[i], path.Length == 0 ? $"{i}" : $"{path}->{i}", depth + 1));
+        }
+
+        if (said == 0)
+            b.AppendLine("      none");
     }
 }

@@ -66,6 +66,13 @@ internal static class Autoloot
 
         /// <summary>The item picked up went onto the cursor; the cursor is taking it to a free place in the inventory.</summary>
         PuttingDown,
+
+        /// <summary>
+        /// An item whose label is under other labels: the ground labels taken off the screen with Toggle Highlighting, and
+        /// the cursor on its way to the item itself, where hovering shows its label and a click picks it up. See
+        /// StepUnderLabels.
+        /// </summary>
+        UnderLabels,
     }
 
     private static Phase _phase = Phase.Idle;
@@ -1095,7 +1102,17 @@ internal static class Autoloot
 
                 return;
 
+            case Phase.UnderLabels:
+                StepUnderLabels(gc);
+
+                return;
+
             case Phase.WaitingForLabel:
+                // Labels just put back read as gone until the key lands, which would take the pickup as done before a
+                // walk to it: until one of the labels that were over it reads shown again. See LabelsBack.
+                if (!LabelsBack())
+                    return;
+
                 // The item on the cursor, the inventory being open, is the pickup done: its label can linger a moment.
                 if (Done(gc) || PickedUpOntoCursor(gc) != null)
                 {
@@ -1173,6 +1190,11 @@ internal static class Autoloot
         var cursor = CursorOnScreen(gc);
         (Entity Of, int[] Path, uint Id, string Name, Vector2 At, int Rank, float Away, double Price, float FromCursor)? best = null;
 
+        // The best listed item whose label is under other labels and whose own place on screen is clear: taken only when
+        // nothing else can be clicked. See StepUnderLabels.
+        var underLabelsAllowed = settings.Automation.On(settings.Automation.Unhide);
+        (Entity Of, int[] Path, uint Id, string Name, Vector2 At, int Rank, float Away, double Price, float FromCursor)? underLabels = null;
+
         void Consider(Entity of, int[] path, int rank, string name)
         {
             var id = Safe.Read(of, static e => e.Id, 0u);
@@ -1202,9 +1224,19 @@ internal static class Autoloot
             var at = Placement.Exposed(gc, covered, rect, id).At;
 
             // Not clickable now - off screen, behind a panel or under other labels. Not tried, so it is taken up when
-            // it can be.
+            // it can be - or, an item whose label is on screen under other labels, from under them. See StepUnderLabels.
             if (at == Vector2.Zero)
+            {
+                if (underLabelsAllowed && path.Length == 0 && rect.Width > 0f && Placement.OnScreen(gc, rect.Center) &&
+                    Safe.Read(of, static e => e.HasComponent<WorldItem>(), false) &&
+                    Placement.ScreenOfItem(gc, of) is var lies && lies != Vector2.Zero && Placement.OnScreen(gc, lies) &&
+                    !Panels.Covers(covered, lies) && !Panels.Blocked(gc, lies, true) &&
+                    (underLabels is not { } under ||
+                     Beats(topFirst, rank, price, away, Vector2.Distance(cursor, lies), under.Rank, under.Price, under.Away, under.FromCursor)))
+                    underLabels = (of, path, id, name, lies, rank, away, price, Vector2.Distance(cursor, lies));
+
                 return;
+            }
 
             var fromCursor = Vector2.Distance(cursor, at);
 
@@ -1238,7 +1270,9 @@ internal static class Autoloot
                 Consider(chest, [], chestsRank, "Excavated chest");
         }
 
-        if (best is not { } chosen)
+        var fromUnderLabels = best == null && underLabels != null;
+
+        if ((best ?? underLabels) is not { } chosen)
             return;
 
         // **Clear in the interface tree, not only of the panels the plugin knows**, before anything is taken: the spot was
@@ -1246,10 +1280,13 @@ internal static class Autoloot
         // clicked on the bar, and the player's input blocked for nothing (Stagnant Basin, 2026-10-11 17:26:13). The walk
         // placement makes before its click, about 0.74ms; a covered item waits CoveredWaitMs and is looked at again,
         // untried. See Panels.Blocked.
-        if (Panels.Blocked(gc, chosen.At, true))
+        if (!fromUnderLabels && Panels.Blocked(gc, chosen.At, true))
         {
             CoveredUntil[chosen.Id] = DateTime.UtcNow + CoveredWait;
-            _lastOutcome = $"{chosen.Name}: under a piece of the interface - not clicked, looked at again shortly";
+            // What covered it, as the dump's cursor line says it, since "the interface" covers chat, a panel left open
+            // and the buff bar alike. A second walk, paid only on this path and at most once per CoveredWait.
+            _lastOutcome = $"{chosen.Name}: under a piece of the interface - not clicked, looked at again shortly; " +
+                           $"at ({chosen.At.X:0},{chosen.At.Y:0}) {Panels.Why(gc, chosen.At)}";
             return;
         }
 
@@ -1279,6 +1316,30 @@ internal static class Autoloot
             _keysBlocked = _input.BlockPlayerKeys(KeyBlockMs, _restoreHeldKeys, _cancelKey);
         _input.SetShortestMove(0);
         _input.SetMoveTimePerRootPixel(autoloot.TeleportForInstantLoot.Value ? 0 : FastMoveTimePerRootPixel);
+
+        // **From under other labels: the labels off the screen first**, the move once they read gone. See StepUnderLabels.
+        if (fromUnderLabels)
+        {
+            _labelsOver.Clear();
+            _labelsOver.AddRange(Placement.LabelElementsOver(gc, chosen.Of));
+            _underLabelsAt = chosen.At;
+            _underLabelsMoved = false;
+            _notShownSince = null;
+
+            if (!HideLabels(settings))
+            {
+                TriedItemIds.Remove(chosen.Id);
+                CoveredUntil[chosen.Id] = DateTime.UtcNow + CoveredWait;
+                _lastOutcome = $"{_itemName}: its label is under other labels, and the tap of Toggle Highlighting was refused";
+                Finish();
+                return;
+            }
+
+            _deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(ms) + Placement.HidesWithin;
+            _phase = Phase.UnderLabels;
+            _clickArmed = false;
+            return;
+        }
 
         if (!_input.MoveTo(new RectangleF(chosen.At.X - 3f, chosen.At.Y - 3f, 6f, 6f)))
         {
@@ -1366,6 +1427,148 @@ internal static class Autoloot
         return true;
     }
 
+    /// <summary>Whether this run took the ground labels off the screen and owes the game the key back, and which key.</summary>
+    private static bool _labelsHidden;
+
+    private static Keys _labelsHiddenWith = Keys.Z;
+
+    private static DateTime _labelsHiddenAt = DateTime.MinValue;
+
+    private static DateTime _labelsShownAt = DateTime.MinValue;
+
+    /// <summary>The labels over the item's label when they were taken down: their going and coming back says the key landed.</summary>
+    private static readonly List<ExileCore2.PoEMemory.Element> _labelsOver = [];
+
+    /// <summary>Where on screen the item being picked up from under other labels lies, and whether the cursor was sent.</summary>
+    private static Vector2 _underLabelsAt;
+
+    private static bool _underLabelsMoved;
+
+    /// <summary>When the arrived cursor was first read as not showing the item's label. See Placement.UnderGrace.</summary>
+    private static DateTime? _notShownSince;
+
+    /// <summary>What the last pickup from under other labels did, for the dump.</summary>
+    internal static string UnderLabelsSaid { get; private set; } = "has not tried";
+
+    private static bool HideLabels(AutoExpeditionSettings settings)
+    {
+        if (_labelsHidden)
+            return true;
+
+        var key = Safe.Read(() => settings.HighlightKey.Value.Key, Keys.Z);
+
+        if (!_input.Tap(key))
+        {
+            UnderLabelsSaid = $"{_itemName}: the tap of {key} was refused";
+            return false;
+        }
+
+        _labelsHidden = true;
+        _labelsHiddenWith = key;
+        _labelsHiddenAt = DateTime.UtcNow;
+        UnderLabelsSaid = $"{_itemName}: its label was under {_labelsOver.Count} other label(s), tapped {key} to hide the labels";
+
+        return true;
+    }
+
+    private static void ShowLabels()
+    {
+        if (!_labelsHidden)
+            return;
+
+        _labelsHidden = false;
+        _labelsShownAt = DateTime.UtcNow;
+        UnderLabelsSaid += _input.Tap(_labelsHiddenWith)
+            ? $"; tapped {_labelsHiddenWith} to put them back"
+            : $"; the tap of {_labelsHiddenWith} to put them back WAS REFUSED - the labels may still be hidden";
+    }
+
+    /// <summary>Whether the labels that were over the item read hidden, or Placement.HidesWithin has passed.</summary>
+    private static bool LabelsGone() =>
+        DateTime.UtcNow - _labelsHiddenAt >= Placement.HidesWithin ||
+        _labelsOver.Count > 0 && _labelsOver.All(e => !Safe.Read(e, static x => x.IsVisible, false));
+
+    /// <summary>Whether a label that was over the item reads shown again, or Placement.HidesWithin has passed since it was put back.</summary>
+    private static bool LabelsBack() =>
+        DateTime.UtcNow - _labelsShownAt >= Placement.HidesWithin ||
+        _labelsOver.Any(e => Safe.Read(e, static x => x.IsVisible, false));
+
+    /// <summary>
+    /// A pickup from under other labels, as the action key run makes it (see Placement.UnderLabelsWord): the labels off
+    /// the screen, the cursor to the item where it lies once the labels over it read gone, the click once the game says
+    /// the cursor is on the item, and the labels back at once. Offered only when no listed item can be clicked as it is.
+    /// The click is never armed on arrival: it waits for the game's word. Not shown its label, the item is let go untried
+    /// and looked at again after CoveredWait.
+    /// </summary>
+    private static void StepUnderLabels(GameController gc)
+    {
+        if (_input.WasStopped())
+        {
+            _lastOutcome = $"{_itemName}: stopped ({_input.Stopped()}) before the click, from under other labels";
+            Finish();
+            return;
+        }
+
+        if (DateTime.UtcNow >= _deadline)
+        {
+            _lastOutcome = $"{_itemName}: the cursor did not reach it from under other labels in time - not clicked";
+            UnderLabelsSaid += "; ran out of time";
+            Finish();
+            return;
+        }
+
+        if (!_underLabelsMoved)
+        {
+            if (!LabelsGone())
+                return;
+
+            var waited = (DateTime.UtcNow - _labelsHiddenAt).TotalMilliseconds;
+
+            UnderLabelsSaid += _labelsOver.Count == 0
+                ? $"; no label over it could be read, so waited the {Placement.HidesWithin.TotalMilliseconds:0}ms ceiling"
+                : waited >= Placement.HidesWithin.TotalMilliseconds
+                    ? $"; the label(s) over it still read shown at the {Placement.HidesWithin.TotalMilliseconds:0}ms ceiling"
+                    : $"; the label(s) over it read hidden after {waited:0}ms";
+
+            // Where it lies now, the camera having had a moment to move.
+            if (Placement.ScreenOfItem(gc, _target) is var lies && lies != Vector2.Zero && Placement.OnScreen(gc, lies))
+                _underLabelsAt = lies;
+
+            if (!_input.MoveTo(new RectangleF(_underLabelsAt.X - 2f, _underLabelsAt.Y - 2f, 4f, 4f)))
+            {
+                _lastOutcome = $"{_itemName}: the move was refused";
+                Finish();
+                return;
+            }
+
+            _underLabelsMoved = true;
+            return;
+        }
+
+        if (!_input.Arrived())
+            return;
+
+        if (!Placement.HoverShowsLabelOf(gc, _target))
+        {
+            if ((_notShownSince ??= DateTime.UtcNow) is var since && DateTime.UtcNow - since < Placement.UnderGrace)
+                return;
+
+            TriedItemIds.Remove(_itemId);
+            CoveredUntil[_itemId] = DateTime.UtcNow + CoveredWait;
+            _lastOutcome = $"{_itemName}: the cursor on it did not show its label - not clicked, looked at again shortly";
+            UnderLabelsSaid += $"; the cursor on it did not show its label (the ground labels say item {Placement.ItemOnHoverId(gc)} " +
+                               $"is under it, against {_itemId}) - not clicked";
+            Finish();
+            return;
+        }
+
+        var clicked = _input.Click();
+
+        UnderLabelsSaid += clicked ? "; the cursor on it showed its label, clicked it" : "; the click was refused";
+        ShowLabels();
+        AfterClick(gc, clicked);
+    }
+
     private static void StepMoving(GameController gc)
     {
         if (_input.WasStopped())
@@ -1421,7 +1624,8 @@ internal static class Autoloot
             {
                 TriedItemIds.Remove(_itemId);
                 CoveredUntil[_itemId] = DateTime.UtcNow + CoveredWait;
-                _lastOutcome = $"{_itemName}: under a piece of the interface at the click - not clicked, input let go";
+                _lastOutcome = $"{_itemName}: under a piece of the interface at the click - not clicked, input let go; " +
+                               $"{Panels.Why(gc, CursorOnScreen(gc))}";
                 Finish();
                 return;
             }
@@ -1776,6 +1980,9 @@ internal static class Autoloot
         if (_input == null)
             return;
 
+        // Labels taken down for a pickup are put back on every way out. See StepUnderLabels.
+        ShowLabels();
+
         if (!keepKeysBlocked)
             EndKeyBlock();
 
@@ -1857,6 +2064,7 @@ internal static class Autoloot
                      $"{settings.Automation.Autoloot.MouseBlockMs.Value}ms, teleport {settings.Automation.Autoloot.TeleportForInstantLoot.Value}");
         b.AppendLine($"  instant loot run: {_phase}, {TriedItemIds.Count} item(s) tried this area, " +
                      $"{RetriesOfItems.Values.Sum()} retry click(s), keys blocked {_keysBlocked}, last: {_lastOutcome}");
+        b.AppendLine($"  instant loot from under other labels, last: {UnderLabelsSaid}");
 
         var labels = Ground.Labels(gc);
         var visible = labels?.Count(l => Safe.Read(l, static x => x.IsVisible, false)) ?? 0;
@@ -1924,12 +2132,18 @@ internal static class Autoloot
 
         foreach (var list in new[] { settings.Automation.Autoloot.InstantLootItems, settings.Automation.Autoloot.ItemsOnActionKey })
         {
-            foreach (var (item, _, rank, name) in ListedOnGround(gc, list))
+            foreach (var (item, label, rank, name) in ListedOnGround(gc, list))
             {
                 var id = Safe.Read(item, static e => e.Id, 0u);
+                var rect = Safe.Read(label, static l => l.Label?.GetClientRect() ?? default, default);
+
+                // What the runs take as over its label, so a label clicked while hidden, or refused while clear, can be
+                // read against what the player saw. See Placement.CoveringRectsOfLabel.
+                var over = rect.Width > 0f ? Placement.LabelsOver(gc, rect, id) : [];
 
                 b.AppendLine($"    on the ground: \"{name}\" (line {rank + 1} of the {(list == settings.Automation.Autoloot.InstantLootItems ? "instant" : "action key")} list), " +
-                             $"id {id}{(TriedItemIds.Contains(id) ? ", tried" : "")}");
+                             $"id {id}{(TriedItemIds.Contains(id) ? ", tried" : "")}, label ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}), " +
+                             (over.Count == 0 ? "nothing taken as over it" : "taken as over it: " + string.Join("; ", over)));
             }
         }
 

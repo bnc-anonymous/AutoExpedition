@@ -2079,7 +2079,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         _boundary.AreaChange(hash);
         _scouted.AreaChange(hash, GameController);
         _streaming.AreaChange(hash);
-        _planning.AreaChange(hash);
+        _planning.AreaChange(hash, Safe.Read(() => area.IsHideout || area.IsTown, false));
         Checked.Here.AreaChange(hash);
         Settled.Here.AreaChange(hash);
         PlacementDisagreements.Here.AreaChange(hash);

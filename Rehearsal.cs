@@ -791,6 +791,13 @@ internal sealed class Rehearsal
         if (Detonator.GrandSiteSetOff(gc))
             return;
 
+        // Nor on a plan kept from before leaving the map, until the detonator panel has filled in. A pass started
+        // earlier would read no explosives down and plan the whole route from the detonator, over the links already
+        // placed. Whether the panel reads empty on return to a site part placed has not been seen either way. See
+        // Planning.KeptFromBeforeLeaving.
+        if (planning.KeptFromBeforeLeaving && !Detonator.PanelReady(gc))
+            return;
+
         // **The continuous reroll mode keeps solving until the player stops it or nothing is left to
         // roll.** Otherwise a pass that fails to beat the standing chain settles the site, and only a
         // change to the site - a marker, a price, a roll - opens it again. Between rolls the player is

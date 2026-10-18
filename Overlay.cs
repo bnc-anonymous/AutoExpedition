@@ -568,7 +568,7 @@ internal static class Overlay
         // ShowOverlay as well, because this pass now runs for the unpriced flag alone and the
         // rings are part of the debug overlay. See the gate in Draw.
         if (settings.Debug.ShowOverlay && settings.Debug.ShowMarkers && !target.Spent)
-            Shape(graphics, gc, settings, target, world, placing && target.Glowing);
+            Shape(graphics, gc, settings, target, world, placing && Planning.LitUnderCursor(gc, settings, target));
 
         if (settings.Debug.ShowOverlay && settings.Debug.ShowArtNames)
             Named(graphics, target.Label, at);
@@ -2578,7 +2578,7 @@ internal static class Overlay
 
         foreach (var target in targets)
         {
-            if (!target.Glowing)
+            if (!Planning.LitUnderCursor(gc, settings, target))
                 continue;
 
             var world = target.Where(gc);

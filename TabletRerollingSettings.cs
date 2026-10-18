@@ -376,6 +376,18 @@ public class TabletTradeSiteSettings
     public RangeNode<int> CheapPriceFreshHours { get; set; } = new RangeNode<int>(24, 1, 72);
 
     /// <summary>
+    /// How long a tablet's own price stays its price once a fresh cheap price at higher rolls caps it. Past its own
+    /// freshness and within this, its own price is still shown; past this, it is shown as at most the cap, and a pricing
+    /// run searches its own rolls again. 72 by default, chosen. See Tablets.OwnPriceStands.
+    /// </summary>
+    [Menu("Capped price fresh for (hours)",
+        "A tablet whose higher rolls have a fresh cheap price:\n" +
+        "its own price is shown for this long, then searched\n" +
+        "again by a pricing run, shown meanwhile as at most\n" +
+        "the higher rolls' price.")]
+    public RangeNode<int> CappedPriceFreshHours { get; set; } = new RangeNode<int>(72, 1, 336);
+
+    /// <summary>
     /// The action key over a tablet searches it again whatever its freshness, but not when its own price is at most
     /// this many minutes old. See Tablets.ActOnActionKey.
     /// </summary>

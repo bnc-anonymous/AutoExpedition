@@ -1293,6 +1293,7 @@ internal static class Dump
         b.AppendLine($"  Site() = {Describe(site)}, matched against icons within 3 grid units");
         b.AppendLine("  set-off latch writes this area: " +
                      (Detonator.SetOffEvidence.Count == 0 ? "none" : string.Join("; ", Detonator.SetOffEvidence)));
+        DetonatorTooltipsSaid(b, gc);
 
         // The same list Detonated reads, so the diagnostic and the thing it diagnoses cannot
         // disagree about what is there. See Detonator.ExplosivesDetonated.
@@ -1959,6 +1960,73 @@ internal static class Dump
             }
             .Where(a => a != 0L)
             .ToHashSet();
+
+    /// <summary>
+    /// The text of every tooltip the detonator panel's elements carry, shown or not, and of the game's hovered tooltip,
+    /// at any depth, each part marked hidden where it is. The panel's list of the modifiers its placed explosives have
+    /// captured is shown on hovering one of its buttons, and the interface walk below stops six deep and printed none of
+    /// it (dump 2026-10-18 02:52:42) - so whether a relic was captured, which the game does not light it up for, could
+    /// not be read. **Hidden as well**, because a reading that needs the cursor on the button is one this plugin may not
+    /// take: whether the list is kept current while nobody hovers it is the question. See Detonator.
+    /// </summary>
+    private static void DetonatorTooltipsSaid(StringBuilder b, GameController gc)
+    {
+        var panel = Safe.Read(gc, static g => (ExileCore2.PoEMemory.Element)g.IngameState.IngameUi.ExpeditionDetonatorElement, null);
+        var shown = 0;
+
+        void Texts(ExileCore2.PoEMemory.Element at, int depth, List<string> into)
+        {
+            if (at == null || depth > 14 || into.Count >= 120)
+                return;
+
+            // GetText with a long limit: Text stopped the captured-modifiers list partway through its fourth line
+            // (dump 2026-10-18 02:59:21), the whole list being one element's text.
+            if (Safe.Read(at, static e => e.GetText(4096), null) is { } text && !string.IsNullOrWhiteSpace(text))
+                into.Add((Safe.Read(at, static e => e.IsVisibleLocal, false) ? "" : "(hidden) ") + text.Trim().Replace("\n", " | "));
+
+            foreach (var kid in Safe.Kids(at) ?? [])
+            {
+                if (kid != null)
+                    Texts(kid, depth + 1, into);
+            }
+        }
+
+        void Tooltip(string from, ExileCore2.PoEMemory.Element tooltip)
+        {
+            if (tooltip == null || Safe.Read(tooltip, static t => t.Address, 0L) == 0L)
+                return;
+
+            var texts = new List<string>();
+            var rect = Safe.Read(tooltip, static t => t.GetClientRectCache, default);
+
+            Texts(tooltip, 0, texts);
+            shown++;
+            b.AppendLine($"  tooltip of {from}, {(Safe.Read(tooltip, static t => t.IsVisible, false) ? "shown" : "hidden")}, at " +
+                         $"({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}), {texts.Count} text(s):");
+
+            foreach (var text in texts)
+                b.AppendLine($"    \"{text}\"");
+        }
+
+        void Elements(ExileCore2.PoEMemory.Element at, string path, int depth)
+        {
+            if (at == null || depth > 6)
+                return;
+
+            Tooltip($"the panel's element [{path}]", Safe.Read(at, static e => e.Tooltip, null));
+
+            var kids = Safe.Kids(at) ?? [];
+
+            for (var i = 0; i < kids.Count; i++)
+                Elements(kids[i], path.Length == 0 ? $"{i}" : $"{path},{i}", depth + 1);
+        }
+
+        Elements(panel, "", 0);
+        Tooltip("the game's hovered element (UIHoverTooltip)", Safe.Read(gc, static g => g.IngameState.UIHoverTooltip, null));
+
+        if (shown == 0)
+            b.AppendLine("  tooltips of the panel: none carried, shown or hidden");
+    }
 
     private static void Walk(StringBuilder b, ExileCore2.PoEMemory.Element element, string path, int depth,
         ref int found, HashSet<long> chat)
@@ -3184,6 +3252,32 @@ internal static class Dump
         b.AppendLine($"  every solve at this dig site, {Planning.Journeyed}");
         b.AppendLine($"  re-solving: {Planning.Progress}");
         b.AppendLine($"  marked as must take: {Insisted.Here.Describe(Plan)}");
+
+        // **What the must avoid modifiers reach, and how near the chain comes to each marker they ban.** A chain was
+        // reported to ignore a ban on monsters immune to fire, and nothing in the dump said whether the ban was loaded,
+        // which markers it put a price on, or how far each lay outside the catch reach the plan used (2026-10-18 02:41).
+        var bannedMods = MustAvoidMods.All.Where(x => x.Refused).Select(x => x.Mod).ToList();
+
+        b.AppendLine($"  must avoid modifiers: {bannedMods.Count} banned of {MustAvoidMods.Count} seen" +
+                     (bannedMods.Count > 0 ? " - " + string.Join(", ", bannedMods) : ""));
+
+        if (Env != null && Chain is { Count: > 0 } links)
+        {
+            foreach (var target in Env.Targets)
+            {
+                // Charged more than any chain is worth, which leaves it negative: the mark of an avoided marker. See
+                // Planning.PlanTargetOf and Planning.Ceiling.
+                if (target.Weight >= 0f)
+                    continue;
+
+                var nearest = links.Min(l => System.Numerics.Vector2.Distance(l, target.Grid));
+                var reach = Env.Blast + target.Radius;
+
+                b.AppendLine($"    avoided ({target.Grid.X:0},{target.Grid.Y:0}) {target.Kind}, weight {target.Weight:N0}: nearest link {nearest:0.##} grid, catch reach " +
+                             $"{Env.Blast:0.##} + {target.Radius:0.##} = {reach:0.##} - " +
+                             (nearest <= reach ? "CAUGHT" : $"clear by {nearest - reach:0.##} grid"));
+            }
+        }
 
         // **The count the objective charges against the flags the search can see.**
         // env.Musts is how many marks the environment was built with and decides what a

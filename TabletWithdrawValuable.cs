@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using ExileCore2;
 using RectangleF = ExileCore2.Shared.RectangleF;
 
@@ -34,11 +35,17 @@ internal static partial class Tablets
     /// <summary>The sub-tab being scanned.</summary>
     private static int _withdrawScanSubTab;
 
-    /// <summary>Each sub-tab's tablets as scanned: where each was read, and its worth in exalts.</summary>
-    private static readonly Dictionary<int, List<(RectangleF Rect, double Worth)>> WithdrawScanned = [];
+    /// <summary>
+    /// Each sub-tab's tablets as scanned: where each was read, its worth in exalts, its fingerprint, and where the worth
+    /// came from (see WorthAndSourceOfSearch).
+    /// </summary>
+    private static readonly Dictionary<int, List<(RectangleF Rect, double Worth, string Fingerprint, string Source)>> WithdrawScanned = [];
 
     /// <summary>The tablets chosen to withdraw and not yet taken, most valuable first.</summary>
     private static readonly List<(int SubTab, (int Column, int Row) Cell, double Worth)> WithdrawPlan = [];
+
+    /// <summary>The planned tablets clicked this run, by sub-tab and cell, so one seen gone is done rather than stale.</summary>
+    private static readonly HashSet<(int SubTab, (int Column, int Row) Cell)> WithdrawSent = [];
 
     /// <summary>What withdrawing a tablet by its worth is called, in the status line.</summary>
     private const string ValuableTablet = "a tablet to withdraw";
@@ -67,22 +74,48 @@ internal static partial class Tablets
     }
 
     /// <summary>
-    /// A tablet's worth in exalts for ordering a withdraw: its own search's price; else the highest floor from searches
-    /// at lower rolls; else the lowest ceiling from searches at higher rolls with as many listings as Price from takes;
-    /// else the estimate from searches one modifier short. Null with none. A tablet its own search takes as under
+    /// A tablet's worth in exalts for ordering a withdraw: the price its label is drawn from (PricedFromAnswers) - its own
+    /// search's price; else the lowest ceiling from searches at higher rolls with as many listings as Price from takes,
+    /// when there is no floor or the ceiling is within Cheap price up to; else the highest floor from searches at lower
+    /// rolls; else the estimate from searches one modifier short. Null with none. A tablet its own search takes as under
     /// a chaos is worth nought, as the reforger takes it.
     /// </summary>
-    private static double? WorthForWithdraw(GameController gc, TabletOnScreen tablet, TabletRerollingSettings settings)
+    private static double? WorthForWithdraw(GameController gc, TabletOnScreen tablet, TabletRerollingSettings settings) =>
+        WorthAndSourceForWithdraw(gc, tablet, settings).Worth;
+
+    /// <summary>WorthForWithdraw, with where it came from. See WorthAndSourceOfSearch.</summary>
+    private static (double? Worth, string Source) WorthAndSourceForWithdraw(GameController gc, TabletOnScreen tablet,
+        TabletRerollingSettings settings)
     {
-        if (_valuation == null || SearchOfTablet(gc, tablet, settings, out _) is not { } search)
-            return null;
+        if (_valuation == null)
+            return (null, "no valuation");
 
-        if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } own && PriceOfAnswer(own, settings, _valuation) is var price &&
-            !double.IsNaN(price))
-            return price;
+        return SearchOfTablet(gc, tablet, settings, out var reason) is { } search
+            ? WorthAndSourceOfSearch(search, settings)
+            : (null, $"no search: {reason}");
+    }
 
-        if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } unconverted && ListedOnlyUnconverted(unconverted, settings, _valuation))
-            return 0d;
+    /// <summary>WorthForWithdraw from a tablet's search, for a tablet known only by its record. See RememberedWorth.</summary>
+    private static double? WorthOfSearch(TabletSearch search, TabletRerollingSettings settings) =>
+        WorthAndSourceOfSearch(search, settings).Worth;
+
+    /// <summary>
+    /// WorthOfSearch, with where it came from - its own search, a floor from lower rolls, a ceiling from higher rolls or an
+    /// estimate - for the run's log, since the label drawn on a tablet can take a different one of these (a ceiling, "<",
+    /// where this takes the floor). See PricedFromAnswers.
+    /// </summary>
+    private static (double? Worth, string Source) WorthAndSourceOfSearch(TabletSearch search, TabletRerollingSettings settings)
+    {
+        if (_valuation == null)
+            return (null, "no valuation");
+
+        if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } own && OwnPriceStands(search, own, settings, _valuation) &&
+            PriceOfAnswer(own, settings, _valuation) is var price && !double.IsNaN(price))
+            return (price, "own search");
+
+        if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } unconverted && OwnPriceStands(search, unconverted, settings, _valuation) &&
+            ListedOnlyUnconverted(unconverted, settings, _valuation))
+            return (0d, "listed only under a chaos");
 
         double? floor = null, ceiling = null;
 
@@ -98,8 +131,41 @@ internal static partial class Tablets
                 ceiling = bound;
         }
 
-        return floor ?? ceiling ?? EstimateFromFewerModifiers(search, settings, _valuation)?.Price;
+        // **The bound the label is drawn from, so the order follows the prices shown.** The label, and the listings shown
+        // on hovering, are the ceiling while there is no floor or the ceiling is cheap, else the floor (PricedFromAnswers).
+        // Taking the floor first, as this did, ordered Planar Terraform at its 2d floor from lower rolls while its label
+        // and hover showed its higher rolls' listings at 14-16c (dump 2026-10-18 01:23:49).
+        if (ceiling is { } top && (floor == null || top / _valuation.PerExalt("Divine") <= settings.TradeSite.CheapPriceUpToDivine.Value))
+            return (top, floor is { } beside ? $"ceiling from higher rolls, floor {Shown(beside, _valuation)}" : "ceiling from higher rolls");
+
+        if (floor is { } low)
+            return (low, ceiling is { } high ? $"floor from lower rolls, ceiling {Shown(high, _valuation)}" : "floor from lower rolls");
+
+        return EstimateFromFewerModifiers(search, settings, _valuation)?.Price is { } estimate
+            ? (estimate, "estimate one modifier short")
+            : (null, "unpriced");
     }
+
+    /// <summary>
+    /// A remembered tablet's worth from the prices known now, through the search collected for its fingerprint; the
+    /// worth its record was written with when none is collected. The record's worth is as of when its sub-tab last
+    /// showed, so a tablet priced since read as unpriced and was left out of the plan: the run withdrew from sub-tab 1
+    /// while more valuable tablets sat in sub-tab 2 (2026-10-18, the user's account).
+    /// </summary>
+    private static (double? Worth, string Source) RememberedWorth(RememberedTablet tablet, TabletRerollingSettings settings) =>
+        Collected.TryGetValue(tablet.Fingerprint, out var search) && WorthAndSourceOfSearch(search, settings) is { Worth: not null } now
+            ? (now.Worth, "remembered: " + now.Source)
+            : (tablet.Worth, "remembered: the record's worth");
+
+    /// <summary>
+    /// Whether every full-uses tablet a sub-tab's record priced has its search collected, so RememberedWorth prices it from
+    /// the prices known now. Collected is kept in memory only, so after the plugin loads every remembered tablet fell back
+    /// to the record's worth, as of when its sub-tab last showed: a tablet searched again since was ordered by its old
+    /// price, behind cheaper ones (dump 2026-10-18 01:21:51, sub-tabs 1 and 2 all "the record's worth"). A sub-tab failing
+    /// this is visited, which reads it fresh and collects it.
+    /// </summary>
+    private static bool PricedNow(List<RememberedTablet> remembered) =>
+        remembered.All(t => t.Uses != FullUses || t.Worth == null || Collected.ContainsKey(t.Fingerprint));
 
     private static void StepWithdrawValuable(GameController gc, TabletRerollingSettings settings)
     {
@@ -111,12 +177,15 @@ internal static partial class Tablets
 
             case WithdrawPhase.Scan:
             {
-                // A sub-tab seen lately is taken as it was seen, not visited. See RememberedContents.
-                if (_withdrawScanSubTab <= 6 && RememberedContents(gc, _withdrawScanSubTab) is { } remembered)
+                // A sub-tab seen lately is taken as it was seen, not visited - while every priced tablet in it can be priced
+                // now. See RememberedContents and PricedNow.
+                if (_withdrawScanSubTab <= 6 && RememberedContents(gc, _withdrawScanSubTab) is { } remembered && PricedNow(remembered))
                 {
                     WithdrawScanned[_withdrawScanSubTab] = remembered
                         .Where(t => t.Uses == FullUses)
-                        .Select(t => (t.Rect, t.Worth ?? double.NaN))
+                        .Select(t => RememberedWorth(t, settings) is var worth
+                            ? (t.Rect, worth.Worth ?? double.NaN, t.Fingerprint, worth.Source)
+                            : default)
                         .ToList();
                     _withdrawScanSubTab++;
                 }
@@ -132,7 +201,9 @@ internal static partial class Tablets
 
                     WithdrawScanned[_withdrawScanSubTab] = StashTablets()
                         .Where(t => t.Uses == FullUses)
-                        .Select(t => (t.Rect, WorthForWithdraw(gc, t, settings) ?? double.NaN))
+                        .Select(t => WorthAndSourceForWithdraw(gc, t, settings) is var worth
+                            ? (t.Rect, worth.Worth ?? double.NaN, FingerprintOf(t), worth.Source)
+                            : default)
                         .ToList();
                     _withdrawScanSubTab++;
                 }
@@ -155,9 +226,57 @@ internal static partial class Tablets
                     return;
                 }
 
-                var subTab = WithdrawPlan[0].SubTab;
+                var showing = SelectedSubTab(gc);
 
-                if (SelectedSubTab(gc) != subTab)
+                if (!ReadSinceSubTabClick())
+                    return;
+
+                // **A plan entry leaves the plan when its cell is seen empty, not when it is clicked.** Taken off at the
+                // click, a tablet still there 150ms after it was clicked again by MoveNext's retry and found nothing to
+                // retry: its entry had gone, and the run withdrew one fewer than planned (dump 2026-10-18 01:29:04). An
+                // entry clicked and now empty is done; one never clicked and empty was planned from a stale record, and
+                // every such entry of the sub-tab goes at once, not one a visit: planned from a stale record, the run went
+                // back and forth between sub-tabs for each one gone (2026-10-10).
+                var shown = StashTablets();
+                var held = shown.Select(t => GridCellOf(t.Rect)).Where(c => c != null).Select(c => c!.Value).ToHashSet();
+
+                bool InFlight((int SubTab, (int Column, int Row) Cell, double Worth) p) =>
+                    p.SubTab == showing && shown.FirstOrDefault(t => GridCellOf(t.Rect) == p.Cell) is { } t &&
+                    ReforgingSent.Contains(AddressOf(t));
+
+                foreach (var p in WithdrawPlan.Where(InFlight))
+                    WithdrawSent.Add((p.SubTab, p.Cell));
+
+                var gone = 0;
+
+                WithdrawPlan.RemoveAll(p =>
+                {
+                    if (p.SubTab != showing || held.Contains(p.Cell))
+                        return false;
+
+                    if (!WithdrawSent.Contains((p.SubTab, p.Cell)))
+                        gone++;
+
+                    return true;
+                });
+
+                if (gone > 0)
+                    LogReforging($"sub-tab {showing}: {gone} planned tablet(s) no longer there");
+
+                // The most valuable not clicked yet, so the inventory fills in that order. One clicked and not yet moved
+                // stays on the plan, so MoveNext's retry has it to click again. See MoveNext.
+                var head = WithdrawPlan.FindIndex(p => !InFlight(p));
+
+                if (head < 0)
+                {
+                    // Everything left is on its way: settled, and retried where one did not move, before calling it done.
+                    MoveNext(gc, [], ValuableTablet, true);
+                    return;
+                }
+
+                var subTab = WithdrawPlan[head].SubTab;
+
+                if (showing != subTab)
                 {
                     // Every move on the sub-tab showing settled before leaving it.
                     if (MoveNext(gc, [], ValuableTablet, true))
@@ -167,44 +286,70 @@ internal static partial class Tablets
                     return;
                 }
 
-                if (!ReadSinceSubTabClick())
-                    return;
-
-                // **Every planned tablet of this sub-tab no longer in its cell is off the plan at once**, not one a visit:
-                // planned from a stale record, the run went back and forth between sub-tabs for each one gone (2026-10-10).
-                var shown = StashTablets();
-                var held = shown.Select(t => GridCellOf(t.Rect)).Where(c => c != null).Select(c => c!.Value).ToHashSet();
-                var gone = WithdrawPlan.RemoveAll(p => p.SubTab == subTab && !held.Contains(p.Cell));
-
-                if (gone > 0)
-                {
-                    LogReforging($"sub-tab {subTab}: {gone} planned tablet(s) no longer there");
-                    return;
-                }
-
-                // The most valuable still to take first, so the inventory fills in that order. Sent already, it is off the
-                // plan. See MoveNext.
-                var cell = WithdrawPlan[0].Cell;
-                var next = shown.FirstOrDefault(t => GridCellOf(t.Rect) == cell);
-
-                if (next == null || ReforgingSent.Contains(AddressOf(next)))
-                {
-                    WithdrawPlan.RemoveAt(0);
-                    return;
-                }
-
                 // **With the rest of this sub-tab's in the plan, in the same order, as one batch**, so ExileInput2 plans and
                 // draws them ahead and the cursor goes straight on from one to the next, as every other withdraw does. Each
                 // was a batch of its own, planned and drawn alone. Only those before the plan next needs another sub-tab.
-                var batch = WithdrawPlan.TakeWhile(p => p.SubTab == subTab)
+                var run = WithdrawPlan.Skip(head).TakeWhile(p => p.SubTab == subTab).ToList();
+                var batch = run
                     .Select(p => shown.FirstOrDefault(t => GridCellOf(t.Rect) == p.Cell))
                     .Where(t => t != null && !ReforgingSent.Contains(AddressOf(t)))
                     .ToList();
 
-                MoveNext(gc, batch, ValuableTablet, true, inOrder: true);
+                var thisSubTab = head + run.Count;
+
+                MoveNext(gc, batch, ValuableTablet, true, inOrder: true,
+                    thenClicks: (_, from) => PlannedValuableAfter(gc, thisSubTab, from));
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// The rest of the most valuable withdraw after the sub-tab showing, as clicks for MoveNext to plan ahead: every tablet
+    /// still in WithdrawPlan in its order, with the sub-tab click before each change of sub-tab, each tablet where the scan
+    /// read it and its point just inside its cell's edge facing the last. Stops at a sub-tab or tablet it cannot place.
+    /// Changes nothing: each click is still sent only once the run decides on it. See PlannedSubTabsAfter, its junk
+    /// counterpart, and ExpectedAfterSubTab.
+    /// </summary>
+    /// <param name="skip">How many of WithdrawPlan's first entries are the sub-tab showing's, planned by MoveNext itself.</param>
+    /// <param name="from">Where the cursor will be when the sub-tab showing is done.</param>
+    private static List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)> PlannedValuableAfter(GameController gc, int skip,
+        Vector2 from)
+    {
+        var planned = new List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)>();
+        var at = SelectedSubTab(gc);
+        var firstOfVisit = false;
+
+        ExpectedAfterSubTab.Clear();
+
+        foreach (var (subTab, cell, _) in WithdrawPlan.Skip(skip))
+        {
+            if (subTab != at)
+            {
+                if (SubTabRect(gc, subTab) is not { Width: > 0f } tab)
+                    break;
+
+                planned.Add((tab, null, false, false));
+                from = new Vector2(tab.X + tab.Width / 2f, tab.Y + tab.Height / 2f);
+                at = subTab;
+                firstOfVisit = true;
+            }
+
+            if (!WithdrawScanned.TryGetValue(subTab, out var scanned) ||
+                scanned.FirstOrDefault(x => GridCellOf(x.Rect) == cell) is not { Rect.Width: > 0f } tablet)
+                break;
+
+            var point = ItemClicks.NearEdgeOf(tablet.Rect, from);
+
+            if (firstOfVisit)
+                ExpectedAfterSubTab.Add((subTab, tablet.Rect, tablet.Fingerprint));
+
+            firstOfVisit = false;
+            planned.Add((tablet.Rect, point, false, true));
+            from = point;
+        }
+
+        return planned;
     }
 
     /// <summary>
@@ -234,7 +379,7 @@ internal static partial class Tablets
 
         var priced = WithdrawScanned
             .SelectMany(x => x.Value.Where(t => !double.IsNaN(t.Worth) && !UnderReforgePrice(t.Worth, settings))
-                .Select(t => (SubTab: x.Key, Cell: GridCellOf(t.Rect), t.Worth)))
+                .Select(t => (SubTab: x.Key, Cell: GridCellOf(t.Rect), t.Worth, t.Source)))
             .Where(t => t.Cell != null)
             .OrderByDescending(t => t.Worth)
             .Take(room)
@@ -252,8 +397,14 @@ internal static partial class Tablets
         WithdrawPlan.AddRange(priced.Select(t => (t.SubTab, t.Cell!.Value, t.Worth)));
 
         LogReforging($"withdraw by worth: {priced.Count} of {all.Count} tablets, from {priced[0].Worth:0.##}ex down to {priced[^1].Worth:0.##}ex");
+
+        // Each in the order taken, with its worth and where that came from, so an order that looks wrong against the labels
+        // can be read rather than guessed at.
+        foreach (var (subTab, cell, worth, source) in priced)
+            LogReforging($"  sub-tab {subTab} ({cell!.Value.Column},{cell.Value.Row}): {Shown(worth, _valuation)} ({worth:0.#}ex), {source}");
         _withdrawPhase = WithdrawPhase.Withdraw;
         ReforgingSent.Clear();
+        WithdrawSent.Clear();
         _moved = 0;
     }
 }

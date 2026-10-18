@@ -340,7 +340,8 @@ internal static partial class Tablets
 
                 if (EnoughJunkToWithdraw(gc, settings) &&
                     MoveNext(gc, StashTablets().Where(t => IsJunk(gc, t, settings)), JunkTablet, true,
-                        room: _roomForBench > 0 && InventoryFreeCells(gc) is >= 0 and var cells ? cells - _roomForBench : null))
+                        room: _roomForBench > 0 && InventoryFreeCells(gc) is >= 0 and var cells ? cells - _roomForBench : null,
+                        thenClicks: (roomLeft, from) => PlannedSubTabsAfter(gc, SubTabPurpose.Junk, roomLeft, from)))
                     return;
 
                 if (NextSubTab(gc, SubTabPurpose.Junk) is { } next)
@@ -843,8 +844,7 @@ internal static partial class Tablets
     /// </summary>
     private static void ClickSubTab(GameController gc, int number)
     {
-        var tab = FragmentTabContent(gc) is { } content ? NumberedSubTabs(content).FirstOrDefault(x => x.Number == number).Element : null;
-        var rect = Safe.Read(tab, static t => t.GetClientRectCache, default);
+        var rect = SubTabRect(gc, number);
 
         if (rect.Width <= 0f)
         {
@@ -855,9 +855,99 @@ internal static partial class Tablets
             return;
         }
 
-        Send(rect, false, $"sub-tab {number}", () => SelectedSubTab(gc) == number && DateTime.UtcNow - _clickedAt > SubTabSettle,
+        // **Up once the tablet planned first reads where it was planned**, so the plan goes straight on; SubTabSettle when
+        // nothing was planned, or the sub-tab turns out different from its record.
+        Send(rect, false, $"sub-tab {number}", () =>
+            {
+                if (SelectedSubTab(gc) != number || DateTime.UtcNow - _clickedAt <= SubTabSettle && !ExpectedTabletShown(number))
+                    return false;
+
+                // This visit's entry is spent, so a later visit to the same sub-tab is judged by its own.
+                if (ExpectedAfterSubTab.FindIndex(x => x.SubTab == number) is >= 0 and var spent)
+                    ExpectedAfterSubTab.RemoveAt(spent);
+
+                return true;
+            },
             null);
     }
+
+    /// <summary>Where a numbered sub-tab of the Expedition tablets is on screen, or empty when it is not found.</summary>
+    private static RectangleF SubTabRect(GameController gc, int number)
+    {
+        var tab = FragmentTabContent(gc) is { } content ? NumberedSubTabs(content).FirstOrDefault(x => x.Number == number).Element : null;
+
+        return Safe.Read(tab, static t => t.GetClientRectCache, default);
+    }
+
+    /// <summary>
+    /// The rest of a withdraw after the sub-tab showing, as clicks for MoveNext to plan ahead: each sub-tab NextSubTab
+    /// would go on to, in its order, then the tablets its record holds that the withdraw takes, until roomLeft is used.
+    /// Each sub-tab's tablets in the order a batch would take them from where the cursor arrives, each point just inside
+    /// its cell's edge facing the last (see BatchNext). Stops after a sub-tab whose contents are not remembered, since
+    /// what follows its click is not known. Changes nothing: NextSubTab still decides, and each click is still sent only
+    /// once a read confirms it. Each sub-tab's first planned tablet is noted for ClickSubTab. See ExpectedAfterSubTab.
+    /// </summary>
+    /// <param name="from">Where the cursor will be when the sub-tab showing is done: its last planned click.</param>
+    private static List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)> PlannedSubTabsAfter(GameController gc,
+        SubTabPurpose purpose, int roomLeft, Vector2 from)
+    {
+        var planned = new List<(RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)>();
+        var showing = SelectedSubTab(gc);
+        var noted = false;
+
+        ExpectedAfterSubTab.Clear();
+
+        for (var number = 1; number <= 6 && roomLeft > 0; number++)
+        {
+            if (number == showing || SubTabsDone.Contains(number) || !SubTabWorthVisiting(gc, number, purpose))
+                continue;
+
+            if (SubTabRect(gc, number) is not { Width: > 0f } tab)
+                break;
+
+            planned.Add((tab, null, false, false));
+            from = new Vector2(tab.X + tab.Width / 2f, tab.Y + tab.Height / 2f);
+            noted = false;
+
+            if (RememberedContents(gc, number) is not { } remembered ||
+                remembered.Any(t => (purpose == SubTabPurpose.Junk ? t.Junk : t.Unidentified) == null))
+                break;
+
+            var taken = remembered.Where(t => purpose == SubTabPurpose.Junk ? t.Junk == true : t.Unidentified == true).ToList();
+
+            while (taken.Count > 0 && roomLeft > 0)
+            {
+                var next = ItemClicks.NextItemOf(taken, static t => t.Rect, from, false);
+                var point = ItemClicks.NearEdgeOf(next.Rect, from);
+
+                if (!noted)
+                    ExpectedAfterSubTab.Add((number, next.Rect, next.Fingerprint));
+
+                noted = true;
+
+                planned.Add((next.Rect, point, false, true));
+                taken.Remove(next);
+                from = point;
+                roomLeft--;
+            }
+        }
+
+        return planned;
+    }
+
+    /// <summary>
+    /// The first tablet planned on each planned visit to a sub-tab, where and which, in visit order: the read showing it
+    /// there is what says the sub-tab's tablets are up, in place of waiting SubTabSettle. In visit order because the most
+    /// valuable withdraw visits a sub-tab more than once. Set by PlannedSubTabsAfter and PlannedValuableAfter; a visit's
+    /// entry goes once its sub-tab is up. See ClickSubTab.
+    /// </summary>
+    private static readonly List<(int SubTab, RectangleF Rect, string Fingerprint)> ExpectedAfterSubTab = [];
+
+    /// <summary>Whether the last read shows the tablet planned first on the next visit to this sub-tab, where it was planned.</summary>
+    private static bool ExpectedTabletShown(int number) =>
+        ExpectedAfterSubTab.FirstOrDefault(x => x.SubTab == number) is { Fingerprint: not null } expected &&
+        StashTablets().Any(t => MathF.Abs(t.Rect.X - expected.Rect.X) < 1f && MathF.Abs(t.Rect.Y - expected.Rect.Y) < 1f &&
+                                FingerprintOf(t) == expected.Fingerprint);
 
     /// <summary>How long after a sub-tab reads selected its tablets are given to be read: the reading runs every 150 ms.</summary>
     private static readonly TimeSpan SubTabSettle = TimeSpan.FromMilliseconds(250);

@@ -49,6 +49,12 @@ internal static partial class Tablets
         /// <summary>Its worth in exalts for ordering a withdraw, when it had one. See WorthForWithdraw.</summary>
         public double? Worth { get; set; }
 
+        /// <summary>Whether it was junk when seen; null in a record saved before this was kept. See PlannedSubTabsAfter.</summary>
+        public bool? Junk { get; set; }
+
+        /// <summary>Whether it was unidentified at full uses when seen; null in a record saved before this was kept.</summary>
+        public bool? Unidentified { get; set; }
+
         public ExileCore2.Shared.RectangleF Rect => new(X, Y, Width, Height);
     }
 
@@ -192,6 +198,7 @@ internal static partial class Tablets
 
         if (Book.SubTabs.TryGetValue(number, out var before) && before.Tablets == record.Tablets && before.Junk == record.Junk &&
             before.Craftable == record.Craftable && before.Unidentified == record.Unidentified && Same(before.Contents) &&
+            before.Contents.All(x => x.Junk != null) &&
             record.When - before.When < TimeSpan.FromMinutes(1))
             return;
 
@@ -200,6 +207,7 @@ internal static partial class Tablets
         {
             X = x.Rect.X, Y = x.Rect.Y, Width = x.Rect.Width, Height = x.Rect.Height, Uses = x.Tablet.Uses,
             Fingerprint = x.Fingerprint, Worth = WorthForWithdraw(gc, x.Tablet, settings),
+            Junk = IsJunk(gc, x.Tablet, settings), Unidentified = !x.Tablet.Identified && x.Tablet.Uses == FullUses,
         }).ToList();
 
         Book.SubTabs[number] = record;

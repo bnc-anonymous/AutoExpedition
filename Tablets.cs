@@ -1451,7 +1451,10 @@ internal static partial class Tablets
               $"({raw.X:0},{raw.Y:0} {raw.Width:0}x{raw.Height:0}), used as ({TooltipOf(hovered).X:0},{TooltipOf(hovered).Y:0} " +
               $"{TooltipOf(hovered).Width:0}x{TooltipOf(hovered).Height:0})");
         if (hovered != null)
+        {
             b.Append(HoveredTabletTierSaid(hovered));
+            b.Append(HoveredPricingSaid(gc, hovered, settings));
+        }
 
         b.AppendLine($"  trade site: {TabletPricing.Status}, {TabletPricing.Pending} waiting; {TabletPricing.Limits}");
         b.AppendLine($"  {PricingRunSaid}");

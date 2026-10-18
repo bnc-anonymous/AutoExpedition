@@ -2998,7 +2998,9 @@ public class AutomationSettings
     public ToggleNode Enable { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// Whether to hide ground labels when one is sitting over a button that needs clicking.
+    /// Whether to hide ground labels when one is sitting over a button that needs clicking, or over every part of a
+    /// listed item's label - for the action key's looting and instant loot alike, which then click the item where it
+    /// lies (see Placement.UnderLabelsWord).
     ///
     /// **A label blocks a click and does not block an explosive**, so the plugin can be certain the
     /// spot is good and still have the click land on somebody else's name. A Verisium Sentry beside
@@ -3013,7 +3015,10 @@ public class AutomationSettings
     /// On, because the alternative when it happens is a run that stops for a reason nobody can see.
     /// Off for anybody who would rather the plugin never pressed a key they did not ask it to.
     /// </summary>
-    [Menu("Use the Toggle Highlighting key when buttons are obscured")]
+    [Menu("Use the Toggle Highlighting key when buttons are obscured",
+        "Also when a listed item's label is under other labels:\n" +
+        "the labels are hidden, the item itself is clicked,\n" +
+        "and the labels are put back.")]
     public ToggleNode Unhide { get; set; } = new ToggleNode(true);
 
     /// <summary>

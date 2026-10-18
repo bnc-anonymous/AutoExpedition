@@ -437,6 +437,58 @@ internal static partial class Tablets
         _planned = DateTime.MinValue;
     }
 
+    /// <summary>
+    /// The hovered tablet's pricing for the dump: whether it is collected, its own search's answer and freshness, every
+    /// related answer with its freshness and whether it settles as a ceiling, and whether a pricing run would search it.
+    /// A tablet whose label was days old was passed over by a pricing run with nothing on screen to say why (dump
+    /// 2026-10-18 01:32:11).
+    /// </summary>
+    private static string HoveredPricingSaid(GameController gc, TabletOnScreen hovered, TabletRerollingSettings settings)
+    {
+        var b = new System.Text.StringBuilder();
+        var valuation = _valuation;
+
+        if (valuation == null)
+            return "    pricing: no valuation yet" + Environment.NewLine;
+
+        if (SearchOfTablet(gc, hovered, settings, out var reason) is not { } search)
+            return $"    pricing: no search: {reason}" + Environment.NewLine;
+
+        string AnswerSaid(TabletPricing.Answer answer) => answer == null
+            ? "not searched"
+            : answer.Error.Length > 0
+                ? $"failed {AgeInWords(DateTime.UtcNow - answer.When)}: {answer.Error}"
+                : $"{answer.Listings.Count} listing(s) of {answer.Total}, price {(PriceOfAnswer(answer, settings, valuation) is var p && !double.IsNaN(p) ? Shown(p, valuation) : "none")}, " +
+                  $"searched {AgeInWords(DateTime.UtcNow - answer.When)}, {(IsUsable(answer, settings, valuation) ? "fresh" : "stale")}";
+
+        b.AppendLine($"    pricing: collected {Collected.ContainsKey(FingerprintOf(hovered))}, in the pricing run {PricingRun.Contains(FingerprintOf(hovered))}, " +
+                     $"a pricing run would search it {NeedsSearch(search, settings, valuation)}");
+        b.AppendLine($"    own search: {AnswerSaid(TabletPricing.Cached(search.Key))}");
+
+        foreach (var (_, answer, tighter, looser) in TabletPricing.RelatedAnswers(search.Key))
+            b.AppendLine($"    {(tighter ? "higher rolls" : looser ? "lower rolls" : "related")}: {AnswerSaid(answer)}" +
+                         (tighter && SettlesAsCeiling(answer, settings, valuation)
+                             ? CappedSearchDue(search, settings, valuation)
+                                 ? " - caps it, and its own price is past Capped price fresh for, so a pricing run searches its own"
+                                 : " - caps it, so a pricing run does not search its own within Capped price fresh for"
+                             : ""));
+
+        return b.ToString();
+    }
+
+    /// <summary>
+    /// Whether a tablet's own search's answer is its price: fresh; stale with no fresh higher-rolls answer settling it as
+    /// a ceiling; or capped so and within Capped price fresh for. Past that it is labelled and withdrawn by the ceiling
+    /// until a pricing run searches it again (CappedSearchDue): before that setting a capped tablet was never searched
+    /// again, and Godless Command read 2d, searched 8 days before, beside its higher rolls at 1d searched 3 hours before
+    /// (dump 2026-10-18 01:35:28). Shared by the label (PricedFromAnswers) and the withdraw's worth
+    /// (WorthAndSourceOfSearch), so the two choose alike.
+    /// </summary>
+    private static bool OwnPriceStands(TabletSearch search, TabletPricing.Answer own, TabletRerollingSettings settings, Valuation valuation) =>
+        IsUsable(own, settings, valuation) ||
+        DateTime.UtcNow - own.When <= TimeSpan.FromHours(settings.TradeSite.CappedPriceFreshHours.Value) ||
+        !CappedByHigherRolls(search, settings, valuation);
+
     /// <summary>An answer that can be relied on now: no error, and fresh by FreshFor. Stale ones are still drawn.</summary>
     private static bool IsUsable(TabletPricing.Answer answer, TabletRerollingSettings settings, Valuation valuation) =>
         answer is { Error.Length: 0 } && DateTime.UtcNow - answer.When <= settings.FreshFor(DivinesOf(answer, settings, valuation));
@@ -452,11 +504,28 @@ internal static partial class Tablets
         IsUsable(answer, settings, valuation) && answer.Listings.Count >= settings.ListingsWanted &&
         DivinesOf(answer, settings, valuation) <= settings.TradeSite.CheapPriceUpToDivine.Value;
 
-    /// <summary>Whether a tablet still wants a search: no usable answer of its own, and no settling ceiling.</summary>
+    /// <summary>
+    /// Whether a tablet still wants a search: no usable answer of its own and no settling ceiling, or its own price past
+    /// Capped price fresh for (CappedSearchDue).
+    /// </summary>
     private static bool NeedsSearch(TabletSearch search, TabletRerollingSettings settings, Valuation valuation) =>
         IsUsable(TabletPricing.Cached(search.Key), settings, valuation)
             ? NextLowerFilters(search, settings, valuation) != null
-            : !TabletPricing.RelatedAnswers(search.Key).Any(x => x.Tighter && SettlesAsCeiling(x.Answer, settings, valuation));
+            : !CappedByHigherRolls(search, settings, valuation) || CappedSearchDue(search, settings, valuation);
+
+    /// <summary>Whether a fresh, cheap answer at higher rolls settles this tablet as a ceiling. See SettlesAsCeiling.</summary>
+    private static bool CappedByHigherRolls(TabletSearch search, TabletRerollingSettings settings, Valuation valuation) =>
+        TabletPricing.RelatedAnswers(search.Key).Any(x => x.Tighter && SettlesAsCeiling(x.Answer, settings, valuation));
+
+    /// <summary>
+    /// Whether a capped tablet's own price is due a search: it has one, it is stale, a ceiling caps it, and it is older
+    /// than Capped price fresh for. Such a search is queued at its own rolls with nothing allowed to settle it, since the
+    /// ceiling that caps it would otherwise drop it from the queue. See PlanPricingRun.
+    /// </summary>
+    private static bool CappedSearchDue(TabletSearch search, TabletRerollingSettings settings, Valuation valuation) =>
+        TabletPricing.Cached(search.Key) is { Error.Length: 0 } own && !IsUsable(own, settings, valuation) &&
+        DateTime.UtcNow - own.When > TimeSpan.FromHours(settings.TradeSite.CappedPriceFreshHours.Value) &&
+        CappedByHigherRolls(search, settings, valuation);
 
     /// <summary>
     /// The next lower search a tablet wants, or null: when its own search found fewer listings than Price from takes,
@@ -504,6 +573,18 @@ internal static partial class Tablets
                     needing.Add(search);
                 else
                     PricingRun.Remove(fingerprint);
+            }
+
+            if (needing.Count == 0)
+                continue;
+
+            // A capped tablet's own price past Capped price fresh for: its own rolls, which the cap must not settle.
+            foreach (var due in needing.Where(x => CappedSearchDue(x, settings, valuation)).ToList())
+            {
+                TabletPricing.Enqueue(due.Key, due.League, due.BodyOf(due.Filters), static _ => false, due.Weight * 1_000_000L,
+                    settings.TradeSite.SweepSearchesPerFiveMinutes.Value, settings);
+                needing.Remove(due);
+                _searchesLeft++;
             }
 
             if (needing.Count == 0)
@@ -726,7 +807,7 @@ internal static partial class Tablets
             new(colour, queued && label.Length > 0 && label != QueuedLabel ? label + QueuedLabel : label, searched, head, columns,
                 listings, detail);
 
-        if (exact is { Error.Length: 0 })
+        if (exact is { Error.Length: 0 } && OwnPriceStands(search, exact, settings, valuation))
         {
             var price = PriceOfAnswer(exact, settings, valuation);
 

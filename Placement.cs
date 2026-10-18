@@ -66,6 +66,16 @@ internal enum Step
     Arriving,
 
     /// <summary>
+    /// A listed item whose label is under other labels: the ground labels taken off the screen with Toggle Highlighting,
+    /// and the cursor on its way to the item itself, where hovering shows its label and a click picks it up. See
+    /// Placement.UnderLabelsWord.
+    /// </summary>
+    UnderLabels,
+
+    /// <summary>The ground labels put back after a pickup from under them was given up; waiting for them to show.</summary>
+    LabelsReturning,
+
+    /// <summary>
     /// An item picked up went onto the cursor, the inventory panel being open; the cursor is taking it to a free place
     /// in the inventory. See Autoloot.PickedUpOntoCursor.
     /// </summary>
@@ -988,9 +998,10 @@ internal sealed class Placement
                         return;
                     }
 
-                    // Still settling from that. Reading the highlight now would read the screen as
-                    // it was before the key landed, which is the fault this whole pause exists for.
-                    if (_hidden && DateTime.UtcNow - _hidAt < Hides)
+                    // Still settling from that. Reading the highlight now would read the screen as it was before the
+                    // key landed, so the run waits until nothing reads as over the button, up to HidesWithin.
+                    if (_hidden && DateTime.UtcNow - _hidAt < HidesWithin &&
+                        Panels.Shaded(gc, Button(gc, _change?.Entity, CombinationsPath).Rect.Center, Safe.Read(() => _change?.Entity, null)))
                         return;
 
                     if (!Lit(_change, CombinationsPath))
@@ -1015,7 +1026,7 @@ internal sealed class Placement
                             return;
                         }
 
-                        Showing(settings);
+                        Showing();
 
                         Give("Failed to click", "the combinations button did not light up under the " +
                                              "cursor - " + Panels.Describe(gc) +
@@ -1028,7 +1039,7 @@ internal sealed class Placement
                     if (!Sent(_input.Click(), "the click opening the combinations window"))
                         return;
 
-                    Showing(settings);
+                    Showing();
 
                     // Long enough for a short walk and no longer - see Opens. It is cut short
                     // the moment it is clear no walk is happening at all, see Step.Opened.
@@ -1144,6 +1155,87 @@ internal sealed class Placement
 
                 return;
 
+            case Step.UnderLabels:
+                // Until the labels that were over it read hidden, up to HidesWithin.
+                if (!LabelsGone())
+                    return;
+
+                if (!_underLabelsMoved)
+                {
+                    // How the wait ended, for the dump: the screen agreeing, or the ceiling. See HidesWithin.
+                    var waitedFor = (DateTime.UtcNow - _hidAt).TotalMilliseconds;
+
+                    Hid += _labelsOver.Count == 0
+                        ? $"; no label over it could be read, so waited the {HidesWithin.TotalMilliseconds:0}ms ceiling"
+                        : waitedFor >= HidesWithin.TotalMilliseconds
+                            ? $"; the {_labelsOver.Count} label(s) over it still read shown at the {HidesWithin.TotalMilliseconds:0}ms ceiling"
+                            : $"; the {_labelsOver.Count} label(s) over it read hidden after {waitedFor:0}ms";
+
+                    // Where it lies now, the camera having had a moment to move.
+                    if (ScreenOfItem(gc, _chore) is var lies && lies != Vector2.Zero && OnScreen(gc, lies))
+                        _underLabelsAt = lies;
+
+                    _input.SetTolerance(3);
+
+                    if (!Sent(_input.MoveTo(new RectangleF(_underLabelsAt.X - 2f, _underLabelsAt.Y - 2f, 4f, 4f)),
+                            "the move to an item under other labels"))
+                        return;
+
+                    _underLabelsMoved = true;
+                    _notUnderSince = null;
+
+                    return;
+                }
+
+                if (!_input.Arrived())
+                    return;
+
+                // Hovering the item shows its label, which the game then names as under the cursor. See HoverShowsLabelOf.
+                if (!HoverShowsLabelOf(gc, _chore) && (_notUnderSince ??= DateTime.UtcNow) is var waited && DateTime.UtcNow - waited < UnderGrace)
+                    return;
+
+                if (!HoverShowsLabelOf(gc, _chore))
+                {
+                    var on = Describe(Safe.Read(gc, static g => g.IngameState.UIHover, null)) +
+                             $", the ground labels saying item {ItemOnHoverId(gc)} is under it against this one's " +
+                             $"{Safe.Read(_chore, static e => e.Id, 0u)}";
+
+                    Hid += $"; the cursor on the item did not show its label - it is on {on}, so the item was skipped";
+                    Say("Tidying", $"the cursor on {ThingSaid(UnderLabelsWord, _chore)} did not show its label - the cursor is on " +
+                                   on + "; skipping it");
+                    _skip.Add(Safe.Read(_chore, static e => e.Id, 0u));
+                    Showing();
+                    Wait(Step.LabelsReturning);
+
+                    return;
+                }
+
+                _notUnderSince = null;
+
+                if (!Sent(_input.Click(), "the click on an item under other labels"))
+                    return;
+
+                // Clicked once, as every item is, and the labels back at once. See Chore.
+                Hid += "; the cursor on the item showed its label, clicked it";
+                _skip.Add(Safe.Read(_chore, static e => e.Id, 0u));
+                Autoloot.NoteClicked(gc, _chore);
+                Showing();
+
+                _choreClickedAt = DateTime.UtcNow;
+                _choreClickedPing = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
+                _characterAtChoreClick = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+                _arrivedAtChore = null;
+                _choreResponseNoted = false;
+                Wait(Step.Shattered);
+
+                return;
+
+            case Step.LabelsReturning:
+                if (LabelsBack())
+                    Advance(gc, settings);
+
+                return;
+
             case Step.Arriving:
                 if (!Walking(gc))
                     Advance(gc, settings);
@@ -1164,6 +1256,12 @@ internal sealed class Placement
                 return;
 
             case Step.Shattered:
+                // Labels just put back read as gone until the key lands, which would count the job done: until one of
+                // the labels that were over it reads shown again, up to HidesWithin. Only after a pickup from under
+                // other labels; any other job finds the labels long back.
+                if (!LabelsBack())
+                    return;
+
                 // The label going away - or the chest reporting itself open - is the game accepting
                 // it. Then straight on to the nearest remaining job, so a finished dig site clears
                 // in one press.
@@ -1333,6 +1431,32 @@ internal sealed class Placement
         Opened = todo.Path == CombinationsPath
             ? Remnant(Safe.Read(todo.Of, static e => e.Id, 0u))
             : null;
+
+        // **An item whose label is under other labels: the labels off the screen, then the item itself.** Not planned
+        // ahead with anything, since the labels are down for it alone. Refused, it is skipped and the run goes on. See
+        // UnderLabelsWord.
+        if (todo.Word == UnderLabelsWord && settings != null)
+        {
+            _lootPlanned.Clear();
+            _underLabelsAt = new Vector2(todo.At.X + todo.At.Width / 2f, todo.At.Y + todo.At.Height / 2f);
+            _underLabelsMoved = false;
+            _labelsOver.Clear();
+            _labelsOver.AddRange(LabelElementsOver(gc, todo.Of));
+
+            if (!HidingForPickup(settings))
+            {
+                _skip.Add(Safe.Read(todo.Of, static e => e.Id, 0u));
+                Advance(gc, settings);
+
+                return;
+            }
+
+            Wait(Step.UnderLabels);
+            Say("Hiding labels", $"{ThingSaid(todo.Word, todo.Of)}'s label is under other labels - taking the ground labels " +
+                                 "off the screen to click it where it lies");
+
+            return;
+        }
         // As tight as the target is, and no tighter.
         //
         // The tolerance is how far from the requested point the cursor may settle and
@@ -2542,6 +2666,7 @@ internal sealed class Placement
 
         Hid = $"something was over the button, tapped {key} to hide the labels";
         _hidden = true;
+        _hiddenWith = key;
         _hidAt = DateTime.UtcNow;
 
         return true;
@@ -2561,19 +2686,117 @@ internal sealed class Placement
     /// <summary>When the labels were taken down, so the screen is given time to agree.</summary>
     private DateTime _hidAt = DateTime.MinValue;
 
+    /// <summary>The key the labels were taken down with, which puts them back. See Showing.</summary>
+    private Keys _hiddenWith = Keys.Z;
+
+    /// <summary>When the labels were last put back, so nothing reads them before the screen agrees. See HidesWithin.</summary>
+    private DateTime _shownAgainAt = DateTime.MinValue;
+
     /// <summary>
-    /// How long to let the client act on the key before reading the screen again.
-    ///
-    /// **The hide used to be undone before it could do anything.** The key was tapped and the
-    /// button's highlight read on the same frame - so the answer came back from the screen as it was
-    /// BEFORE the labels went, the run concluded the button was not a button, and the way out of
-    /// that branch taps the key back. The labels flickered and the click was never attempted, which
-    /// from outside looks exactly like the hiding not happening at all.
-    ///
-    /// A key press is not a function call. It goes to the client, which acts on it on its own
-    /// schedule, and everything downstream of one has to wait for the screen to say so.
+    /// What a listed item is picked up as when its label is under other labels on every side: Chore offers it only when
+    /// nothing else can be clicked, and the run takes the labels off the screen with Toggle Highlighting and clicks the
+    /// item where it lies, which hovering shows the label of and a click picks up - so the cursor does not go to the label
+    /// at all. A tablet under a relic's label could not be picked up otherwise (the user's account and dumps of
+    /// 2026-10-18 02:10 to 02:20). Behind Use the Toggle Highlighting key when buttons are obscured. See Step.UnderLabels.
     /// </summary>
-    private static readonly TimeSpan Hides = TimeSpan.FromMilliseconds(150);
+    private const string UnderLabelsWord = "picking up a listed item from under other labels";
+
+    /// <summary>Where on screen the item being picked up from under other labels lies, and whether the cursor was sent.</summary>
+    private Vector2 _underLabelsAt;
+
+    private bool _underLabelsMoved;
+
+    /// <summary>Where an item lies on screen, from its position in the world, or zero when it cannot be read.</summary>
+    internal static Vector2 ScreenOfItem(GameController gc, Entity item)
+    {
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+        var world = Safe.Read(item, static e => e.Pos, Vector3.Zero);
+
+        return camera == null || world == Vector3.Zero
+            ? Vector2.Zero
+            : Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
+    }
+
+    /// <summary>
+    /// Takes the ground labels off the screen for a pickup from under them, when the switch allows it. True when they are
+    /// down now or were already. See UnderLabelsWord.
+    /// </summary>
+    private bool HidingForPickup(AutoExpeditionSettings settings)
+    {
+        if (_hidden)
+            return true;
+
+        var key = Safe.Read(() => settings.HighlightKey.Value.Key, Keys.Z);
+
+        if (!_input.Tap(key))
+        {
+            Hid = $"an item's label is under other labels, and the tap of {key} was refused - no input lease, or ExileInput2 " +
+                  "is not available";
+
+            return false;
+        }
+
+        Hid = $"an item's label was under other labels, tapped {key} to hide the labels and click the item itself";
+        _hidden = true;
+        _hiddenWith = key;
+        _hidAt = DateTime.UtcNow;
+
+        return true;
+    }
+
+    /// <summary>
+    /// The longest the run waits for the screen to show the labels gone, or back, after the key. A ceiling, not a delay:
+    /// each wait ends the frame the screen agrees (see LabelsGone and LabelsBack), and this is for a screen that never
+    /// says so. Chosen, not measured.
+    ///
+    /// **The hide used to be undone before it could do anything.** The key was tapped and the button's highlight read on
+    /// the same frame - so the answer came back from the screen as it was BEFORE the labels went, the run concluded the
+    /// button was not a button, and the way out of that branch taps the key back. A key press goes to the client, which
+    /// acts on it on its own schedule, so what follows waits for the screen to say so. It was a fixed 150ms wait, which
+    /// every pickup from under other labels would have paid whether the labels went in one frame or not.
+    /// </summary>
+    internal static readonly TimeSpan HidesWithin = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// The labels that were over the job's label when they were taken down: their going and coming back is what says
+    /// the key has landed. Empty when none could be read, and then only HidesWithin ends a wait. See LabelsGone.
+    /// </summary>
+    private readonly List<Element> _labelsOver = new();
+
+    /// <summary>The visible ground labels other than this item's own whose covering rectangles overlap its label.</summary>
+    internal static List<Element> LabelElementsOver(GameController gc, Entity of)
+    {
+        var found = new List<Element>();
+        var mine = Safe.Read(of, static e => e.Id, 0u);
+        var rect = Button(gc, of, []).Rect;
+
+        if (rect.Width <= 0f)
+            return found;
+
+        foreach (var label in Ground.Labels(gc) ?? [])
+        {
+            var element = Safe.Read(label, static l => l.Label, null);
+
+            if (element == null || !Safe.Read(element, static e => e.IsVisible, false) ||
+                Safe.Read(label, static l => l.ItemOnGround?.Id ?? 0u, 0u) == mine)
+                continue;
+
+            if (CoveringRectsOfLabel(label, element).Any(r => r.Left < rect.Right && r.Right > rect.Left && r.Top < rect.Bottom && r.Bottom > rect.Top))
+                found.Add(element);
+        }
+
+        return found;
+    }
+
+    /// <summary>Whether the labels that were over the job's label read hidden, or the ceiling has passed. See HidesWithin.</summary>
+    private bool LabelsGone() =>
+        DateTime.UtcNow - _hidAt >= HidesWithin ||
+        _labelsOver.Count > 0 && _labelsOver.All(e => !Safe.Read(e, static x => x.IsVisible, false));
+
+    /// <summary>Whether a label that was over the job's label reads shown again, or the ceiling has passed.</summary>
+    private bool LabelsBack() =>
+        DateTime.UtcNow - _shownAgainAt >= HidesWithin ||
+        _labelsOver.Any(e => Safe.Read(e, static x => x.IsVisible, false));
 
     /// <summary>
     /// Puts them back, which is owed the moment the click is done or abandoned.
@@ -2582,14 +2805,15 @@ internal sealed class Placement
     /// game's labels and then gives up leaves the player looking at a dig site with no names on it
     /// and no idea why - which is worse than the click it was trying to rescue.
     /// </summary>
-    private void Showing(AutoExpeditionSettings settings)
+    private void Showing()
     {
         if (!_hidden)
             return;
 
         _hidden = false;
+        _shownAgainAt = DateTime.UtcNow;
 
-        var key = Safe.Read(() => settings.HighlightKey.Value.Key, Keys.Z);
+        var key = _hiddenWith;
 
         Hid = _input.Tap(key)
             ? Hid + $"; then tapped {key} to put them back"
@@ -2959,6 +3183,11 @@ internal sealed class Placement
 
         var unclickable = new List<string>();
 
+        // The nearest listed item whose label is under other labels and whose own place on screen is clear: taken only
+        // when nothing else can be clicked, and never by a plan's look ahead. See UnderLabelsWord.
+        var underLabelsAllowed = cursorAt == null && settings.Automation.On(settings.Automation.Unhide);
+        (Entity Of, Vector2 At, float Distance)? underLabels = null;
+
         void Consider(Entity of, int[] into, string says, int rank = int.MaxValue, double price = 0d)
         {
             if (_skip.Contains(Safe.Read(of, static e => e.Id, 0u)))
@@ -2980,9 +3209,16 @@ internal sealed class Placement
                 var away = Vector2.Distance(player, Safe.Read(of, static e => e.GridPos, Vector2.Zero));
                 var why = rect.Width <= 0f ? "its label or button is not shown"
                     : !OnScreen(gc, rect.Center) ? "its label is off screen"
-                    : "its label is covered by a panel or other labels";
+                    : CoveredSaid(gc, covered, rect, Safe.Read(of, static e => e.Id, 0u));
 
                 unclickable.Add($"{ThingSaid(says, of)} {away:0} grid away: {why}");
+
+                if (underLabelsAllowed && rect.Width > 0f && OnScreen(gc, rect.Center) &&
+                    Safe.Read(of, static e => e.HasComponent<WorldItem>(), false) &&
+                    ScreenOfItem(gc, of) is { } lies && lies != Vector2.Zero && OnScreen(gc, lies) &&
+                    !Panels.Covers(covered, lies) && !Panels.Blocked(gc, lies) &&
+                    (underLabels == null || away < underLabels.Value.Distance))
+                    underLabels = (of, lies, away);
 
                 return;
             }
@@ -3089,8 +3325,16 @@ internal sealed class Placement
             }
         }
 
+        // Both, for the message and the dump. Unclickable was overwritten by NoRoomFor's line when that was added
+        // (9225dbd), so the dump's "could not click" stayed empty and a listed item left on the ground said nothing.
         if (cursorAt == null)
+        {
             NoRoomFor = noRoom;
+            Unclickable = unclickable;
+        }
+
+        if (nearest == null && underLabels is { } under)
+            return (under.Of, [], UnderLabelsWord, new RectangleF(under.At.X - 3f, under.At.Y - 3f, 6f, 6f), waiting);
 
         return (nearest, path, word, at, waiting);
     }
@@ -3241,6 +3485,68 @@ internal sealed class Placement
         }
 
         return (best, room);
+    }
+
+    /// <summary>
+    /// Which of Exposed's three tests refused a label, for Unclickable: other ground labels over all of it, or at the
+    /// middle of what they leave a panel this plugin names or an element of the interface tree, named as the dump's
+    /// cursor line names it (Panels.Why). "Covered by a panel or other labels" could not tell them apart, and an
+    /// Expedition Tablet refused so had nothing in the dump over it (dump 2026-10-18 02:10:17).
+    /// </summary>
+    private static string CoveredSaid(GameController gc, List<RectangleF> covered, RectangleF rect, uint mine)
+    {
+        var free = new List<RectangleF> { rect };
+
+        foreach (var other in Neighbours(gc, mine))
+            free = Cut(free, other);
+
+        var biggest = free.Where(p => p.Width >= Sliver && p.Height >= Sliver).OrderByDescending(p => p.Width * p.Height).FirstOrDefault();
+
+        if (biggest.Width <= 0f)
+            return $"its label at ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}) is covered by other ground labels: " +
+                   string.Join("; ", LabelsOver(gc, rect, mine));
+
+        var middle = new Vector2(MathF.Round(biggest.X + biggest.Width / 2f), MathF.Round(biggest.Y + biggest.Height / 2f));
+
+        return Panels.Covers(covered, middle)
+            ? $"its label at ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}) is under a panel this plugin knows, at ({middle.X:0},{middle.Y:0})"
+            : $"its label at ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}) is under the interface at ({middle.X:0},{middle.Y:0}): " +
+              Panels.Why(gc, middle);
+    }
+
+    /// <summary>
+    /// The visible ground labels whose clickable rectangle (Hit) overlaps this one, each with its item's name, that
+    /// rectangle and the label's own, for CoveredSaid: the dump prints labels by their text's rectangle, which can be
+    /// smaller than what Neighbours cuts out, and a label refused as covered had no text over it (dump 2026-10-18 02:12:11).
+    /// </summary>
+    internal static List<string> LabelsOver(GameController gc, RectangleF rect, uint mine)
+    {
+        var said = new List<string>();
+
+        foreach (var label in Ground.Labels(gc) ?? [])
+        {
+            var element = Safe.Read(label, static l => l.Label, null);
+            var item = Safe.Read(label, static l => l.ItemOnGround, null);
+
+            if (element == null || !Safe.Read(element, static e => e.IsVisible, false) || Safe.Read(item, static e => e.Id, 0u) == mine)
+                continue;
+
+            var over = CoveringRectsOfLabel(label, element)
+                .Where(hit => hit.Left < rect.Right && hit.Right > rect.Left && hit.Top < rect.Bottom && hit.Bottom > rect.Top)
+                .ToList();
+
+            if (over.Count == 0)
+                continue;
+
+            var own = Safe.Read(element, static e => e.GetClientRect(), default);
+            var name = Safe.Read(item, static e => e.GetComponent<ExileCore2.PoEMemory.Components.WorldItem>()?.ItemEntity?.GetComponent<ExileCore2.PoEMemory.Components.Base>()?.Name, null) ??
+                       Safe.Read(item, static e => e.Metadata, "?");
+
+            said.Add($"{name} over it at " + string.Join(", ", over.Select(hit => $"({hit.X:0},{hit.Y:0} {hit.Width:0}x{hit.Height:0})")) +
+                     $", label ({own.X:0},{own.Y:0} {own.Width:0}x{own.Height:0})");
+        }
+
+        return said;
     }
 
     /// <summary>
@@ -3591,7 +3897,7 @@ internal sealed class Placement
     /// How long an arrived cursor may read as not on its target before the job is given up as covered: the game's hover
     /// reading follows the cursor by a frame or more. Chosen, several frames at 60 frames a second.
     /// </summary>
-    private static readonly TimeSpan UnderGrace = TimeSpan.FromMilliseconds(150);
+    internal static readonly TimeSpan UnderGrace = TimeSpan.FromMilliseconds(150);
 
     /// <summary>The points of a loot run's planned clicks still to come, in order. See PlanLootAhead.</summary>
     private readonly List<Vector2> _lootPlanned = new();
@@ -3859,6 +4165,60 @@ internal sealed class Placement
     /// one this build fills in, so it is tried second, and an address of zero is treated as no
     /// answer rather than as an answer of nothing.
     /// </summary>
+    /// <summary>
+    /// Whether the cursor, on an item with the ground labels hidden, shows that item's label: Hovered, or the hovered
+    /// element reads the item's label text with the cursor inside it. **The label shown on hover is a copy**, drawn apart
+    /// from the ground labels' list (at 8,0,1,0 where they are at 8,0,0,n in the dump of 2026-10-18 02:06:54), so
+    /// Hovered, which looks for the item's own label element, refused the tablet the cursor was showing and the run put
+    /// the labels back without a click (dump 2026-10-18 02:28:05). Another item of the same name under the cursor would
+    /// pass too; it is as listed as this one.
+    /// </summary>
+    internal static bool HoverShowsLabelOf(GameController gc, Entity of)
+    {
+        // **The ground labels' own word on what the cursor is on**, first: UIHover read an unnamed element at
+        // (0,0 0x0) with the cursor on the tablet and the labels hidden, so neither test below could pass (dump
+        // 2026-10-18 02:30:27). See ItemOnHoverId.
+        if (ItemOnHoverId(gc) is var onHover && onHover != 0u && onHover == Safe.Read(of, static e => e.Id, 0u))
+            return true;
+
+        if (Hovered(gc, of))
+            return true;
+
+        var hover = Hover(gc);
+        var own = Safe.Read(Ground.LabelOf(gc, Safe.Read(of, static e => e.Id, 0u)), static l => l.Label, null);
+        var want = TextIn(own, 0);
+
+        if (hover == null || string.IsNullOrWhiteSpace(want) || !string.Equals(TextIn(hover, 0), want, StringComparison.Ordinal))
+            return false;
+
+        var rect = Safe.Read(hover, static e => e.GetClientRect(), default);
+        var cursor = Autoloot.CursorOnScreen(gc);
+
+        return rect.Width > 0f && cursor.X >= rect.Left && cursor.X <= rect.Right && cursor.Y >= rect.Top && cursor.Y <= rect.Bottom;
+    }
+
+    /// <summary>The id of the ground item the cursor is on, as the ground labels' element says, or 0. See Panels.Shaded.</summary>
+    internal static uint ItemOnHoverId(GameController gc) =>
+        Safe.Read(gc, static g => g.IngameState.IngameUi.ItemsOnGroundLabelElement?.ItemOnHover?.Id ?? 0u, 0u);
+
+    /// <summary>An element's own text, or the first text below it, a few deep; trimmed, or empty with none.</summary>
+    private static string TextIn(Element at, int depth)
+    {
+        if (at == null || depth > 3)
+            return "";
+
+        if (Safe.Read(at, static e => e.Text, null) is { } text && !string.IsNullOrWhiteSpace(text))
+            return text.Trim();
+
+        foreach (var kid in Safe.Kids(at) ?? [])
+        {
+            if (TextIn(kid, depth + 1) is { Length: > 0 } found)
+                return found;
+        }
+
+        return "";
+    }
+
     private static Element Hover(GameController gc)
     {
         foreach (var element in new[]
@@ -4048,10 +4408,10 @@ internal sealed class Placement
             if (element == null || !Safe.Read(element, static e => e.IsVisible, false))
                 continue;
 
-            var rect = Safe.Read(Hit(element), static e => e.GetClientRect(), default);
+            var id = Safe.Read(label, static l => l.ItemOnGround?.Id ?? 0u, 0u);
 
-            if (rect.Width > 0f && rect.Height > 0f)
-                found.Add((Safe.Read(label, static l => l.ItemOnGround?.Id ?? 0u, 0u), rect));
+            foreach (var rect in CoveringRectsOfLabel(label, element))
+                found.Add((id, rect));
         }
 
         if (Ground.OnOwnerThread)
@@ -4061,6 +4421,57 @@ internal sealed class Placement
         }
 
         return found;
+    }
+
+    /// <summary>
+    /// The rectangles of a visible ground label that take a click from a label under them. An item's label: its clickable
+    /// rectangle, Hit. Any other - a relic's, a chest's: the whole label while any visible part of it draws text or a
+    /// texture, and nothing while none does.
+    ///
+    /// **The whole label, not the parts that draw.** A relic's modifiers sit on a box painted larger than their text, and
+    /// no element of the label carries that box - no background colour is read on any of them - so the text alone left a
+    /// strip of an Expedition Tablet's label below it, which the run went for while the box hid it (dump 2026-10-18
+    /// 02:20:17, the label 454x153 round text of 407x76).
+    ///
+    /// **Nothing, while nothing in it draws.** A relic's label read visible at 571x179 with none of its text shown - the
+    /// dump's walk of the visible interface found nothing there and the player saw no label - and the tablet under it was
+    /// refused as covered on every press (dump 2026-10-18 02:14:10).
+    /// </summary>
+    private static List<RectangleF> CoveringRectsOfLabel(ExileCore2.PoEMemory.Elements.LabelOnGround label, Element element)
+    {
+        var rects = new List<RectangleF>();
+        var item = Safe.Read(label, static l => l.ItemOnGround, null);
+
+        if (Safe.Read(item, static e => e.HasComponent<WorldItem>(), false))
+        {
+            var hit = Safe.Read(Hit(element), static e => e.GetClientRect(), default);
+
+            if (hit.Width > 0f && hit.Height > 0f)
+                rects.Add(hit);
+
+            return rects;
+        }
+
+        bool Draws(Element at, int depth)
+        {
+            foreach (var kid in Safe.Kids(at) ?? [])
+            {
+                if (kid == null || !Safe.Read(kid, static e => e.IsVisibleLocal, false))
+                    continue;
+
+                if (!string.IsNullOrWhiteSpace(Safe.Read(kid, static e => e.Text, null)) ||
+                    !string.IsNullOrEmpty(Safe.Read(kid, static e => e.TextureName, null)) ||
+                    depth < 5 && Draws(kid, depth + 1))
+                    return true;
+            }
+
+            return false;
+        }
+
+        if (Draws(element, 0) && Safe.Read(element, static e => e.GetClientRect(), default) is { Width: > 0f, Height: > 0f } whole)
+            rects.Add(whole);
+
+        return rects;
     }
 
     private static List<(uint Id, RectangleF Rect)> _labelRects;
@@ -4341,7 +4752,7 @@ internal sealed class Placement
 
         _offSpotFrames = 0;
 
-        var (lit, missing, unknown) = Coverage(gc, scan);
+        var (lit, missing, unknown) = Coverage(gc, settings, scan);
 
         // The game is highlighting exactly what this explosive would take, and it has to agree that
         // nothing the spot was chosen for is missing. At least one marker must be confirmed lit -
@@ -4576,7 +4987,7 @@ internal sealed class Placement
 
                 wanted += worth;
 
-                if (target.Live && target.GlowReadable && !target.Glowing && !target.InPlacedBlast)
+                if (target.Live && target.GlowReadable && !Planning.LitUnderCursor(gc, settings, target) && !target.InPlacedBlast)
                 {
                     lost += worth;
                     dark.Add(want);
@@ -4589,7 +5000,7 @@ internal sealed class Placement
         return (lost, wanted);
     }
 
-    private (int Lit, int Missing, int Unknown) Coverage(GameController gc, Scan scan)
+    private (int Lit, int Missing, int Unknown) Coverage(GameController gc, AutoExpeditionSettings settings, Scan scan)
     {
         // Nothing lights up when the game is not showing a placement circle, so the check would
         // report every marker as missing and be measuring its own absence.
@@ -4620,7 +5031,7 @@ internal sealed class Placement
             // A marker whose highlight cannot be read is not known to be dark. See Target.GlowReadable.
             if (found is not { Live: true } || !found.GlowReadable)
                 unknown++;
-            else if (found.Glowing || found.InPlacedBlast)
+            else if (Planning.LitUnderCursor(gc, settings, found) || found.InPlacedBlast)
                 lit++;
             else
                 missing++;
@@ -4859,7 +5270,7 @@ internal sealed class Placement
     }
 
     /// <summary>Whether a projected point is somewhere the cursor can usefully be put.</summary>
-    private static bool OnScreen(GameController gc, Vector2 at) => OnScreen(gc, at, Margin);
+    internal static bool OnScreen(GameController gc, Vector2 at) => OnScreen(gc, at, Margin);
 
     /// <summary>
     /// Whether a point is inside the window, with a chosen margin.
@@ -5054,6 +5465,11 @@ internal sealed class Placement
         // AutolootSettings.ShortestMoveWhenAutolootingMs.
         if (_lootOnly)
             _input.SetShortestMove(-1);
+
+        // **Labels taken down are put back on every way out**: a run ending mid-pickup or mid-click on a covered button,
+        // by a timeout or a refusal, left the player looking at a site with no labels. Refused once the player has the
+        // mouse back, since the lease is gone; then the dump's Hid line says the labels may still be hidden.
+        Showing();
 
         _input.Release();
         _step = Step.Idle;
