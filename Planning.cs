@@ -2738,7 +2738,13 @@ internal sealed class Planning
 
         // What the atlas grants, kept current for the dump. See AtlasStats.
         using (Spent.On("Planning.Start/AtlasStats"))
+        {
             AtlasStats.Refresh(gc);
+
+            // And the chance of a rolled remnant passing two runes, which the reroll passes ask off the frame. See
+            // Rolls.ReadTwoSlots.
+            Rolls.ReadTwoSlots(gc);
+        }
 
         Planner.Unfetch();
         Planner.ForgetEnumeratedSolve();

@@ -10,8 +10,9 @@ namespace AutoExpedition;
 ///
 /// **Not from the map, which does not carry them.** The rune slot floor reaches the map's visible stats (see Census),
 /// but "Gaining Traction" does not: on a map with it allocated, MapStatsVisible held three expedition stats and not
-/// this one (2026-09-30). Read from ServerData.AtlasStats when that holds it, which needs no panel open - not yet
-/// confirmed in play - and otherwise from the atlas tree panel, which is not always loaded, so the last value read
+/// this one (2026-09-30). Read from ServerData.AtlasStats when that holds it, which needs no panel open - confirmed in
+/// play: after restarting the game and never opening the atlas, a dump inside a map read all 292 atlas stats
+/// (2026-10-18) - and otherwise from the atlas tree panel, which is not always loaded, so the last value read
 /// is kept and the dump says where it came from and how old it is.
 /// </summary>
 internal static class AtlasStats

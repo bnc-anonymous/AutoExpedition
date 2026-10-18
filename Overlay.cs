@@ -66,6 +66,8 @@ internal static class Overlay
         Target.MarkerFacingOffset = Safe.Read(settings, static s => s.Debug.MarkerFacingOffset.Value, 0f);
         Target.MarkerSidewaysOffset = Safe.Read(settings, static s => s.Debug.MarkerSidewaysOffset.Value, 0f);
         Target.MarkersAtInteractCentre = Safe.Read(settings, static s => s.Debug.MarkersAtInteractCentre.Value, false);
+        _lineStartOffset = new Vector2(Safe.Read(settings, static s => s.Display.LineStartOffsetX.Value, 0),
+            Safe.Read(settings, static s => s.Display.LineStartOffsetY.Value, 0));
 
         // Only the site being stood in. A map can hold two encounters, and merging them would
         // inflate every count and let the planner chain across the map to the other one.
@@ -332,10 +334,11 @@ internal static class Overlay
             }
 
         // **Each remnant's socket count on the map, over the reward and reroll lines**, which are all drawn by now: a
-        // line through a number made it hard to read. See Minimap.SocketCounts.
+        // line through a number made it hard to read. Every remnant in the scan, not only the site stood in: on a map
+        // with two expeditions the other site's remnants had no count. See Minimap.SocketCounts.
         if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.DrawSocketCountOnMinimap)
             using (Spent.On("Minimap.SocketCounts"))
-                Minimap.SocketCounts(graphics, gc, settings, targets);
+                Minimap.SocketCounts(graphics, gc, settings, scan.Targets);
 
         // The reroll verdicts on the map, over the lines for the same reason. See Minimap.RollFigures.
         if (settings.Display.DrawOnMinimap && settings.Display.Remnants.Rerolls.RollFiguresOnMinimap)
@@ -2147,12 +2150,15 @@ internal static class Overlay
             return;
 
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
-        var player = Safe.Read(gc, static g => g.Player.Pos, Vector3.Zero);
+        var player = PlayerFeetAt(gc);
 
         if (camera == null || player == Vector3.Zero)
             return;
 
         var from = Safe.Read((camera, player), static x => x.camera.WorldToScreen(x.player), Vector2.Zero);
+        // The bearing is measured from where the player projects this frame; the line starts at FeetOnScreen.
+        var projected = from;
+        from = FeetOnScreen(gc);
 
         if (from == Vector2.Zero || Panels.Covers(covered, from))
             return;
@@ -2172,7 +2178,7 @@ internal static class Overlay
 
             // Behind the camera projects to the wrong place rather than to nowhere, and a red line
             // pointing away from the thing it names is worse than no line. See Toward.
-            var toward = Toward(gc, camera, here, one.Grid, from);
+            var toward = Toward(gc, camera, here, one.Grid, projected);
 
             if (toward != Vector2.Zero && Vector2.Dot(toward, Normal(to - from)) <= 0.5f)
                 continue;
@@ -2233,29 +2239,12 @@ internal static class Overlay
             return;
 
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
-        var player = Safe.Read(gc, static g => g.Player.Pos, Vector3.Zero);
-        var at = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
-
-        if (camera == null || player == Vector3.Zero || at == Vector2.Zero)
-            return;
-
         var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default);
 
-        if (window.Width <= 0f || window.Height <= 0f)
+        if (camera == null || window.Width <= 0f || window.Height <= 0f || LineStartAndMap(gc, camera) is not { } start)
             return;
 
-        var from = Safe.Read((camera, player), static x => x.camera.WorldToScreen(x.player),
-            Vector2.Zero);
-        var world = Safe.Read(() => gc.IngameState.Data.ToWorldWithTerrainHeight(best.Grid),
-            Vector3.Zero);
-
-        if (from == Vector2.Zero || world == Vector3.Zero)
-            return;
-
-        var to = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
-
-        if (to == Vector2.Zero)
-            return;
+        var (from, map) = start;
 
         // **At the button, once there is one.** The line exists to answer "which remnant do I walk
         // to", and the answer stops being a direction the moment you arrive: what is wanted then is
@@ -2266,40 +2255,17 @@ internal static class Overlay
         // The button exists only while the label is up and only while a Verisium is carried, so the
         // remnant's own position is what the line uses for the whole walk in - which is every frame
         // the line is doing the job it was added for. See RollButton, and Rolling for the advice.
-        // **Kept before the button replaces it, because the check below needs the ground.**
-        var ground = to;
-
-        var button = ButtonFor(gc, best.Grid);
-
-        if (button.Width > 0f)
-            to = new Vector2(button.X + button.Width / 2f, button.Y + button.Height / 2f);
-
-        // Aimed by a step of ground rather than by the far projection, which mirrors behind the
-        // camera and would point the opposite way. See Toward.
         //
-        // **Against the remnant's own projection, not the button's.** The button sits above the
-        // label, which is well above the remnant on screen, so walking up to the remnant turns
-        // `to - from` towards straight up while a step of ground still points sideways. The two
-        // stop agreeing, the projection is called untrusted, and the else branch below fires a line
-        // `window.Width + window.Height` long in the ground direction - which clips to the window
-        // edge and points off the screen at a remnant standing a few paces away. The projection was
-        // never in doubt; the two vectors were about different points.
-        var toward = Toward(gc, camera, at, best.Grid, from);
-        var trusted = toward == Vector2.Zero || Vector2.Dot(toward, Normal(ground - from)) > 0.5f;
+        // **Only a button on screen.** The game reports the button of a label that is not laid out at a position far
+        // off the window - (-701090,-615124) on an Augury site (2026-10-18) - and a line drawn to it pointed away from
+        // the remnant.
+        var button = ButtonFor(gc, best.Grid);
+        var middle = new Vector2(button.X + button.Width / 2f, button.Y + button.Height / 2f);
+        var end = button.Width > 0f && Inside(window, middle, 0f)
+            ? middle
+            : FlatEnd(window, from, map, best.Grid).End;
 
-        // A projection the step disagrees with is off screen whatever it says - that is what a point
-        // behind the camera looks like.
-        var off = !trusted || !Inside(window, to, Edge);
-
-        // **Off screen, clipped along the ground bearing and never along the far projection.** This
-        // preferred the projection whenever the step agreed with it, which is the rule the reward line
-        // was fixed out of and for both of its reasons. The projection of a point near the camera
-        // plane swings about, so the endpoint jitters along the window edge; and the dot test only has
-        // to be wrong once - a bearing read at 0.51 against a mirrored projection hands the clip a
-        // point on the opposite side, and the line reverses. The bearing cannot mirror, so out here it
-        // is the only input. On screen the projection is the answer and is used unchanged, and just past the
-        // edge it is too, since that is where the bearing's perspective error shows. See EdgeEnd.
-        var end = !off ? to : EdgeEnd(window, from, ground, toward, trusted);
+        RollLineSaid = LineSaid("roll", best.Grid, from, map, end);
 
         if (end != Vector2.Zero && !Panels.Covers(covered, end))
             graphics.DrawLine(from, end, settings.Display.Remnants.Rerolls.RollLineThicknessInWorld.Value,
@@ -2372,7 +2338,7 @@ internal static class Overlay
         Scan scan, List<RectangleF> covered)
     {
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
-        var player = Safe.Read(gc, static g => g.Player.Pos, Vector3.Zero);
+        var player = PlayerFeetAt(gc);
         var at = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
         var site = Detonator.DetonatorGridPosition(gc);
 
@@ -2384,10 +2350,10 @@ internal static class Overlay
         if (window.Width <= 0f || window.Height <= 0f)
             return;
 
-        var from = Safe.Read((camera, player), static x => x.camera.WorldToScreen(x.player), Vector2.Zero);
-
-        if (from == Vector2.Zero || Panels.Covers(covered, from))
+        if (LineStartAndMap(gc, camera) is not { } start || Panels.Covers(covered, start.From))
             return;
+
+        var (from, map) = start;
 
         // One line, to the nearest thing left.
         var nearest = Vector3.Zero;
@@ -2495,20 +2461,8 @@ internal static class Overlay
         if (nearest == Vector3.Zero)
             return;
 
-        var to = Safe.Read((camera, nearest), static x => x.camera.WorldToScreen(x.nearest), Vector2.Zero);
-
-        if (to == Vector2.Zero)
-            return;
-
-        // Clipped to the edge when it is behind you, so the line still says which way to walk - and
-        // aimed by a step of ground rather than by the far projection, which mirrors behind the
-        // camera and would point the opposite way. See Toward.
-        var toward = Toward(gc, camera, at, nearestGrid, from);
-        var trusted = toward == Vector2.Zero || Vector2.Dot(toward, Normal(to - from)) > 0.5f;
-
-        var end = trusted && Inside(window, to, Edge)
-            ? to
-            : Clip(window, from, trusted ? to : from + toward * (window.Width + window.Height));
+        // Clipped to the edge when it is off screen, so the line still says which way to walk. See FlatEnd.
+        var end = FlatEnd(window, from, map, nearestGrid).End;
 
         if (end != Vector2.Zero && !Panels.Covers(covered, end))
             graphics.DrawLine(from, end, Autoloot.LineThickness(settings), settings.Automation.Autoloot.LineColour.Value);
@@ -3660,64 +3614,27 @@ internal static class Overlay
         EdgePrices.Clear();
 
         var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
-
-        if (camera == null)
-            return;
-
-        var player = Safe.Read(gc, static g => g.Player.Pos, Vector3.Zero);
-
-        if (player == Vector3.Zero)
-            return;
-
-        var from = Safe.Read((camera, player), static x => x.camera.WorldToScreen(x.player), Vector2.Zero);
-
-        if (from == Vector2.Zero)
-            return;
-
         var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default);
 
-        if (window.Width <= 0f || window.Height <= 0f)
+        if (camera == null || window.Width <= 0f || window.Height <= 0f || LineStartAndMap(gc, camera) is not { } start)
             return;
+
+        var (from, map) = start;
 
         var here = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
 
         var thickness = settings.Display.Remnants.Rewards.LineThicknessInWorld.Value;
+        var drawn = new List<string>();
 
         foreach (var target in targets)
         {
             if (!WantsRewardLine(target, settings, valuation, here))
                 continue;
 
-            var world = target.Where(gc);
+            // Clipped to the edge rather than dropped, so an off-screen remnant still gets pointed at. See FlatEnd.
+            var (end, off) = FlatEnd(window, from, map, target.Grid);
 
-            if (world == Vector3.Zero)
-                continue;
-
-            var to = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
-
-            if (to == Vector2.Zero)
-                continue;
-
-            // Which way the remnant really lies, taken from a step of ground rather than from the
-            // far projection. See Toward.
-            var toward = Toward(gc, camera, here, target.Grid, from);
-            var trusted = toward == Vector2.Zero || Vector2.Dot(toward, Normal(to - from)) > 0.5f;
-
-            // Clipped to the edge rather than dropped, so an off-screen remnant still gets pointed
-            // at. On-screen ones come back unchanged and the clip costs nothing.
-            //
-            // A projection the step disagrees with is off-screen whatever it says - that is what a
-            // point behind the camera looks like - and the clip then runs along the step's
-            // direction, which is the one that cannot be mirrored.
-            var off = !trusted || !Inside(window, to, Edge);
-
-            // **Off screen, the line is clipped along the ground bearing and never along the far
-            // projection.** It used to prefer the projection whenever the two roughly agreed, and
-            // that is the one that is unstable out there: a point approaching the camera plane
-            // projects to a figure that swings about, so the endpoint jittered along the edge while
-            // the bearing beside it sat still. On screen the projection is the answer and is used
-            // unchanged, and just past the edge it is too. See EdgeEnd.
-            var end = !off ? to : EdgeEnd(window, from, to, toward, trusted);
+            drawn.Add(LineSaid("reward", target.Grid, from, map, end));
 
             if (end == Vector2.Zero || Panels.Covers(covered, end) || Panels.Covers(covered, from))
                 continue;
@@ -3731,6 +3648,26 @@ internal static class Overlay
 
             EdgePrices.Add((Prices.Text(target.Rewards[0].Value, settings, valuation), end));
         }
+
+        RewardLinesSaid = drawn.Count == 0 ? "none" : string.Join("; ", drawn);
+    }
+
+    /// <summary>Each reward line on the last frame that drew them, for the dump. See LineSaid.</summary>
+    internal static string RewardLinesSaid { get; private set; } = "not drawn yet";
+
+    /// <summary>The reroll line on the last frame that drew it, for the dump. See LineSaid.</summary>
+    internal static string RollLineSaid { get; private set; } = "not drawn yet";
+
+    /// <summary>
+    /// One line's geometry in screen pixels: where it starts, where the flat map puts the target, and where the line
+    /// was drawn to. See FlatMap.
+    /// </summary>
+    private static string LineSaid(string kind, Vector2 grid, Vector2 from, FlatMap map, Vector2 end)
+    {
+        var to = from + map.OffsetTo(grid);
+
+        return $"{kind} ({grid.X:0},{grid.Y:0}): from ({from.X:0},{from.Y:0}), the flat map puts it at ({to.X:0},{to.Y:0}), " +
+               $"drawn to ({end.X:0},{end.Y:0})";
     }
 
     /// <summary>
@@ -3761,20 +3698,25 @@ internal static class Overlay
         of.LengthSquared() > 0.0001f ? Vector2.Normalize(of) : Vector2.Zero;
 
     /// <summary>
-    /// Which way something lies on screen, measured from a few steps of ground rather than from
-    /// where it projects to.
+    /// Which way something lies on screen, from a step of ground towards it level with the player rather than from
+    /// where it projects to. Zero when the step cannot be projected; the callers then draw no line.
     ///
-    /// **A point behind the camera projects to the wrong place, not to nowhere.** The transform
-    /// mirrors it round in front of the viewer, so a remnant behind you comes back as an ordinary
-    /// screen coordinate on the opposite side - and a line clipped towards it points away from the
-    /// thing it is naming. Observed: a purple price drawn off the wrong edge entirely.
+    /// **A point behind the camera projects to the wrong place, not to nowhere.** The transform mirrors it round in
+    /// front of the viewer, so a remnant behind you comes back as an ordinary screen coordinate on the opposite side -
+    /// and a line clipped towards it points away from the thing it is naming. A step of ten grid from the player
+    /// cannot be behind the camera when the player is not.
     ///
-    /// A short step from the player towards it cannot be behind the camera when the player is not,
-    /// so the direction it projects to is trustworthy whatever the far end does. Ten grid, which is
-    /// far enough that the projected step is longer than the rounding on it.
+    /// **Level with the player, never at the terrain's height.** The line starts at the player's projection, so a step
+    /// at another height adds a vertical shift that has nothing to do with direction, and over ten grid it can
+    /// outweigh the step's own run. On an Augury site (2026-10-18) the line started at Entity.Pos, which read height 0
+    /// while the terrain there read about -101: a remnant down and right of the player got a bearing up and right,
+    /// (0.94,-0.35).
     ///
-    /// Zero when the step cannot be read, which leaves the caller trusting the far projection - the
-    /// behaviour it had before, for the case where there is nothing better.
+    /// **One step is enough.** A straight line projects to a straight line, so every point of the level ray towards
+    /// the target that is in front of the camera lies on the same screen line through the player; a further step adds
+    /// no precision. Halving back from the target for the furthest point that projected sanely chose a different step
+    /// as the player moved, and the points near the camera plane it sometimes chose carry the projection's numerical
+    /// swing, which showed as the line flickering while the player walked.
     /// </summary>
     private static Vector2 Toward(GameController gc, Camera camera, Vector2 here, Vector2 target,
         Vector2 from)
@@ -3782,92 +3724,150 @@ internal static class Overlay
         if (here == Vector2.Zero || target == here)
             return Vector2.Zero;
 
-        // **The furthest point along the ground that still projects sanely, not a fixed short step.**
-        //
-        // This took one step of ten grid, which is stable because it is near the camera and is only a
-        // rough bearing to something two hundred grid away - under perspective the ground curves in
-        // screen space, so a near step and a far target do not share a direction. Used to CLIP a line
-        // to the window edge, a bearing that is slightly wrong puts the endpoint in slightly the wrong
-        // place, and it moves as the player moves. Reported as the endpoint being jittery at a
-        // distance and smooth close up, which is this: near the remnant the two bearings agree.
-        //
-        // Halving from the target back towards the player takes the best point available. Whatever
-        // survives the sanity check is both projectable and as close to the true bearing as this can
-        // get, and the search costs at most a handful of projections for a handful of remnants.
         var way = Normal(target - here);
+        var standing = PlayerFeetAt(gc);
 
-        // **The near step decides the DIRECTION, a further one only refines it.**
-        //
-        // Ten grid from the player is close enough to the camera to project reliably, so its bearing
-        // is trustworthy in sign and rough in precision. A point further along is more precise and
-        // not trustworthy: past the camera plane it projects MIRRORED, to a point that is a plausible
-        // distance from the player and on entirely the wrong side. Taking the furthest sanely-projected
-        // point on its own, which is what this did for one commit, therefore pointed a line off the
-        // opposite edge of the screen.
-        //
-        // So the near bearing is established first and every further candidate has to agree with it
-        // before it is preferred. That keeps the precision that fixed the jitter and cannot reverse:
-        // a mirrored projection fails the dot test by pointing backwards, which is the one thing it
-        // reliably does.
-        var close = Where(gc, here + way * 10f);
-
-        if (close == Vector3.Zero)
+        if (way == Vector2.Zero || standing == Vector3.Zero)
             return Vector2.Zero;
 
+        var close = standing + new Vector3(way * 10f * Detonator.GridToWorld, 0f);
         var near = Safe.Read((camera, close), static x => x.camera.WorldToScreen(x.close), Vector2.Zero);
 
-        if (near == Vector2.Zero)
-            return Vector2.Zero;
+        return near == Vector2.Zero ? Vector2.Zero : Normal(near - from);
+    }
 
-        var bearing = Normal(near - from);
+    /// <summary>
+    /// The player's feet, which the lines aimed from the player start at: the Render component's position across the
+    /// ground, at the terrain's height under it (Placement.BlendedHeight, the surface the game picks the cursor
+    /// against). Render's own height is the middle of the model, so a line started there left from the character's
+    /// chest. Not GridPos, which can trail the drawn character when frames lag. Render's height when the terrain's
+    /// cannot be read, and Entity.Pos when Render cannot be.
+    /// </summary>
+    private static Vector3 PlayerFeetAt(GameController gc)
+    {
+        var drawn = Safe.Read(gc, static g => g.Player.GetComponent<ExileCore2.PoEMemory.Components.Render>()?.Pos ?? g.Player.Pos,
+            Vector3.Zero);
 
-        if (bearing == Vector2.Zero)
-            return Vector2.Zero;
+        if (drawn == Vector3.Zero)
+            return drawn;
 
-        // Read here rather than taken as an argument: four passes call this and only two of them have
-        // a window in hand, and the figure is only a sanity bound.
-        var screen = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default(RectangleF));
-        var sane = 4f * MathF.Max(MathF.Max(screen.Width, screen.Height), 1000f);
+        var data = Safe.Read(gc, static g => g.IngameState.Data, null);
+        var ground = data == null
+            ? float.NaN
+            : Placement.BlendedHeight(data, new Vector2(drawn.X, drawn.Y) / Detonator.GridToWorld);
 
-        // **Bounded twice, because halving does not terminate on an infinity.**
-        //
-        // reach *= 0.5f leaves an infinite reach infinite, and the loop test passes every time - so a
-        // grid coordinate that reads as huge or non-finite, which a bad memory read can produce at any
-        // moment, spins this forever ON THE RENDER THREAD, taking a terrain read and a projection each
-        // time round. A hung render thread is not a dropped frame: the overlay stops presenting and
-        // the device is left waiting, which is how a plugin reaches the display driver.
-        //
-        // So the span is checked for being finite before the loop starts, and the loop carries its own
-        // trip count regardless. Twenty-four halvings take any sane distance below twenty, so the
-        // count never ends a run that was going to succeed - it only ends one that was not.
-        var span = Vector2.Distance(target, here);
+        return float.IsFinite(ground) ? new Vector3(drawn.X, drawn.Y, ground) : drawn;
+    }
 
-        if (!float.IsFinite(span) || span <= 0f)
-            return bearing;
+    /// <summary>
+    /// The point on screen where the character's feet are drawn, which every line aimed from the player starts at: a
+    /// fixed share of the window, since the camera keeps the character at one place on screen.
+    ///
+    /// Fixed rather than projected. The camera's matrix is cached for the frame (ExileCore2's Camera holds a
+    /// CachedValue) while the player's position is read live, so on a frame where the game advanced between the two the
+    /// player projected a frame's movement ahead, and lines started there shifted now and then in the direction of
+    /// travel (2026-10-18); a projection also needs the feet's height. See FeetShareOfWindow. Moved by Line start
+    /// offset X and Y.
+    /// </summary>
+    private static Vector2 FeetOnScreen(GameController gc)
+    {
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default(RectangleF));
 
-        for (var (reach, tries) = (span, 0); reach >= 20f && tries < 24; reach *= 0.5f, tries++)
-        {
-            var step = Where(gc, here + way * reach);
+        return window.Width > 0f && window.Height > 0f
+            ? new Vector2(window.Width * FeetShareOfWindow.X, window.Height * FeetShareOfWindow.Y) + _lineStartOffset
+            : Vector2.Zero;
+    }
 
-            if (step == Vector3.Zero)
-                continue;
+    /// <summary>Line start offset X and Y, in pixels, read at the top of each frame's drawing. See FeetOnScreen.</summary>
+    private static Vector2 _lineStartOffset;
 
-            var at = Safe.Read((camera, step), static x => x.camera.WorldToScreen(x.step), Vector2.Zero);
+    /// <summary>
+    /// Where the character's feet sit, as a share of the window's width and height. Measured: the feet's projection
+    /// standing still read (1280,668) in a 2560x1440 window (dump 2026-10-18 16:56:28). Measured at that one size;
+    /// whether the share holds at another aspect ratio has not been checked, and the dump's line start prints the
+    /// feet's projection this frame beside it to check against.
+    /// </summary>
+    private static readonly Vector2 FeetShareOfWindow = new(0.5f, 0.4636f);
 
-            if (at == Vector2.Zero || Vector2.Distance(at, from) > sane)
-                continue;
+    /// <summary>
+    /// How the ground around the player maps onto the screen, taken as flat: the pixels one grid step along each axis
+    /// moves, measured this frame from the camera with two level steps of ten grid at the player's drawn position.
+    ///
+    /// **No height enters.** Both steps share the player's height, so the map is the screen's own view of the ground
+    /// and needs no terrain read; it scales with the resolution and follows any change of camera by itself. Every
+    /// line aimed from the player is drawn along it: lines started at Entity.Pos against steps at the terrain's height
+    /// pointed the wrong way on an Augury site where the two heights were about 100 apart (2026-10-18), and a far
+    /// point projected through the camera mirrors once it is behind it. Flat, a target on screen is placed with the
+    /// perspective left out, so the end sits a little off the remnant, more towards the top of the screen. Measured
+    /// against the same camera reading as the player, so a frame where the game advanced between the two reads does
+    /// not shift it.
+    /// </summary>
+    private readonly record struct FlatMap(Vector2 Here, Vector2 PerGridX, Vector2 PerGridY)
+    {
+        /// <summary>The screen offset from the player to a grid point.</summary>
+        public Vector2 OffsetTo(Vector2 grid) => PerGridX * (grid.X - Here.X) + PerGridY * (grid.Y - Here.Y);
+    }
 
-            var refined = Normal(at - from);
+    /// <summary>The flat map at the player this frame, or null when the camera or the player cannot be read. See FlatMap.</summary>
+    private static FlatMap? FlatMapAtPlayer(GameController gc, Camera camera)
+    {
+        var drawn = Safe.Read(gc,
+            static g => g.Player.GetComponent<ExileCore2.PoEMemory.Components.Render>()?.Pos ?? g.Player.Pos, Vector3.Zero);
 
-            // Half a right angle of disagreement is generous for two bearings to the same thing and
-            // nowhere near enough to admit a reversal.
-            if (refined == Vector2.Zero || Vector2.Dot(refined, bearing) < 0.7f)
-                continue;
+        if (drawn == Vector3.Zero)
+            return null;
 
-            return refined;
-        }
+        const float steps = 10f;
+        var origin = Safe.Read((camera, drawn), static x => x.camera.WorldToScreen(x.drawn), Vector2.Zero);
+        var alongX = drawn + new Vector3(steps * Detonator.GridToWorld, 0f, 0f);
+        var alongY = drawn + new Vector3(0f, steps * Detonator.GridToWorld, 0f);
+        var x = Safe.Read((camera, alongX), static v => v.camera.WorldToScreen(v.alongX), Vector2.Zero);
+        var y = Safe.Read((camera, alongY), static v => v.camera.WorldToScreen(v.alongY), Vector2.Zero);
 
-        return bearing;
+        if (origin == Vector2.Zero || x == Vector2.Zero || y == Vector2.Zero)
+            return null;
+
+        return new FlatMap(new Vector2(drawn.X, drawn.Y) / Detonator.GridToWorld, (x - origin) / steps,
+            (y - origin) / steps);
+    }
+
+    /// <summary>
+    /// Where a line aimed from the player starts, and the flat map it is drawn along, or null when either cannot be had.
+    /// See FeetOnScreen and FlatMap.
+    /// </summary>
+    private static (Vector2 From, FlatMap Map)? LineStartAndMap(GameController gc, Camera camera)
+    {
+        if (FlatMapAtPlayer(gc, camera) is not { } map)
+            return null;
+
+        var feet = PlayerFeetAt(gc);
+        var projected = feet == Vector3.Zero
+            ? Vector2.Zero
+            : Safe.Read((camera, feet), static x => x.camera.WorldToScreen(x.feet), Vector2.Zero);
+        var from = FeetOnScreen(gc);
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default(RectangleF));
+
+        if (window.Width > 0f && window.Height > 0f)
+            LineStartSaid = $"({from.X:0},{from.Y:0}) in a {window.Width:0}x{window.Height:0} window, " +
+                            $"({from.X / window.Width:0.0000},{from.Y / window.Height:0.0000}) of it; the feet project to " +
+                            $"({projected.X:0},{projected.Y:0}) this frame; one grid step along x moves " +
+                            $"({map.PerGridX.X:0.00},{map.PerGridX.Y:0.00}) px and along y ({map.PerGridY.X:0.00},{map.PerGridY.Y:0.00})";
+
+        return from == Vector2.Zero ? null : (from, map);
+    }
+
+    /// <summary>Where the lines aimed from the player last started, as pixels and as a share of the window, for the dump.</summary>
+    internal static string LineStartSaid { get; private set; } = "no line drawn yet";
+
+    /// <summary>
+    /// Where a line from the player towards a grid point ends: where the flat map puts the point while that is on
+    /// screen, else where the line meets the window edge. Off says which. See FlatMap.
+    /// </summary>
+    private static (Vector2 End, bool Off) FlatEnd(RectangleF window, Vector2 from, FlatMap map, Vector2 grid)
+    {
+        var to = from + map.OffsetTo(grid);
+
+        return Inside(window, to, Edge) ? (to, false) : (Clip(window, from, to), true);
     }
 
     private static bool Inside(RectangleF window, Vector2 at, float margin) =>
@@ -3882,27 +3882,6 @@ internal static class Overlay
     /// handful of remnants a frame. Halving the interval twenty times puts the answer inside a
     /// thousandth of a pixel, which is further than anybody is going to look.
     /// </summary>
-    /// <summary>
-    /// Where a line to something off screen meets the window edge.
-    ///
-    /// **Along the projection just past the edge, along the ground bearing further out.** The bearing is a step
-    /// of ground turned into screen space, and perspective bends it: a remnant barely off the edge, or just
-    /// inside the margin, got a line clipped a few degrees away from where it actually stood. The projection
-    /// is exact there. It is the far projection that cannot be trusted - near the camera plane it swings about
-    /// and behind the camera it mirrors - so the bearing is kept for anything more than a window's size out,
-    /// and for any projection the bearing disagrees with.
-    /// </summary>
-    private static Vector2 EdgeEnd(RectangleF window, Vector2 from, Vector2 to, Vector2 toward, bool trusted)
-    {
-        var near = to.X > -window.Width && to.X < 2f * window.Width &&
-                   to.Y > -window.Height && to.Y < 2f * window.Height;
-
-        if (trusted && near)
-            return Clip(window, from, to);
-
-        return Clip(window, from, toward != Vector2.Zero ? from + toward * (window.Width + window.Height) : to);
-    }
-
     private static Vector2 Clip(RectangleF window, Vector2 from, Vector2 to)
     {
         if (!Inside(window, from, Edge))
@@ -4519,12 +4498,15 @@ internal static class Overlay
     /// chance that a roll scores the chain above how it stands, both to no decimals - "+200 (30%)". The gain is what
     /// the verdict is made on; the chance says how often a roll actually comes out ahead, since a positive average
     /// can rest on a few large outcomes. Thousands separated, because the gain runs to five digits on a big chain.
-    /// Led by "~" while the figures are a step behind the screen, being worked out again. See Rolling.RollAdvice and
-    /// Rolling.FiguresShowable.
+    /// Led by "~" while the figures are a step behind the screen, being worked out again. "off chain" for a remnant
+    /// within reach that the chain does not take, whose gain is nought by construction and which is rolled anyway -
+    /// see Rolling.OffChainRollsAreAdvised. See Rolling.RollAdvice and Rolling.FiguresShowable.
     /// </summary>
     internal static string RollFigureText(Rolling.RollAdvice said) =>
-        string.Create(System.Globalization.CultureInfo.InvariantCulture,
-            $"{(Rolling.Here.Fresh ? "" : "~")}{said.Gain.ToString("+#,##0;-#,##0;0", System.Globalization.CultureInfo.InvariantCulture)} ({said.ChanceAbove * 100d:0}%)");
+        said.OffChain && said.Gain < 1d
+            ? $"{(Rolling.Here.Fresh ? "" : "~")}off chain"
+            : string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"{(Rolling.Here.Fresh ? "" : "~")}{said.Gain.ToString("+#,##0;-#,##0;0", System.Globalization.CultureInfo.InvariantCulture)} ({said.ChanceAbove * 100d:0}%)");
 
     /// <summary>One of those figures on the same dark ground the reward lines use.</summary>
     private static void Figure(Graphics graphics, ref Vector2 at, string said, Color colour)

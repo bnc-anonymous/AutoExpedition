@@ -123,26 +123,63 @@ internal static class Rolls
         Safe.Read(() => gc.IngameState.Data.MapStatsVisible.TryGetValue(stat, out var said) ? said : 0, 0);
 
     /// <summary>
-    /// The chance of a remnant carrying two propagating slots rather than one, as a fraction.
+    /// The chance of a remnant carrying two propagating slots rather than one, as a fraction: the stat
+    /// MapExpeditionRemnantsPass2RunicModifiersChancePct as last read (see ReadTwoSlots), or before any read the 25%
+    /// the atlas node "Double or Nothing" prints for its "Double" choice.
     ///
-    /// **The game states this and the player chooses it, so it is a setting rather than a number
-    /// here.** The atlas node "Double or Nothing" decides how Verisium remnants add runic modifiers
-    /// to future remnants - which is what this plugin calls a propagating rune - and it offers three
-    /// choices. One is "25% chance to add an additional Runic Modifier". A constant cannot be right
-    /// for a player who took a different one.
-    ///
-    /// **It was 0.283, sampled rather than stated**, with the sample flat across socket counts -
-    /// 65% one slot at three sockets, 76% at six. That is within noise of the stated 25% for a
-    /// sample that size, and eight remnants on one site later came out at exactly 2 of 8. A figure
-    /// the game prints beats one counted off a handful of remnants, so the default is the printed
-    /// one and the sample is corroboration.
-    ///
-    /// Asked rather than read, because nothing states the answer: the node shows as allocated in
-    /// IngameUi.AtlasTreePanel.Passives, and its only stat is a marker saying it opens a chooser.
-    /// See Debug.DoubleOrNothingDouble.
+    /// **Read off the game.** The stat is 25 in the server's atlas stats for the node's "Double" choice, and on a map
+    /// with Expedition tablets granting it, in the map's visible stats as well - 135 on a map with three such tablets,
+    /// where all 7 remnants passed two runes against 663 of 2,662 (25%) across 295 maps without (census, 2026-10-18).
+    /// It replaced a Debug setting, "Double or Nothing: Double", kept on the belief that the node's choice could not
+    /// be read - the tree shows only a selector marker - which assumed 25% for every roll and undervalued each one on
+    /// such a map. That replaced a sampled 0.283, within noise of the stated 25%.
     /// </summary>
-    public static float TwoSlots(AutoExpeditionSettings settings) =>
-        Safe.Read(() => settings.Debug.DoubleOrNothingDouble.Value, true) ? Stated : 0f;
+    public static float TwoSlots(AutoExpeditionSettings settings) => _twoSlotsRead >= 0f ? _twoSlotsRead : Stated;
+
+    /// <summary>The two-slot chance as last read, or below nought before one could be. See ReadTwoSlots.</summary>
+    private static float _twoSlotsRead = -1f;
+
+    /// <summary>Where the two-slot chance last came from, for the dump.</summary>
+    internal static string TwoSlotsSaid { get; private set; } = "not read yet: the 25% Double or Nothing prints stands in";
+
+    /// <summary>
+    /// Reads the two-slot chance for TwoSlots, on the frame, since the reroll passes that ask it run off it: the
+    /// map's visible stat and the atlas's added together, capped at one.
+    ///
+    /// **The map's value does not hold the atlas's.** One tablet rolled 30% read 40 in the map's stats against the
+    /// atlas's 25 - neither 30 nor 55 - so the map's value is the tablets' alone, after the map's increased effect of
+    /// tablet modifiers (likely Jado's "Partial Translations", 0-40% at random per map; about a third on both maps
+    /// seen), and the atlas adds on top. The visible stat already carries that boost, so it is read, not worked out: that
+    /// map's remnants passed two at 4 of 5, about four times likelier at 65% than at 40% (2026-10-18). Taking the
+    /// map's value alone, as this did at first, read that map at 40%. Kept when nothing can be read.
+    /// </summary>
+    public static void ReadTwoSlots(ExileCore2.GameController gc)
+    {
+        var visible = MapStat(gc, ExileCore2.Shared.Enums.GameStat.MapExpeditionRemnantsPass2RunicModifiersChancePct);
+        var atlas = Safe.Read(() => gc.IngameState.ServerData.AtlasStats, null);
+        var fromAtlas = atlas != null &&
+                        atlas.TryGetValue(ExileCore2.Shared.Enums.GameStat.MapExpeditionRemnantsPass2RunicModifiersChancePct, out var a)
+            ? a
+            : -1;
+
+        if (visible <= 0 && fromAtlas < 0)
+        {
+            // The atlas list read but naming no such stat is the node not taken: no two-slot remnants at all.
+            if (atlas != null)
+            {
+                _twoSlotsRead = 0f;
+                TwoSlotsSaid = "0: the atlas stats name no two-slot chance and the map adds none";
+            }
+
+            return;
+        }
+
+        var percent = Math.Max(0, visible) + Math.Max(0, fromAtlas);
+
+        _twoSlotsRead = Math.Clamp(percent / 100f, 0f, 1f);
+        TwoSlotsSaid = $"{_twoSlotsRead:P0}: the map's visible stat {Math.Max(0, visible)} + the atlas stats {Math.Max(0, fromAtlas)}" +
+                       (percent > 100 ? $" = {percent}, capped at one" : "");
+    }
 
     /// <summary>The chance the node prints for its "Double" choice.</summary>
     private const float Stated = 0.25f;

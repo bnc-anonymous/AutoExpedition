@@ -61,8 +61,29 @@ internal sealed class Rolling
     /// The recipe the plan took at this remnant when the verdict was weighed, or null when none was recorded. See
     /// RecipeTakenAt and Divert.
     /// </param>
+    /// <param name="OffChain">
+    /// Within the reach gate and not taken by the chain. Its Gain is nought by construction, since the chain is held
+    /// still, and it is advised once no roll on the chain clears MinimumAdvisedGain. See OffChainRollsAreAdvised.
+    /// </param>
+    /// <param name="AwayFromChain">For an off-chain remnant, its distance in grid from the nearest planned link.</param>
     internal sealed record RollAdvice(Vector2 Grid, double Gain, string Why, bool Refused = false,
-        string TakenWhenWeighed = null, double ChanceAbove = 0d);
+        string TakenWhenWeighed = null, double ChanceAbove = 0d, bool OffChain = false, float AwayFromChain = 0f);
+
+    /// <summary>
+    /// **A remnant within reach that the chain does not take is always rolled.** Its roll is scored against the chain
+    /// held still, which does not take it, so every outcome scores exactly nought - even a nine socket one - and it was
+    /// kept at "0 (0%)": on a Pit site (2026-10-18) an Expansive Alloy remnant 47.5 grid from the nearest link, with all
+    /// five explosives spent elsewhere. A roll there costs the current plan nothing and a good draw can make it worth
+    /// taking, so it is advised, nearest the chain first. The reach gate, Only advise rolling within (reach), decides
+    /// which remnants count as within reach.
+    ///
+    /// **Last, after every roll on the chain that clears MinimumAdvisedGain.** A remnant the best chain misses may sit
+    /// on another chain scoring close to it, and a roll of an earlier remnant can make that chain the best - taking the
+    /// remnant as it is. Rolling it first would spend that. Each roll is followed by a re-solve, so a remnant a later
+    /// chain takes is weighed as on the chain from then on, and only one that no chain has come to take by the end is
+    /// rolled. Off-chain remnants are not ranked against each other beyond their distance, since each figure is nought.
+    /// </summary>
+    private const bool OffChainRollsAreAdvised = true;
 
     /// <summary>
     /// The advice as it stands, keyed by the remnant's cell so the overlay can find it.
@@ -395,7 +416,7 @@ internal sealed class Rolling
         foreach (var (cell, verdict) in said)
         {
             // A positive gain that is not the advised roll is a roll worth making later, not a keep. See Divert.
-            text.Add($"        ({cell.X},{cell.Y}) {(Advising(verdict.Grid) ? "ROLL" : verdict.Gain >= MinimumAdvisedGain && !verdict.Refused ? "roll later" : "keep")} " +
+            text.Add($"        ({cell.X},{cell.Y}) {(Advising(verdict.Grid) ? "ROLL" : (verdict.Gain >= MinimumAdvisedGain || verdict.OffChain) && !verdict.Refused ? "roll later" : "keep")} " +
                      $"{verdict.Gain:+#,##0.0;-#,##0.0;0} - {verdict.Why}");
         }
 
@@ -1382,7 +1403,7 @@ internal sealed class Rolling
     /// <summary>
     /// How many ways the propagating slots can fall on a remnant of this many sockets.
     ///
-    /// One slot always propagates and a second sometimes does - see Debug.DoubleOrNothingDouble -
+    /// One slot always propagates and a second sometimes does - see Rolls.TwoSlots -
     /// and which are which is drawn. So it is every single slot plus every unordered pair.
     /// </summary>
     private static int PositionSets(int sockets) =>
@@ -1759,13 +1780,15 @@ internal sealed class Rolling
 
         // Everything screening looked at gets a line, so the overlay can explain a remnant it is
         // advising against as readily as one it is advising for.
-        foreach (var (i, gain, _, above) in worth)
+        foreach (var (i, gain, reached, above) in worth)
         {
             var at = i;
 
             RecordAdvice(said, env.Targets[i].Grid, gain,
                 ResultOfStage($"explaining the remnant at ({env.Targets[i].Grid.X:0},{env.Targets[i].Grid.Y:0})",
-                    () => AdviceReason(env, chain, at, gain, settings)), taken, chanceAbove: above);
+                    () => AdviceReason(env, chain, at, gain, settings)), taken, chanceAbove: above,
+                offChain: OffChainRollsAreAdvised && !reached,
+                awayFromChain: reached ? 0f : DistanceToChain(env, chain, i));
         }
 
         // Dropped if the question has moved on - a zone change, or another solve - because
@@ -1801,6 +1824,27 @@ internal sealed class Rolling
         // A point is the smallest amount the readout can show. Below that the advice is claiming a
         // difference the player cannot see, about a consumable they cannot get back.
         var won = best >= 0 && top >= MinimumAdvisedGain;
+
+        // Failing that, the off-chain remnant nearest the chain. See OffChainRollsAreAdvised.
+        if (!won && OffChainRollsAreAdvised)
+        {
+            var nearest = float.MaxValue;
+
+            foreach (var (i, _, reached, _) in worth)
+            {
+                if (reached)
+                    continue;
+
+                var away = DistanceToChain(env, chain, i);
+
+                if (away < nearest)
+                {
+                    nearest = away;
+                    best = i;
+                    won = true;
+                }
+            }
+        }
 
         // **The continuous mode picks its own, on the frame, and would only be overwritten here.**
         // Its choice moves between passes and this one cannot; setting it would make the advice
@@ -2057,6 +2101,11 @@ internal sealed class Rolling
         var standing = float.MaxValue;
         var standingGain = double.MinValue;
 
+        // The off-chain remnant nearest the chain, advised when no roll on the chain clears the floor. See
+        // OffChainRollsAreAdvised.
+        var offChainAt = Vector2.Zero;
+        var offChainAway = float.MaxValue;
+
         for (var i = 0; i < env.Targets.Count; i++)
         {
             var target = env.Targets[i];
@@ -2090,6 +2139,17 @@ internal sealed class Rolling
             // So the two quantities do what each is good for: the enumerated gain decides whether a
             // roll is worth a Verisium, and the prior picks between the ones that are. Same floor the
             // other modes use, so Continuous cannot recommend what they would refuse.
+            if (verdict.OffChain && verdict.Gain < MinimumAdvisedGain)
+            {
+                if (verdict.AwayFromChain < offChainAway)
+                {
+                    offChainAway = verdict.AwayFromChain;
+                    offChainAt = target.Grid;
+                }
+
+                continue;
+            }
+
             if (verdict.Gain < MinimumAdvisedGain)
                 continue;
 
@@ -2117,6 +2177,18 @@ internal sealed class Rolling
             bestCost = cost;
             bestGain = verdict.Gain;
             bestAt = target.Grid;
+        }
+
+        if (bestAt == Vector2.Zero && offChainAt != Vector2.Zero)
+        {
+            var movedOff = Advised == null || Vector2.Distance(Advised.Grid, offChainAt) >= 1f;
+
+            Advised = Of(offChainAt);
+            NoAdviceReason = Advised == null ? "the best candidate has no verdict yet" : "";
+            Diverted = $"{(movedOff ? "moved to" : "still")} ({offChainAt.X:0},{offChainAt.Y:0}), not taken by the chain " +
+                       $"and {offChainAway:0} grid from it: no roll on the chain clears {MinimumAdvisedGain:0.#}";
+
+            return;
         }
 
         if (bestAt == Vector2.Zero)
@@ -2297,11 +2369,13 @@ internal sealed class Rolling
     }
 
     private static void RecordAdvice(Dictionary<(int X, int Y), RollAdvice> said, Vector2 grid, double gain,
-        string why, Dictionary<(int X, int Y), string> taken, bool refused = false, double chanceAbove = 0d)
+        string why, Dictionary<(int X, int Y), string> taken, bool refused = false, double chanceAbove = 0d,
+        bool offChain = false, float awayFromChain = 0f)
     {
         var cell = ((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y));
 
-        said[cell] = new RollAdvice(grid, gain, why, refused, taken?.GetValueOrDefault(cell), chanceAbove);
+        said[cell] = new RollAdvice(grid, gain, why, refused, taken?.GetValueOrDefault(cell), chanceAbove, offChain,
+            awayFromChain);
     }
 
     /// <summary>
@@ -2988,7 +3062,7 @@ internal sealed class Rolling
     /// Every set of this many slot positions on a remnant of this many sockets.
     ///
     /// One or two, because a remnant carries one propagating slot and sometimes a second - see
-    /// Debug.DoubleOrNothingDouble. Which of them propagate is drawn rather than chosen and the
+    /// Rolls.TwoSlots. Which of them propagate is drawn rather than chosen and the
     /// odds are stated nowhere, so the caller treats every set as equally likely.
     /// </summary>
     private static List<int[]> PositionSetsOf(int sockets, int howMany)
@@ -3241,9 +3315,11 @@ internal sealed class Rolling
                          "roll replaces and the figure beside this counts against it");
         }
 
-        // The chain gets nothing from this remnant as it stands, and the figure holds the chain still.
+        // The chain gets nothing from this remnant as it stands, and the figure holds the chain still. See
+        // OffChainRollsAreAdvised.
         if (!ChainCatches(env, chain, index))
-            said.Add("the chain does not reach it as planned, so rolling it changes nothing the plan collects");
+            said.Add("the chain does not take it, so a roll costs the plan nothing and a good draw may make it worth " +
+                     "taking; rolled once no roll on the chain clears the floor");
 
         var why = said.Count > 0 ? string.Join("; ", said) : "nothing carried forward";
 

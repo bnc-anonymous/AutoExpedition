@@ -86,7 +86,7 @@ internal sealed class Valuation
     /// you are stood next to the remnant and the value wants knowing from across the site. If a
     /// patch moves it this returns null and remnants quietly fall back to socket count.
     /// </summary>
-    private const ushort EncounterDataHash = 0x87B2;
+    internal const ushort EncounterDataHash = 0x87B2;
 
     private readonly GameController _gc;
     private readonly AutoExpeditionSettings _settings;
@@ -868,7 +868,7 @@ internal sealed class Valuation
         var data = Data(entity);
 
         if (data == null)
-            return "encounter data unreadable";
+            return $"encounter data unreadable - id-keyed components: {EncounterComponentsSaid(entity)}";
 
         var text = new StringBuilder();
         var sockets = Safe.Read(() => data.RuneCount, 0);
@@ -1651,7 +1651,7 @@ internal sealed class Valuation
         var data = Data(entity);
 
         if (data == null)
-            return $"no encounter data (component {EncounterDataHash:X} absent)";
+            return $"no encounter data (component {EncounterDataHash:X} absent or empty: {EncounterComponentsSaid(entity)})";
 
         var level = Safe.Read(() => _gc.IngameState.Data.CurrentAreaLevel, 0);
         var sockets = Safe.Read(() => data.RuneCount, 0);
@@ -1902,5 +1902,45 @@ internal sealed class Valuation
         return address == 0
             ? null
             : Safe.Read(() => RemoteMemoryObject.GetObjectStatic<Expedition2EncounterData>(address), null);
+    }
+
+    /// <summary>
+    /// The encounter data at an address, when it reads as a remnant's: 1 to 12 sockets, a fixed rune with an id, and
+    /// its position inside the sockets. For the dump, which marks each id-keyed component that reads as one.
+    /// </summary>
+    private static Expedition2EncounterData ReadEncounter(long address)
+    {
+        var data = Safe.Read(() => RemoteMemoryObject.GetObjectStatic<Expedition2EncounterData>(address), null);
+
+        if (data == null)
+            return null;
+
+        var sockets = Safe.Read(() => data.RuneCount, 0);
+        var position = Safe.Read(() => data.FixedRunePosition, -1);
+        var rune = Safe.Read(() => data.FixedRune?.Id, null);
+
+        return sockets is >= 1 and <= 12 && position >= 0 && position < sockets && !string.IsNullOrWhiteSpace(rune) ? data : null;
+    }
+
+    /// <summary>
+    /// Each id-keyed component of an entity, and whether it reads as encounter data, for the dump: as the entity held
+    /// reads them, and as a fresh reading at the same address does.
+    /// </summary>
+    internal static string EncounterComponentsSaid(Entity entity)
+    {
+        string Of(Entity of)
+        {
+            var components = Safe.Read(() => of?.HashComponents, null);
+
+            return components == null
+                ? "none readable"
+                : string.Join(", ", components.Select(c =>
+                    $"0x{c.Key:X}{(c.Value != 0 && ReadEncounter(c.Value) is { } d ? $" ENCOUNTER ({Safe.Read(() => d.RuneCount, 0)} sockets, {Safe.Read(() => d.FixedRune?.Id, "?")}@{Safe.Read(() => d.FixedRunePosition, -1)})" : "")}"));
+        }
+
+        var address = Safe.Read(() => entity?.Address ?? 0L, 0L);
+        var fresh = address == 0 ? null : Safe.Read(() => RemoteMemoryObject.GetObjectStatic<Entity>(address), null);
+
+        return $"held [{Of(entity)}], read afresh at 0x{address:X} [{Of(fresh)}]";
     }
 }

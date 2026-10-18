@@ -803,7 +803,15 @@ internal static class Dump
         RuneSlots(b, gc);
         EveryRecipe(b, gc);
         AtlasPassives(b, gc);
-        RemnantSlotsFromTheClient(b);
+        RemnantSlotsFromTheClient(b, gc);
+
+        b.AppendLine();
+        SectionHeader(b, "=== reward and reroll lines, as last drawn ===");
+        b.AppendLine($"  start: {Overlay.LineStartSaid}");
+        b.AppendLine($"  reward lines: {Overlay.RewardLinesSaid}");
+        b.AppendLine($"  reroll line: {Overlay.RollLineSaid}");
+        b.AppendLine("  (screen pixels; a line runs from the start along the flat map of the ground, to the target while " +
+                     "that is on screen, else to the window edge)");
         Entities(b, gc, range);
     }
 
@@ -4443,10 +4451,20 @@ internal static class Dump
     /// socket count, which is why a two rune recipe is legal on a four socket remnant. This section
     /// is what one particular remnant actually offers.
     /// </summary>
-    private static void RemnantSlotsFromTheClient(StringBuilder b)
+    private static void RemnantSlotsFromTheClient(StringBuilder b, GameController gc)
     {
         b.AppendLine();
         SectionHeader(b, "=== what the client says about each remnant's slots ===");
+
+        // After logging back in inside a map, remnants' encounter data and rune panels stay empty until the character
+        // moves (2026-10-18). The player's buffs are printed to see whether a grace period is held over that span.
+        var playerBuffs = Safe.Read(() => gc.Player?.GetComponent<Buffs>()?.BuffsList, null);
+        b.AppendLine("  player buffs: " + (playerBuffs == null
+            ? "unreadable"
+            : playerBuffs.Count == 0
+                ? "none"
+                : string.Join(", ", playerBuffs.Select(buff =>
+                    $"{Safe.Read(() => buff.Name, "?")} (timer {Safe.Read(() => buff.Timer.ToString("0.#"), "?")})"))));
         b.AppendLine("  Slots are the CLIENT's numbering, from zero. The weights table above numbers " +
                      "from one, so its slot 1 is this section's slot 0.");
         b.AppendLine("  A * on a slot means the game passes that slot's rune on; everything else is local.");
@@ -4472,10 +4490,56 @@ internal static class Dump
             b.Append("      ").AppendLine(
                 Safe.Read(() => Valuation.SlotsAndRecipesOfRemnant(target.Entity), "threw")
                     ?.TrimEnd() ?? "nothing");
+            b.Append("      ").AppendLine(EntityStateOfRemnant(gc, target.Entity));
         }
 
         if (!any)
             b.AppendLine("  no remnants in the scan");
+    }
+
+    /// <summary>
+    /// The entity the scan holds for a remnant beside the one the game's entity list holds under the same id: address,
+    /// validity, version, id-keyed components (held and read afresh), and the first bytes behind the shipped encounter
+    /// component id. Says whether a remnant whose encounter data reads nothing is an out-of-date entity or one the game
+    /// has not filled.
+    /// </summary>
+    private static string EntityStateOfRemnant(GameController gc, Entity held)
+    {
+        string StateOf(Entity e) =>
+            $"0x{Safe.Read(() => e.Address, 0L):X} valid {Safe.Read(() => e.IsValid.ToString(), "?")} " +
+            $"version {Safe.Read(() => e.Version.ToString(), "?")} components {Safe.Read(() => ((e.ComponentList.Last - e.ComponentList.First) / 8).ToString(), "?")}";
+
+        var id = Safe.Read(() => held.Id, 0u);
+        var listed = Safe.Read(() => gc.EntityListWrapper.Entities.FirstOrDefault(e => e.Id == id), null);
+        var said = new StringBuilder($"entity {id}: held {StateOf(held)}; ");
+
+        said.Append(listed == null
+            ? "the game's entity list has no entity with this id"
+            : $"listed {StateOf(listed)}{(Safe.Read(() => listed.Address == held.Address, false) ? " (same address)" : " (DIFFERENT address)")}" +
+              (ReferenceEquals(listed, held)
+                  ? " (the same object)"
+                  : $" (a DIFFERENT object, its components {Valuation.EncounterComponentsSaid(listed)})"));
+
+        said.Append("; components ").Append(Valuation.EncounterComponentsSaid(held));
+
+        void BytesBehindEncounterHash(string reading, Entity of)
+        {
+            var components = Safe.Read(() => of?.HashComponents, null);
+
+            if (components == null || !components.TryGetValue(Valuation.EncounterDataHash, out var address) || address == 0)
+                return;
+
+            var raw = Safe.Read(() => held.M.ReadBytes(address, 0x60), null);
+            said.Append($"; {reading} 0x{Valuation.EncounterDataHash:X} at 0x{address:X}: {(raw == null ? "unreadable" : BitConverter.ToString(raw).Replace("-", " "))}");
+        }
+
+        BytesBehindEncounterHash("held", held);
+
+        var heldAddress = Safe.Read(() => held.Address, 0L);
+        BytesBehindEncounterHash("read afresh",
+            heldAddress == 0 ? null : Safe.Read(() => ExileCore2.PoEMemory.RemoteMemoryObject.GetObjectStatic<Entity>(heldAddress), null));
+
+        return said.ToString();
     }
 
     /// <summary>
@@ -4573,6 +4637,10 @@ internal static class Dump
 
         AtlasStats.Refresh(gc);
         b.AppendLine($"  {AtlasStats.Said(Settings?.Debug.GainingTraction.Value ?? true)}");
+
+        // The chance a rolled remnant passes two runes, as the reroll advice takes it. See Rolls.ReadTwoSlots.
+        Rolls.ReadTwoSlots(gc);
+        b.AppendLine($"  a rolled remnant passing two runes: {Rolls.TwoSlotsSaid}");
 
         // What the server says the atlas grants, which needs no panel open: whether choosers such as Double or Nothing
         // show their choice here is what this is for. See AtlasStats.

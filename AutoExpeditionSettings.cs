@@ -3774,6 +3774,19 @@ public class DisplaySettings
     [Menu("Hide behind panels")]
     public ToggleNode HideBehindPanels { get; set; } = new ToggleNode(true);
 
+    /// <summary>
+    /// Moves the point every line aimed from the player starts at - the reward, reroll and loot lines - right by this
+    /// many pixels; negative moves it left. The point is a fixed share of the window, measured as the character's feet
+    /// in a 2560x1440 window (Overlay.FeetShareOfWindow); this corrects it where another window shape puts the feet
+    /// elsewhere. The dump's line start prints the feet's projection beside it to compare.
+    /// </summary>
+    [Menu("Line start offset X (px)", "Moves the start of the reward, reroll and loot lines right (negative: left).")]
+    public RangeNode<int> LineStartOffsetX { get; set; } = new RangeNode<int>(0, -300, 300);
+
+    /// <summary>The same, downwards; negative moves it up. See LineStartOffsetX.</summary>
+    [Menu("Line start offset Y (px)", "Moves the start of the reward, reroll and loot lines down (negative: up).")]
+    public RangeNode<int> LineStartOffsetY { get; set; } = new RangeNode<int>(0, -300, 300);
+
     [Submenu(CollapsedByDefault = true)]
     public PlanDisplaySettings ThePlan { get; set; } = new PlanDisplaySettings();
 
@@ -5931,31 +5944,6 @@ public class DebugSettings
 
     [JsonIgnore]
     public CustomNode ThePlannerGroup { get; set; } = Section.Of("The planner");
-
-    /// <summary>
-    /// Whether the atlas node's "Double" choice is taken, which is what makes a rolled remnant
-    /// sometimes carry a second propagating rune.
-    ///
-    /// **A fact about the player's atlas, which nothing can read.** The node is allocated visibly
-    /// enough - it appears as AtlasExpeditionNotable2_ in IngameUi.AtlasTreePanel.Passives - but its
-    /// only stat is dummy_display_expedition_remnant_modifier_selector at 1, a marker saying the
-    /// node opens a chooser rather than which of the three was chosen. Every selector node on the
-    /// tree reads the same way. So it is asked rather than detected.
-    ///
-    /// On means the 25% the node states; off means a roll never adds one. It feeds the reroll
-    /// advisor, which cannot know whether a roll will produce one propagating rune or two - only
-    /// how often. See Rolls.TwoSlots.
-    ///
-    /// **It replaced a sampled 0.283.** That came from counting remnants, was flat across socket
-    /// counts, and is within noise of 25% at that sample size; eight remnants on one site later came
-    /// out at exactly 2 of 8. A figure the game prints beats one counted off a handful.
-    /// </summary>
-    [Menu("Double or Nothing: Double (Atlas node)",
-        "Adjusts how Verisium Remnants within Expeditions and Grand\n" +
-        "Expeditions add Runic Modifiers to future Remnants\n" +
-        "\n" +
-        "25%% chance to add an additional Runic Modifier")]
-    public ToggleNode DoubleOrNothingDouble { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// Whether the atlas notable "Gaining Traction" is allocated: a remnant's waves carry more magic and rare packs for

@@ -973,6 +973,20 @@ internal sealed class Target
     private long _highestActivated = -1;
 
     /// <summary>
+    /// The highest activated state kept for a remnant, for the site file: 6 once blown, 7 once shattered, and neither is
+    /// undone, so it is safe to keep across a reload and a trip out and back where a live state is not. Set from the file
+    /// on restore. **A shattered remnant leaves the entity list for good**, so without it a remnant completed before a
+    /// portal trip or a plugin reload read as never completed, and Gaining Traction counted it out of every chain after
+    /// - the other expedition and the lone remnants of a regular map (2026-10-18). See Spent and
+    /// PlanEnvironment.RemnantsCompletedInArea.
+    /// </summary>
+    public long KeptActivated
+    {
+        get => Kind == TargetKind.Remnant ? HighestActivated() : -1;
+        init => _highestActivated = value;
+    }
+
+    /// <summary>
     /// Whether this remnant has been blown but not yet shattered - the only state worth walking to.
     ///
     /// Six exactly, not six or more. The state carries on past the detonation: across every dump
@@ -2004,6 +2018,7 @@ internal sealed class Scan
             _saved = 0;
             _savedMods = 0;
             _savedLone = _loneVerdicts;
+            _savedSpent = 0;
 
             // A new area is walked at once rather than waiting out the backstop, and its first walk
             // is not counted as a miss - nothing has been told to us about this area yet.
@@ -2025,6 +2040,7 @@ internal sealed class Scan
 
                 _saved = _known.Count;
                 _savedMods = ModsKnownCount();
+                _savedSpent = SpentRemnantCount();
             }
         }
 
@@ -2044,13 +2060,15 @@ internal sealed class Scan
     /// </summary>
     public void Keep()
     {
-        if (_real == 0 || _known.Count <= _saved && ModsKnownCount() <= _savedMods && _loneVerdicts <= _savedLone)
+        if (_real == 0 || _known.Count <= _saved && ModsKnownCount() <= _savedMods && _loneVerdicts <= _savedLone &&
+            SpentRemnantCount() <= _savedSpent)
             return;
 
         Remembered.Save(Home, _real, _name, _size, _known.Values);
         _saved = _known.Count;
         _savedMods = ModsKnownCount();
         _savedLone = _loneVerdicts;
+        _savedSpent = SpentRemnantCount();
         _wrote = DateTime.UtcNow;
     }
 
@@ -2062,6 +2080,12 @@ internal sealed class Scan
 
     /// <summary>How many lone remnant verdicts had been given at the last write. See Keep.</summary>
     private int _savedLone;
+
+    /// <summary>How many known remnants are spent, blown or shattered. See Keep and Target.KeptActivated.</summary>
+    private int SpentRemnantCount() => _known.Values.Count(t => t.Kind == TargetKind.Remnant && t.KeptActivated >= 6);
+
+    /// <summary>How many were spent at the last write. See Keep.</summary>
+    private int _savedSpent;
 
     /// <summary>
     /// Prices any remnant that is loaded and has not been priced yet.
@@ -3199,7 +3223,8 @@ internal sealed class Scan
         // showing twenty milliseconds against a ten millisecond average looks like either way.
         sweeping.Dispose();
 
-        if ((_known.Count > _saved || ModsKnownCount() > _savedMods || _loneVerdicts > _savedLone) &&
+        if ((_known.Count > _saved || ModsKnownCount() > _savedMods || _loneVerdicts > _savedLone ||
+             SpentRemnantCount() > _savedSpent) &&
             DateTime.UtcNow - _wrote > TimeSpan.FromSeconds(10))
             using (Spent.On("Scan.Tick/Keep"))
                 Keep();

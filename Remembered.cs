@@ -129,6 +129,9 @@ internal static class Remembered
                     // Whether a remnant was found to belong to no dig site, which is settled only by picking a
                     // recipe beside it and is not something to have to do twice. See Target.Lone.
                     target.Lone switch { true => "1", false => "0", _ => "" },
+                    // A remnant's activated state once blown (6) or shattered (7), which is never undone and cannot be
+                    // read again once a shattered remnant leaves the entity list; blank otherwise. See Target.KeptActivated.
+                    target.KeptActivated >= 6 ? target.KeptActivated.ToString(CultureInfo.InvariantCulture) : "",
                     target.Meta));
             }
 
@@ -248,6 +251,10 @@ internal static class Remembered
                     // One more, the modifiers, read the same way; a file written before it has none.
                     Mods = parts.Length > 23 ? parts[22] : "",
                     Lone = parts.Length > 24 ? parts[23] switch { "1" => true, "0" => false, _ => null } : null,
+                    // And whether it was spent, read the same way; a file written before it has none. See Target.KeptActivated.
+                    KeptActivated = parts.Length > 25 && long.TryParse(parts[24], NumberStyles.Integer, CultureInfo.InvariantCulture, out var kept)
+                        ? kept
+                        : -1,
                     Meta = parts[^1],
                 };
 
