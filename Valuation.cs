@@ -1892,6 +1892,108 @@ internal sealed class Valuation
         return data == null ? 0 : Math.Max(0, Safe.Read(() => data.RuneCount, 0));
     }
 
+    /// <summary>
+    /// Where in a remnant's encounter data the loot id of the player it belongs to sits: Player.AllocatedLootId, as the
+    /// game's "you are not a valid owner of this remnant" at another player's site implies a remnant has one. Read: the
+    /// players' ids searched for in every remnant's memory turned up one loot id per remnant here, varying between
+    /// remnants of one site, and never the local player's at a site where the game refused them (dump 2026-10-18
+    /// 23:28:53, 16 remnants, 6 players). That it is the owner is inferred, not confirmed. See OwnerOfRemnant.
+    /// </summary>
+    internal const int OwnerLootIdOffset = 0x1C4;
+
+    /// <summary>The loot id at OwnerLootIdOffset in a remnant's encounter data, or 0 when it cannot be read.</summary>
+    internal static uint OwnerLootIdOfRemnant(Entity entity)
+    {
+        var address = Safe.Read(() => entity.HashComponents.GetValueOrDefault(EncounterDataHash), 0L);
+
+        if (address < Offsets.Lowest)
+            return 0u;
+
+        var bytes = Safe.Read(() => entity.M.ReadBytes(address + OwnerLootIdOffset, 4), null);
+
+        return bytes is { Length: 4 } ? BitConverter.ToUInt32(bytes, 0) : 0u;
+    }
+
+    /// <summary>
+    /// Who a remnant belongs to, by its owner loot id: the name of the player with that Player.AllocatedLootId and whether
+    /// it is the local player (Autoloot.OwnLootId). UnknownOwner where it is not the local player's but whose cannot be
+    /// told: no name ever read for the id.
+    ///
+    /// **Remembered, because the id is there only while its player is in the area.** After the party left every remnant
+    /// read 0, a remnant that had read Uncut_Spear's id among them, and the game still refused it as "not a valid owner"
+    /// (dumps 2026-10-18 23:28:53 and 23:40:33). So the last id read on each remnant is kept for the area and used while
+    /// it reads 0, and every player's name is kept by loot id for the session, from the entity list while they are in
+    /// it. With nothing remembered, no id within SiteReach of a detonator that is another player's
+    /// (Detonator.SiteIsAnotherPlayers) is UnknownOwner as well; anywhere else it is null, as whether it is the local
+    /// player's cannot be told. Kept until the plugin reloads. Ids read once a second per remnant, players once a
+    /// second. See OwnerLootIdOffset.
+    /// </summary>
+    internal static (string Name, bool Yours)? OwnerOfRemnant(GameController gc, Entity remnant)
+    {
+        var now = DateTime.UtcNow;
+        var id = Safe.Read(remnant, static e => e.Id, 0u);
+        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
+        if (id == 0u)
+            return null;
+
+        if (now - _playersReadAt > OwnersReadFor)
+        {
+            _playersReadAt = now;
+
+            foreach (var entity in Safe.Read(gc, static g => g.EntityListWrapper.Entities, null) ?? [])
+            {
+                var player = Safe.Read(entity, static e => e.GetComponent<Player>(), null);
+                var loot = Safe.Read(player, static p => unchecked((uint)p.AllocatedLootId), 0u);
+                var name = Safe.Read(player, static p => p.PlayerName, "") ?? "";
+
+                if (loot != 0u && name.Length > 0)
+                    PlayerNamesByLootId[loot] = name;
+            }
+        }
+
+        var key = (area, id);
+
+        if (!OwnersOfRemnants.TryGetValue(key, out var owner) || now - owner.ReadAt > OwnersReadFor)
+        {
+            var read = OwnerLootIdOfRemnant(remnant);
+
+            // A 0 keeps the id last read here. See the summary.
+            owner = (read != 0u ? read : owner.LootId, now);
+            OwnersOfRemnants[key] = owner;
+        }
+
+        if (owner.LootId == 0u)
+        {
+            var at = Safe.Read(remnant, static e => e.GridPos, System.Numerics.Vector2.Zero);
+
+            return at != System.Numerics.Vector2.Zero && Detonator.SiteIsAnotherPlayers(gc) &&
+                   System.Numerics.Vector2.Distance(at, Detonator.DetonatorGridPosition(gc)) <= Detonator.SiteReach(gc)
+                ? (UnknownOwner, false)
+                : null;
+        }
+
+        var yours = owner.LootId == Autoloot.OwnLootId(gc);
+
+        return PlayerNamesByLootId.TryGetValue(owner.LootId, out var known)
+            ? (known, yours)
+            : (yours ? "you" : UnknownOwner, yours);
+    }
+
+    /// <summary>What OwnerOfRemnant names a remnant that is not the local player's when whose it is cannot be told.</summary>
+    internal const string UnknownOwner = "Unknown";
+
+    /// <summary>The last owner loot id read on each remnant, by area hash and entity id, and when it was read. See OwnerOfRemnant.</summary>
+    private static readonly Dictionary<(uint Area, uint Id), (uint LootId, DateTime ReadAt)> OwnersOfRemnants = new();
+
+    /// <summary>Every player's name seen this session, by loot id. See OwnerOfRemnant.</summary>
+    private static readonly Dictionary<uint, string> PlayerNamesByLootId = new();
+
+    private static DateTime _playersReadAt;
+
+    /// <summary>How long an owner or the players are answered from their last reading. Chosen.</summary>
+    private static readonly TimeSpan OwnersReadFor = TimeSpan.FromSeconds(1);
+
     private static Expedition2EncounterData Data(Entity entity)
     {
         if (entity == null)

@@ -1413,10 +1413,10 @@ internal static partial class Tablets
     /// <summary>MoveSettle with no ping read. Chosen.</summary>
     private const int MoveSettleUnknownMs = 300;
 
-    /// <summary>Settings.TabletRerolling.ShortestMoveWhenDepositingMs, as last read; 0 for ExileInput2's own. See Draw.</summary>
+    /// <summary>Settings.TabletRerolling.ShortestMoveWhenDepositingMs, as last read. See Draw.</summary>
     private static int _shortestMoveDepositingMs;
 
-    /// <summary>Settings.TabletRerolling.ShortestMoveBetweenTabletsMs, as last read; 0 for ExileInput2's own. See Draw.</summary>
+    /// <summary>Settings.TabletRerolling.ShortestMoveBetweenTabletsMs, as last read. See Draw.</summary>
     private static int _shortestMoveMs;
 
     /// <summary>The cell of the tablet the move in flight is for, or null for anything else. See the Moving step.</summary>
@@ -1473,7 +1473,7 @@ internal static partial class Tablets
     {
         // The Deposit zone's run has its own. See TabletRerollingSettings.ShortestMoveWhenDepositingMs.
         var shortest = _run == TabletRun.Deposit ? _shortestMoveDepositingMs : _shortestMoveMs;
-        var wanted = hop && shortest > 0 ? shortest : -1;
+        var wanted = hop ? shortest : -1;
 
         if (_shortestMoveApplied != wanted && Input.SetShortestMove(wanted))
             _shortestMoveApplied = wanted;

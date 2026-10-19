@@ -109,7 +109,7 @@ internal static class InventoryDeposit
     /// <summary>When the run paused for the game taking typed input. See Tick.</summary>
     private static DateTime _pausedSince;
 
-    /// <summary>Shortest move between items, read when the run began; 0 for ExileInput2's own.</summary>
+    /// <summary>Shortest move between items, read when the run began.</summary>
     private static int _shortestMs;
 
     private static DateTime _deadline;
@@ -216,12 +216,11 @@ internal static class InventoryDeposit
         Tablets.UseTolerance(Tablets.TabletTolerancePx);
 
         // For the moves the queue did not plan - a retry, a re-aim. The planned ones carry their own. See GiveQueue.
-        input.SetShortestMove(_shortestMs > 0 ? _shortestMs : -1);
+        input.SetShortestMove(_shortestMs);
 
         // The part of every move that grows with its length, for the whole run, planned moves included: set before the
         // queue is planned, which times each move with it. See AutodepositSettings.MoveTimePerRootPixelBetweenItemsMs.
-        var perRootPixel = settings.Automation.Autodeposit.MoveTimePerRootPixelBetweenItemsMs.Value;
-        input.SetMoveTimePerRootPixel(perRootPixel > 0 ? perRootPixel : -1);
+        input.SetMoveTimePerRootPixel(settings.Automation.Autodeposit.MoveTimePerRootPixelBetweenItemsMs.Value);
         Queue.Clear();
 
         Sent.Clear();
@@ -462,7 +461,7 @@ internal static class InventoryDeposit
     /// </summary>
     private static void GiveQueue(AutoExpeditionSettings settings)
     {
-        var between = _shortestMs > 0 ? _shortestMs : -1;
+        var between = _shortestMs;
 
         Tablets.Input.PlanClicks(Queue.Select(q => q.Click.Rect).ToArray(), Queue.Select(q => q.Point).ToArray(),
             Queue.Select(q => q.Click.Right).ToArray(), Queue.Select(_ => new[] { System.Windows.Forms.Keys.LControlKey }).ToArray(),

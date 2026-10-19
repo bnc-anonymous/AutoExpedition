@@ -341,6 +341,9 @@ internal static class Dump
         foreach (var plan in lootPlans)
             b.AppendLine("    " + plan);
 
+        // Each move ahead during a walk, judged at the next click. See Autoloot.NoteClickAfterWalkAhead.
+        Autoloot.DescribeWalkAhead(b);
+
         // What the post-expedition pass last found and could not click, and why. See Placement.Unclickable.
         foreach (var thing in Placement.Unclickable)
             b.AppendLine($"    could not click: {thing}");
@@ -804,6 +807,7 @@ internal static class Dump
         EveryRecipe(b, gc);
         AtlasPassives(b, gc);
         RemnantSlotsFromTheClient(b, gc);
+        RemnantOwnerSearch(b, gc);
 
         b.AppendLine();
         SectionHeader(b, "=== reward and reroll lines, as last drawn ===");
@@ -2275,6 +2279,14 @@ internal static class Dump
         b.AppendLine($"  base is {(Detonator.Grand(gc) ? "GRAND" : "ordinary")} because the count is " +
                      $"{Detonator.ExplosivesToPlanFor(gc)} against {Detonator.GrandExplosives} - " +
                      $"{Detonator.Counting}");
+        b.AppendLine($"  at another player's site: {(Detonator.SiteIsAnotherPlayers(gc) ? "this is one" : "this is not one")}; " +
+                     $"{Detonator.ExplosivesStandingInOrder(gc).Length} explosive(s) down on this site's chain; learnt from " +
+                     $"owners' placements: {Detonator.LearnedAtAnotherPlayersSiteSaid}");
+
+        foreach (var explosive in Detonator.ExplosiveEntities(gc))
+            b.AppendLine($"    explosive entity id {Safe.Read(explosive, static e => e.Id, 0u)} at " +
+                         $"{Safe.Read(explosive, static e => e.GridPos, System.Numerics.Vector2.Zero):0} valid " +
+                         $"{Safe.Read(explosive, static e => e.IsValid, false)}");
         b.AppendLine("  the game's Grand flag, IngameData.CurrentArea: " + (Detonator.GrandAreaFields(gc) is { } fields
             ? $"AreaKind = 0x{fields.Kind:X} (Grand at 0x1C or 0x27), WorldAreaId = 0x{fields.WorldAreaId:X8} " +
               "(Grand with 0x1C03 in its low half) - " + (Detonator.GrandAreaFlag(gc) == true ? "GRAND" : "ordinary")
@@ -4451,6 +4463,115 @@ internal static class Dump
     /// socket count, which is why a two rune recipe is legal on a four socket remnant. This section
     /// is what one particular remnant actually offers.
     /// </summary>
+    /// <summary>
+    /// Where each player's ids turn up in each remnant's memory, to find which field, if any, names the player a remnant
+    /// belongs to: at another player's site the game answers "you are not a valid owner of this remnant" (2026-10-18), and
+    /// none of the components ExileCore2 names, nor the remnant's states, says whose it is. Searched for: every player in
+    /// the entity list's Player.AllocatedLootId - a large number, so a match is unlikely to be chance - and entity id,
+    /// small, so a match may be. Searched in: the remnant entity, each of its components by name and by id, and one
+    /// pointer deep from its encounter data (0x87B2) and InteractionAction. Reads only, at the dump. Modelled on
+    /// Autoloot.AllocationIdFound, which found where an item's allocation id sits the same way.
+    /// </summary>
+    private static void RemnantOwnerSearch(StringBuilder b, GameController gc)
+    {
+        b.AppendLine();
+        SectionHeader(b, "=== who each remnant belongs to: the players' ids searched for in its memory ===");
+
+        var wanted = new Dictionary<uint, string>();
+
+        foreach (var entity in Safe.Read(gc, static g => g.EntityListWrapper.Entities, null) ?? [])
+        {
+            var player = Safe.Read(entity, static e => e.GetComponent<Player>(), null);
+
+            if (player == null)
+                continue;
+
+            var name = Safe.Read(player, static p => p.PlayerName, "") ?? "";
+            var local = Safe.Read(entity, static e => e.Address, 0L) == Safe.Read(gc, static g => g.Player.Address, -1L);
+            var who = $"{(name.Length > 0 ? name : "?")}{(local ? " (you)" : "")}";
+            var loot = Safe.Read(player, static p => unchecked((uint)p.AllocatedLootId), 0u);
+            var id = Safe.Read(entity, static e => e.Id, 0u);
+
+            if (loot != 0u)
+                wanted.TryAdd(loot, $"{who}'s loot id");
+
+            if (id != 0u)
+                wanted.TryAdd(id, $"{who}'s entity id (small - may be chance)");
+        }
+
+        b.AppendLine("  looking for: " + (wanted.Count == 0
+            ? "no player read"
+            : string.Join(", ", wanted.Select(w => $"{w.Key} = {w.Value}"))));
+
+        if (wanted.Count == 0 || Scan == null)
+            return;
+
+        var memory = gc.Memory;
+
+        foreach (var target in Scan.Targets)
+        {
+            if (target.Kind != TargetKind.Remnant || target.Entity == null)
+                continue;
+
+            var entity = target.Entity;
+            var blocks = new List<(string Name, long Address, int Size)>
+            {
+                ("entity", Safe.Read(entity, static e => e.Address, 0L), 0x1000),
+            };
+
+            foreach (var (name, address) in Safe.Read(() => entity.CacheComp, null) ?? new Dictionary<string, long>())
+                blocks.Add((name, address, 0x400));
+
+            foreach (var (hash, address) in Safe.Read(() => entity.HashComponents, null) ?? new Dictionary<ushort, long>())
+                blocks.Add(($"0x{hash:X}", address, 0x400));
+
+            var found = new List<string>();
+
+            void Search(string name, long address, int size)
+            {
+                if (address < Offsets.Lowest)
+                    return;
+
+                var bytes = Safe.Read(() => memory.ReadBytes(address, size), null);
+
+                for (var at = 0; bytes != null && at + 4 <= bytes.Length; at += 4)
+                {
+                    if (wanted.TryGetValue(BitConverter.ToUInt32(bytes, at), out var what))
+                        found.Add($"{what} at {name}+0x{at:X}");
+                }
+            }
+
+            foreach (var (name, address, size) in blocks)
+                Search(name, address, size);
+
+            // One pointer deep from the encounter data and InteractionAction: the owner may sit in a structure they hold.
+            foreach (var (name, address, _) in blocks.Where(x => x.Name is "0x87B2" or "InteractionAction"))
+            {
+                var bytes = Safe.Read(() => memory.ReadBytes(address, 0x400), null);
+
+                for (var at = 0; bytes != null && at + 8 <= bytes.Length; at += 8)
+                {
+                    var pointer = BitConverter.ToInt64(bytes, at);
+
+                    if (pointer is > 0x10000L and < 0x7FFFFFFFFFFFL)
+                        Search($"[{name}+0x{at:X}]", pointer, 0x200);
+                }
+            }
+
+            var states = Safe.Read(() => string.Join(", ", target.Entity.GetComponent<StateMachine>()?.States
+                .Where(s => s.Name is "activated" or "is_rerolled")
+                .Select(s => $"{s.Name}={s.Value}") ?? []), "");
+
+            var owner = Valuation.OwnerOfRemnant(gc, entity);
+
+            b.AppendLine($"  remnant ({target.Grid.X:0},{target.Grid.Y:0}) entity {Safe.Read(entity, static e => e.Id, 0u)}, {states}, " +
+                         $"owner by 0x87B2+0x{Valuation.OwnerLootIdOffset:X} = {Valuation.OwnerLootIdOfRemnant(entity)}: " +
+                         $"{(owner is { } o ? o.Name + (o.Yours ? " (you)" : "") : "none read")}; " +
+                         $"{blocks.Count} blocks searched: " +
+                         (found.Count == 0 ? "no player's id found" : string.Join("; ", found.Distinct().Take(20))));
+        }
+    }
+
     private static void RemnantSlotsFromTheClient(StringBuilder b, GameController gc)
     {
         b.AppendLine();

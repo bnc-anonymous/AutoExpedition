@@ -2343,7 +2343,8 @@ public class AdvancedSolverSettings
     /// </summary>
     /// <summary>
     /// How many explosives a chain is planned for at another player's site, in a party, or 0 to work it out: 15 for a
-    /// Grand site and 5 otherwise, times the map's explosives increase, and never fewer than its owner has placed. Its
+    /// Grand site and 5 otherwise, or the most an owner has been seen to place at one of each kind this session, times
+    /// the map's explosives increase, and never fewer than its owner has placed. Its
     /// detonator panel gives no count. Planned only to compare with where its owner goes: the action key does not place
     /// there. See Detonator.ExplosivesAtAnotherPlayersSite.
     /// </summary>
@@ -2351,7 +2352,9 @@ public class AdvancedSolverSettings
         "In a party, at a site that is another player's, the game gives no explosive count.\n" +
         "The plan there - to compare with where they go - is made for this many explosives.\n" +
         "0 works it out: 15 on a Grand site, 5 otherwise, times the map's explosives increase,\n" +
-        "and never fewer than they have placed. A site is taken as Grand once they place more\n" +
+        "and never fewer than they have placed. Once an owner places more - an atlas bonus the\n" +
+        "game does not show you - their later sites are planned for that many, until you reload.\n" +
+        "A site is taken as Grand once they place more\n" +
         "than an ordinary site allows, or when it holds 7 or more remnants.\n" +
         "Nothing is placed there by the action key; it only loots.")]
     public RangeNode<int> ExplosivesAtAnotherPlayersSite { get; set; } = new RangeNode<int>(0, 0, 40);
@@ -3051,15 +3054,14 @@ public class AutomationSettings
     public ToggleNode ShowPlannedAutomation { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// Whether the clicks an action key loot run plans ahead are drawn, as the hideout's are: the items, spent remnants
-    /// and excavated chests that can be clicked without a walk, in the order they will be clicked, and the first one
-    /// that needs a walk last. See Placement.PlanLootAhead.
+    /// Whether the clicks an action key loot run or instant autoloot plans ahead are drawn, as the hideout's are: the
+    /// things that can be clicked without a walk, in the order they will be clicked, and the first one that needs a walk
+    /// last. Instant autoloot plans the items of one list line. See Placement.PlanLootAhead and Autoloot's plan in Tick.
     /// </summary>
     [Menu("Show planned automation: Autoloot",
-        "Draws the mouse moves and clicks an action key loot run has planned, as it goes, the\n" +
-        "same way as the hideout's: the items, spent remnants and chests that can be clicked\n" +
-        "from where you stand, in the order they will be clicked, then the first one that\n" +
-        "needs a walk.")]
+        "Draws the mouse moves and clicks an action key loot run or instant autoloot has planned,\n" +
+        "as it goes, the same way as the hideout's: what can be clicked from where you stand, in\n" +
+        "the order it will be clicked, then the first one that needs a walk.")]
     public ToggleNode ShowPlannedAutomationAutoloot { get; set; } = new ToggleNode(true);
 
     /// <summary>Whether a switch below is on AND automation is on at all.</summary>
@@ -3116,7 +3118,8 @@ public class AutolootSettings
     /// <summary>
     /// The post-expedition pass does what the action key list says: picks up its items, and shatters spent remnants and
     /// opens excavated chests where it has their ENTITY lines. Off, the list is kept and none of it is done. Needs Enable
-    /// automation. See Placement.Chore.
+    /// automation. Does nothing while chat or another text box has focus, as ExileInput2 refuses the cursor then. See
+    /// Placement.Chore.
     /// </summary>
     [Menu("Enable Autoloot",
         "Does what the action key list below says when you press the action key\n" +
@@ -3128,16 +3131,20 @@ public class AutolootSettings
         "- ENTITY:Remnants shatters spent remnants, ENTITY:ExcavatedChests opens\n" +
         "  excavated chests; without those lines neither is done\n" +
         "- one job at a time: with a party member in the area, higher lines first,\n" +
-        "  then the more expensive, then the nearer; alone, the nearest first\n" +
+        "  then on one line those in reach, then the dearest, those within Priority\n" +
+        "  threshold for loot matched by the same line nearest first; alone, the\n" +
+        "  nearest first\n" +
         "- moving the mouse stops it, and so does a key with Cancel autoloot on\n" +
         "  keyboard input; your input is never blocked\n" +
+        "- disabled while chat or another text box is open\n" +
         "Off, the list is kept and none of it is done.")]
     public ToggleNode EnableAutoloot { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// Items on the instant list are picked up as they appear, and the instant loot sounds play. Off, neither happens.
     /// Off by default: it moves the mouse and can block the player's input without a key being pressed. Needs Enable
-    /// automation. See Autoloot.Tick.
+    /// automation. Clicks nothing while chat or another text box has focus, as ExileInput2 refuses the cursor then; the
+    /// sound still plays. See Autoloot.Tick.
     /// </summary>
     [Menu("Enable Instant Autoloot",
         "Picks up items on the instant list below the moment they can be clicked,\n" +
@@ -3149,8 +3156,40 @@ public class AutolootSettings
         "  with Block mouse and keyboard during instant loot\n" +
         "- press the action key (F4 by default) to end a block and stop that pickup\n" +
         "- letters, digits and Space you were holding are pressed again after a block\n" +
-        "- plays a sound when a listed item appears, and when it is picked up or lost")]
+        "- plays a sound when a listed item appears, and when it is picked up or lost\n" +
+        "- disabled while chat or another text box is open; the sound still plays")]
     public ToggleNode EnableInstantAutoloot { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// After a click on an item out of pickup reach, which starts a walk, the cursor goes to where the next item the run
+    /// would choose is expected to be on screen once the character arrives, so the click after the walk is a short move.
+    /// Both runs: the action key run and instant loot. The point is an estimate (Autoloot.LabelAfterWalk); the next
+    /// click still aims at the label where it is then. Moving the mouse takes it back as at any other time. See
+    /// Autoloot.AfterClick and Placement's Step.Shattering.
+    /// </summary>
+    [Menu("Move cursor ahead during walks",
+        "After clicking an item that needs a walk, moves the cursor to where the next\n" +
+        "item is expected to be once the character arrives, so the next click is\n" +
+        "a short move. For both Autoloot and Instant Autoloot.\n\n" +
+        "The point is an estimate; the next click still aims at the item itself.\n" +
+        "Moving the mouse during the walk takes it back.")]
+    public ToggleNode MoveCursorAheadDuringWalks { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// With a party member in the area, how far apart in divines the prices of two jobs on one list line must be for the
+    /// dearer to go first; closer than that, the one nearer the cursor goes first in pickup reach, and the shorter walk
+    /// out of it. Measured from the dearest left at each look. Converted at the divine price in use; with none read yet,
+    /// price alone decides. Both runs. Chosen. See Autoloot.BestInLootOrder.
+    /// </summary>
+    [Menu("Priority threshold for loot matched by the same line (divines)",
+        "With a party member in the area, items on one list line are taken in\n" +
+        "reach first, then out of reach. Within each, the dearest goes first,\n" +
+        "and items priced within this many divines of it go nearest first:\n" +
+        "to the cursor in reach, to the character out of reach.\n\n" +
+        "At 0.25, items in reach at 2, 1.5, 1.4, 1.3 and 1 divine go 2 first,\n" +
+        "then 1.5, 1.4 and 1.3 nearest the cursor first, then 1.\n\n" +
+        "For both Autoloot and Instant Autoloot. 0 takes them strictly by price.")]
+    public RangeNode<float> SameLinePriorityThresholdDivines { get; set; } = new RangeNode<float>(0.25f, 0f, 5f);
 
     /// <summary>
     /// Instant loot picks items up only while a party member is in the area, where there is a race for them; alone they
@@ -3304,17 +3343,34 @@ public class AutolootSettings
     public ToggleNode CancelAutolootOnKeyboardInput { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// ExileInput2's Shortest Move for the action key's autoloot run, in place of ExileInput2's own 40ms: a move takes
-    /// this plus Move Time Per Root Pixel times the square root of its length in pixels, so this is the term that sets
-    /// the pace of short hops between labels, as Shortest move between tablets does for tablets. 0 uses ExileInput2's
-    /// own. 67 by default, chosen in play, not measured. Set when the run starts and handed back when it ends, as
-    /// explosive placement and the tablet runs share the caller name. Instant autoloot has its own speed. Needs an
-    /// ExileInput2 with SetShortestMove. See Placement.BeginLooting.
+    /// ExileInput2's Shortest Move for the action key's autoloot run, replacing ExileInput2's own (40ms by default): a
+    /// move takes this plus AutolootMoveTimePerRootPixelMs times the square root of its length in pixels, so this is the
+    /// term that sets the pace of short hops between labels. The value as it stands, 0 included, as Instant loot shortest
+    /// move is. 67 by default, chosen in play, not measured. Set when the run starts and handed back when it ends, as
+    /// explosive placement and the tablet runs share the caller name. Needs an ExileInput2 with SetShortestMove. See
+    /// Placement.BeginLooting.
+    ///
+    /// Named ShortestMoveWhenAutolootingMs until 0 stood for ExileInput2's own, so that 1 was faster than 0; renamed
+    /// with the change, so a saved 0 is not read as the new meaning.
     /// </summary>
-    [Menu("Shortest move when autolooting (ms)",
-        "The least time the mouse takes to move to each thing the action key loots.\n" +
-        "Raise it if short hops click too quickly. 0 uses ExileInput2's own setting.")]
-    public RangeNode<int> ShortestMoveWhenAutolootingMs { get; set; } = new RangeNode<int>(67, 0, 400);
+    [Menu("Autoloot shortest move (ms)",
+        "The fixed part of each mouse move to a thing the action key loots, however near it is.\n" +
+        "Raise it if short hops click too quickly. ExileInput2's own setting is 40.")]
+    public RangeNode<int> AutolootShortestMoveMs { get; set; } = new RangeNode<int>(67, 0, 400);
+
+    /// <summary>
+    /// ExileInput2's Move Time Per Root Pixel for the action key's autoloot run, replacing ExileInput2's own (6 by
+    /// default): the part of a move that grows with the square root of its length in pixels. The value as it stands, 0
+    /// included, as Instant loot move time per root pixel is; 0 with AutolootShortestMoveMs at 0 teleports. 6 by
+    /// default, ExileInput2's own default. Set and handed back with AutolootShortestMoveMs. See Placement.BeginLooting.
+    ///
+    /// Named MoveTimePerRootPixelWhenAutolootingMs until 0 stood for ExileInput2's own; renamed with the change, so a
+    /// saved 0 - the old default - is not read as the new meaning.
+    /// </summary>
+    [Menu("Autoloot move time per root pixel (ms)",
+        "The part of each mouse move to a thing the action key loots that grows with its length:\n" +
+        "higher is slower. ExileInput2's own setting is 6.")]
+    public RangeNode<int> AutolootMoveTimePerRootPixelMs { get; set; } = new RangeNode<int>(6, 0, 60);
     [JsonIgnore]
     public CustomNode InstantAutolootGroup { get; set; } = Section.Of("Instant Autoloot");
 
@@ -3400,9 +3456,26 @@ public class AutolootSettings
         "  blocked, but moving it does not stop the pickup for this long")]
     public RangeNode<int> MouseBlockMs { get; set; } = new RangeNode<int>(500, 125, 1000);
 
-    /// <summary>The instant loot move as a teleport rather than a fast movement. See Autoloot.FastMoveTimePerRootPixel.</summary>
-    [Menu("Teleport the mouse for instant loot", "Puts the cursor on the item at once instead of moving it there.")]
-    public ToggleNode TeleportForInstantLoot { get; set; } = new ToggleNode(false);
+    /// <summary>
+    /// ExileInput2's Shortest Move for the instant loot move: the fixed part of the move's time, near or far. 0 adds
+    /// nothing, unlike the action key's setting, where 0 means ExileInput2's own. 0 by default, so the move's time is
+    /// InstantLootMoveTimePerRootPixelMs alone. See Autoloot.Tick.
+    /// </summary>
+    [Menu("Instant loot shortest move (ms)",
+        "The fixed part of the instant loot mouse move, however near the item is.\n" +
+        "With this and the move time per root pixel both at 0, the cursor is put on the item at once.")]
+    public RangeNode<int> InstantLootShortestMoveMs { get; set; } = new RangeNode<int>(0, 0, 400);
+
+    /// <summary>
+    /// ExileInput2's Move Time Per Root Pixel for the instant loot move, in place of its own 6: the part of the move's
+    /// time that grows with the square root of its length in pixels. 0 with InstantLootShortestMoveMs at 0 teleports. 2 by
+    /// default, chosen, not measured: with no shortest move, about 60ms over 1000 pixels and 100ms over 2560 (2 x the square root),
+    /// which reads as close to a teleport. See Autoloot.Tick.
+    /// </summary>
+    [Menu("Instant loot move time per root pixel (ms)",
+        "The part of the instant loot mouse move that grows with its length: higher is slower.\n" +
+        "2 moves 1000 pixels in about 60ms; ExileInput2's own setting is 6.")]
+    public RangeNode<int> InstantLootMoveTimePerRootPixelMs { get; set; } = new RangeNode<int>(2, 0, 60);
 
     /// <summary>
     /// Whether an instant loot click goes out the moment the cursor reaches the item, from ExileInput2's own input thread,
@@ -3421,11 +3494,12 @@ public class AutolootSettings
     public ToggleNode ClickInstantLootWithoutWaiting { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// How many times an instant loot item is clicked again when its label is still there once the character has
-    /// stopped moving - a walk to it cut short. 0 is the item clicked once. See Autoloot.Tick.
+    /// How many times an instant loot item is clicked again when the click failed: the label still there and the
+    /// character standing, with no walk begun or no pickup within the ping plus a measured margin. 0 is the item clicked
+    /// once. See Autoloot.ClickFailed.
     /// </summary>
-    [Menu("Instant loot retries", "Clicks an instant loot item again if it is still there\n" +
-                                  "once your character has stopped moving.")]
+    [Menu("Instant loot retries", "Clicks an instant loot item again if the click did nothing:\n" +
+                                  "no walk towards it, or no pickup, within your ping plus a margin.")]
     public RangeNode<int> InstantLootRetries { get; set; } = new RangeNode<int>(1, 0, 1);
     /// <summary>"Instant autoloot: name" under the cursor for 4 seconds after each instant click. See Autoloot.DrawPickupNote.</summary>
     [Menu("Show instant loot message", "Shows \"Instant autoloot: <name>\" under the cursor for 4 seconds\nafter each instant pickup.")]
@@ -3530,25 +3604,27 @@ public class AutodepositSettings
     public ToggleNode EnableAutodeposit { get; set; } = new ToggleNode(true);
 
     /// <summary>
-    /// ExileInput2's Shortest Move for each move of a deposit run after its first, in place of ExileInput2's own 40ms; 0
-    /// uses ExileInput2's own. A move takes this plus Move time per root pixel between items times the square root of its
+    /// ExileInput2's Shortest Move for each move of a deposit run after its first, replacing ExileInput2's own (40ms by
+    /// default); the value as it stands, 0 included, where 0 once meant ExileInput2's own, so that 1 was faster than 0.
+    /// A move takes this plus Move time per root pixel between items times the square root of its
     /// length in pixels: 40 here with 10 there makes a hop to the next cell about 125ms and one across the inventory about
     /// 240ms, where 67 with ExileInput2's own 6 made every hop much the same, 115 to 145ms (2026-10-11). Put back when
     /// the run ends. See InventoryDeposit.
     /// </summary>
     [Menu("Shortest move between items (ms)",
         "The fixed part of every move from one item to the next.\n" +
-        "Lower is faster. 0 uses ExileInput2's own setting.")]
+        "Lower is faster. ExileInput2's own setting is 40.")]
     public RangeNode<int> ShortestMoveBetweenItemsMs { get; set; } = new RangeNode<int>(40, 0, 400);
 
     /// <summary>
-    /// ExileInput2's Move Time Per Root Pixel for a deposit run, in place of its own 6: the part of a move that grows with
-    /// its length, so a long hop takes longer than a short one. 0 uses ExileInput2's own. Put back when the run ends. See
+    /// ExileInput2's Move Time Per Root Pixel for a deposit run, replacing its own (6 by default): the part of a move that
+    /// grows with its length, so a long hop takes longer than a short one. The value as it stands, 0 included, where 0
+    /// once meant ExileInput2's own; 0 with Shortest move between items at 0 teleports. Put back when the run ends. See
     /// ShortestMoveBetweenItemsMs.
     /// </summary>
     [Menu("Move time per root pixel between items (ms)",
         "The part of each move that grows with its length: higher makes long\n" +
-        "hops take longer than short ones. 0 uses ExileInput2's own setting.")]
+        "hops take longer than short ones. ExileInput2's own setting is 6.")]
     public RangeNode<int> MoveTimePerRootPixelBetweenItemsMs { get; set; } = new RangeNode<int>(10, 0, 30);
 
     /// <summary>
@@ -4187,6 +4263,15 @@ public class RemnantDisplaySettings
 
     [Submenu(CollapsedByDefault = true)]
     public CombinationsWindowSettings RuneshapeCombinationsWindow { get; set; } = new CombinationsWindowSettings();
+
+    /// <summary>
+    /// Whether a remnant that belongs to another player has that player's name drawn in the world under it, spent
+    /// remnants included; your own remnants have none. In a party the game refuses a remnant to anyone but its owner. See
+    /// Overlay.Owners and Valuation.OwnerOfRemnant.
+    /// </summary>
+    [Menu("Show name under remnants not owned by you", "Names the player a remnant belongs to, under it,\n" +
+                                                       "when that is not you. In a party only they can use it.")]
+    public ToggleNode ShowNameUnderRemnantsNotOwnedByYou { get; set; } = new ToggleNode(true);
 }
 
 /// <summary>

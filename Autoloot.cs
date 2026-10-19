@@ -26,12 +26,15 @@ namespace AutoExpedition;
 /// things nobody meant.
 ///
 /// **Instant loot.** Its list may hold the action key list's ENTITY lines too, which shatter spent remnants and open
-/// chests as they become clickable. One item at a time: with a party member in the area, in list order, the most
-/// expensive within a line by NinjaPricer and then the nearest; alone, the nearest. See TopFirstNow. The cursor is taken, the player's mouse ignored - and by default blocked - for Mouse block time, the move
-/// made fast or as a teleport, and one click sent. The cursor is taken from a placement or tablet run that holds it
+/// chests as they become clickable. One item at a time: with a party member in the area, in list order, and within a
+/// line those in pickup reach first, then by NinjaPricer the dearest, those within Priority threshold for loot matched by
+/// the same line of each other taken nearest first; alone, the nearest. See TopFirstNow and BestInLootOrder. An item in reach plans the rest of its line in reach and the line's nearest
+/// out of reach, and the cursor glides through them; see the plan in Tick. The cursor is taken, the player's mouse ignored - and by default blocked - for Mouse block time, the move
+/// made at Instant loot shortest move and Instant loot move time per root pixel, and one click sent. The cursor is taken from a placement or tablet run that holds it
 /// (InstantLootPriority). Each item is tried once, by entity id, whether the click took or not,
-/// for as long as the area lasts. The next item waits until the last one's label has gone, so a click is never sent
-/// at a label about to move as the one before it is picked up.
+/// for as long as the area lasts. After a click on an item in pickup reach the next is clicked at once, the pickup
+/// checked in the background (InReachPickups); after one that needs a walk, from under other labels, or with the
+/// inventory open, the next waits until its label has gone.
 /// </summary>
 internal static class Autoloot
 {
@@ -43,9 +46,6 @@ internal static class Autoloot
     /// it is stopped with TakenOver and says so, and is started again by pressing its key. See ExileInput2.TakeWithPriority.
     /// </summary>
     private const int InstantLootPriority = 1;
-
-    /// <summary>Move Time Per Root Pixel for the instant loot move, in place of ExileInput2's own (6 by default): about 60ms over 1000 pixels.</summary>
-    private const int FastMoveTimePerRootPixel = 2;
 
     /// <summary>How long a clicked item's label may stay before the next item is tried anyway: a walk to it, or a pickup that failed.</summary>
     private static readonly TimeSpan LabelGoneWithin = TimeSpan.FromSeconds(5);
@@ -93,6 +93,16 @@ internal static class Autoloot
 
     /// <summary>What the instant loot run last did, for the dump.</summary>
     private static string _lastOutcome = "nothing yet";
+
+    /// <summary>
+    /// For the dump: the last idle look that saw a listed item, with the time, and what it did with it - taken up, or
+    /// why not. Written only when something listed was in view, so it survives the item being gone by the time of the
+    /// dump. The sound plays on seeing an item; every reason here is one where it plays and nothing is clicked.
+    /// </summary>
+    private static string _lastListedDecision = "no listed item seen yet";
+
+    private static void RecordListedDecision(string decision) =>
+        _lastListedDecision = $"{DateTime.Now:HH:mm:ss.fff} {decision}";
 
     public static void Initialise(GameController gc, string pluginDirectory)
     {
@@ -288,6 +298,8 @@ internal static class Autoloot
         RetriesOfItems.Clear();
         CoveredUntil.Clear();
         SoundedItemIds.Clear();
+        PendingConfirmations.Clear();
+        InReachPickups.Clear();
         PricesOfItems.Clear();
         UnpricedUntil.Clear();
         FactsOfItems.Clear();
@@ -504,13 +516,196 @@ internal static class Autoloot
     /// How near the player an item may be and be picked up without walking, in grid: an item that close counts as at the
     /// player's feet when ordering, so nearer ones do not win over it on distance alone. Measured: of 19 pickups after a
     /// click, the three that walked first ended 23.2, 23.5 and 23.8 grid from the item, and the other 16 were clicked from
-    /// 1.4 to 9.2 (dump 2026-10-11 15:37:16). 23 sits just under the walked ones. Each pickup after a click is measured
-    /// into the dump; see ObservePickups.
+    /// 1.4 to 9.2 (dump 2026-10-11 15:37:16). Since, the character has stopped as far as 24.0 grid from an item it walked
+    /// to, and 23.3 to 23.9 in all ten walks judged in the dump of 2026-10-19 14:15:21; the game stops it once the item
+    /// is in reach, so the reach is at least that. 24 rather than 23, which took items 23 to 24 grid away as walks:
+    /// waited for and never planned. Each pickup after a click is measured into the dump; see ObservePickups.
     /// </summary>
-    internal const float PickupReachGrid = 23f;
+    internal const float PickupReachGrid = 24f;
 
     /// <summary>The walk to an item that far away: none within PickupReachGrid, otherwise the distance past it.</summary>
     internal static float WalkToItem(float away) => Math.Max(0f, away - PickupReachGrid);
+
+    /// <summary>
+    /// Where a label now at label on screen is expected once the character has walked into pickup reach of walkTo, a grid
+    /// position; null where no walk is needed, a position cannot be read, or the point falls within Placement.Margin of
+    /// the window's edge or outside it. Such a job cannot be clicked from the walk's end, and a point clamped to the edge
+    /// sent the cursor towards an item the walk had taken off screen, the run then ending with it unclickable (dump
+    /// 2026-10-19 14:19:40, 35.034). The
+    /// camera follows the character, so the screen moves by the screen point of where the character stands now less that
+    /// of where the walk ends, both projected with the camera as it is now. The walk is taken to end PickupReachGrid short
+    /// of walkTo in a straight line, so a walk round an obstacle ends elsewhere and the estimate is off by the difference.
+    /// See AutolootSettings.MoveCursorAheadDuringWalks.
+    /// </summary>
+    internal static Vector2? LabelAfterWalk(GameController gc, Vector2 walkTo, Vector2 label)
+    {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+        var window = Safe.Read(gc, static g => g.Window.GetWindowRectangle(), default);
+        var away = Vector2.Distance(player, walkTo);
+
+        if (player == Vector2.Zero || walkTo == Vector2.Zero || label == Vector2.Zero || camera == null ||
+            window.Width <= 2f * Placement.Margin || window.Height <= 2f * Placement.Margin || away <= PickupReachGrid)
+            return null;
+
+        var end = WalkEnd(player, walkTo);
+        var standsWorld = Safe.Read(() => gc.IngameState.Data.ToWorldWithTerrainHeight(player), Vector3.Zero);
+        var endWorld = Safe.Read(() => gc.IngameState.Data.ToWorldWithTerrainHeight(end), Vector3.Zero);
+
+        if (standsWorld == Vector3.Zero || endWorld == Vector3.Zero)
+            return null;
+
+        var stands = Safe.Read((camera, standsWorld), static x => x.camera.WorldToScreen(x.standsWorld), Vector2.Zero);
+        var ends = Safe.Read((camera, endWorld), static x => x.camera.WorldToScreen(x.endWorld), Vector2.Zero);
+
+        if (stands == Vector2.Zero || ends == Vector2.Zero)
+            return null;
+
+        var at = label + stands - ends;
+
+        return at.X > Placement.Margin && at.Y > Placement.Margin &&
+               at.X < window.Width - Placement.Margin && at.Y < window.Height - Placement.Margin
+            ? at
+            : null;
+    }
+
+    /// <summary>
+    /// Where a walk from player to an item at walkTo is taken to end, in grid: PickupReachGrid short of it in a straight
+    /// line, or where the player stands when it is already in reach. See LabelAfterWalk.
+    /// </summary>
+    internal static Vector2 WalkEnd(Vector2 player, Vector2 walkTo)
+    {
+        var away = Vector2.Distance(player, walkTo);
+
+        return away > PickupReachGrid ? walkTo + (player - walkTo) / away * PickupReachGrid : player;
+    }
+
+    /// <summary>
+    /// A move ahead during a walk, waiting to be judged at its run's next click, by run: the job it was for, the point
+    /// the cursor was sent to, the cursor's point at the walk's click, the item walked to, where the walk was taken to
+    /// end (LabelAfterWalk's straight line), and when. See NoteClickAfterWalkAhead.
+    /// </summary>
+    private static readonly Dictionary<string, (uint NextId, string NextName, Vector2 Guessed, Vector2 ClickedAt, Vector2 WalkTo,
+        Vector2 WalkEndGuessed, DateTime At)> WalkAheadGuesses = new();
+
+    /// <summary>
+    /// How long after the walk's click a move ahead is judged at the next click; later, it is counted as not judged. Two
+    /// of ten were judged about 3s after, one with the character stopped 98 grid from the item walked to - something
+    /// came between - while the rest came 190 to 700ms after (dump 2026-10-19 14:15:21). Chosen.
+    /// </summary>
+    private static readonly TimeSpan WalkAheadJudgedWithin = TimeSpan.FromSeconds(1.5);
+
+    /// <summary>Moves ahead whose next click came after WalkAheadJudgedWithin, not judged. See DescribeWalkAhead.</summary>
+    private static int _walkAheadNotJudged;
+
+    /// <summary>
+    /// Kept when a run has moved the cursor ahead of a walk, to be judged at its next click. Run names the run, "action
+    /// key" or "instant loot"; clickedAt is the cursor's point at the walk's click, read before the move ahead. See
+    /// AutolootSettings.MoveCursorAheadDuringWalks.
+    /// </summary>
+    internal static void NoteWalkAheadGuess(GameController gc, string run, uint nextId, string nextName, Vector2 guessed,
+        Vector2 clickedAt, Vector2 walkTo)
+    {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var end = player == Vector2.Zero ? player : WalkEnd(player, walkTo);
+
+        lock (WalkAheadGuesses)
+            WalkAheadGuesses[run] = (nextId, nextName, guessed, clickedAt, walkTo, end, DateTime.UtcNow);
+    }
+
+    /// <summary>
+    /// At a run's next click after a move ahead, before the cursor moves to it: how good the guess was, kept for the dump.
+    /// Whether it was the job guessed; how far the point aimed at is from the point guessed; how far the cursor still is
+    /// from it, against how far it would be without the move ahead, from the walk's click; and where the character
+    /// stopped, against the item walked to and the walk's guessed end. Nothing without a guess in hand. See
+    /// WalkAheadSaid.
+    /// </summary>
+    internal static void NoteClickAfterWalkAhead(GameController gc, string run, uint id, string name, Vector2 aimedAt)
+    {
+        (uint NextId, string NextName, Vector2 Guessed, Vector2 ClickedAt, Vector2 WalkTo, Vector2 WalkEndGuessed, DateTime At) guess;
+
+        lock (WalkAheadGuesses)
+        {
+            if (!WalkAheadGuesses.Remove(run, out guess))
+                return;
+        }
+
+        var since = DateTime.UtcNow - guess.At;
+
+        if (since > WalkAheadJudgedWithin)
+        {
+            _walkAheadNotJudged++;
+            return;
+        }
+
+        var cursor = CursorOnScreen(gc);
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var same = id == guess.NextId;
+        var off = Vector2.Distance(guess.Guessed, aimedAt);
+        var left = Vector2.Distance(cursor, aimedAt);
+        var without = Vector2.Distance(guess.ClickedAt, aimedAt);
+        var fromItem = player == Vector2.Zero ? -1f : Vector2.Distance(player, guess.WalkTo);
+        var fromEnd = player == Vector2.Zero ? -1f : Vector2.Distance(player, guess.WalkEndGuessed);
+
+        lock (WalkAheadResults)
+        {
+            WalkAheadResults.Add((same, off, left, without, fromItem, fromEnd,
+                $"{DateTime.Now:HH:mm:ss.fff} {run}: " +
+                (same ? $"{name}, as guessed" : $"guessed {guess.NextName}, chose {name}") +
+                $", {since.TotalMilliseconds:0}ms after the walk's click; guessed ({guess.Guessed.X:0},{guess.Guessed.Y:0}), " +
+                $"aimed at ({aimedAt.X:0},{aimedAt.Y:0}), off {off:0}px; the cursor {left:0}px from it, " +
+                $"{without:0}px without the move ahead; the character stopped {fromItem:0.0} grid from the item walked to, " +
+                $"{fromEnd:0.0} grid from the walk's guessed end"));
+
+            if (WalkAheadResults.Count > WalkAheadResultsKept)
+                WalkAheadResults.RemoveAt(0);
+        }
+    }
+
+    /// <summary>Each move ahead judged at the next click, newest last. See NoteClickAfterWalkAhead.</summary>
+    private static readonly List<(bool Same, float Off, float Left, float Without, float FromItem, float FromEnd, string Said)>
+        WalkAheadResults = new();
+
+    /// <summary>How many judged moves ahead are kept for the dump. Chosen.</summary>
+    private const int WalkAheadResultsKept = 60;
+
+    /// <summary>
+    /// Each move ahead during a walk judged at its run's next click, newest last, with medians over those of the job
+    /// guessed: the guess's error, the cursor's distance left with and without it, and where the character stopped. For
+    /// the dump. See NoteClickAfterWalkAhead.
+    /// </summary>
+    internal static void DescribeWalkAhead(StringBuilder b)
+    {
+        List<(bool Same, float Off, float Left, float Without, float FromItem, float FromEnd, string Said)> results;
+
+        lock (WalkAheadResults)
+            results = WalkAheadResults.ToList();
+
+        b.AppendLine($"  cursor moved ahead during walks, judged at the next click, newest last ({results.Count}; " +
+                     $"{_walkAheadNotJudged} not judged, their next click over {WalkAheadJudgedWithin.TotalSeconds:0.#}s after " +
+                     "the walk's click):" + (results.Count == 0 ? " none since the plugin loaded" : ""));
+
+        if (results.Count == 0)
+            return;
+
+        var same = results.Where(r => r.Same).ToList();
+
+        static string Median(IEnumerable<float> values, string format)
+        {
+            var sorted = values.Where(v => v >= 0f).OrderBy(v => v).ToList();
+
+            return sorted.Count == 0 ? "-" : sorted[sorted.Count / 2].ToString(format);
+        }
+
+        b.AppendLine($"    the job guessed in {same.Count} of {results.Count}; over those, medians: guess off " +
+                     $"{Median(same.Select(r => r.Off), "0")}px, the cursor {Median(same.Select(r => r.Left), "0")}px from the " +
+                     $"job against {Median(same.Select(r => r.Without), "0")}px without the move ahead; the character stopped " +
+                     $"{Median(same.Select(r => r.FromItem), "0.0")} grid from the item walked to (taken as {PickupReachGrid:0}), " +
+                     $"{Median(same.Select(r => r.FromEnd), "0.0")} grid from the walk's guessed end");
+
+        foreach (var r in results)
+            b.AppendLine("    " + r.Said);
+    }
 
     /// <summary>
     /// Whether another party member is in this area, by either test: a party portrait without the portal icon, or
@@ -591,10 +786,11 @@ internal static class Autoloot
     private static string _partySaid = "not read yet";
 
     /// <summary>
-    /// Whether both lists are taken top first now - higher lines, then the more expensive, then the nearer - rather than
+    /// Whether both lists are taken top first now - higher lines, then those in pickup reach, then the dearer by more
+    /// than Priority threshold for loot matched by the same line, then the nearer (see BestInLootOrder) - rather than
     /// nearest first. Top first with another party member in this area, racing for the same loot; nearest first alone,
     /// where nothing can be lost and the shortest path round is best. Was a dropdown per list, removed 2026-10-11 as
-    /// this was the only choice worth making. See Beats.
+    /// this was the only choice worth making. See BestInLootOrder.
     /// </summary>
     internal static bool TopFirstNow(GameController gc) => PartyInArea(gc);
 
@@ -707,20 +903,89 @@ internal static class Autoloot
         }
     }
 
-    /// <summary>
-    /// Whether a candidate beats the best so far. Top first: a higher line, then on one line the more expensive, then the
-    /// shorter walk, then the label nearer the cursor. Nearest first: the shorter walk, then the label nearer the cursor -
-    /// so among items within pickup reach, which all walk 0 (WalkToItem), the cursor's nearest goes first, and only when
-    /// none is in reach does distance decide. Shared by the instant run and the post-expedition pass.
-    /// </summary>
-    internal static bool Beats(bool topFirst, int rank, double price, float away, float fromCursor,
-        int bestRank, double bestPrice, float bestAway, float bestFromCursor) =>
-        topFirst && rank != bestRank ? rank < bestRank :
-        topFirst && price != bestPrice ? price > bestPrice :
-        away != bestAway ? away < bestAway :
-        fromCursor < bestFromCursor;
+    /// <summary>What the loot order weighs of one candidate: its list line, price in exalts, walk in grid and how far its label is from the cursor in pixels. See BestInLootOrder.</summary>
+    internal readonly record struct LootOrderFacts(int Rank, double Price, float Away, float FromCursor);
 
-    /// <summary>The cursor's position on screen, or the screen's corner when it cannot be read. See Beats.</summary>
+    /// <summary>
+    /// The candidate the loot order takes, by index, or -1 with none; for both the action key run and instant loot.
+    ///
+    /// Top first: the highest list line. On it, those within pickup reach, which all walk 0 (WalkToItem), before those
+    /// out of it. Of those, the ones priced within bandExalts of the dearest; and of them, in reach the label nearest the
+    /// cursor, out of reach the shortest walk. So with a band of 0.25 divine, items in reach at 2, 1.5, 1.4, 1.3 and 1
+    /// divine go 2 first, then 1.5, 1.4 and 1.3 nearest the cursor first, then 1. The band is measured from the dearest
+    /// left at each look, so once 1.5 is taken an item at 1.2 would join 1.4 and 1.3. A higher line still wins whatever
+    /// the walk: a Mirror of Kalandra out of reach is walked to before a Divine Orb at the feet.
+    ///
+    /// Nearest first: the shortest walk, then the label nearest the cursor.
+    ///
+    /// Price came before the walk in the action key run, one candidate against the next: with a party member in the area
+    /// it walked to a 10ex item past others of the same line worth 2 to 5ex within reach (the player's account; the dump
+    /// of 2026-10-19 13:39:43 reads top first, party in area True). See AutolootSettings.SameLinePriorityThresholdDivines.
+    /// </summary>
+    internal static int BestInLootOrder(IReadOnlyList<LootOrderFacts> candidates, bool topFirst, double bandExalts)
+    {
+        var best = -1;
+
+        if (!topFirst)
+        {
+            for (var i = 0; i < candidates.Count; i++)
+            {
+                var c = candidates[i];
+
+                if (best < 0 || c.Away < candidates[best].Away ||
+                    c.Away == candidates[best].Away && c.FromCursor < candidates[best].FromCursor)
+                    best = i;
+            }
+
+            return best;
+        }
+
+        if (candidates.Count == 0)
+            return -1;
+
+        var rank = candidates.Min(c => c.Rank);
+        var inReach = candidates.Any(c => c.Rank == rank && c.Away <= 0f);
+        var dearest = candidates.Where(c => c.Rank == rank && c.Away <= 0f == inReach).Max(c => c.Price);
+
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var c = candidates[i];
+
+            if (c.Rank != rank || c.Away <= 0f != inReach || c.Price < dearest - bandExalts)
+                continue;
+
+            if (best < 0 ||
+                (inReach
+                    ? c.FromCursor < candidates[best].FromCursor
+                    : c.Away < candidates[best].Away ||
+                      c.Away == candidates[best].Away && c.FromCursor < candidates[best].FromCursor))
+                best = i;
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Whether a candidate loses to one already found whatever its price and label: top first, a lower line, or out of
+    /// reach on a line with one in reach; nearest first, a longer walk. So its clickable point, the dear part of a look,
+    /// need not be worked out. See BestInLootOrder.
+    /// </summary>
+    internal static bool LosesInLootOrder(bool topFirst, int rank, float away, IReadOnlyList<LootOrderFacts> found)
+    {
+        foreach (var f in found)
+        {
+            if (topFirst ? f.Rank < rank || f.Rank == rank && f.Away <= 0f && away > 0f : f.Away < away)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>The price band of the loot order in exalts: Priority threshold for loot matched by the same line at the divine price in use, 0 before one is read. See BestInLootOrder.</summary>
+    internal static double LootOrderBandExalts(AutoExpeditionSettings settings) =>
+        settings.Automation.Autoloot.SameLinePriorityThresholdDivines.Value * Math.Max(0d, Valuation.DivineInExalts);
+
+    /// <summary>The cursor's position on screen, or the screen's corner when it cannot be read. See BestInLootOrder.</summary>
     internal static Vector2 CursorOnScreen(GameController gc) =>
         Safe.Read(gc, static g => new Vector2(g.IngameState.MousePosX, g.IngameState.MousePosY), Vector2.Zero);
 
@@ -1059,6 +1324,12 @@ internal static class Autoloot
     {
         var autoloot = settings.Automation.Autoloot;
 
+        // Every Tick, whatever the phase, while a click's response is being timed. See ClickResponse.
+        ObserveClickResponse(gc);
+
+        // Every Tick, whatever the phase: the pickups in reach the run did not wait for. See InReachPickups.
+        StepInReachPickups(gc, settings);
+
         // **A look at the ground every ScanEvery, not every Tick.** Tick ran about eleven times a rendered frame, each
         // reading every ground label - 498 in the list, 32 on screen - for 18ms and 15MB a call (dump 2026-10-11
         // 15:58:49). A move or a wait in hand still steps every Tick.
@@ -1074,6 +1345,7 @@ internal static class Autoloot
             listed = _phase == Phase.Idle ? ListedOnGround(gc, autoloot.InstantLootItems) : [];
 
         SoundForNewItems(gc, settings, listed);
+        ConfirmInBackground(gc, settings);
 
         // The action key pressed during the block: ExileInput2 has already ended the key and mouse blocks, and the
         // pickup stops here, before its click if it had not been sent. See AutolootSettings.ActionKeyEndsInputBlock.
@@ -1121,8 +1393,22 @@ internal static class Autoloot
                     // The label gone is not the item carried: a party member's pickup takes it the same way. See
                     // ConfirmPickup.
                     _deadline = DateTime.UtcNow + InventoryShowsWithin;
-                    _phase = Phase.ConfirmingPickup;
-                    ConfirmPickup(gc, settings);
+
+                    if (PickedUpOntoCursor(gc) != null)
+                    {
+                        _phase = Phase.ConfirmingPickup;
+                        ConfirmPickup(gc, settings);
+
+                        return;
+                    }
+
+                    // **Confirmed in the background, not waited on.** Waiting held the run for InventoryShowsWithin
+                    // whenever the item went to somebody else, since the count then never rises, and every other listed
+                    // item in view waited out the second. See ConfirmInBackground.
+                    PendingConfirmations.Add((_itemName, _targetMetadata, _carriedAtClick, _deadline));
+                    _phase = Phase.Idle;
+                    _scannedAt = DateTime.MinValue;
+                    ConfirmInBackground(gc, settings);
 
                     return;
                 }
@@ -1136,7 +1422,7 @@ internal static class Autoloot
                     return;
                 }
 
-                // The walk's start, measured for WalkStartsWithin.
+                // The walk's start, measured for WalkStartsMeasured and ClickFailed.
                 var moving = MovingNow(gc);
 
                 if (_walkExpected && !_walkSeen && moving)
@@ -1148,23 +1434,28 @@ internal static class Autoloot
                         WalkStartsMeasured.RemoveAt(0);
                 }
 
-                // **A walk expected and not begun lets the keyboard go.** An item out of pickup reach is walked to; a
-                // character still standing WalkStartsWithin after the click is not going to, and the block would only hold
-                // the player still for nothing. See KeyBlockMs.
-                if (_keysBlocked && _walkExpected && !_walkSeen && DateTime.UtcNow - _clickedAt >= WalkStartsWithin && !moving)
+                // **A click that failed**, with the label still there and the character standing: no walk begun
+                // ClickFailsAfterMs after the button went down, for an item out of reach; no pickup by then, for one in
+                // reach; and for a walk that has ended, no pickup that long after the character stopped, as arriving
+                // starts the same pickup an item in reach does. With a retry left (Instant loot retries) it is clicked
+                // again, under the key block, so the retry's walk is not cut short. With none, the keyboard is let go and
+                // the item given up, so the run goes on to the rest in view rather than waiting out LabelGoneWithin
+                // with the player's keys held: a fixed 400ms after the click let the keyboard go before, and nothing
+                // else did.
+                if (!moving && ClickFailed(gc) is { Length: > 0 } failed)
                 {
-                    EndKeyBlock();
-                    _lastOutcome += "; no walk began, so the keyboard was let go";
-                }
-                // **A walk cut short, clicked again**, as Instant loot retries allows: the label still there and the
-                // character standing - which a click needs a moment to change, so not straight after it. Kept under the
-                // key block, so the retry's walk is not cut short the same way. See InstantLootRetries.
-                else if (DateTime.UtcNow - _clickedAt >= RetryAfterStandingMs && !moving &&
-                         RetriesOfItems.GetValueOrDefault(_itemId) < settings.Automation.Autoloot.InstantLootRetries)
-                {
-                    RetriesOfItems[_itemId] = RetriesOfItems.GetValueOrDefault(_itemId) + 1;
-                    TriedItemIds.Remove(_itemId);
-                    _lastOutcome = $"{_itemName}: still there with the character standing - clicked again";
+                    if (RetriesOfItems.GetValueOrDefault(_itemId) < settings.Automation.Autoloot.InstantLootRetries)
+                    {
+                        RetriesOfItems[_itemId] = RetriesOfItems.GetValueOrDefault(_itemId) + 1;
+                        TriedItemIds.Remove(_itemId);
+                        _lastOutcome = $"{_itemName}: {failed} - clicked again";
+                    }
+                    else
+                    {
+                        EndKeyBlock();
+                        _lastOutcome += $"; {failed}, with no retry left - given up, and the keyboard let go";
+                    }
+
                     _scannedAt = DateTime.MinValue;
                     _phase = Phase.Idle;
                 }
@@ -1172,17 +1463,38 @@ internal static class Autoloot
                 return;
         }
 
-        if (!settings.Automation.Enable.Value || !autoloot.EnableInstantAutoloot || _input is not { Available: true })
+        if (!settings.Automation.Enable.Value || !autoloot.EnableInstantAutoloot)
+        {
+            LetGoWhenNoPickupStarts();
             return;
+        }
+
+        if (_input is not { Available: true })
+        {
+            if (listed.Count > 0)
+                RecordListedDecision($"{listed[0].Name}: not clicked - ExileInput2 is not available");
+
+            LetGoWhenNoPickupStarts();
+            return;
+        }
 
         // Alone there is no race for an item: it is left for the action key. See DisableInstantAutolootWithoutParty.
         if (autoloot.DisableInstantAutolootWithoutParty.Value && !PartyInArea(gc))
+        {
+            LetGoWhenNoPickupStarts();
             return;
+        }
 
         // Nothing on the ground is clicked with the inventory open and an item on the cursor: the click would carry the
         // held item off. See PickedUpOntoCursor.
         if (InventoryPanelOpen(gc) && Tablets.ItemOnCursor(gc, true) != null)
+        {
+            if (listed.Count > 0)
+                RecordListedDecision($"{listed[0].Name}: not clicked - the inventory is open with an item on the cursor");
+
+            LetGoWhenNoPickupStarts();
             return;
+        }
 
         var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
         var covered = Panels.Covered(gc);
@@ -1190,23 +1502,51 @@ internal static class Autoloot
         var cursor = CursorOnScreen(gc);
         (Entity Of, int[] Path, uint Id, string Name, Vector2 At, int Rank, float Away, double Price, float FromCursor)? best = null;
 
+        // Items already in the plan being worked out, passed over as if tried. See PlanInstantLootAhead.
+        var setAside = new HashSet<uint>();
+
         // The best listed item whose label is under other labels and whose own place on screen is clear: taken only when
         // nothing else can be clicked. See StepUnderLabels.
         var underLabelsAllowed = settings.Automation.On(settings.Automation.Unhide);
         (Entity Of, int[] Path, uint Id, string Name, Vector2 At, int Rank, float Away, double Price, float FromCursor)? underLabels = null;
 
+        // Why listed items were passed over, for the dump. See RecordListedDecision.
+        int alreadyTried = 0, waitingAfterCovered = 0, withoutRoom = 0, notClickable = 0;
+
+        // Everything clickable and everything from under labels at this look, which the loot order chooses among as a
+        // whole, as its price band is measured from the dearest. See BestInLootOrder.
+        var band = LootOrderBandExalts(settings);
+        var clickable = new List<(Entity Of, int[] Path, uint Id, string Name, Vector2 At, int Rank, float Away, double Price, float FromCursor)>();
+        var clickableFacts = new List<LootOrderFacts>();
+        var fromUnder = new List<(Entity Of, int[] Path, uint Id, string Name, Vector2 At, int Rank, float Away, double Price, float FromCursor)>();
+        var fromUnderFacts = new List<LootOrderFacts>();
+
         void Consider(Entity of, int[] path, int rank, string name)
         {
             var id = Safe.Read(of, static e => e.Id, 0u);
 
-            if (id == 0u || TriedItemIds.Contains(id) ||
-                CoveredUntil.TryGetValue(id, out var lookAgain) && DateTime.UtcNow < lookAgain)
+            if (setAside.Contains(id))
                 return;
+
+            if (id == 0u || TriedItemIds.Contains(id))
+            {
+                alreadyTried++;
+                return;
+            }
+
+            if (CoveredUntil.TryGetValue(id, out var lookAgain) && DateTime.UtcNow < lookAgain)
+            {
+                waitingAfterCovered++;
+                return;
+            }
 
             // Not one with no room in the inventory, slots kept for it included. Not tried, so it is taken up once there
             // is room. See InventorySpace.
             if (path.Length == 0 && !InventorySpace.Fits(gc, of, 0))
+            {
+                withoutRoom++;
                 return;
+            }
 
             var away = Vector2.Distance(player, Safe.Read(of, static e => e.GridPos, Vector2.Zero));
             var price = path.Length == 0 ? PriceOfItem(gc, of) : 0d;
@@ -1215,9 +1555,9 @@ internal static class Autoloot
             if (path.Length == 0)
                 away = WalkToItem(away);
 
-            // One that cannot win even at the cursor is not looked at further: the clear-spot search is the dear part.
-            if (best is { } leader &&
-                !Beats(topFirst, rank, price, away, 0f, leader.Rank, leader.Price, leader.Away, leader.FromCursor))
+            // One that cannot win whatever its price and label is not looked at further: the clear-spot search is the
+            // dear part.
+            if (LosesInLootOrder(topFirst, rank, away, clickableFacts))
                 return;
 
             var rect = Placement.Button(gc, of, path).Rect;
@@ -1227,53 +1567,80 @@ internal static class Autoloot
             // it can be - or, an item whose label is on screen under other labels, from under them. See StepUnderLabels.
             if (at == Vector2.Zero)
             {
+                notClickable++;
+
                 if (underLabelsAllowed && path.Length == 0 && rect.Width > 0f && Placement.OnScreen(gc, rect.Center) &&
                     Safe.Read(of, static e => e.HasComponent<WorldItem>(), false) &&
                     Placement.ScreenOfItem(gc, of) is var lies && lies != Vector2.Zero && Placement.OnScreen(gc, lies) &&
-                    !Panels.Covers(covered, lies) && !Panels.Blocked(gc, lies, true) &&
-                    (underLabels is not { } under ||
-                     Beats(topFirst, rank, price, away, Vector2.Distance(cursor, lies), under.Rank, under.Price, under.Away, under.FromCursor)))
-                    underLabels = (of, path, id, name, lies, rank, away, price, Vector2.Distance(cursor, lies));
+                    !Panels.Covers(covered, lies) && !Panels.Blocked(gc, lies, true))
+                {
+                    fromUnder.Add((of, path, id, name, lies, rank, away, price, Vector2.Distance(cursor, lies)));
+                    fromUnderFacts.Add(new LootOrderFacts(rank, price, away, Vector2.Distance(cursor, lies)));
+                }
 
                 return;
             }
 
             var fromCursor = Vector2.Distance(cursor, at);
 
-            // See Beats.
-            if (best is { } held &&
-                !Beats(topFirst, rank, price, away, fromCursor, held.Rank, held.Price, held.Away, held.FromCursor))
-                return;
-
-            best = (of, path, id, name, at, rank, away, price, fromCursor);
+            clickable.Add((of, path, id, name, at, rank, away, price, fromCursor));
+            clickableFacts.Add(new LootOrderFacts(rank, price, away, fromCursor));
         }
-
-        foreach (var (item, _, rank, name) in listed)
-            Consider(item, [], rank, name);
 
         // ENTITY lines: shattering and chests, ranked by their line; without the line, not done. See RemnantsLine.
         var remnantsRank = RankOfLine(autoloot.InstantLootItems, RemnantsLine);
         var chestsRank = RankOfLine(autoloot.InstantLootItems, ExcavatedChestsLine);
 
-        if (remnantsRank != int.MaxValue && scan != null)
+        // Everything in view weighed with the cursor at cursorAt: the best clickable as best, the best from under labels
+        // as underLabels. Asked again with the cursor on each planned point to work out the plan. See the plan below.
+        void ChooseWithCursorAt(Vector2 cursorAt)
         {
-            foreach (var target in scan.Targets)
+            cursor = cursorAt;
+            clickable.Clear();
+            clickableFacts.Clear();
+            fromUnder.Clear();
+            fromUnderFacts.Clear();
+
+            foreach (var (item, _, rank, name) in listed)
+                Consider(item, [], rank, name);
+
+            if (remnantsRank != int.MaxValue && scan != null)
             {
-                if (target.Shatterable && target.Entity != null)
-                    Consider(target.Entity, Placement.ShatterPath, remnantsRank, "Spent remnant");
+                foreach (var target in scan.Targets)
+                {
+                    if (target.Shatterable && target.Entity != null)
+                        Consider(target.Entity, Placement.ShatterPath, remnantsRank, "Spent remnant");
+                }
             }
+
+            if (chestsRank != int.MaxValue)
+            {
+                foreach (var chest in Placement.ExcavatedChestsToOpen(gc))
+                    Consider(chest, [], chestsRank, "Excavated chest");
+            }
+
+            var chosenIndex = BestInLootOrder(clickableFacts, topFirst, band);
+            var underIndex = BestInLootOrder(fromUnderFacts, topFirst, band);
+
+            best = chosenIndex < 0 ? null : clickable[chosenIndex];
+            underLabels = underIndex < 0 ? null : fromUnder[underIndex];
         }
 
-        if (chestsRank != int.MaxValue)
-        {
-            foreach (var chest in Placement.ExcavatedChestsToOpen(gc))
-                Consider(chest, [], chestsRank, "Excavated chest");
-        }
+        ChooseWithCursorAt(cursor);
 
         var fromUnderLabels = best == null && underLabels != null;
 
         if ((best ?? underLabels) is not { } chosen)
+        {
+            if (listed.Count > 0)
+                RecordListedDecision($"{listed[0].Name}: not clicked - {listed.Count} listed in view, {alreadyTried} already " +
+                                     $"tried, {waitingAfterCovered} waiting after being covered, {withoutRoom} without inventory " +
+                                     $"room, {notClickable} off screen, behind a panel or under other labels" +
+                                     (underLabelsAllowed ? "" : " (\"Use the Toggle Highlighting key when buttons are obscured\" is off, so none is taken from under labels)"));
+
+            LetGoWhenNoPickupStarts();
             return;
+        }
 
         // **Clear in the interface tree, not only of the panels the plugin knows**, before anything is taken: the spot was
         // judged against the fixed furniture and named panels alone, so a Divine Orb under the buff bar was moved to,
@@ -1287,14 +1654,35 @@ internal static class Autoloot
             // and the buff bar alike. A second walk, paid only on this path and at most once per CoveredWait.
             _lastOutcome = $"{chosen.Name}: under a piece of the interface - not clicked, looked at again shortly; " +
                            $"at ({chosen.At.X:0},{chosen.At.Y:0}) {Panels.Why(gc, chosen.At)}";
+            RecordListedDecision(_lastOutcome);
+            LetGoWhenNoPickupStarts();
             return;
         }
 
         // An ExileInput2 without TakeWithPriority falls back to an ordinary Take, and waits for the cursor to be free.
         if (!(_input.TakeWithPriority(InstantLootPriority) || _input.Take()))
+        {
+            // **A refusal can be a stop, and a stop is cleared only by Release.** ExileInput2 stops a caller whose claim
+            // finds the game out of focus or typing into chat, and refuses every later claim from it until it releases.
+            // The idle look releases nothing, as it holds nothing, so one claim made while chat was open refused every
+            // listed item for the rest of the area. Released here, the next look claims again. With no stop, the cursor
+            // is held by another caller at the same or a higher priority.
+            var stopped = _input.Stopped();
+
+            if (stopped.Length > 0)
+                _input.Release();
+
+            RecordListedDecision(stopped.Length > 0
+                ? $"{chosen.Name}: not clicked - ExileInput2 had stopped instant loot ({stopped}); released, to claim again on the next look"
+                : $"{chosen.Name}: not clicked - ExileInput2 refused the cursor, held by another caller");
+            LetGoWhenNoPickupStarts();
             return;
+        }
+
+        RecordListedDecision($"{chosen.Name}: taken up");
 
         _itemId = chosen.Id;
+        _pickupFromUnderLabels = fromUnderLabels;
         _itemName = chosen.Name;
         _target = chosen.Of;
         _targetPath = chosen.Path;
@@ -1314,8 +1702,8 @@ internal static class Autoloot
 
         if (blockInput)
             _keysBlocked = _input.BlockPlayerKeys(KeyBlockMs, _restoreHeldKeys, _cancelKey);
-        _input.SetShortestMove(0);
-        _input.SetMoveTimePerRootPixel(autoloot.TeleportForInstantLoot.Value ? 0 : FastMoveTimePerRootPixel);
+        _input.SetShortestMove(autoloot.InstantLootShortestMoveMs.Value);
+        _input.SetMoveTimePerRootPixel(autoloot.InstantLootMoveTimePerRootPixelMs.Value);
 
         // **From under other labels: the labels off the screen first**, the move once they read gone. See StepUnderLabels.
         if (fromUnderLabels)
@@ -1341,7 +1729,126 @@ internal static class Autoloot
             return;
         }
 
-        if (!_input.MoveTo(new RectangleF(chosen.At.X - 3f, chosen.At.Y - 3f, 6f, 6f)))
+        // **The items after this one, planned with it**, when this is not already the next of the plan in hand: the rest
+        // of its line within pickup reach, then its line's nearest out of reach. The cursor glides through them, and is
+        // kept between their clicks, since handing it back drops the plan. Each click still waits for the last label to
+        // go. Worked out by choosing again with each planned item set aside and the cursor on the one before, as it will
+        // be when the run chooses, so the plan is the run's own order.
+        _nextAfterWalk = null;
+
+        if (_instantPlanned.Count > 0 && _instantPlanned[0].Id == chosen.Id && _instantPlanned[0].At == chosen.At)
+        {
+            _instantPlanned.RemoveAt(0);
+            SayInstantPlan($"{chosen.Name}: followed the plan, {_instantPlanned.Count} still planned after it");
+        }
+        else
+        {
+            var dropped = _instantPlanned.Count > 0
+                ? $"the plan's next point was ({_instantPlanned[0].At.X:0},{_instantPlanned[0].At.Y:0}), this is ({chosen.At.X:0},{chosen.At.Y:0}) - "
+                : "";
+
+            _instantPlanned.Clear();
+
+            var isItem = chosen.Path.Length == 0 && Safe.Read(chosen.Of, static e => e.HasComponent<WorldItem>(), false);
+
+            if (!isItem)
+                SayInstantPlan($"{chosen.Name}: {dropped}not planned - not an item");
+            else if (chosen.Away > 0f)
+            {
+                // The item the run would choose once this one is picked up, for the cursor to go ahead to during the
+                // walk. See MoveCursorAheadOfWalk.
+                // Chosen with the character where the walk is taken to end, as the run will choose once there: from where
+                // it stands the walks differ, and another item of the same name was chosen (dump 2026-10-19 14:15:21).
+                // The cursor on this item's label, which the screen's move leaves where it is against the others.
+                if (autoloot.MoveCursorAheadDuringWalks.Value)
+                {
+                    var stands = player;
+
+                    player = WalkEnd(player, Safe.Read(chosen.Of, static e => e.GridPos, Vector2.Zero));
+                    setAside.Add(chosen.Id);
+                    ChooseWithCursorAt(chosen.At);
+                    player = stands;
+
+                    if (best is { } next)
+                        _nextAfterWalk = (next.Id, next.Name, next.At);
+                }
+
+                SayInstantPlan($"{chosen.Name}: {dropped}not planned - it needs a walk, so it is clicked and its pickup waited for alone");
+            }
+            else if (InventoryPanelOpen(gc))
+                SayInstantPlan($"{chosen.Name}: {dropped}not planned - the inventory is open, so each item is put down from the cursor");
+            else
+            {
+                var points = new List<Vector2> { chosen.At };
+                var ids = new List<uint> { chosen.Id };
+                var names = new List<string> { chosen.Name };
+                var ended = $"planned up to {InstantPlannedMost}, the most one plan holds";
+
+                setAside.Add(chosen.Id);
+
+                while (points.Count < InstantPlannedMost)
+                {
+                    ChooseWithCursorAt(points[^1]);
+
+                    if (best is not { } next)
+                    {
+                        ended = "nothing more to click from here";
+                        break;
+                    }
+
+                    // Top first, a plan keeps to one line: a higher line arriving is chosen at the next look anyway.
+                    if (topFirst && next.Rank != chosen.Rank)
+                    {
+                        ended = $"{next.Name} is on another line of the list";
+                        break;
+                    }
+
+                    if (next.Path.Length != 0 || !Safe.Read(next.Of, static e => e.HasComponent<WorldItem>(), false))
+                    {
+                        ended = $"{next.Name} is not an item";
+                        break;
+                    }
+
+                    setAside.Add(next.Id);
+                    points.Add(next.At);
+                    ids.Add(next.Id);
+                    names.Add(next.Name);
+
+                    // The first needing a walk ends it: the walk moves every label with the camera.
+                    if (next.Away > 0f)
+                    {
+                        ended = $"{next.Name} needs a walk";
+                        break;
+                    }
+                }
+
+                if (points.Count < 2)
+                    SayInstantPlan($"{chosen.Name}: {dropped}not planned - only one item ({ended})");
+                else
+                {
+                    var shortest = autoloot.InstantLootShortestMoveMs.Value;
+                    var planned = _input.PlanClicks(points.Select(p => new RectangleF(p.X - 3f, p.Y - 3f, 6f, 6f)).ToArray(),
+                        points.ToArray(), new bool[points.Count], points.Select(_ => Array.Empty<Keys>()).ToArray(),
+                        points.Select(_ => shortest).ToArray(), settings.Automation.ShowPlannedAutomationAutoloot.Value);
+
+                    if (planned)
+                    {
+                        for (var i = 1; i < points.Count; i++)
+                            _instantPlanned.Add((ids[i], points[i]));
+                    }
+
+                    SayInstantPlan(planned
+                        ? $"{chosen.Name}: {dropped}planned {points.Count} - {string.Join(", ", names)}; ended: {ended}"
+                        : $"{chosen.Name}: {dropped}not planned - ExileInput2 refused the plan of {points.Count}");
+                }
+            }
+        }
+
+        // How good a move ahead of the last walk was, before the cursor leaves where it put it. See MoveCursorAheadOfWalk.
+        NoteClickAfterWalkAhead(gc, "instant loot", chosen.Id, chosen.Name, chosen.At);
+
+        // To the point itself, which is what a planned move is matched against. See PlanClicks.
+        if (!_input.MoveTo(chosen.At))
         {
             _lastOutcome = $"{_itemName}: the move was refused";
             Finish();
@@ -1653,6 +2160,15 @@ internal static class Autoloot
             _pickupNote = ($"Instant autoloot: {_itemName}", DateTime.UtcNow);
             _clickedAt = DateTime.UtcNow;
 
+            // When the button went down, from ExileInput2 where it answers with a press this last second, else now. See
+            // ClickFailsAfterMs.
+            var down = _input.LastPressDownAt();
+            var since = down > 0 ? System.Diagnostics.Stopwatch.GetElapsedTime(down).TotalMilliseconds : -1d;
+
+            _clickPressedFromExileInput2 = since is >= 0d and < 1000d;
+            _clickPressedAt = _clickPressedFromExileInput2 ? down : System.Diagnostics.Stopwatch.GetTimestamp();
+            StartClickResponse(gc);
+
             if (_targetPath.Length == 0)
                 NoteClicked(gc, _target);
 
@@ -1660,7 +2176,7 @@ internal static class Autoloot
             _targetMetadata = Safe.Read(_target, static e => e.GetComponent<WorldItem>()?.ItemEntity?.Metadata, "") ?? "";
             _carriedAtClick = CarriedOfMetadata(gc, _targetMetadata);
 
-            // Out of reach, the character walks to it. See WalkStartsWithin.
+            // Out of reach, the character walks to it. See ClickFailed.
             var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
             var item = Safe.Read(_target, static e => e.GridPos, Vector2.Zero);
 
@@ -1676,12 +2192,130 @@ internal static class Autoloot
                 _input.BlockPlayerKeys(KeyBlockMs, _restoreHeldKeys, _cancelKey);
         }
 
-        Finish(keepKeysBlocked: clicked);
+        var aheadOfWalk = clicked && _walkExpected && MoveCursorAheadOfWalk(gc);
 
-        if (clicked)
+        Finish(keepKeysBlocked: clicked, keepCursor: clicked && (_instantPlanned.Count > 0 || aheadOfWalk));
+
+        if (!clicked)
+            return;
+
+        // **An item in reach is not waited for.** Its label took 389 to 432ms to go at a ping of 13 to 15, and the run
+        // waited that out before every next click, about 600ms an item through a plan (dump 2026-10-18 23:05:51). The
+        // game takes the pickup on the button going down, so the next item is clicked at once and this one is checked
+        // in the background. Waited for still: a walk, which a click elsewhere would cut short; an item from under other
+        // labels, put back over it; and with the inventory open, the item going onto the cursor to be put down first.
+        if (!_walkExpected && !_pickupFromUnderLabels && _targetPath.Length == 0 && !InventoryPanelOpen(gc) &&
+            Safe.Read(_target, static e => e.HasComponent<WorldItem>(), false))
         {
-            _deadline = DateTime.UtcNow + LabelGoneWithin;
-            _phase = Phase.WaitingForLabel;
+            InReachPickups.Add((_itemId, _target, _itemName, _clickPressedAt, _targetMetadata, _carriedAtClick));
+            EndKeyBlock();
+            _scannedAt = DateTime.MinValue;
+
+            return;
+        }
+
+        _deadline = DateTime.UtcNow + LabelGoneWithin;
+        _phase = Phase.WaitingForLabel;
+    }
+
+    /// <summary>
+    /// After a click starting a walk: the cursor to where the item chosen to follow it (_nextAfterWalk) is expected once
+    /// the walk has ended, so the move after the walk is short. True when the move was sent, and the cursor is then kept
+    /// through the walk, as the plan's is; the next look lets it go when it starts no pickup. Moving the mouse stops it in
+    /// ExileInput2, as at any other time. See AutolootSettings.MoveCursorAheadDuringWalks and LabelAfterWalk.
+    /// </summary>
+    private static bool MoveCursorAheadOfWalk(GameController gc)
+    {
+        if (_nextAfterWalk is not { } next)
+            return false;
+
+        _nextAfterWalk = null;
+
+        var walkTo = Safe.Read(_target, static e => e.GridPos, Vector2.Zero);
+
+        if (LabelAfterWalk(gc, walkTo, next.At) is not { } ahead)
+        {
+            SayInstantPlan($"{_itemName}: needs a walk; cursor not moved ahead of it for {next.Name} - expected off screen after " +
+                           "the walk, or the walk's end could not be projected");
+            return false;
+        }
+
+        var clickedAt = CursorOnScreen(gc);
+        var moved = _input.MoveTo(ahead);
+
+        if (moved)
+            NoteWalkAheadGuess(gc, "instant loot", next.Id, next.Name, ahead, clickedAt, walkTo);
+
+        SayInstantPlan(moved
+            ? $"{_itemName}: needs a walk; cursor moved ahead to ({ahead.X:0},{ahead.Y:0}) for {next.Name}, now at ({next.At.X:0},{next.At.Y:0})"
+            : $"{_itemName}: needs a walk; the move ahead for {next.Name} was refused");
+
+        return moved;
+    }
+
+    /// <summary>The item chosen to follow one that needs a walk, and its label's point when chosen. See MoveCursorAheadOfWalk.</summary>
+    private static (uint Id, string Name, Vector2 At)? _nextAfterWalk;
+
+    /// <summary>
+    /// For each pickup in reach not waited for, how long after the button went down its label was seen gone, in ms, and
+    /// the ping then, the last InReachPickupTimesKept, for ClickPickupMarginMs. Seen each Tick, so up to a Tick late.
+    /// </summary>
+    private static readonly List<(int Ms, int Ping)> InReachPickupTimes = new();
+
+    private const int InReachPickupTimesKept = 40;
+
+    /// <summary>Whether the pickup in hand was started from under other labels. See StepUnderLabels.</summary>
+    private static bool _pickupFromUnderLabels;
+
+    /// <summary>
+    /// Items in reach clicked and not waited for, oldest first: entity id, entity, name, when the button went down (a
+    /// Stopwatch timestamp), metadata and what was carried of it at the click. See StepInReachPickups.
+    /// </summary>
+    private static readonly List<(uint Id, Entity Of, string Name, long PressedAt, string Metadata, int CarriedAtClick)>
+        InReachPickups = new();
+
+    /// <summary>
+    /// Each pickup in reach the run did not wait for, every Tick: its label gone, confirmed against the inventory in the
+    /// background; still there ClickFailsAfterMs after its click, failed - clicked again as Instant loot retries allows,
+    /// by putting it back among the untried, or given up.
+    /// </summary>
+    private static void StepInReachPickups(GameController gc, AutoExpeditionSettings settings)
+    {
+        for (var i = InReachPickups.Count - 1; i >= 0; i--)
+        {
+            var pickup = InReachPickups[i];
+
+            if (Placement.Button(gc, pickup.Of, []).Rect.Width <= 0f)
+            {
+                // The timing a click's response would have given, which closes when the next click starts. See
+                // InReachPickupTimes.
+                InReachPickupTimes.Add(((int)System.Diagnostics.Stopwatch.GetElapsedTime(pickup.PressedAt).TotalMilliseconds,
+                    Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1)));
+
+                if (InReachPickupTimes.Count > InReachPickupTimesKept)
+                    InReachPickupTimes.RemoveAt(0);
+
+                InReachPickups.RemoveAt(i);
+                PendingConfirmations.Add((pickup.Name, pickup.Metadata, pickup.CarriedAtClick, DateTime.UtcNow + InventoryShowsWithin));
+                continue;
+            }
+
+            var since = System.Diagnostics.Stopwatch.GetElapsedTime(pickup.PressedAt).TotalMilliseconds;
+
+            if (since < ClickFailsAfterMs(gc, false))
+                continue;
+
+            InReachPickups.RemoveAt(i);
+
+            if (RetriesOfItems.GetValueOrDefault(pickup.Id) < settings.Automation.Autoloot.InstantLootRetries)
+            {
+                RetriesOfItems[pickup.Id] = RetriesOfItems.GetValueOrDefault(pickup.Id) + 1;
+                TriedItemIds.Remove(pickup.Id);
+                _scannedAt = DateTime.MinValue;
+                _lastOutcome += $"; {pickup.Name}: not picked up {since:0}ms after the click - to be clicked again";
+            }
+            else
+                _lastOutcome += $"; {pickup.Name}: not picked up {since:0}ms after the click, with no retry left - given up";
         }
     }
 
@@ -1691,19 +2325,69 @@ internal static class Autoloot
     /// </summary>
     private const int KeyBlockMs = 2000;
 
-    /// <summary>How soon after a click a standing character counts as having stopped, rather than not yet started. See Tick.</summary>
-    private static readonly TimeSpan RetryAfterStandingMs = TimeSpan.FromMilliseconds(250);
+    /// <summary>When the last instant click's button went down, a Stopwatch timestamp. See AfterClick.</summary>
+    private static long _clickPressedAt;
+
+    /// <summary>Whether _clickPressedAt came from ExileInput2 rather than this plugin's frame after the click.</summary>
+    private static bool _clickPressedFromExileInput2;
+
+    /// <summary>
+    /// Why the click being waited on has failed, or "" while it has not: the character is standing, and ClickFailsAfterMs
+    /// has passed since the button went down with no walk begun (an item out of reach) or no pickup (an item in reach),
+    /// or since the character stopped after a walk with no pickup. The caller has already found the label there.
+    /// </summary>
+    private static string ClickFailed(GameController gc)
+    {
+        var sincePress = System.Diagnostics.Stopwatch.GetElapsedTime(_clickPressedAt).TotalMilliseconds;
+
+        if (_walkExpected && !_walkSeen)
+            return sincePress >= ClickFailsAfterMs(gc, true) ? $"no walk began {sincePress:0}ms after the click" : "";
+
+        if (!_walkExpected)
+            return sincePress >= ClickFailsAfterMs(gc, false) ? $"not picked up {sincePress:0}ms after the click" : "";
+
+        var sinceStopped = (DateTime.UtcNow - _movedAt).TotalMilliseconds;
+
+        return sinceStopped >= ClickFailsAfterMs(gc, false) ? $"not picked up {sinceStopped:0}ms after the walk ended" : "";
+    }
+
+    /// <summary>
+    /// How long a click may take to show it worked before it counts as failed: the player's ping (ServerData.Latency, as
+    /// Placement.ChoreMissedAfter reads it), plus ClickWalkStartMarginMs for a walk to begin or ClickPickupMarginMs for an
+    /// item in reach to be picked up; ClickUnknownPingMs stands in for a ping that cannot be read.
+    /// </summary>
+    private static double ClickFailsAfterMs(GameController gc, bool walk)
+    {
+        var ping = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
+
+        return (ping is > 0 and < 2000 ? ping : ClickUnknownPingMs) + (walk ? ClickWalkStartMarginMs : ClickPickupMarginMs);
+    }
+
+    /// <summary>
+    /// The margin over the ping for a walk to an item out of reach to begin. Measured: of 7 clicks that walked, the
+    /// position first moved 125 to 203ms after the button went down, 109 to 185ms over the ping (14 to 26), each figure in
+    /// steps of 15.6ms (dump 2026-10-18 22:48:08). 200 sits just over the slowest. One map; 81 earlier walk starts, timed
+    /// from the frame after the click by the half-grid move, reached 261ms at the 99th percentile, so this may be tight.
+    /// See ClickResponses for more.
+    /// </summary>
+    private const int ClickWalkStartMarginMs = 200;
+
+    /// <summary>
+    /// The margin over the ping for an item in reach to be picked up. Measured: of 11 pickups in reach, the label went 63
+    /// to 375ms after the button went down, 48 to 360ms over the ping (15 to 50), each figure in steps of 15.6ms (dump
+    /// 2026-10-18 22:48:08). The 250ms the retry waited before was under 8 of them. 380, just over that slowest, was under
+    /// most pickups on the next map: 9 in reach went 389 to 432ms after the button, 374 to 419ms over pings of 13 to 15,
+    /// on the Stopwatch clock (dump 2026-10-18 23:05:51), and 7 were clicked again. 480 sits 60 over the slowest of both.
+    /// See ClickResponses for more.
+    /// </summary>
+    private const int ClickPickupMarginMs = 480;
+
+    /// <summary>The ping assumed when ServerData.Latency cannot be read. Chosen.</summary>
+    private const int ClickUnknownPingMs = 100;
 
     /// <summary>Whether this pickup asked for the player's keys blocked, so it lets them go when done.</summary>
     private static bool _keysBlocked;
 
-    /// <summary>
-    /// How soon after a click on an item out of reach the character is walking, or the key block ends. 125ms let the
-    /// keyboard go before a walk to a Divine Orb began, and the player, still holding W, walked away from it (2026-10-11
-    /// 17:31:39). 400 is a guess at comfortably more than the click's round trip, until the walk starts measured in the
-    /// dump say otherwise. See WalkStartsMeasured.
-    /// </summary>
-    private static readonly TimeSpan WalkStartsWithin = TimeSpan.FromMilliseconds(400);
 
     /// <summary>How long after each instant click out of reach the character was first seen walking, in ms, the last 20.</summary>
     private static readonly List<int> WalkStartsMeasured = new();
@@ -1748,6 +2432,123 @@ internal static class Autoloot
     private static Vector2 _lastPosition;
     private static DateTime _movedAt = DateTime.MinValue;
 
+    /// <summary>
+    /// **What follows an instant click, and how soon, timed from the button going down.** For setting how soon a click
+    /// that started nothing counts as failed: a walk is now seen by a change of position of half a grid (MovingNow),
+    /// first seen 16 to 137ms after the click at a ping of 5 to 6 (dump 2026-10-18 22:03:41), and a faster sign would let
+    /// a failed click be retried sooner. Each sign is the first Tick on which it differs from its reading at the click:
+    /// the Pathfinding component's TargetMovePos, WantMoveToPosition, IsMoving and PathingNodes count, the actor's
+    /// isMoving or Moving action, its animation, the position moved 0.1 and 0.5 grid, and the label gone. Timed from
+    /// _clickPressedAt on the Stopwatch clock. The first 20, on Environment.TickCount64, moved in steps of 15.6ms; none of
+    /// the Pathfinding or actor signs came before the position's own change (dump 2026-10-18 22:48:08). Kept for
+    /// ClickResponseFor, the last ClickResponsesKept, for the dump. Reads only.
+    /// </summary>
+    private static readonly string[] ClickResponseSigns =
+        ["path target", "path wants", "path moving", "path nodes", "actor moving", "animation", "moved 0.1", "moved 0.5", "label gone"];
+
+    /// <summary>How long after the button went down a click's response is timed. Chosen.</summary>
+    private static readonly long ClickResponseFor = 1500;
+
+    private const int ClickResponsesKept = 20;
+
+    private static readonly List<string> ClickResponses = new();
+
+    private static bool _responseOpen;
+    private static long _responseFrom;
+    private static bool _responseFromExileInput2;
+    private static string[] _responseBaseline;
+    private static int[] _responseFirstMs;
+    private static Vector2 _responseStartGrid;
+    private static string _responseItem = "";
+    private static int _responsePing;
+    private static float _responseAway;
+
+    /// <summary>
+    /// The readings ClickResponseSigns compares, as text so any type compares alike: the first six of them, in order.
+    /// </summary>
+    private static string[] ClickResponseReadings(GameController gc)
+    {
+        var player = Safe.Read(gc, static g => g.Player, null);
+        var path = Safe.Read(player, static e => e.GetComponent<Pathfinding>(), null);
+        var actor = Safe.Read(player, static e => e.GetComponent<Actor>(), null);
+
+        return
+        [
+            Safe.Read(path, static p => p.TargetMovePos.ToString(), "?"),
+            Safe.Read(path, static p => p.WantMoveToPosition.ToString(), "?"),
+            Safe.Read(path, static p => p.IsMoving.ToString(), "?"),
+            Safe.Read(path, static p => (object)p.PathingNodes is System.Collections.ICollection c ? c.Count.ToString() : "?", "?"),
+            Safe.Read(actor, static a => (a.isMoving || a.Action.HasFlag(ActionFlags.Moving)).ToString(), "?"),
+            Safe.Read(actor, static a => a.Animation.ToString(), "?"),
+        ];
+    }
+
+    /// <summary>Begins timing what follows this click, closing the last one first. See ClickResponseSigns.</summary>
+    private static void StartClickResponse(GameController gc)
+    {
+        if (_responseOpen)
+            CloseClickResponse();
+
+        _responseFromExileInput2 = _clickPressedFromExileInput2;
+        _responseFrom = _clickPressedAt;
+        _responseBaseline = ClickResponseReadings(gc);
+        _responseFirstMs = Enumerable.Repeat(-1, ClickResponseSigns.Length).ToArray();
+        _responseStartGrid = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        _responseItem = _itemName;
+        _responsePing = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
+        _responseAway = Vector2.Distance(_responseStartGrid, Safe.Read(_target, static e => e.GridPos, Vector2.Zero));
+        _responseOpen = true;
+
+        // A sign already changed by the time this frame read it is timed now. See ObserveClickResponse.
+        ObserveClickResponse(gc);
+    }
+
+    /// <summary>Notes each sign the first time it differs from its reading at the click. See ClickResponseSigns.</summary>
+    private static void ObserveClickResponse(GameController gc)
+    {
+        if (!_responseOpen)
+            return;
+
+        var ms = (int)System.Diagnostics.Stopwatch.GetElapsedTime(_responseFrom).TotalMilliseconds;
+        var now = ClickResponseReadings(gc);
+
+        for (var i = 0; i < now.Length; i++)
+        {
+            if (_responseFirstMs[i] < 0 && now[i] != _responseBaseline[i])
+                _responseFirstMs[i] = ms;
+        }
+
+        var moved = Vector2.Distance(_responseStartGrid, Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero));
+
+        if (_responseFirstMs[6] < 0 && moved > 0.1f)
+            _responseFirstMs[6] = ms;
+
+        if (_responseFirstMs[7] < 0 && moved > 0.5f)
+            _responseFirstMs[7] = ms;
+
+        if (_responseFirstMs[8] < 0 && Done(gc))
+            _responseFirstMs[8] = ms;
+
+        if (ms >= ClickResponseFor || _responseFirstMs.All(x => x >= 0))
+            CloseClickResponse();
+    }
+
+    private static void CloseClickResponse()
+    {
+        _responseOpen = false;
+
+        var signs = string.Join(", ", ClickResponseSigns.Select((name, i) =>
+            $"{name} {(_responseFirstMs[i] < 0 ? "-" : _responseFirstMs[i] + "ms")}"));
+
+        ClickResponses.Add($"{DateTime.Now:HH:mm:ss.fff} {_responseItem}, {_responseAway:0.#} grid " +
+                           $"({(_responseAway > PickupReachGrid ? "walk expected" : "in reach")}), ping {_responsePing}, from " +
+                           $"{(_responseFromExileInput2 ? "the button going down" : "this plugin's frame after the click")}: {signs}; " +
+                           $"at the click: {string.Join(" | ", _responseBaseline)}");
+
+        if (ClickResponses.Count > ClickResponsesKept)
+            ClickResponses.RemoveAt(0);
+    }
+
     /// <summary>How long an item found under a piece of the interface is left before it is looked at again.</summary>
     private static readonly TimeSpan CoveredWait = TimeSpan.FromMilliseconds(250);
 
@@ -1765,6 +2566,49 @@ internal static class Autoloot
 
     /// <summary>CarriedOfMetadata for _targetMetadata at the click; -1 when it could not be read.</summary>
     private static int _carriedAtClick = -1;
+
+    /// <summary>
+    /// Pickups whose label has gone, still to be confirmed against the inventory while the run looks at other items,
+    /// oldest first. See ConfirmInBackground.
+    /// </summary>
+    private static readonly List<(string Name, string Metadata, int CarriedAtClick, DateTime Until)> PendingConfirmations = new();
+
+    /// <summary>
+    /// ConfirmPickup for each pickup whose label has gone, run on every Tick whatever the run is doing: success once more
+    /// of the item is carried than at its click, failure when Until passes without it. Two of the same metadata in flight
+    /// compare against their own counts at their clicks, so one arriving can read as both: a failure beside a success of
+    /// the same item can be sounded as a success. See AfterClick.
+    /// </summary>
+    private static void ConfirmInBackground(GameController gc, AutoExpeditionSettings settings)
+    {
+        for (var i = 0; i < PendingConfirmations.Count; i++)
+        {
+            var pending = PendingConfirmations[i];
+            var carried = CarriedOfMetadata(gc, pending.Metadata);
+
+            if (pending.CarriedAtClick < 0 || carried < 0)
+            {
+                PendingConfirmations.RemoveAt(i--);
+                continue;
+            }
+
+            if (carried > pending.CarriedAtClick)
+            {
+                PendingConfirmations.RemoveAt(i--);
+                _lastOutcome += $"; {pending.Name} picked up";
+                SoundForResult(settings, true);
+                continue;
+            }
+
+            if (DateTime.UtcNow < pending.Until)
+                continue;
+
+            PendingConfirmations.RemoveAt(i--);
+            _lastOutcome += $"; {pending.Name}: the label went but no more was carried after " +
+                            $"{InventoryShowsWithin.TotalMilliseconds:0}ms - taken by someone else, or no room";
+            SoundForResult(settings, false);
+        }
+    }
 
     /// <summary>
     /// How many of this base the player carries in the main inventory, stacks summed, from the game's own record of it
@@ -1845,6 +2689,10 @@ internal static class Autoloot
 
         if (!(_input.TakeWithPriority(InstantLootPriority) || _input.Take()))
         {
+            // A stop refuses every claim until released. See the claim in Tick.
+            if (_input.Stopped().Length > 0)
+                _input.Release();
+
             if (DateTime.UtcNow >= _deadline)
             {
                 _phase = Phase.Idle;
@@ -1926,6 +2774,51 @@ internal static class Autoloot
     /// <summary>Times each item has been clicked again, by entity id, for the area. See AutolootSettings.InstantLootRetries.</summary>
     private static readonly Dictionary<uint, int> RetriesOfItems = new();
 
+    /// <summary>
+    /// What a look that starts no pickup lets go of. A key block kept from a click for its retry: the retry keeps the
+    /// block so its walk is not cut short (see InstantLootRetries), and with the item gone off screen - a dodge roll away
+    /// from it - nothing was clicked and the player's keys stayed blocked for the rest of KeyBlockMs with the run idle.
+    /// And the cursor kept for a plan whose next item is no longer to be clicked. See Finish.
+    /// </summary>
+    private static void LetGoWhenNoPickupStarts()
+    {
+        if (_keysBlocked)
+        {
+            EndKeyBlock();
+            _lastOutcome += "; nothing more to click, so the keyboard was let go";
+        }
+
+        if (_cursorKeptForPlan)
+            Finish();
+    }
+
+    /// <summary>
+    /// The instant loot plan in hand: the items after the one being picked up, by entity id and the point planned for
+    /// each, in order. The next look follows it while it chooses the next of them at that point; anything else drops it.
+    /// See the plan in Tick.
+    /// </summary>
+    private static readonly List<(uint Id, Vector2 At)> _instantPlanned = new();
+
+    /// <summary>Whether the cursor was kept after a click, for the plan's next one or moved ahead of a walk. See Finish.</summary>
+    private static bool _cursorKeptForPlan;
+
+    /// <summary>The most clicks one instant loot plan holds, as the action key run's do. Chosen.</summary>
+    private const int InstantPlannedMost = 12;
+
+    /// <summary>What each instant loot pickup did about the plan, newest last, kept across areas. See SayInstantPlan.</summary>
+    private static readonly List<string> InstantPlans = new();
+
+    /// <summary>How many instant loot plan decisions are kept for the dump. Chosen.</summary>
+    private const int InstantPlansKept = 40;
+
+    private static void SayInstantPlan(string said)
+    {
+        InstantPlans.Add($"{DateTime.Now:HH:mm:ss.fff} {said}");
+
+        if (InstantPlans.Count > InstantPlansKept)
+            InstantPlans.RemoveAt(0);
+    }
+
     /// <summary>Ends the key block this pickup asked for, if any.</summary>
     private static void EndKeyBlock()
     {
@@ -1972,10 +2865,27 @@ internal static class Autoloot
             System.Drawing.Color.FromArgb(alpha * 200 / 255, System.Drawing.Color.Black));
     }
 
-    /// <summary>Puts this caller's move speeds back, lets go of the cursor and goes idle.</summary>
-    private static void Finish(bool keepKeysBlocked = false)
+    /// <summary>
+    /// Puts this caller's move speeds back, lets go of the cursor and goes idle. With keepCursor, after a click with a
+    /// plan still in hand, the cursor and speeds are kept for the plan's next click, as handing the cursor back drops the
+    /// plan. See _instantPlanned.
+    /// </summary>
+    private static void Finish(bool keepKeysBlocked = false, bool keepCursor = false)
     {
         _phase = Phase.Idle;
+
+        if (keepCursor && _input != null)
+        {
+            _cursorKeptForPlan = true;
+
+            if (!keepKeysBlocked)
+                EndKeyBlock();
+
+            return;
+        }
+
+        _cursorKeptForPlan = false;
+        _instantPlanned.Clear();
 
         if (_input == null)
             return;
@@ -2061,10 +2971,29 @@ internal static class Autoloot
         b.AppendLine("=== autoloot ===");
         b.AppendLine($"  instant list: {RanksOf(settings.Automation.Autoloot.InstantLootItems).Count} name(s), on the action key: " +
                      $"{RanksOf(settings.Automation.Autoloot.ItemsOnActionKey).Count} name(s); block mouse {settings.Automation.Autoloot.BlockInputForInstantLoot.Value}, " +
-                     $"{settings.Automation.Autoloot.MouseBlockMs.Value}ms, teleport {settings.Automation.Autoloot.TeleportForInstantLoot.Value}");
+                     $"{settings.Automation.Autoloot.MouseBlockMs.Value}ms, instant move {settings.Automation.Autoloot.InstantLootShortestMoveMs.Value}ms + " +
+                     $"{settings.Automation.Autoloot.InstantLootMoveTimePerRootPixelMs.Value}ms per root pixel; action key move " +
+                     $"{settings.Automation.Autoloot.AutolootShortestMoveMs.Value}ms + " +
+                     $"{settings.Automation.Autoloot.AutolootMoveTimePerRootPixelMs.Value}ms per root pixel");
         b.AppendLine($"  instant loot run: {_phase}, {TriedItemIds.Count} item(s) tried this area, " +
                      $"{RetriesOfItems.Values.Sum()} retry click(s), keys blocked {_keysBlocked}, last: {_lastOutcome}");
         b.AppendLine($"  instant loot from under other labels, last: {UnderLabelsSaid}");
+        b.AppendLine($"  instant loot, the last look with a listed item in view: {_lastListedDecision}");
+        b.AppendLine($"  instant loot plan in hand: {(_instantPlanned.Count == 0 ? "none" : string.Join(" ", _instantPlanned.Select(p => $"({p.At.X:0},{p.At.Y:0})")))}, " +
+                     $"cursor kept for it {_cursorKeptForPlan}; pickups in reach not waited for, still in flight " +
+                     $"{InReachPickups.Count}, confirmations pending {PendingConfirmations.Count}; plan decisions, newest last " +
+                     $"({InstantPlans.Count}):");
+
+        foreach (var said in InstantPlans)
+            b.AppendLine($"    {said}");
+
+        var planEnds = _input?.PlanEndsSaid() ?? [];
+
+        b.AppendLine($"  ExileInput2's plans for instant loot, how each ended, newest last ({planEnds.Length}):" +
+                     (planEnds.Length == 0 ? " none, or an ExileInput2 too old to say" : ""));
+
+        foreach (var said in planEnds)
+            b.AppendLine($"    {said}");
 
         var labels = Ground.Labels(gc);
         var visible = labels?.Count(l => Safe.Read(l, static x => x.IsVisible, false)) ?? 0;
@@ -2092,7 +3021,17 @@ internal static class Autoloot
 
         b.AppendLine($"  walks after an instant click began after (ms): " +
                      (WalkStartsMeasured.Count == 0 ? "none measured yet" : string.Join(", ", WalkStartsMeasured)) +
-                     $"; the keyboard is let go after {WalkStartsWithin.TotalMilliseconds:0}ms without one");
+                     $"; a click counts as failed after the ping + {ClickWalkStartMarginMs}ms without one");
+        b.AppendLine($"  what followed each instant click, and how soon, newest last ({ClickResponses.Count}; - is not seen " +
+                     $"within {ClickResponseFor}ms; the readings at the click are path target | path wants | path moving | " +
+                     "path nodes | actor moving | animation):");
+
+        foreach (var said in ClickResponses)
+            b.AppendLine($"    {said}");
+
+        b.AppendLine($"  pickups in reach not waited for, label gone after the button went down, ms (ping), newest last " +
+                     $"({InReachPickupTimes.Count}; failed at the ping + {ClickPickupMarginMs}ms): " +
+                     (InReachPickupTimes.Count == 0 ? "none yet" : string.Join(", ", InReachPickupTimes.Select(t => $"{t.Ms} ({t.Ping})"))));
         b.AppendLine($"  {Ground.VisibleCountsSaid(gc)}");
         b.AppendLine($"  inventory space: {InventorySpace.Said(gc)}; slots kept for instant loot now: " +
                      $"{InventorySpace.KeptForInstantLoot(gc, settings)}; listed items left for want of room at the last look: " +

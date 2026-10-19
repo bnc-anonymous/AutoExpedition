@@ -378,6 +378,12 @@ internal static class Overlay
             Astrayed(graphics, gc, settings, planning, targets, blast, covered);
         }
 
+        if (settings.Display.Remnants.ShowNameUnderRemnantsNotOwnedByYou)
+            using (Spent.On("Owners"))
+            {
+                Owners(graphics, gc, targets, settings, covered);
+            }
+
         if (settings.Display.Remnants.Rewards.ShowRewards || settings.Display.Remnants.Propagation.ShowWaves ||
             settings.Display.Remnants.Rerolls.HighlightRerolls)
             using (Spent.On("Remnants"))
@@ -3901,6 +3907,43 @@ internal static class Overlay
         }
 
         return Vector2.Lerp(from, to, near);
+    }
+
+    /// <summary>
+    /// The owner of each remnant not yet shattered that is not yours, as "Owner: name" - "Owner: Unknown" where whose
+    /// cannot be told - in the world just under it, in Warning colour on black, the light red the reward under a remnant
+    /// takes when the plan would choose another. Blown remnants (activated 6) are named, as their reward and shattering
+    /// are still the owner's; only shattered ones (7) are not, though Target.Spent counts both. See
+    /// Valuation.OwnerOfRemnant.
+    /// </summary>
+    private static void Owners(Graphics graphics, GameController gc, List<Target> targets,
+        AutoExpeditionSettings settings, List<RectangleF> covered)
+    {
+        var camera = Safe.Read(gc, static g => g.IngameState.Camera, null);
+
+        if (camera == null)
+            return;
+
+        foreach (var target in targets)
+        {
+            if (target.Kind != TargetKind.Remnant || target.KeptActivated >= 7 || target.Entity == null ||
+                Valuation.OwnerOfRemnant(gc, target.Entity) is not { Yours: false } owner)
+                continue;
+
+            var world = Where(gc, target.Grid);
+            var on = world == Vector3.Zero
+                ? Vector2.Zero
+                : Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
+
+            if (on == Vector2.Zero || Panels.Covers(covered, on))
+                continue;
+
+            var text = $"Owner: {owner.Name}";
+            var size = graphics.MeasureText(text);
+
+            graphics.DrawTextWithBackground(text, new Vector2(on.X - size.X / 2f, on.Y),
+                (Color)settings.Display.Remnants.Rewards.OverruledColour, Color.Black);
+        }
     }
 
     /// <summary>

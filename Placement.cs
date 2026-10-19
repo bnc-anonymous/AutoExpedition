@@ -344,7 +344,7 @@ internal sealed class Placement
     /// The edge of the screen is not somewhere to aim: the projection is least trustworthy there,
     /// and a spot that near the edge is one to walk towards rather than stretch for.
     /// </summary>
-    private const float Margin = 48f;
+    internal const float Margin = 48f;
 
     /// <summary>
     /// How long to give the key before deciding the circle is not coming up.
@@ -528,8 +528,9 @@ internal sealed class Placement
             }
 
         // Placement moves at ExileInput2's own speed, whatever a loot run on the same caller name last set. See
-        // AutolootSettings.ShortestMoveWhenAutolootingMs.
+        // AutolootSettings.AutolootShortestMoveMs.
         _input.SetShortestMove(-1);
+        _input.SetMoveTimePerRootPixel(-1);
 
         Advance(gc, settings);
 
@@ -546,10 +547,27 @@ internal sealed class Placement
     /// </summary>
     private bool _lootOnly;
 
-    /// <summary>Whether an item on the action key list is clickable now, for the action key to loot it first. See BeginLooting.</summary>
-    public bool ListedItemReady(GameController gc, AutoExpeditionSettings settings) =>
-        settings.Automation.Enable.Value && settings.Automation.Autoloot.EnableAutoloot &&
-        Chore(gc, settings, itemsOnly: true).Of != null;
+    /// <summary>
+    /// Whether an item on the action key list is clickable now, for the action key to loot it first. See BeginLooting.
+    ///
+    /// **Not passing over what a finished run skipped.** Each run skips an item once clicked, and the skips outlived the
+    /// run: a Gemcutter's Prism whose walk was cut short stayed skipped, so every press after found nothing ready and
+    /// started a solve instead, for five seconds of presses (dump 2026-10-19 14:19:09: "what asked for the last solve:
+    /// the action key"). With no run going they are cleared here, as BeginLooting and Begin clear them anyway.
+    /// </summary>
+    public bool ListedItemReady(GameController gc, AutoExpeditionSettings settings)
+    {
+        if (!settings.Automation.Enable.Value || !settings.Automation.Autoloot.EnableAutoloot)
+            return false;
+
+        if (!Busy)
+        {
+            _skip.Clear();
+            _choresClickedAgain.Clear();
+        }
+
+        return Chore(gc, settings, itemsOnly: true).Of != null;
+    }
 
     /// <summary>Starts a run of the post-expedition jobs alone, in the action key list's order. See _lootOnly.</summary>
     public string BeginLooting(GameController gc, AutoExpeditionSettings settings)
@@ -594,9 +612,10 @@ internal sealed class Placement
             return Status;
         }
 
-        // The run's own shortest move, or ExileInput2's. See AutolootSettings.ShortestMoveWhenAutolootingMs.
-        var shortest = settings.Automation.Autoloot.ShortestMoveWhenAutolootingMs.Value;
-        _input.SetShortestMove(shortest > 0 ? shortest : -1);
+        // The run's own shortest move and move time per root pixel. See AutolootSettings.AutolootShortestMoveMs and
+        // AutolootMoveTimePerRootPixelMs.
+        _input.SetShortestMove(settings.Automation.Autoloot.AutolootShortestMoveMs.Value);
+        _input.SetMoveTimePerRootPixel(settings.Automation.Autoloot.AutolootMoveTimePerRootPixelMs.Value);
 
         // A key of the player's - WASD to walk - stops this run, as the mouse does; the plugin's hotkeys excepted. Asked
         // for on each claim, as ExileInput2 clears it on release. See AutolootSettings.CancelAutolootOnKeyboardInput.
@@ -1143,6 +1162,8 @@ internal sealed class Placement
                             return;
                         }
 
+                        if (settings != null && settings.Automation.Autoloot.MoveCursorAheadDuringWalks.Value)
+                            MoveCursorAheadOfWalk(gc, settings, item);
                     }
 
                     _choreClickedAt = DateTime.UtcNow;
@@ -1475,6 +1496,10 @@ internal sealed class Placement
         // outside the sliver it was aimed at - which is how a chest with a seven pixel gap
         // ended up hovering the label behind it and being written off as covered.
         _input.SetTolerance((int)Math.Clamp(spot.Room - 1f, Closest, 12f));
+
+        // How good a move ahead of the last walk was, before the cursor leaves where it put it. See MoveCursorAheadOfWalk.
+        Autoloot.NoteClickAfterWalkAhead(gc, "action key", Safe.Read(todo.Of, static e => e.Id, 0u), ThingSaid(todo.Word, todo.Of),
+            spot.At);
 
         // The items after this one, planned with it, when this is not already the next of a plan. See PlanLootAhead.
         if (settings != null)
@@ -3149,10 +3174,15 @@ internal sealed class Placement
     /// Where the cursor is taken to be when ranking jobs, in place of where it is: the point of the job before, when
     /// PlanLootAhead asks what follows it. Unclickable is left as it was when this is given.
     /// </param>
+    /// <param name="playerAt">
+    /// Where the character is taken to stand, in grid, in place of where it does: where a walk is taken to end, when
+    /// MoveCursorAheadOfWalk asks what follows it.
+    /// </param>
     private (Entity Of, int[] Path, string Word, RectangleF At, int Waiting) Chore(
-        GameController gc, AutoExpeditionSettings settings, bool itemsOnly = false, Vector2? cursorAt = null)
+        GameController gc, AutoExpeditionSettings settings, bool itemsOnly = false, Vector2? cursorAt = null,
+        Vector2? playerAt = null)
     {
-        var player = Safe.Read(() => gc.Player.GridPos, Vector2.Zero);
+        var player = playerAt ?? Safe.Read(() => gc.Player.GridPos, Vector2.Zero);
 
         if (player == Vector2.Zero)
             return (null, null, null, default, 0);
@@ -3164,22 +3194,22 @@ internal sealed class Placement
         int[] path = null;
         string word = null;
         var at = default(RectangleF);
-        var closest = float.MaxValue;
 
         // Things that want doing and cannot be reached from here. Counted rather than chosen, so
         // "walk closer" can be said about a real number instead of about the one candidate that
         // happened to be nearest.
         var waiting = 0;
 
-        // The action key list's order, with a party member in the area: a job on a higher line wins, then the more
-        // expensive by NinjaPricer, then the nearer, and a job no line names ranks below every line. Alone, the nearest.
-        // See Autoloot.TopFirstNow.
+        // The action key list's order, with a party member in the area: a job on a higher line wins, then one in reach,
+        // then the dearer by more than the price band, then the nearer, and a job no line names ranks below every line.
+        // Alone, the nearest. Chosen among all the clickable jobs at once, as the band is measured from the dearest. See
+        // Autoloot.BestInLootOrder.
         var autoloot = settings.Automation.Autoloot;
         var topFirst = Autoloot.TopFirstNow(gc);
-        var bestRank = int.MaxValue;
-        var bestPrice = 0d;
-        var bestFromCursor = float.MaxValue;
+        var band = Autoloot.LootOrderBandExalts(settings);
         var cursor = cursorAt ?? Autoloot.CursorOnScreen(gc);
+        var clickable = new List<(Entity Of, int[] Path, string Word, RectangleF At)>();
+        var clickableFacts = new List<Autoloot.LootOrderFacts>();
 
         var unclickable = new List<string>();
 
@@ -3229,20 +3259,8 @@ internal sealed class Placement
             if (Safe.Read(of, static e => e.HasComponent<WorldItem>(), false))
                 distance = Autoloot.WalkToItem(distance);
 
-            var fromCursor = Vector2.Distance(cursor, spot);
-
-            if (nearest != null &&
-                !Autoloot.Beats(topFirst, rank, price, distance, fromCursor, bestRank, bestPrice, closest, bestFromCursor))
-                return;
-
-            bestRank = rank;
-            bestPrice = price;
-            bestFromCursor = fromCursor;
-            closest = distance;
-            nearest = of;
-            path = into;
-            at = rect;
-            word = says;
+            clickable.Add((of, into, says, rect));
+            clickableFacts.Add(new Autoloot.LootOrderFacts(rank, price, distance, Vector2.Distance(cursor, spot)));
         }
 
         // Shattering and chests only where the action key list has their ENTITY line: the list is their only switch.
@@ -3332,6 +3350,9 @@ internal sealed class Placement
             NoRoomFor = noRoom;
             Unclickable = unclickable;
         }
+
+        if (Autoloot.BestInLootOrder(clickableFacts, topFirst, band) is var chosen and >= 0)
+            (nearest, path, word, at) = clickable[chosen];
 
         if (nearest == null && underLabels is { } under)
             return (under.Of, [], UnderLabelsWord, new RectangleF(under.At.X - 3f, under.At.Y - 3f, 6f, 6f), waiting);
@@ -3842,6 +3863,49 @@ internal sealed class Placement
         SayLootPlan(planned
             ? $"{name}: {dropped}planned {points.Count} - {string.Join(", ", names)}; ended: {ended}"
             : $"{name}: {dropped}not planned - ExileInput2 refused the plan of {points.Count}");
+    }
+
+    /// <summary>
+    /// After the click on an item out of pickup reach: the cursor to where the job the run would choose next is expected
+    /// once the walk to the item has ended, so the move after the walk is short. The next job is asked of Chore with the
+    /// cursor where it is, the character where the walk is taken to end and the clicked item set aside, as the run will
+    /// ask it on arrival: from where the character stands the walks differ, and another item of the same name was chosen
+    /// (dump 2026-10-19 14:15:21). Nothing is clicked here,
+    /// and the job after the walk is still aimed at where it is then. Each decision is kept for the dump. See
+    /// AutolootSettings.MoveCursorAheadDuringWalks and Autoloot.LabelAfterWalk.
+    /// </summary>
+    private void MoveCursorAheadOfWalk(GameController gc, AutoExpeditionSettings settings, Vector2 walkTo)
+    {
+        var name = ThingSaid("item", _chore);
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var next = Chore(gc, settings, cursorAt: Autoloot.CursorOnScreen(gc),
+            playerAt: player == Vector2.Zero ? null : Autoloot.WalkEnd(player, walkTo));
+
+        if (next.Of == null)
+        {
+            SayLootPlan($"{name}: needs a walk; cursor not moved ahead - nothing more to click from here");
+            return;
+        }
+
+        var nextName = ThingSaid(next.Word, next.Of);
+        var label = Exposed(gc, Panels.Covered(gc), next.At, Safe.Read(next.Of, static e => e.Id, 0u)).At;
+
+        if (Autoloot.LabelAfterWalk(gc, walkTo, label) is not { } ahead)
+        {
+            SayLootPlan($"{name}: needs a walk; cursor not moved ahead of it for {nextName} - expected off screen after the walk, " +
+                        "or the walk's end could not be projected");
+            return;
+        }
+
+        var clickedAt = Autoloot.CursorOnScreen(gc);
+        var moved = _input.MoveTo(ahead);
+
+        if (moved)
+            Autoloot.NoteWalkAheadGuess(gc, "action key", Safe.Read(next.Of, static e => e.Id, 0u), nextName, ahead, clickedAt, walkTo);
+
+        SayLootPlan(moved
+            ? $"{name}: needs a walk; cursor moved ahead to ({ahead.X:0},{ahead.Y:0}) for {nextName}, now at ({label.X:0},{label.Y:0})"
+            : $"{name}: needs a walk; the move ahead for {nextName} was refused");
     }
 
     /// <summary>
@@ -5462,9 +5526,12 @@ internal sealed class Placement
         _armed = false;
 
         // ExileInput2's own move speed back, for whatever takes the cursor under this name next. See
-        // AutolootSettings.ShortestMoveWhenAutolootingMs.
+        // AutolootSettings.AutolootShortestMoveMs.
         if (_lootOnly)
+        {
             _input.SetShortestMove(-1);
+            _input.SetMoveTimePerRootPixel(-1);
+        }
 
         // **Labels taken down are put back on every way out**: a run ending mid-pickup or mid-click on a covered button,
         // by a timeout or a refusal, left the player looking at a site with no labels. Refused once the player has the

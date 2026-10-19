@@ -83,6 +83,7 @@ public sealed class ExileInput2Client
     private Func<string, Vector2, float, int, Keys[], bool> _loiter;
     private Func<string, bool> _stopLoitering;
     private Func<string, bool> _loitering;
+    private Func<long> _lastPressDownAt;
 
     private bool _looked;
 
@@ -195,6 +196,7 @@ public sealed class ExileInput2Client
             _loiter = b.GetMethod<Func<string, Vector2, float, int, Keys[], bool>>("ExileInput2.Loiter");
             _stopLoitering = b.GetMethod<Func<string, bool>>("ExileInput2.StopLoitering");
             _loitering = b.GetMethod<Func<string, bool>>("ExileInput2.Loitering");
+            _lastPressDownAt = b.GetMethod<Func<long>>("ExileInput2.LastPressDownAt");
         }
         catch
         {
@@ -475,6 +477,17 @@ public sealed class ExileInput2Client
     {
         Look();
         return _loitering?.Invoke(_me) ?? false;
+    }
+
+    /// <summary>
+    /// When the last click's button went down, as System.Diagnostics.Stopwatch.GetTimestamp - read the time since with
+    /// Stopwatch.GetElapsedTime - whichever caller sent it; 0 before any click, or from an ExileInput2 too old to say. A click armed with ClickOnArrival goes down on ExileInput2's own thread,
+    /// before this caller's next frame. Needs nothing held.
+    /// </summary>
+    public long LastPressDownAt()
+    {
+        Look();
+        return _lastPressDownAt?.Invoke() ?? 0L;
     }
 
     /// <summary>Whether the cursor has been taken away from this plugin. See <see cref="Stopped"/>.</summary>

@@ -293,22 +293,23 @@ public class TabletAutomationSettings
     /// <summary>
     /// ExileInput2's Shortest Move for a hop from one tablet to the next in a batch - a withdraw after a withdraw, a
     /// bench load after a load, a currency use after a use - in place of ExileInput2's own 40ms. ExileInput2 adds it to
-    /// every move's time, so every other move of a run, the first to a tablet included, keeps ExileInput2's own. 0 uses
-    /// ExileInput2's own for the hops too. Needs an ExileInput2 with SetShortestMove. See Tablets.UseShortestMove.
+    /// every move's time, so every other move of a run, the first to a tablet included, keeps ExileInput2's own. The value
+    /// as it stands, 0 included, where 0 once meant ExileInput2's own, so that 1 was faster than 0. Needs an ExileInput2
+    /// with SetShortestMove. See Tablets.UseShortestMove.
     /// </summary>
     [Menu("Shortest move between tablets (ms)",
         "The least time the mouse takes to move from one tablet to the next.\n" +
-        "Lower is faster. 0 uses ExileInput2's own setting.")]
+        "Lower is faster. ExileInput2's own setting is 40.")]
     public RangeNode<int> ShortestMoveBetweenTabletsMs { get; set; } = new RangeNode<int>(200, 0, 400);
 
     /// <summary>
     /// ExileInput2's Shortest Move for a hop from one tablet to the next in the Deposit zone's run, in place of Shortest
-    /// move between tablets: a deposit only empties the inventory, so it can go faster. 0 uses ExileInput2's own. See
-    /// Tablets.UseShortestMove.
+    /// move between tablets: a deposit only empties the inventory, so it can go faster. The value as it stands, 0
+    /// included, where 0 once meant ExileInput2's own. See Tablets.UseShortestMove.
     /// </summary>
     [Menu("Shortest move when depositing (ms)",
         "The same, for the Deposit zone only.\n" +
-        "0 uses ExileInput2's own setting.")]
+        "ExileInput2's own setting is 40.")]
     public RangeNode<int> ShortestMoveWhenDepositingMs { get; set; } = new RangeNode<int>(67, 0, 400);
 
     /// <summary>Moves the action zones right. See EnableTabletAutomation.</summary>

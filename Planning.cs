@@ -3733,6 +3733,16 @@ internal sealed class Planning
     {
         why = "";
 
+        // **No more links than explosives in hand.** A chain carried over or filed under a larger count kept its length,
+        // and the search, which never shortens a chain, improved on it: at another player's site with 6 explosives the
+        // floor and the plan on screen held 13 links (dump 2026-10-18 22:31:06).
+        if (chain.Count > env.Explosives)
+        {
+            why = $"it has {chain.Count} links and only {env.Explosives} explosives are to be planned for";
+
+            return false;
+        }
+
         for (var i = 0; i < chain.Count; i++)
         {
             if (env.CanPlace(chain[i]))
