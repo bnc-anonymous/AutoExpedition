@@ -388,69 +388,146 @@ internal static class Detonator
     /// The explosives standing on the ground, from the entity list, in the order they were placed: by entity id, which
     /// the game hands out as each is made. For another player's site, whose panel lists none of them: nine of a host's
     /// read there with ids rising along the chain from the detonator, each within reach of the one before (dump
-    /// 2026-10-12 16:30:30). Only those the game has loaded, so a chain part of which is out of range reads short.
-    /// Entities no longer valid are left out, and of two on one grid cell only the newer is kept: an undone explosive
-    /// can stay in the entity list after the game removed it, and counting it made a host who undid placements seem to
-    /// have more explosives than they do (suspected, not yet seen in a dump; the dump lists every explosive entity to
-    /// settle it). See SiteIsAnotherPlayers.
+    /// 2026-10-12 16:30:30).
+    ///
+    /// **Entities the game no longer updates are counted where they are out of its range.** Away from the player an
+    /// explosive's entity reads not valid but keeps its position: a host's chain of 12 read 4 links, those near the
+    /// player, while the 8 not valid continued it 99 to 108 grid apart (dump 2026-10-19 18:10:42). One not valid within
+    /// EntitiesLoadedWithin of the player is gone, undone or gone off, and left out.
+    ///
+    /// **Built as the game builds a chain**: each explosive within a link's reach of the last, the reach being the
+    /// longest base reach with the map's increase - not PlacementRange, which asks the explosive count, which asks this.
+    /// One within reach only of an earlier link follows that link and drops those after it, which an undo took back
+    /// while their entities stayed: six not valid sat 0 to 3 grid from newer ones in the dump of 2026-10-19 17:39:37.
+    /// One within reach of no link and not of the detonator is not this site's chain: a map can hold two expeditions,
+    /// and the other site's explosives were counted too - one likely way a 6 explosive site was planned for 13 (dump
+    /// 2026-10-18 22:31:06, not confirmed). With no detonator read, every explosive kept, in id order. See
+    /// SiteIsAnotherPlayers.
     /// </summary>
     public static Vector2[] ExplosivesStandingInOrder(GameController gc)
     {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
         var found = new List<(uint Id, Vector2 At)>();
 
         foreach (var entity in ExplosiveEntities(gc))
         {
-            if (!Safe.Read(entity, static e => e.IsValid, false))
-                continue;
-
             var at = Safe.Read(entity, static e => e.GridPos, Vector2.Zero);
-            var id = Safe.Read(entity, static e => e.Id, 0u);
 
             if (at == Vector2.Zero)
                 continue;
 
-            var same = found.FindIndex(f => Vector2.Distance(f.At, at) < 1f);
+            if (!Safe.Read(entity, static e => e.IsValid, false) && player != Vector2.Zero &&
+                Vector2.Distance(player, at) <= EntitiesLoadedWithin)
+                continue;
 
-            if (same < 0)
-                found.Add((id, at));
-            else if (id > found[same].Id)
-                found[same] = (id, at);
+            found.Add((Safe.Read(entity, static e => e.Id, 0u), at));
         }
 
-        // **This site's chain only.** The entity list is the map's, and a map can hold two expeditions, so the explosives
-        // of the other site were counted too - one likely way a 6 explosive site was planned for 13 (dump 2026-10-18
-        // 22:31:06, not confirmed). Kept: those joined to the detonator by steps no longer than a link can be, the
-        // longest base reach with the map's increase. Not PlacementRange, which asks the explosive count, which asks this.
+        found.Sort((a, b) => a.Id.CompareTo(b.Id));
+
         var detonator = DetonatorGridPosition(gc);
 
-        if (detonator != Vector2.Zero && found.Count > 0)
+        if (detonator == Vector2.Zero)
+            return found.Select(x => x.At).ToArray();
+
+        var step = MathF.Floor(MathF.Max(1f, 100f + PlacementRangePct(gc)) * GrandReach / 100f) + 1f;
+        var chain = new List<Vector2>();
+
+        foreach (var (_, at) in found)
         {
-            var step = MathF.Floor(MathF.Max(1f, 100f + PlacementRangePct(gc)) * GrandReach / 100f) + 1f;
-            var joined = new List<Vector2> { detonator };
-            var left = new List<(uint Id, Vector2 At)>(found);
-            var kept = new List<(uint Id, Vector2 At)>();
+            var from = chain.Count - 1;
 
-            for (var grew = true; grew;)
-            {
-                grew = false;
+            while (from >= 0 && Vector2.Distance(chain[from], at) > step)
+                from--;
 
-                for (var i = left.Count - 1; i >= 0; i--)
-                {
-                    if (!joined.Any(j => Vector2.Distance(j, left[i].At) <= step))
-                        continue;
+            if (from < 0 && Vector2.Distance(detonator, at) > step)
+                continue;
 
-                    joined.Add(left[i].At);
-                    kept.Add(left[i]);
-                    left.RemoveAt(i);
-                    grew = true;
-                }
-            }
-
-            found = kept;
+            chain.RemoveRange(from + 1, chain.Count - from - 1);
+            chain.Add(at);
         }
 
-        return found.OrderBy(x => x.Id).Select(x => x.At).ToArray();
+        return chain.ToArray();
     }
+
+    /// <summary>
+    /// How far from the player the game holds every entity, in grid units: Debug.ScoutReach, set each tick. An explosive
+    /// not valid within it is gone; see ExplosivesStandingInOrder.
+    /// </summary>
+    public static float EntitiesLoadedWithin { get; set; } = 160f;
+
+    /// <summary>
+    /// The chain another player has laid at the site in front of the player, in the order it went down: drawn and scored
+    /// in place of the plan once the site is set off, when the plan is a chain nobody placed there. Read from
+    /// ExplosivesStandingInOrder until the site is set off, and kept unchanged from then. Going off removes the
+    /// explosives from the detonator outwards, and ExplosivesStandingInOrder starts the chain within reach of the
+    /// detonator, so it reads none once the first link has gone (dump 2026-10-19 17:39:37: 0 on the chain, with 25
+    /// explosive entities in the list and 12 of them valid).
+    ///
+    /// A reading that is the kept chain cut short is not taken while every link it lacks is over EntitiesLoadedWithin
+    /// from the player; a link missing nearer was undone. Null away from another player's site, or with nothing read
+    /// there; the same list until the reading changes, so callers can cache on it.
+    /// </summary>
+    public static List<Vector2> AnotherPlayersChain(GameController gc)
+    {
+        if (!SiteIsAnotherPlayers(gc))
+            return null;
+
+        var site = DetonatorGridPosition(gc);
+        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
+        if (site == Vector2.Zero)
+            return null;
+
+        if (site != _anotherPlayersChainSite || area != _anotherPlayersChainArea)
+        {
+            _anotherPlayersChain = null;
+            _anotherPlayersChainSite = site;
+            _anotherPlayersChainArea = area;
+            AnotherPlayersChainSaid = "nothing read at this site";
+        }
+
+        if (SetOffHere(gc))
+        {
+            if (_anotherPlayersChain != null && !AnotherPlayersChainSaid.EndsWith(SetOffSaid, StringComparison.Ordinal))
+                AnotherPlayersChainSaid += SetOffSaid;
+
+            return _anotherPlayersChain;
+        }
+
+        if (DateTime.UtcNow - _anotherPlayersChainReadAt < AnotherPlayersReadFor)
+            return _anotherPlayersChain;
+
+        _anotherPlayersChainReadAt = DateTime.UtcNow;
+
+        var read = ExplosivesStandingInOrder(gc);
+        var kept = _anotherPlayersChain;
+        var prefixOfKept = kept != null && read.Length <= kept.Count &&
+                           read.Select((at, i) => Vector2.Distance(at, kept[i]) < 1f).All(same => same);
+
+        if (prefixOfKept && read.Length == kept.Count)
+            return kept;
+
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (prefixOfKept && player != Vector2.Zero &&
+            kept.Skip(read.Length).All(at => Vector2.Distance(player, at) > EntitiesLoadedWithin))
+            return kept;
+
+        _anotherPlayersChain = read.Length == 0 ? null : read.ToList();
+        AnotherPlayersChainSaid = $"{read.Length} link(s), read {DateTime.Now:HH:mm:ss}";
+
+        return _anotherPlayersChain;
+    }
+
+    private static List<Vector2> _anotherPlayersChain;
+    private static Vector2 _anotherPlayersChainSite;
+    private static uint _anotherPlayersChainArea;
+    private static DateTime _anotherPlayersChainReadAt;
+    private const string SetOffSaid = ", kept since the site was set off";
+
+    /// <summary>What AnotherPlayersChain holds and when it was read, for the dump.</summary>
+    public static string AnotherPlayersChainSaid { get; private set; } = "nothing read this session";
 
     /// <summary>Every ExpeditionExplosive entity in the entity list, valid or not, from either site. See ExplosivesStandingInOrder.</summary>
     public static IEnumerable<Entity> ExplosiveEntities(GameController gc)

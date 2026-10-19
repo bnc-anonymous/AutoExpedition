@@ -144,11 +144,24 @@ internal static class Overlay
         // set off, to keep a fresh plan off a finished site after leaving and coming back; that took the chain away
         // the moment a Grand site was set off. Solving and the presolve refuse a Grand site set off (see
         // Detonator.GrandSiteSetOff), so the plan here is the chain that was set off.
-        var here = Vector2.Distance(planning.Site, site) < 1f &&
+        //
+        // **At another player's site once set off, the chain its owner laid**, not the plan: the plan is a chain nobody
+        // placed there, so its lines and circles led the fight along a route the host never took. Drawn without
+        // readiness or per-link figures from another site's plan. See Detonator.AnotherPlayersChain.
+        var laidByAnotherPlayer = Detonator.SetOffHere(gc)
+            ? Detonator.AnotherPlayersChain(gc)
+            : null;
+        var planIsForThisSite = Vector2.Distance(planning.Site, site) < 1f;
+        var here = laidByAnotherPlayer != null ||
+                   planIsForThisSite &&
                    (Planning.Showing(site) ||
                     (settings.Solver.Presolve.Enable.Value && settings.Solver.Presolve.ShowPresolve.Value));
-        var live = here && settings.Display.ThePlan.ShowProgress && planning.Searching ? planning.Live : null;
-        var shown = live is { Count: > 0 } ? new Plan(live, 0d, 0) : planning.Plan;
+        var live = laidByAnotherPlayer == null && here && settings.Display.ThePlan.ShowProgress && planning.Searching
+            ? planning.Live
+            : null;
+        var shown = laidByAnotherPlayer != null ? AnotherPlayersPlan(laidByAnotherPlayer)
+            : live is { Count: > 0 } ? new Plan(live, 0d, 0)
+            : planning.Plan;
 
         // One answer for the whole chain, used by the world drawing and the minimap alike: the
         // two pictures of one plan must never disagree about which spots are live. See Reachable.
@@ -164,11 +177,21 @@ internal static class Overlay
         // The honest answer during a solve is that nothing is known yet, and the honest colour for
         // that is not green. It costs nothing: a chain that is still being found is not one to be
         // placing from.
+        // What is on show and why, for the dump. See ChainShownSaid.
+        ChainShownSaid = $"{DateTime.Now:HH:mm:ss.fff}: " +
+                         (laidByAnotherPlayer != null ? "the chain another player laid"
+                             : live is { Count: > 0 } ? "the search's best so far"
+                             : "the plan") +
+                         $", {shown?.Points.Count ?? 0} link(s); in the world {settings.Display.DrawInWorld.Value && here}, " +
+                         $"on the minimap {settings.Display.DrawOnMinimap.Value && here}; set off {Detonator.SetOffHere(gc)}, " +
+                         $"another player's site {Detonator.SiteIsAnotherPlayers(gc)}, the plan for this site {planIsForThisSite}, " +
+                         $"shown here {Planning.Showing(site)}";
+
         bool[] lit;
 
         using (Spent.On("Reachable"))
         {
-            lit = planning.Searching
+            lit = planning.Searching || laidByAnotherPlayer != null
                 ? new bool[shown?.Points.Count ?? 0]
                 : Reachable(gc, settings, shown, placement, cleared, covered);
         }
@@ -191,7 +214,8 @@ internal static class Overlay
 
             using (Spent.On("Breakdown"))
             {
-                worth = settings.Display.PlacementCircle.BlastValue.ShowSpotWorth || settings.Display.Remnants.Propagation.ShowWaves
+                worth = planIsForThisSite &&
+                        (settings.Display.PlacementCircle.BlastValue.ShowSpotWorth || settings.Display.Remnants.Propagation.ShowWaves)
                     ? planning.Breakdown(shown.Points)
                     : null;
             }
@@ -202,7 +226,7 @@ internal static class Overlay
             {
                 Chain(graphics, gc, settings, shown, targets, blast, cleared, covered, placement,
                     lit, settings.Display.PlacementCircle.BlastValue.ShowSpotWorth ? worth : null,
-                    planning.Laid);
+                    laidByAnotherPlayer != null ? 0 : planning.Laid);
             }
         }
 
@@ -1180,6 +1204,20 @@ internal static class Overlay
     // -------------------------------------------------------------------- the plan
 
     /// <summary>
+    /// The chain another player laid, as a plan to draw: the same object while the chain is the same list, so what is
+    /// cached on the plan's points holds. See Detonator.AnotherPlayersChain.
+    /// </summary>
+    private static Plan AnotherPlayersPlan(List<Vector2> chain)
+    {
+        if (!ReferenceEquals(_anotherPlayersPlan?.Points, chain))
+            _anotherPlayersPlan = new Plan(chain, 0d, 0);
+
+        return _anotherPlayersPlan;
+    }
+
+    private static Plan _anotherPlayersPlan;
+
+    /// <summary>
     /// The chain: where each explosive goes, in order, and what each one catches.
     ///
     /// Drawn from the origin outwards so the order is visible - the line is the sequence the
@@ -1258,12 +1296,20 @@ internal static class Overlay
         // PlanDisplaySettings.ChainHeadColour.
         var headStillToDraw = Detonator.SetOffHere(gc);
 
+        // What each link drew, for the dump, every ChainLinksSaidEvery. See ChainLinksSaid.
+        var said = DateTime.UtcNow >= _chainLinksSaidNext ? new List<string>() : null;
+        var linesDrawn = 0;
+
         for (var i = 0; i < plan.Points.Count; i++)
         {
             var world = Where(gc, plan.Points[i]);
 
             if (world == Vector3.Zero)
+            {
+                said?.Add($"{i + 1} no ground point");
+
                 continue;
+            }
 
             var done = Already(placed, plan.Points[i]);
 
@@ -1293,6 +1339,12 @@ internal static class Overlay
                 : ready
                     ? MathF.Max(0.5f, settings.Display.ThePlan.ReadyThickness.Value)
                     : MathF.Max(0.5f, settings.Display.ThePlan.PlanThickness.Value);
+
+            said?.Add($"{i + 1} ({plan.Points[i].X:0},{plan.Points[i].Y:0}) " +
+                      (gone ? "gone off"
+                          : Under(gc, covered, world) ? "under a panel"
+                          : radius != null && !done && (ready || next || settings.Display.ThePlan.ShowLater) ? "circle and number"
+                          : "number only"));
 
             if (!gone && !Under(gc, covered, world))
             {
@@ -1372,14 +1424,34 @@ internal static class Overlay
                     !Panels.Covers(covered, b) &&
                     Plausible(scale, Vector2.Distance(fromGrid, plan.Points[i]),
                         Vector2.Distance(a, b)))
+                {
                     graphics.DrawLine(a, b, thickness, lineColour);
+                    linesDrawn++;
+                }
             }
 
             from = world;
             fromGrid = plan.Points[i];
             behind = gone;
         }
+
+        if (said != null)
+        {
+            ChainLinksSaid = $"{DateTime.Now:HH:mm:ss.fff}: {linesDrawn} line(s) drawn; {string.Join("; ", said)}";
+            _chainLinksSaidNext = DateTime.UtcNow + ChainLinksSaidEvery;
+        }
     }
+
+    /// <summary>Which chain the last frame put on show, how many links, and whether each surface drew it, for the dump.</summary>
+    public static string ChainShownSaid { get; private set; } = "nothing drawn this session";
+
+    /// <summary>What the chain's drawing did link by link, at most every ChainLinksSaidEvery, for the dump. See Chain.</summary>
+    public static string ChainLinksSaid { get; private set; } = "no chain drawn in the world this session";
+
+    private static DateTime _chainLinksSaidNext;
+
+    /// <summary>How often Chain writes ChainLinksSaid. Chosen: often enough for a dump, rarely enough to cost nothing.</summary>
+    private static readonly TimeSpan ChainLinksSaidEvery = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
     /// How many pixels one grid unit covers on screen, measured rather than assumed.

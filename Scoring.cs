@@ -303,10 +303,12 @@ internal sealed class Scoring
 
         // **Another player's site: the chain its owner has placed, read from the explosives standing**, in the order they
         // went down; the panel lists none there. Scored as the player's own placed chain is, so the left figure is the
-        // host's chain against the plan. See Detonator.ExplosivesStandingInOrder.
+        // host's chain against the plan, and kept once the site is set off. See Detonator.AnotherPlayersChain.
         _atAnotherPlayersSite = Detonator.SiteIsAnotherPlayers(gc);
 
-        var placed = _atAnotherPlayersSite ? Detonator.ExplosivesStandingInOrder(gc) : Detonator.PlacedExplosiveGridPositions(gc);
+        var placed = _atAnotherPlayersSite
+            ? Detonator.AnotherPlayersChain(gc)?.ToArray() ?? []
+            : Detonator.PlacedExplosiveGridPositions(gc);
 
         // While a search is running the number tracks its best chain so far, which is what makes it
         // climb on screen rather than appear at the end. Recomputed when the search publishes a

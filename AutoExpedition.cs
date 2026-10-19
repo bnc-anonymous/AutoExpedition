@@ -795,6 +795,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         // What another player's site is planned for. See Detonator.AnotherPlayersSiteExplosives.
         Detonator.AnotherPlayersSiteExplosives = Settings.Solver.Advanced.ExplosivesAtAnotherPlayersSite.Value;
+        Detonator.EntitiesLoadedWithin = Settings.Debug.ScoutReach.Value;
         Detonator.RemnantsAtSite = _scan?.At(Detonator.DetonatorGridPosition(GameController)).Count(t => t.Kind == TargetKind.Remnant) ?? 0;
 
         Ground.NextFrame();
@@ -2329,7 +2330,13 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Cleared.Observe"))
         {
-            _cleared.Observe(GameController, _planning.Plan.Points, Settings.Debug.ScoutReach.Value);
+            // The chain drawn: at another player's site once set off, the one its owner laid. Read every tick, so it is
+            // kept from before the site is set off. See Overlay.Draw and Detonator.AnotherPlayersChain.
+            var laidByAnotherPlayer = Detonator.AnotherPlayersChain(GameController);
+
+            _cleared.Observe(GameController,
+                laidByAnotherPlayer != null && Detonator.SetOffHere(GameController) ? laidByAnotherPlayer : _planning.Plan.Points,
+                Settings.Debug.ScoutReach.Value);
         }
 
         using (Spent.On("Overlay.Draw"))

@@ -2280,8 +2280,11 @@ internal static class Dump
                      $"{Detonator.ExplosivesToPlanFor(gc)} against {Detonator.GrandExplosives} - " +
                      $"{Detonator.Counting}");
         b.AppendLine($"  at another player's site: {(Detonator.SiteIsAnotherPlayers(gc) ? "this is one" : "this is not one")}; " +
-                     $"{Detonator.ExplosivesStandingInOrder(gc).Length} explosive(s) down on this site's chain; learnt from " +
+                     $"{Detonator.ExplosivesStandingInOrder(gc).Length} explosive(s) down on this site's chain; the chain its " +
+                     $"owner laid, as kept: {Detonator.AnotherPlayersChainSaid}; learnt from " +
                      $"owners' placements: {Detonator.LearnedAtAnotherPlayersSiteSaid}");
+        b.AppendLine($"  the chain on show, last frame drawn: {Overlay.ChainShownSaid}");
+        b.AppendLine($"  the chain drawn in the world, link by link: {Overlay.ChainLinksSaid}");
 
         foreach (var explosive in Detonator.ExplosiveEntities(gc))
             b.AppendLine($"    explosive entity id {Safe.Read(explosive, static e => e.Id, 0u)} at " +
