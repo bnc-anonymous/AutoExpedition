@@ -27,8 +27,8 @@ namespace AutoExpedition;
 ///
 /// **Instant loot.** Its list may hold the action key list's ENTITY lines too, which shatter spent remnants and open
 /// chests as they become clickable. One item at a time: with a party member in the area, in list order, and within a
-/// line those in pickup reach first, then by NinjaPricer the dearest, those within Priority threshold for loot matched by
-/// the same line of each other taken nearest first; alone, the nearest. See TopFirstNow and BestInLootOrder. An item in reach plans the rest of its line in reach and the line's nearest
+/// line those in pickup reach first, then by NinjaPricer the dearest, those within Same-line priority threshold of each other
+/// taken nearest first; alone, the nearest. See TopFirstNow and BestInLootOrder. An item in reach plans the rest of its line in reach and the line's nearest
 /// out of reach, and the cursor glides through them; see the plan in Tick. The cursor is taken, the player's mouse ignored - and by default blocked - for Mouse block time, the move
 /// made at Instant loot shortest move and Instant loot move time per root pixel, and one click sent. The cursor is taken from a placement or tablet run that holds it
 /// (InstantLootPriority). Each item is tried once, by entity id, whether the click took or not,
@@ -383,8 +383,10 @@ internal static class Autoloot
     /// **For gear** (2026-10-20): CLASS takes several classes separated by commas, any of which will do. GEAR:Armour or
     /// GEAR:Weapon, or both separated by a comma, is an item with the game's Armour or Weapon component. ILVL:&lt;n&gt; is
     /// the item level at least (Mods.ItemLevel); LEVEL:&lt;n&gt; the base's level at least (BaseItemType.DropLevel), the
-    /// requirement a normal base shows - not checked against the game's tooltip yet, and mods can raise a magic or rare
-    /// item's requirement above it; SOCKETS:&lt;n&gt; the sockets at least (Sockets.NumberOfSockets). DEFENCE: the base's
+    /// requirement a normal base shows, and mods can raise a magic or rare item's requirement above it; SOCKETS:&lt;n&gt; the
+    /// sockets at least (Sockets.NumberOfSockets). Read on one item, a rare Tasalian Focus (dump 2026-10-20 20:33:01):
+    /// class Focus, item level 82, Mods.RequiredLevel and DropLevel both 80, 2 sockets, energy shield 91 and no armour or
+    /// evasion, an Armour component and no Weapon one - each as the lines take it. No normal base read yet. DEFENCE: the base's
     /// defences exactly, as AR, EV and ES joined by + for a hybrid, NONE for none, several separated by commas, any of
     /// which will do: AR where its Armour component's armour is above 0, and so on. Words before the first condition word
     /// name the item, its base type or unique name ignoring case. The gear words come from a price survey of normal
@@ -970,7 +972,7 @@ internal static class Autoloot
 
     /// <summary>
     /// Whether both lists are taken top first now - higher lines, then those in pickup reach, then the dearer by more
-    /// than Priority threshold for loot matched by the same line, then the nearer (see BestInLootOrder) - rather than
+    /// than Same-line priority threshold, then the nearer (see BestInLootOrder) - rather than
     /// nearest first. Top first with another party member in this area, racing for the same loot; nearest first alone,
     /// where nothing can be lost and the shortest path round is best. Was a dropdown per list, removed 2026-10-11 as
     /// this was the only choice worth making. See BestInLootOrder.
@@ -1164,7 +1166,7 @@ internal static class Autoloot
         return false;
     }
 
-    /// <summary>The price band of the loot order in exalts: Priority threshold for loot matched by the same line at the divine price in use, 0 before one is read. See BestInLootOrder.</summary>
+    /// <summary>The price band of the loot order in exalts: Same-line priority threshold at the divine price in use, 0 before one is read. See BestInLootOrder.</summary>
     internal static double LootOrderBandExalts(AutoExpeditionSettings settings) =>
         settings.Automation.Autoloot.SameLinePriorityThresholdDivines.Value * Math.Max(0d, Valuation.DivineInExalts);
 

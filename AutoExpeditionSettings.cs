@@ -3192,7 +3192,9 @@ public class AutolootSettings
     /// out of it. Measured from the dearest left at each look. Converted at the divine price in use; with none read yet,
     /// price alone decides. Both runs. Chosen. See Autoloot.BestInLootOrder.
     /// </summary>
-    [Menu("Priority threshold for loot matched by the same line (divines)",
+    [Menu("Same-line priority threshold (divines)",
+        "How close in price, in divines, items matched by the same list line must be\n" +
+        "to be taken nearest first rather than dearest first.\n\n" +
         "With a party member in the area, items on one list line are taken in\n" +
         "reach first, then out of reach. Within each, the dearest goes first,\n" +
         "and items priced within this many divines of it go nearest first:\n" +
@@ -3323,7 +3325,23 @@ public class AutolootSettings
     public TextNode ItemsOnActionKey { get; set; } = new TextNode(
         "ART:Headhunter\nCLASS:StackableCurrency MIN:1c\nCLASS:Omen MIN:3c\nCLASS:Expedition2Logbooks MIN:3c\n" +
         "CLASS:UncutReservationGemStackable MIN:3c\nCLASS:UncutSkillGemStackable MIN:3c\nCLASS:SoulCore MIN:3c\n" +
-        "CLASS:TowerAugmentation MIN:3c\nExpedition Tablet\nCLASS:VaultKey MIN:3c\nMIN:1d");
+        "CLASS:TowerAugmentation MIN:3c\nExpedition Tablet\nCLASS:VaultKey MIN:3c\nMIN:1d\n" +
+        "# 1d+ exceptional socket bases\n" +
+        "CLASS:Helmet,Boots,Gloves,Focus ILVL:82 LEVEL:75 SOCKETS:2 DEFENCE:ES\n" +
+        "CLASS:Boots ILVL:82 LEVEL:80 SOCKETS:2\n" +
+        "Warmonger Bow ILVL:82 SOCKETS:2\n" +
+        "CLASS:Helmet,Gloves,Focus LEVEL:80 SOCKETS:2 DEFENCE:ES\n" +
+        "Flying Spear ILVL:82 SOCKETS:2\n" +
+        "Dueling Wand SOCKETS:2\n" +
+        "CLASS:Gloves LEVEL:80 SOCKETS:2 DEFENCE:AR,AR+EV\n" +
+        "CLASS:Gloves ILVL:82 LEVEL:80 SOCKETS:2 DEFENCE:EV+ES\n" +
+        "Obliterator Bow ILVL:82 SOCKETS:3\n" +
+        "Ironwood Greathammer ILVL:82 SOCKETS:3\n" +
+        "Akoyan Spear ILVL:82 SOCKETS:2\n" +
+        "CLASS:Helmet ILVL:82 LEVEL:80 SOCKETS:2 DEFENCE:AR,AR+EV\n" +
+        "CLASS:Boots ILVL:82 LEVEL:70 SOCKETS:2 DEFENCE:ES\n" +
+        "CLASS:Boots LEVEL:80 SOCKETS:2 DEFENCE:AR,ES,EV+ES\n" +
+        "CLASS:Shield ILVL:82 LEVEL:80 SOCKETS:2 DEFENCE:AR");
 
     [JsonIgnore]
     public CustomNode ItemsOnActionKeyUi { get; set; } = new CustomNode(() => ItemListEditor.Draw(
@@ -3380,7 +3398,7 @@ public class AutolootSettings
     /// ExileInput2's Shortest Move for the action key's autoloot run, replacing ExileInput2's own (40ms by default): a
     /// move takes this plus AutolootMoveTimePerRootPixelMs times the square root of its length in pixels, so this is the
     /// term that sets the pace of short hops between labels. The value as it stands, 0 included, as Instant loot shortest
-    /// move is. 67 by default, chosen in play, not measured. Set when the run starts and handed back when it ends, as
+    /// move is. 66 by default, the player's setting in play (2026-10-20); 67 before, also chosen in play, not measured. Set when the run starts and handed back when it ends, as
     /// explosive placement and the tablet runs share the caller name. Needs an ExileInput2 with SetShortestMove. See
     /// Placement.BeginLooting.
     ///
@@ -3390,13 +3408,13 @@ public class AutolootSettings
     [Menu("Autoloot shortest move (ms)",
         "The fixed part of each mouse move to a thing the action key loots, however near it is.\n" +
         "Raise it if short hops click too quickly. ExileInput2's own setting is 40.")]
-    public RangeNode<int> AutolootShortestMoveMs { get; set; } = new RangeNode<int>(67, 0, 400);
+    public RangeNode<int> AutolootShortestMoveMs { get; set; } = new RangeNode<int>(66, 0, 400);
 
     /// <summary>
     /// ExileInput2's Move Time Per Root Pixel for the action key's autoloot run, replacing ExileInput2's own (6 by
     /// default): the part of a move that grows with the square root of its length in pixels. The value as it stands, 0
-    /// included, as Instant loot move time per root pixel is; 0 with AutolootShortestMoveMs at 0 teleports. 6 by
-    /// default, ExileInput2's own default. Set and handed back with AutolootShortestMoveMs. See Placement.BeginLooting.
+    /// included, as Instant loot move time per root pixel is; 0 with AutolootShortestMoveMs at 0 teleports. 3 by
+    /// default, the player's setting in play (2026-10-20); 6, ExileInput2's own default, before. Set and handed back with AutolootShortestMoveMs. See Placement.BeginLooting.
     ///
     /// Named MoveTimePerRootPixelWhenAutolootingMs until 0 stood for ExileInput2's own; renamed with the change, so a
     /// saved 0 - the old default - is not read as the new meaning.
@@ -3404,7 +3422,7 @@ public class AutolootSettings
     [Menu("Autoloot move time per root pixel (ms)",
         "The part of each mouse move to a thing the action key loots that grows with its length:\n" +
         "higher is slower. ExileInput2's own setting is 6.")]
-    public RangeNode<int> AutolootMoveTimePerRootPixelMs { get; set; } = new RangeNode<int>(6, 0, 60);
+    public RangeNode<int> AutolootMoveTimePerRootPixelMs { get; set; } = new RangeNode<int>(3, 0, 60);
     [JsonIgnore]
     public CustomNode InstantAutolootGroup { get; set; } = Section.Of("Instant Autoloot");
 
@@ -3415,7 +3433,16 @@ public class AutolootSettings
     /// last one's label or button to go. Needs Enable automation and EnableInstantAutoloot. See Autoloot.
     /// </summary>
     [IgnoreMenu]
-    public TextNode InstantLootItems { get; set; } = new TextNode("Mirror of Kalandra\nHinekora's Lock\nART:Mageblood\nPerfect Chaos Orb\nMIN:10d");
+    public TextNode InstantLootItems { get; set; } = new TextNode(
+        "Mirror of Kalandra\nHinekora's Lock\nART:Mageblood\nPerfect Chaos Orb\nMIN:10d\n" +
+        "# 5d+ exceptional socket bases\n" +
+        "CLASS:Helmet,Boots,Focus ILVL:82 LEVEL:75 SOCKETS:2 DEFENCE:ES\n" +
+        "CLASS:Boots ILVL:82 LEVEL:80 SOCKETS:2 DEFENCE:AR,EV,AR+EV,EV+ES\n" +
+        "Warmonger Bow ILVL:82 SOCKETS:2\n" +
+        "CLASS:Helmet,Gloves,Focus LEVEL:80 SOCKETS:2 DEFENCE:ES\n" +
+        "Flying Spear ILVL:82 SOCKETS:2\n" +
+        "Dueling Wand ILVL:82 SOCKETS:2\n" +
+        "CLASS:Gloves LEVEL:80 SOCKETS:2 DEFENCE:AR+EV");
 
     [JsonIgnore]
     public CustomNode InstantLootItemsUi { get; set; } = new CustomNode(() => ItemListEditor.Draw(
@@ -3492,24 +3519,24 @@ public class AutolootSettings
 
     /// <summary>
     /// ExileInput2's Shortest Move for the instant loot move: the fixed part of the move's time, near or far. 0 adds
-    /// nothing, unlike the action key's setting, where 0 means ExileInput2's own. 0 by default, so the move's time is
-    /// InstantLootMoveTimePerRootPixelMs alone. See Autoloot.Tick.
+    /// nothing, unlike the action key's setting, where 0 means ExileInput2's own. 33 by default, the player's choice
+    /// (2026-10-20); 0 before, which left the move's time to InstantLootMoveTimePerRootPixelMs alone. See Autoloot.Tick.
     /// </summary>
     [Menu("Instant loot shortest move (ms)",
         "The fixed part of the instant loot mouse move, however near the item is.\n" +
         "With this and the move time per root pixel both at 0, the cursor is put on the item at once.")]
-    public RangeNode<int> InstantLootShortestMoveMs { get; set; } = new RangeNode<int>(0, 0, 400);
+    public RangeNode<int> InstantLootShortestMoveMs { get; set; } = new RangeNode<int>(33, 0, 400);
 
     /// <summary>
     /// ExileInput2's Move Time Per Root Pixel for the instant loot move, in place of its own 6: the part of the move's
-    /// time that grows with the square root of its length in pixels. 0 with InstantLootShortestMoveMs at 0 teleports. 2 by
-    /// default, chosen, not measured: with no shortest move, about 60ms over 1000 pixels and 100ms over 2560 (2 x the square root),
-    /// which reads as close to a teleport. See Autoloot.Tick.
+    /// time that grows with the square root of its length in pixels. 0 with InstantLootShortestMoveMs at 0 teleports. 1 by
+    /// default with a shortest move of 33, the player's choice (2026-10-20): about 65ms over 1000 pixels and 84ms over
+    /// 2560 (33 plus the square root). 2 before, with no shortest move. See Autoloot.Tick.
     /// </summary>
     [Menu("Instant loot move time per root pixel (ms)",
         "The part of the instant loot mouse move that grows with its length: higher is slower.\n" +
-        "2 moves 1000 pixels in about 60ms; ExileInput2's own setting is 6.")]
-    public RangeNode<int> InstantLootMoveTimePerRootPixelMs { get; set; } = new RangeNode<int>(2, 0, 60);
+        "Each 1 adds about 32ms over 1000 pixels; ExileInput2's own setting is 6.")]
+    public RangeNode<int> InstantLootMoveTimePerRootPixelMs { get; set; } = new RangeNode<int>(1, 0, 60);
 
     /// <summary>
     /// Whether an instant loot click goes out the moment the cursor reaches the item, from ExileInput2's own input thread,
