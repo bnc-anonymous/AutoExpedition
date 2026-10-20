@@ -300,9 +300,11 @@ internal static class Autoloot
         SoundedItemIds.Clear();
         PendingConfirmations.Clear();
         InReachPickups.Clear();
+        ClickTargets.Clear();
         PricesOfItems.Clear();
         UnpricedUntil.Clear();
         FactsOfItems.Clear();
+        FirstLooks.Clear();
         RanksOfItems.Clear();
         Finish();
     }
@@ -1075,12 +1077,71 @@ internal static class Autoloot
         if (id != 0u)
         {
             var whole = ranked.Rank >= 0 && FactsOfItem(null, onGround)?.Metadata is { Length: > 0 };
+            var fresh = NoteLook(gc, onGround, id, ranked);
 
             lock (kept)
-                kept[id] = (ranked.Rank, ranked.Name, whole ? DateTime.MaxValue : DateTime.UtcNow + RankKeptUnmatched);
+                kept[id] = (ranked.Rank, ranked.Name,
+                    whole ? DateTime.MaxValue : DateTime.UtcNow + (fresh ? RankKeptUnmatchedWhileFresh : RankKeptUnmatched));
         }
 
         return ranked;
+    }
+
+    /// <summary>
+    /// How long after an item is first looked at its rank, unmatched, is kept for only RankKeptUnmatchedWhileFresh. A stack
+    /// a party member dropped right after one that went at once waited about a second before its click, the first
+    /// waiting none (the player's account, 2026-10-20 18:06): suspected, its first look came before its facts or price
+    /// read, and the "no match" was kept for RankKeptUnmatched. ListedItemTimings records what the first look read.
+    /// </summary>
+    private static readonly TimeSpan FreshFor = TimeSpan.FromSeconds(2);
+
+    /// <summary>How long a rank that matched nothing is kept while the item is fresh. See FreshFor. Chosen.</summary>
+    private static readonly TimeSpan RankKeptUnmatchedWhileFresh = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// Each item's first look, by entity id: when, whether its metadata had read, and its price then; dropped once it has
+    /// matched a line and been noted in ListedItemTimings. Cleared on an area change.
+    /// </summary>
+    private static readonly Dictionary<uint, (DateTime At, bool MetadataRead, double Price)> FirstLooks = new();
+
+    /// <summary>For each listed item, its first look and how long after it the item first matched a line, newest last, for the dump.</summary>
+    private static readonly List<string> ListedItemTimings = new();
+
+    /// <summary>
+    /// Notes an item's first look, and how soon after it the item first matched a line. True while the item is within
+    /// FreshFor of its first look. See FreshFor.
+    /// </summary>
+    private static bool NoteLook(GameController gc, Entity onGround, uint id, (int Rank, string Name) ranked)
+    {
+        lock (FirstLooks)
+        {
+            if (!FirstLooks.TryGetValue(id, out var first))
+            {
+                if (FirstLooks.Count > 2000)
+                    FirstLooks.Clear();
+
+                first = (DateTime.UtcNow, FactsOfItem(null, onGround)?.Metadata is { Length: > 0 }, PriceOfItem(gc, onGround));
+                FirstLooks[id] = first;
+            }
+
+            if (ranked.Rank >= 0 && first.At != DateTime.MinValue)
+            {
+                var arrived = Ground.ArrivalOfItem(id);
+
+                ListedItemTimings.Add($"{first.At.ToLocalTime():HH:mm:ss.fff} {ranked.Name} (id {id}): " +
+                                      (arrived is { } a ? $"arrived {(first.At - a).TotalMilliseconds:0}ms before " : "arrival not seen; ") +
+                                      "its first look, with its " +
+                                      $"metadata {(first.MetadataRead ? "read" : "not read")} and priced {first.Price:0.#}ex; " +
+                                      $"matched a line {(DateTime.UtcNow - first.At).TotalMilliseconds:0}ms later");
+
+                if (ListedItemTimings.Count > 20)
+                    ListedItemTimings.RemoveAt(0);
+
+                FirstLooks[id] = (DateTime.MinValue, first.MetadataRead, first.Price);
+            }
+
+            return first.At != DateTime.MinValue && DateTime.UtcNow - first.At < FreshFor;
+        }
     }
 
     /// <summary>Each item's rank by entity id, for each parsed list. See RankOfItem.</summary>
@@ -1326,6 +1387,7 @@ internal static class Autoloot
 
         // Every Tick, whatever the phase, while a click's response is being timed. See ClickResponse.
         ObserveClickResponse(gc);
+        ObserveClickTargets(gc);
 
         // Every Tick, whatever the phase: the pickups in reach the run did not wait for. See InReachPickups.
         StepInReachPickups(gc, settings);
@@ -1847,8 +1909,20 @@ internal static class Autoloot
         // How good a move ahead of the last walk was, before the cursor leaves where it put it. See MoveCursorAheadOfWalk.
         NoteClickAfterWalkAhead(gc, "instant loot", chosen.Id, chosen.Name, chosen.At);
 
+        // **Where the cursor is, when the game says it is on this item already**: the cursor was moved across the label it
+        // was on (the player's account, 2026-10-20). The game's label element names the ground item under the cursor by
+        // the id aimed at - 9 of 10 clicks read so (dump 18:28:17) - and with nothing in the interface over that point,
+        // the click goes there. Not with a plan in hand or being followed: a planned click is matched by its point.
+        var aim = chosen.At;
+
+        if (_instantPlanned.Count == 0 && !_cursorKeptForPlan && Placement.ItemOnHoverId(gc) == chosen.Id &&
+            CursorOnScreen(gc) is var cursorNow && !Panels.Blocked(gc, cursorNow, true))
+            aim = cursorNow;
+
+        _aimedWhereCursorWas = aim != chosen.At;
+
         // To the point itself, which is what a planned move is matched against. See PlanClicks.
-        if (!_input.MoveTo(chosen.At))
+        if (!_input.MoveTo(aim))
         {
             _lastOutcome = $"{_itemName}: the move was refused";
             Finish();
@@ -1861,7 +1935,7 @@ internal static class Autoloot
 
         // The click armed to go out on arrival from ExileInput2's input thread. See StepMoving and
         // AutolootSettings.ClickInstantLootWithoutWaiting.
-        _armedAt = chosen.At;
+        _armedAt = aim;
         _clickArmed = autoloot.ClickInstantLootWithoutWaiting.Value && _input.ClickOnArrival();
     }
 
@@ -2157,6 +2231,8 @@ internal static class Autoloot
 
         if (clicked)
         {
+            // The labels read often for a while, so another item landing meanwhile is seen at once. See Ground.FastRefreshForMs.
+            Ground.FastRefreshNow();
             _pickupNote = ($"Instant autoloot: {_itemName}", DateTime.UtcNow);
             _clickedAt = DateTime.UtcNow;
 
@@ -2168,6 +2244,7 @@ internal static class Autoloot
             _clickPressedFromExileInput2 = since is >= 0d and < 1000d;
             _clickPressedAt = _clickPressedFromExileInput2 ? down : System.Diagnostics.Stopwatch.GetTimestamp();
             StartClickResponse(gc);
+            NoteClickTarget(gc);
 
             if (_targetPath.Length == 0)
                 NoteClicked(gc, _target);
@@ -2460,6 +2537,13 @@ internal static class Autoloot
     private static int[] _responseFirstMs;
     private static Vector2 _responseStartGrid;
     private static string _responseItem = "";
+
+    /// <summary>
+    /// The wall clock at the click, which a row is stamped with. Stamped at its close instead, a row read as the click
+    /// going out 1.5s after it was decided on - ClickResponseFor, or until the next click - where it had gone within
+    /// 10ms (dump 2026-10-20 18:06:20).
+    /// </summary>
+    private static DateTime _responseClickedAt;
     private static int _responsePing;
     private static float _responseAway;
 
@@ -2483,6 +2567,75 @@ internal static class Autoloot
         ];
     }
 
+    /// <summary>
+    /// Each instant click, followed for ClickResponseFor whatever is clicked after it: the item aimed at, the ground item
+    /// the game's label element says the cursor was on at the click, and which of the items visible then went, and when.
+    /// ClickResponses closes a click's row at the next click, so a label going after it was not seen. Kept for a stack of
+    /// ten dropped one every half second, eight taken and two left after their retries, which the rows could not explain:
+    /// a click cancelling the pickup before it, or landing on a newer stack's label, were both suspected (dump 2026-10-20
+    /// 18:21:50). Reads only.
+    /// </summary>
+    private static readonly List<(DateTime At, long PressedAt, uint TargetId, string Name, uint HoveredId,
+        Dictionary<uint, string> Visible, List<string> Gone)> ClickTargets = new();
+
+    /// <summary>Whether the click in hand went where the cursor already was, the game naming the item under it. See Tick.</summary>
+    private static bool _aimedWhereCursorWas;
+
+    /// <summary>The finished ClickTargets, newest last, for the dump.</summary>
+    private static readonly List<string> ClickTargetsSaid = new();
+
+    private static void NoteClickTarget(GameController gc)
+    {
+        var visible = new Dictionary<uint, string>();
+
+        foreach (var (_, onGround) in Ground.VisibleItems(gc))
+        {
+            var id = Safe.Read(onGround, static e => e.Id, 0u);
+
+            if (id != 0u)
+                visible[id] = NamesOfItem(onGround).BaseName;
+        }
+
+        ClickTargets.Add((DateTime.Now, _clickPressedAt, _itemId, _itemName + (_aimedWhereCursorWas ? " (clicked where the cursor was)" : ""),
+            Placement.ItemOnHoverId(gc), visible, new List<string>()));
+    }
+
+    private static void ObserveClickTargets(GameController gc)
+    {
+        if (ClickTargets.Count == 0)
+            return;
+
+        var now = new HashSet<uint>();
+
+        foreach (var (_, onGround) in Ground.VisibleItems(gc))
+            now.Add(Safe.Read(onGround, static e => e.Id, 0u));
+
+        for (var i = ClickTargets.Count - 1; i >= 0; i--)
+        {
+            var click = ClickTargets[i];
+            var ms = (int)System.Diagnostics.Stopwatch.GetElapsedTime(click.PressedAt).TotalMilliseconds;
+
+            foreach (var (id, name) in click.Visible.ToList())
+            {
+                if (now.Contains(id))
+                    continue;
+
+                click.Gone.Add($"{(id == click.TargetId ? "the one aimed at" : $"{name} {id}")} {ms}ms");
+                click.Visible.Remove(id);
+            }
+
+            if (ms < ClickResponseFor)
+                continue;
+
+            ClickTargets.RemoveAt(i);
+            ClickTargetsSaid.Add($"{click.At:HH:mm:ss.fff} {click.Name} {click.TargetId}, the game's hovered item {click.HoveredId}; " +
+                                 $"gone within {ClickResponseFor}ms: {(click.Gone.Count == 0 ? "nothing" : string.Join(", ", click.Gone))}");
+
+            if (ClickTargetsSaid.Count > ClickResponsesKept)
+                ClickTargetsSaid.RemoveAt(0);
+        }
+    }
+
     /// <summary>Begins timing what follows this click, closing the last one first. See ClickResponseSigns.</summary>
     private static void StartClickResponse(GameController gc)
     {
@@ -2495,6 +2648,7 @@ internal static class Autoloot
         _responseFirstMs = Enumerable.Repeat(-1, ClickResponseSigns.Length).ToArray();
         _responseStartGrid = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
         _responseItem = _itemName;
+        _responseClickedAt = DateTime.Now;
         _responsePing = Safe.Read(gc, static g => g.IngameState.ServerData.Latency, -1);
         _responseAway = Vector2.Distance(_responseStartGrid, Safe.Read(_target, static e => e.GridPos, Vector2.Zero));
         _responseOpen = true;
@@ -2540,7 +2694,7 @@ internal static class Autoloot
         var signs = string.Join(", ", ClickResponseSigns.Select((name, i) =>
             $"{name} {(_responseFirstMs[i] < 0 ? "-" : _responseFirstMs[i] + "ms")}"));
 
-        ClickResponses.Add($"{DateTime.Now:HH:mm:ss.fff} {_responseItem}, {_responseAway:0.#} grid " +
+        ClickResponses.Add($"{_responseClickedAt:HH:mm:ss.fff} {_responseItem}, {_responseAway:0.#} grid " +
                            $"({(_responseAway > PickupReachGrid ? "walk expected" : "in reach")}), ping {_responsePing}, from " +
                            $"{(_responseFromExileInput2 ? "the button going down" : "this plugin's frame after the click")}: {signs}; " +
                            $"at the click: {string.Join(" | ", _responseBaseline)}");
@@ -2979,6 +3133,14 @@ internal static class Autoloot
                      $"{RetriesOfItems.Values.Sum()} retry click(s), keys blocked {_keysBlocked}, last: {_lastOutcome}");
         b.AppendLine($"  instant loot from under other labels, last: {UnderLabelsSaid}");
         b.AppendLine($"  instant loot, the last look with a listed item in view: {_lastListedDecision}");
+
+        lock (FirstLooks)
+        {
+            b.AppendLine($"  listed items, from the first look at each to its first match, newest last ({ListedItemTimings.Count}):");
+
+            foreach (var line in ListedItemTimings)
+                b.AppendLine("    " + line);
+        }
         b.AppendLine($"  instant loot plan in hand: {(_instantPlanned.Count == 0 ? "none" : string.Join(" ", _instantPlanned.Select(p => $"({p.At.X:0},{p.At.Y:0})")))}, " +
                      $"cursor kept for it {_cursorKeptForPlan}; pickups in reach not waited for, still in flight " +
                      $"{InReachPickups.Count}, confirmations pending {PendingConfirmations.Count}; plan decisions, newest last " +
@@ -3022,11 +3184,17 @@ internal static class Autoloot
         b.AppendLine($"  walks after an instant click began after (ms): " +
                      (WalkStartsMeasured.Count == 0 ? "none measured yet" : string.Join(", ", WalkStartsMeasured)) +
                      $"; a click counts as failed after the ping + {ClickWalkStartMarginMs}ms without one");
-        b.AppendLine($"  what followed each instant click, and how soon, newest last ({ClickResponses.Count}; - is not seen " +
+        b.AppendLine($"  what followed each instant click, stamped with the click's time, and how soon, newest last ({ClickResponses.Count}; - is not seen " +
                      $"within {ClickResponseFor}ms; the readings at the click are path target | path wants | path moving | " +
                      "path nodes | actor moving | animation):");
 
         foreach (var said in ClickResponses)
+            b.AppendLine($"    {said}");
+
+        b.AppendLine($"  each instant click followed for {ClickResponseFor}ms whatever came after it - the item aimed at, the item " +
+                     $"the game said the cursor was on, and which items in view went - newest last ({ClickTargetsSaid.Count}):");
+
+        foreach (var said in ClickTargetsSaid)
             b.AppendLine($"    {said}");
 
         b.AppendLine($"  pickups in reach not waited for, label gone after the button went down, ms (ping), newest last " +

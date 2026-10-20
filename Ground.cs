@@ -31,16 +31,62 @@ internal static class Ground
     public static void Changed()
     {
         _changed = true;
+        FastRefreshNow();
         ChangesSeen++;
     }
+
+    /// <summary>An instant loot click went out: the list is read every FastRefreshEveryMs for FastRefreshForMs. See there.</summary>
+    public static void FastRefreshNow() => _rereadUntil = Environment.TickCount64 + Math.Max(0, FastRefreshForMs);
+
+    /// <summary>
+    /// An item entity arrived: noted with the time, for the dump to set against its first look (see
+    /// Autoloot.ListedItemTimings), and the list read again as Changed does.
+    /// </summary>
+    public static void ItemArrived(uint id)
+    {
+        lock (ArrivalsOfItems)
+        {
+            if (ArrivalsOfItems.Count > 2000)
+                ArrivalsOfItems.Clear();
+
+            ArrivalsOfItems[id] = DateTime.UtcNow;
+        }
+
+        Changed();
+    }
+
+    /// <summary>When each item entity arrived this area, by id, or null. See ItemArrived.</summary>
+    public static DateTime? ArrivalOfItem(uint id)
+    {
+        lock (ArrivalsOfItems)
+            return ArrivalsOfItems.TryGetValue(id, out var at) ? at : null;
+    }
+
+    private static readonly Dictionary<uint, DateTime> ArrivalsOfItems = new();
+
+    /// <summary>
+    /// **Read every FastRefreshEveryMs for this long after an item arrives or goes, or an instant loot click, not only
+    /// once.** An item's entity can arrive before its label is in the list, so the one read the arrival asks for can miss
+    /// it, and it was then seen only at the next RefreshEveryMs: of two stacks dropped together, one was clicked at once
+    /// and the other sat about half a second (the player's account, 2026-10-20; suspected, not yet seen in a dump -
+    /// ItemArrived records each arrival against the item's first look to settle it). Set each tick from
+    /// AutolootSettings.FastGroundLabelRefreshAfterDropOrPickupMs.
+    /// </summary>
+    public static int FastRefreshForMs { get; set; } = 1000;
+
+    /// <summary>How often the list is read while FastRefreshForMs runs. Chosen: about two rendered frames.</summary>
+    private const int FastRefreshEveryMs = 33;
+
+    private static long _rereadUntil;
 
     /// <summary>
     /// **The list is read when it changes, not every frame.** One read builds every label afresh - 555 of them, 0.65ms
     /// and 0.95MB (dump 2026-10-11 16:05:38) - and the list itself changes only when something drops or goes, while what
     /// moves every frame is where the labels are drawn, which each label's element reads live. So the list is read on
-    /// Changed, and every RefreshEveryMs regardless, in case a change came without an event.
+    /// Changed, and every RefreshEveryMs regardless, in case a change came without an event. Set each tick from
+    /// AutolootSettings.GroundLabelRefreshMs; 500 until 2026-10-20.
     /// </summary>
-    private const int RefreshEveryMs = 500;
+    public static int RefreshEveryMs { get; set; } = 198;
 
     /// <summary>
     /// How long one look at which item labels are visible serves every caller. 10ms, under a rendered frame, made the
@@ -87,7 +133,8 @@ internal static class Ground
             return Read(gc);
 
         var now = Environment.TickCount64;
-        var stale = now - _readMs >= RefreshEveryMs;
+        var stale = now - _readMs >= RefreshEveryMs ||
+                    (now < _rereadUntil && now - _readMs >= FastRefreshEveryMs);
 
         if (_labels == null || _changed || stale)
         {

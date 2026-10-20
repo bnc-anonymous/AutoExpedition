@@ -2263,6 +2263,58 @@ internal static class Dump
         }
     }
 
+    /// <summary>
+    /// What the game says about the item under the cursor and every item in view on the ground that bears on judging
+    /// gear: the level required (Mods.RequiredLevel) beside the base's drop level (BaseItemType.DropLevel), sockets
+    /// (Sockets.NumberOfSockets), the base's defences (Armour's three scores), whether it is a weapon (a Weapon
+    /// component), and quality. Read to settle what a loot line about gear can test; nothing matches on them yet.
+    /// </summary>
+    private static void GearFacts(StringBuilder b, GameController gc)
+    {
+        SectionHeader(b, "=== gear: what the game says of the hovered item and the items on the ground ===");
+
+        string Said(Entity item)
+        {
+            if (item == null)
+                return "no item";
+
+            var metadata = Safe.Read(item, static e => e.Metadata, "") ?? "";
+            var type = metadata.Length == 0 ? null : Safe.Read(() => gc.Files.BaseItemTypes.Translate(metadata), null);
+            var mods = Safe.Read(item, static e => e.GetComponent<Mods>(), null);
+            var armour = Safe.Read(item, static e => e.GetComponent<Armour>(), null);
+            var weapon = Safe.Read(item, static e => e.GetComponent<Weapon>(), null);
+            var sockets = Safe.Read(item, static e => e.GetComponent<Sockets>(), null);
+            var quality = Safe.Read(item, static e => e.GetComponent<Quality>(), null);
+
+            return $"{Safe.Read(item, static e => e.GetComponent<Base>()?.Name, "") ?? ""}, class " +
+                   $"{Safe.Read(() => type?.ClassName, "") ?? ""}, rarity {Safe.Read(mods, static m => m.ItemRarity.ToString(), "-")}, " +
+                   $"item level {Safe.Read(mods, static m => m.ItemLevel.ToString(), "-")}; " +
+                   $"required level {Safe.Read(mods, static m => m.RequiredLevel.ToString(), "-")}, " +
+                   $"base drop level {Safe.Read(() => type?.DropLevel.ToString(), "-") ?? "-"}; " +
+                   $"sockets {(sockets == null ? "no component" : Safe.Read(sockets, static s => s.NumberOfSockets.ToString(), "unreadable"))}; " +
+                   (armour == null
+                       ? "no Armour component"
+                       : $"armour {Safe.Read(armour, static a => a.ArmourScore, -1)}, evasion {Safe.Read(armour, static a => a.EvasionScore, -1)}, " +
+                         $"energy shield {Safe.Read(armour, static a => a.EnergyShieldScore, -1)}") + "; " +
+                   (weapon == null
+                       ? "no Weapon component"
+                       : $"weapon, damage {Safe.Read(weapon, static w => w.DamageMin, -1)}-{Safe.Read(weapon, static w => w.DamageMax, -1)}") + "; " +
+                   $"quality {(quality == null ? "no component" : Safe.Read(quality, static q => q.ItemQuality.ToString(), "unreadable"))}; " +
+                   $"metadata {metadata}";
+        }
+
+        var cursor = Autoloot.CursorOnScreen(gc);
+
+        b.AppendLine($"  under the cursor ({cursor.X:0},{cursor.Y:0}): {Said(AddListLineFromHover.HoveredItem(gc, cursor))}");
+
+        var onGround = Ground.VisibleItems(gc);
+
+        b.AppendLine($"  on the ground, in view ({onGround.Count}):");
+
+        foreach (var (_, item) in onGround)
+            b.AppendLine("    " + Said(Safe.Read(item, static e => e.GetComponent<WorldItem>()?.ItemEntity, null)));
+    }
+
     private static void TerrainGrid(StringBuilder b, GameController gc, Scan scan)
     {
         Texts(b, gc);
@@ -2273,6 +2325,8 @@ internal static class Dump
             Autoloot.Describe(b, gc, Settings);
             InventoryDeposit.Describe(b, gc, Settings);
         }
+
+        GearFacts(b, gc);
         SectionHeader(b, "=== how far the chain is believed to range ===");
         b.AppendLine($"  predicted {Detonator.PlacementRange(gc):0.#} grid " +
                      $"(base {Detonator.BaseReach(gc):0.#}, map {Detonator.PlacementRangePct(gc):+0;-0;+0}%)");
@@ -2283,6 +2337,11 @@ internal static class Dump
                      $"{Detonator.ExplosivesStandingInOrder(gc).Length} explosive(s) down on this site's chain; the chain its " +
                      $"owner laid, as kept: {Detonator.AnotherPlayersChainSaid}; learnt from " +
                      $"owners' placements: {Detonator.LearnedAtAnotherPlayersSiteSaid}");
+        b.AppendLine($"  each change in the explosives kept for that chain ({Detonator.AnotherPlayersChainReads.Count}):");
+
+        foreach (var line in Detonator.AnotherPlayersChainReads.ToList())
+            b.AppendLine("    " + line);
+
         b.AppendLine($"  the chain on show, last frame drawn: {Overlay.ChainShownSaid}");
         b.AppendLine($"  the chain drawn in the world, link by link: {Overlay.ChainLinksSaid}");
 
@@ -3794,6 +3853,16 @@ internal static class Dump
                     b.AppendLine($"    {key} = {value}");
             }
         }
+
+        // Every visible map stat, by name: the map's modifiers with its tablets and biome folded in, which the game's map
+        // summary shows as lines. The game names monster effectiveness "potency" (StrongboxMonsterPotencyPct is the stat of
+        // the modifier StrongboxChestQuantityAndMonsterEffectiveness), and the sections that filter by name miss it.
+        var visible = Safe.Read(() => gc.IngameState.Data.MapStatsVisible, null);
+
+        b.AppendLine($"  MapStatsVisible, all of them, by name ({visible?.Count.ToString() ?? "null"}):");
+
+        foreach (var (stat, value) in (visible ?? new Dictionary<GameStat, int>()).OrderBy(x => x.Key.ToString(), StringComparer.Ordinal))
+            b.AppendLine($"    {stat} = {value}");
     }
 
     /// <summary>
@@ -4782,6 +4851,13 @@ internal static class Dump
                 key.Contains("emnant", StringComparison.OrdinalIgnoreCase))
                 b.AppendLine($"    {key} = {value}");
         }
+
+        // Every one, by name: the totals of the allocated passives, which is where a mastery's chosen option shows, since
+        // the passive lists it only as a dummy_display_*_mastery_choice stat.
+        b.AppendLine("  the server's atlas stats, all of them, by name:");
+
+        foreach (var (stat, value) in (serverStats ?? new Dictionary<GameStat, int>()).OrderBy(x => x.Key.ToString(), StringComparer.Ordinal))
+            b.AppendLine($"    {stat} = {value}");
 
         var panel = Safe.Read(gc, static g => g.IngameState.IngameUi.AtlasTreePanel, null);
         var passives = Safe.Read(() => panel?.Passives, null);

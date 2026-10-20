@@ -2706,7 +2706,15 @@ internal sealed class Spawns
 
         _blasts.Clear();
 
-        foreach (var at in Detonator.PlacedExplosiveGridPositions(gc))
+        // At another player's site the panel lists no explosives, so every run there had no blasts and Write dropped it:
+        // after 2026-10-18 20:41 only three resumed runs reached spawns.csv and deaths.csv up to 2026-10-20, while
+        // the dumps showed runs counted (2026-10-20 15:52:51: 768 monsters unearthed, 0 blasts). The chain its owner
+        // laid instead, as read from the explosives standing. See Detonator.AnotherPlayersChain.
+        var placed = Detonator.SiteIsAnotherPlayers(gc)
+            ? Detonator.AnotherPlayersChain(gc)?.ToArray() ?? []
+            : Detonator.PlacedExplosiveGridPositions(gc);
+
+        foreach (var at in placed)
             _blasts.Add(new Blast { At = at });
 
         _waves.Clear();

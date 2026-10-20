@@ -181,7 +181,7 @@ internal static class AddListLineFromHover
     /// each element's own rectangle rather than IngameState.UIHover, which reads as an element at address zero on this
     /// build (see Placement.Hovered). Null when the cursor is over none.
     /// </summary>
-    private static Entity HoveredItem(GameController gc, Vector2 cursor)
+    internal static Entity HoveredItem(GameController gc, Vector2 cursor)
     {
         bool Under(ExileCore2.Shared.RectangleF rect) =>
             rect.Width > 0f && cursor.X >= rect.Left && cursor.X <= rect.Right && cursor.Y >= rect.Top && cursor.Y <= rect.Bottom;

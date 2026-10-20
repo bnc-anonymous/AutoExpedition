@@ -3192,6 +3192,29 @@ public class AutolootSettings
     public RangeNode<float> SameLinePriorityThresholdDivines { get; set; } = new RangeNode<float>(0.25f, 0f, 5f);
 
     /// <summary>
+    /// How often the ground labels are read when nothing has arrived or gone. A read builds every label afresh, about
+    /// 0.65ms and 0.95MB with 555 labels (dump 2026-10-11 16:05:38). Shared by instant loot, the action key run and the
+    /// overlay. See Ground.RefreshEveryMs.
+    /// </summary>
+    [Menu("Ground label refresh (ms)",
+        "How often the list of item labels on the ground is read again when no item has\n" +
+        "arrived or gone. Lower finds a new item sooner; each read costs about 0.65ms\n" +
+        "and 1MB of memory with 550 labels on the ground.\n\n" +
+        "For both Autoloot and Instant Autoloot.")]
+    public RangeNode<int> GroundLabelRefreshMs { get; set; } = new RangeNode<int>(198, 33, 1000);
+
+    /// <summary>
+    /// How long after an item arrives or goes, or an instant loot click, the ground labels are read every 33ms. Shared, as
+    /// the ground labels are, by instant loot, the action key run and the overlay. See Ground.FastRefreshForMs.
+    /// </summary>
+    [Menu("Fast ground label refresh after a drop or pickup (ms)",
+        "For this long after an item drops or is picked up, or an instant loot click,\n" +
+        "the list of item labels on the ground is read every 33ms, so an item whose label\n" +
+        "appears a moment after it lands is seen at once. 0 reads it once per change.\n\n" +
+        "For both Autoloot and Instant Autoloot.")]
+    public RangeNode<int> FastGroundLabelRefreshAfterDropOrPickupMs { get; set; } = new RangeNode<int>(1000, 0, 3000);
+
+    /// <summary>
     /// Instant loot picks items up only while a party member is in the area, where there is a race for them; alone they
     /// are left for the action key, and the instant loot sound is silent too. Party members are found as Automatic list
     /// order finds them. See Autoloot.PartyInArea.

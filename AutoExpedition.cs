@@ -796,6 +796,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // What another player's site is planned for. See Detonator.AnotherPlayersSiteExplosives.
         Detonator.AnotherPlayersSiteExplosives = Settings.Solver.Advanced.ExplosivesAtAnotherPlayersSite.Value;
         Detonator.EntitiesLoadedWithin = Settings.Debug.ScoutReach.Value;
+
+        // How often the ground labels are read. See Ground.RefreshEveryMs and Ground.FastRefreshForMs.
+        Ground.RefreshEveryMs = Settings.Automation.Autoloot.GroundLabelRefreshMs.Value;
+        Ground.FastRefreshForMs = Settings.Automation.Autoloot.FastGroundLabelRefreshAfterDropOrPickupMs.Value;
         Detonator.RemnantsAtSite = _scan?.At(Detonator.DetonatorGridPosition(GameController)).Count(t => t.Kind == TargetKind.Remnant) ?? 0;
 
         Ground.NextFrame();
@@ -2036,9 +2040,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         {
             Safe.Do(() => _scan.Arrived(entity));
 
-            // An item dropped: the ground labels are read again on the next ask. See Ground.Changed.
+            // An item dropped: the ground labels are read again on the next ask. See Ground.ItemArrived.
             if (Safe.Read(entity, static e => e.Type, ExileCore2.Shared.Enums.EntityType.Error) == ExileCore2.Shared.Enums.EntityType.WorldItem)
-                Ground.Changed();
+                Ground.ItemArrived(Safe.Read(entity, static e => e.Id, 0u));
         }
     }
 
