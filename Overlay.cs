@@ -197,7 +197,10 @@ internal static class Overlay
         }
 
         // The plan under the rest, so the rings and the text sit over it rather than beneath it.
-        if (settings.Display.DrawInWorld && here)
+        //
+        // **Not another player's chain once set off**: its circles stood on the ground through the fight, where only the
+        // minimap's line for the chain's path was wanted (the player's account, 2026-10-20). See Minimap.Draw below.
+        if (settings.Display.DrawInWorld && here && laidByAnotherPlayer == null)
         {
             // **The detailed pass runs when EITHER thing that needs it is being drawn.**
             //

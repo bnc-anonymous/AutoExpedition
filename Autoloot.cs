@@ -304,14 +304,21 @@ internal static class Autoloot
         PricesOfItems.Clear();
         UnpricedUntil.Clear();
         FactsOfItems.Clear();
+        GearReadingsOfItems.Clear();
         FirstLooks.Clear();
         RanksOfItems.Clear();
         Finish();
     }
 
     /// <summary>
-    /// The lines of a list in order, trimmed, blank ones dropped, by name ignoring case to their position. Parsed again
-    /// only when the text changes.
+    /// The lines of a list in order, trimmed, blank ones dropped, by name ignoring case to their position: the line's
+    /// number among the non-blank lines from 0, so the dump's "line N" is the N-th line in the editor. Parsed again only
+    /// when the text changes.
+    ///
+    /// **A line starting with # is a comment**, counted for the numbering and otherwise ignored. **Commas split a line
+    /// of names, not a line of conditions**: lists were once comma-separated, and splitting every line at its commas cut
+    /// CLASS:Helmet,Boots or DEFENCE:ES,AR+ES into pieces, none a whole line. The names of one comma-separated line share
+    /// its rank.
     /// </summary>
     private static Dictionary<string, int> RanksOf(TextNode list)
     {
@@ -320,9 +327,24 @@ internal static class Autoloot
         if (!ParsedLists.TryGetValue(list ?? new TextNode(), out var parsed) || parsed.Text != text)
         {
             var ranks = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var number = 0;
 
-            foreach (var line in text.Split(new[] { '\n', ',' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
-                ranks.TryAdd(line, ranks.Count);
+            foreach (var line in text.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            {
+                var rank = number++;
+
+                if (line.StartsWith('#'))
+                    continue;
+
+                if (IsConditionLine(line))
+                {
+                    ranks.TryAdd(line, rank);
+                    continue;
+                }
+
+                foreach (var name in line.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                    ranks.TryAdd(name, rank);
+            }
 
             parsed = (text, ranks);
 
@@ -357,9 +379,87 @@ internal static class Autoloot
     /// with none of these words is an item's name. Classes read in dumps of 2026-10-11 15:23:50: StackableCurrency
     /// (orbs, fluxes, Verisium, alloys, expedition artifacts), Omen, Expedition2Logbooks, UncutSkillGemStackable,
     /// UncutReservationGemStackable.
+    ///
+    /// **For gear** (2026-10-20): CLASS takes several classes separated by commas, any of which will do. GEAR:Armour or
+    /// GEAR:Weapon, or both separated by a comma, is an item with the game's Armour or Weapon component. ILVL:&lt;n&gt; is
+    /// the item level at least (Mods.ItemLevel); LEVEL:&lt;n&gt; the base's level at least (BaseItemType.DropLevel), the
+    /// requirement a normal base shows - not checked against the game's tooltip yet, and mods can raise a magic or rare
+    /// item's requirement above it; SOCKETS:&lt;n&gt; the sockets at least (Sockets.NumberOfSockets). DEFENCE: the base's
+    /// defences exactly, as AR, EV and ES joined by + for a hybrid, NONE for none, several separated by commas, any of
+    /// which will do: AR where its Armour component's armour is above 0, and so on. Words before the first condition word
+    /// name the item, its base type or unique name ignoring case. The gear words come from a price survey of normal
+    /// bases (2026-10-20): what made one worth picking up was the exceptional socket, item level 82, energy shield, and
+    /// for weapons the base itself. See GearReadingsOfItem.
     /// </summary>
-    private sealed record ConditionLine(int Rank, string Line, string ItemClass, string MetadataStart, string ArtName, double Amount,
-        string Unit, string Unreadable);
+    private sealed record ConditionLine(int Rank, string Line, string Name, string[] ItemClasses, string MetadataStart,
+        string ArtName, double Amount, string Unit, string[] GearKinds, int? MinItemLevel, int? MinLevel, int? MinSockets,
+        string[] Defences, string Unreadable);
+
+    /// <summary>
+    /// What a gear condition reads of an item, once: whether it has the Armour or the Weapon component, its item level,
+    /// its base's level, its sockets and its defences as DEFENCE writes them. Null fields could not be read. See
+    /// ConditionLine.
+    /// </summary>
+    private sealed record GearReadings(bool Armour, bool Weapon, int? ItemLevel, int? BaseLevel, int? Sockets, string Defences);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<uint, GearReadings> GearReadingsOfItems = new();
+
+    /// <summary>An item's gear readings, read once and kept by entity id for the area, or null with no item. See GearReadings.</summary>
+    private static GearReadings GearReadingsOfItem(GameController gc, Entity onGround)
+    {
+        var id = Safe.Read(onGround, static e => e.Id, 0u);
+
+        if (id != 0u && GearReadingsOfItems.TryGetValue(id, out var known))
+            return known;
+
+        var item = Safe.Read(onGround, static e => e.GetComponent<WorldItem>()?.ItemEntity, null);
+
+        if (item == null)
+            return null;
+
+        var armour = Safe.Read(item, static e => e.GetComponent<Armour>(), null);
+        var sockets = Safe.Read(item, static e => e.GetComponent<Sockets>(), null);
+        var mods = Safe.Read(item, static e => e.GetComponent<Mods>(), null);
+        var type = FactsOfItem(gc, onGround)?.Type;
+        var parts = new List<string>();
+
+        if (Safe.Read(armour, static a => a.ArmourScore, 0) > 0)
+            parts.Add("AR");
+
+        if (Safe.Read(armour, static a => a.EvasionScore, 0) > 0)
+            parts.Add("EV");
+
+        if (Safe.Read(armour, static a => a.EnergyShieldScore, 0) > 0)
+            parts.Add("ES");
+
+        var read = new GearReadings(
+            armour != null,
+            Safe.Read(item, static e => e.HasComponent<Weapon>(), false),
+            mods == null ? null : Safe.Read(mods, static m => (int?)m.ItemLevel, null),
+            type == null ? null : Safe.Read(() => (int?)type.DropLevel, null),
+            sockets == null ? 0 : Safe.Read(sockets, static s => (int?)s.NumberOfSockets, null),
+            parts.Count == 0 ? "NONE" : string.Join("+", parts));
+
+        // Kept once its base type has read, as an item on the ground does not change.
+        if (id != 0u && type != null)
+            GearReadingsOfItems[id] = read;
+
+        return read;
+    }
+
+    /// <summary>A DEFENCE value as GearReadings writes one: AR, EV and ES in that order joined by +, or NONE; null if unreadable.</summary>
+    private static string DefenceOfWord(string word)
+    {
+        var parts = word.ToUpperInvariant().Split('+', StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 1 && parts[0] == "NONE")
+            return "NONE";
+
+        if (parts.Length == 0 || parts.Any(p => p is not ("AR" or "EV" or "ES")) || parts.Distinct().Count() != parts.Length)
+            return null;
+
+        return string.Join("+", new[] { "AR", "EV", "ES" }.Where(parts.Contains));
+    }
 
     /// <summary>The prices, set by the plugin. See ConditionLine.</summary>
     internal static Valuation Valuation { get; set; }
@@ -368,7 +468,7 @@ internal static class Autoloot
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<uint, double> PricesOfItems = new();
 
     /// <summary>The words a condition line is made of. See ConditionLine.</summary>
-    private static readonly string[] ConditionWords = ["CLASS:", "METADATA:", "ART:", "MIN:"];
+    private static readonly string[] ConditionWords = ["CLASS:", "METADATA:", "ART:", "MIN:", "GEAR:", "ILVL:", "LEVEL:", "SOCKETS:", "DEFENCE:"];
 
     /// <summary>Whether a list line is a condition line rather than a name: any of its words starts with a condition word.</summary>
     private static bool IsConditionLine(string line) =>
@@ -402,13 +502,61 @@ internal static class Autoloot
             if (!IsConditionLine(line))
                 continue;
 
-            string itemClass = null, metadataStart = null, artName = null, unit = null, unreadable = null;
+            string metadataStart = null, artName = null, unit = null, unreadable = null;
+            string[] itemClasses = null, gearKinds = null, defences = null;
+            int? minItemLevel = null, minLevel = null, minSockets = null;
             var amount = 0d;
+            var nameWords = new List<string>();
+            var conditionSeen = false;
+
+            int? Whole(string word, string prefix)
+            {
+                if (int.TryParse(word[prefix.Length..], System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out var value))
+                    return value;
+
+                unreadable ??= $"{word} is not a whole number";
+                return null;
+            }
 
             foreach (var word in line.Split(' ', StringSplitOptions.RemoveEmptyEntries))
             {
+                var isCondition = ConditionWords.Any(c => word.StartsWith(c, StringComparison.OrdinalIgnoreCase));
+
+                // The item's name: the words before the first condition word. See ConditionLine.
+                if (!isCondition && !conditionSeen)
+                {
+                    nameWords.Add(word);
+                    continue;
+                }
+
+                conditionSeen = true;
+
                 if (word.StartsWith("CLASS:", StringComparison.OrdinalIgnoreCase))
-                    itemClass = word["CLASS:".Length..];
+                    itemClasses = word["CLASS:".Length..].Split(',', StringSplitOptions.RemoveEmptyEntries);
+                else if (word.StartsWith("GEAR:", StringComparison.OrdinalIgnoreCase))
+                {
+                    gearKinds = word["GEAR:".Length..].Split(',', StringSplitOptions.RemoveEmptyEntries);
+
+                    if (gearKinds.Length == 0 || gearKinds.Any(k => !k.Equals("Armour", StringComparison.OrdinalIgnoreCase) &&
+                                                                   !k.Equals("Weapon", StringComparison.OrdinalIgnoreCase)))
+                        unreadable ??= $"{word} is not GEAR:Armour, GEAR:Weapon or both";
+                }
+                else if (word.StartsWith("ILVL:", StringComparison.OrdinalIgnoreCase))
+                    minItemLevel = Whole(word, "ILVL:");
+                else if (word.StartsWith("LEVEL:", StringComparison.OrdinalIgnoreCase))
+                    minLevel = Whole(word, "LEVEL:");
+                else if (word.StartsWith("SOCKETS:", StringComparison.OrdinalIgnoreCase))
+                    minSockets = Whole(word, "SOCKETS:");
+                else if (word.StartsWith("DEFENCE:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var read = word["DEFENCE:".Length..].Split(',', StringSplitOptions.RemoveEmptyEntries).Select(DefenceOfWord).ToArray();
+
+                    if (read.Length == 0 || read.Any(d => d == null))
+                        unreadable ??= $"{word} is not AR, EV, ES or NONE, joined by + or separated by commas";
+                    else
+                        defences = read;
+                }
                 else if (word.StartsWith("METADATA:", StringComparison.OrdinalIgnoreCase))
                     metadataStart = word["METADATA:".Length..];
                 else if (word.StartsWith("ART:", StringComparison.OrdinalIgnoreCase))
@@ -430,10 +578,11 @@ internal static class Autoloot
                     };
                 }
                 else
-                    unreadable ??= $"{word} is not CLASS:, METADATA:, ART: or MIN:";
+                    unreadable ??= $"{word} comes after a condition and is not one of {string.Join(", ", ConditionWords)}";
             }
 
-            lines.Add(new ConditionLine(rank, line, itemClass, metadataStart, artName, amount, unit, unreadable));
+            lines.Add(new ConditionLine(rank, line, nameWords.Count == 0 ? null : string.Join(" ", nameWords), itemClasses,
+                metadataStart, artName, amount, unit, gearKinds, minItemLevel, minLevel, minSockets, defences, unreadable));
         }
 
         return lines;
@@ -449,9 +598,41 @@ internal static class Autoloot
         if (line.Unreadable != null)
             return false;
 
-        if (line.ItemClass != null &&
-            !string.Equals(ItemClassOfItem(gc, onGround), line.ItemClass, StringComparison.OrdinalIgnoreCase))
+        if (line.Name != null)
+        {
+            var (baseName, unique) = NamesOfItem(onGround);
+
+            if (!string.Equals(baseName, line.Name, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(unique, line.Name, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        if (line.ItemClasses != null &&
+            !line.ItemClasses.Contains(ItemClassOfItem(gc, onGround), StringComparer.OrdinalIgnoreCase))
             return false;
+
+        if (line.GearKinds != null || line.MinItemLevel != null || line.MinLevel != null || line.MinSockets != null ||
+            line.Defences != null)
+        {
+            if (GearReadingsOfItem(gc, onGround) is not { } gear)
+                return false;
+
+            if (line.GearKinds != null &&
+                !line.GearKinds.Any(k => k.Equals("Armour", StringComparison.OrdinalIgnoreCase) ? gear.Armour : gear.Weapon))
+                return false;
+
+            if (line.MinItemLevel is { } itemLevel && !(gear.ItemLevel >= itemLevel))
+                return false;
+
+            if (line.MinLevel is { } level && !(gear.BaseLevel >= level))
+                return false;
+
+            if (line.MinSockets is { } sockets && !(gear.Sockets >= sockets))
+                return false;
+
+            if (line.Defences != null && !line.Defences.Contains(gear.Defences))
+                return false;
+        }
 
         if (line.MetadataStart != null &&
             !MetadataOfItem(onGround).StartsWith(line.MetadataStart, StringComparison.OrdinalIgnoreCase))
@@ -3232,8 +3413,14 @@ internal static class Autoloot
             {
                 b.AppendLine(line.Unreadable != null
                     ? $"  {listName} list line {line.Rank + 1}: {line.Line} - not used: {line.Unreadable}"
-                    : $"  {listName} list line {line.Rank + 1}: {line.Line} = class {line.ItemClass ?? "any"}, metadata from " +
-                      $"{line.MetadataStart ?? "any"}, art {line.ArtName ?? "any"}, at least {(line.Unit == null ? "any price" : ExaltsOfMin(line) is { } least ? $"{least:0.##}ex" : $"? ({line.Unit} rate not known yet)")}");
+                    : $"  {listName} list line {line.Rank + 1}: {line.Line} = name {line.Name ?? "any"}, class " +
+                      $"{(line.ItemClasses == null ? "any" : string.Join(" or ", line.ItemClasses))}, metadata from " +
+                      $"{line.MetadataStart ?? "any"}, art {line.ArtName ?? "any"}, at least {(line.Unit == null ? "any price" : ExaltsOfMin(line) is { } least ? $"{least:0.##}ex" : $"? ({line.Unit} rate not known yet)")}" +
+                      (line.GearKinds == null ? "" : $", gear {string.Join(" or ", line.GearKinds)}") +
+                      (line.MinItemLevel == null ? "" : $", item level at least {line.MinItemLevel}") +
+                      (line.MinLevel == null ? "" : $", base level at least {line.MinLevel}") +
+                      (line.MinSockets == null ? "" : $", sockets at least {line.MinSockets}") +
+                      (line.Defences == null ? "" : $", defences {string.Join(" or ", line.Defences)}"));
             }
         }
 

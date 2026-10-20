@@ -1231,16 +1231,27 @@ internal static class ItemListEditor
     /// </summary>
     public const string ListLinesHelp =
         "One line each, in order:\n" +
-        "- an item's name: its base type (\"Divine Orb\") or a unique's name, ignoring case\n" +
+        "- an item's name: its base type (\"Divine Orb\") or a unique's name, ignoring case,\n" +
+        "  which conditions may follow (\"Warmonger Bow ILVL:82 SOCKETS:3\")\n" +
         "- conditions, all of which must hold, separated by spaces:\n" +
-        "    CLASS:StackableCurrency - the game's item class (shown for each item in an F6 dump)\n" +
+        "    CLASS:StackableCurrency - the game's item class (shown for each item in an F6 dump);\n" +
+        "      several separated by commas, any of which will do (CLASS:Helmet,Boots)\n" +
+        "    GEAR:Armour - an armour piece; GEAR:Weapon - a weapon; GEAR:Armour,Weapon - either\n" +
+        "    ILVL:82 - the item level, at least\n" +
+        "    LEVEL:80 - the base's level requirement, at least (75 takes 75 and 80)\n" +
+        "    SOCKETS:2 - the sockets, at least\n" +
+        "    DEFENCE:ES - the base's defences exactly: AR armour, EV evasion, ES energy shield,\n" +
+        "      two joined by + for a hybrid (AR+ES), NONE for none; several separated by\n" +
+        "      commas, any of which will do (DEFENCE:ES,AR+ES,EV+ES)\n" +
         "    METADATA:Metadata/Items/Currency/ - the start of the item's metadata path\n" +
         "    ART:Mageblood - the item's art name: a unique, identified or not\n" +
         "    MIN:5ex (or 1d, 10c) - NinjaPricer's price for the item and its stack, at least;\n" +
         "      alone, any item priced that high, uniques included (magic and rare gear have no price)\n" +
         "  e.g. CLASS:Omen MIN:1d, or MIN:2d alone\n" +
+        "  e.g. GEAR:Armour ILVL:82 LEVEL:80 SOCKETS:2 DEFENCE:ES\n" +
         "- ENTITY:Remnants - shatter spent remnants\n" +
         "- ENTITY:ExcavatedChests - open excavated chests\n" +
+        "- # at the start: a comment, ignored (\"# 5d+ exceptional bases\")\n" +
         "\n" +
         "Without its ENTITY line, that job is not done.\n" +
         "\n" +
