@@ -109,6 +109,13 @@ internal static partial class Tablets
     /// <summary>The currencies the supply step has dealt with this run, withdrawn or found missing.</summary>
     private static readonly HashSet<string> CraftSupplied = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The currencies found in neither the inventory nor the currency tab this run, by base name: passed over from then
+    /// on, and named when the run finishes. A run out of one stopped there, leaving tablets that wanted another currency
+    /// untouched and a reforge to follow unstarted (2026-10-20 22:19:35, no Orb of Augmentation). See StepCrafting.
+    /// </summary>
+    private static readonly HashSet<string> CraftCurrenciesRunOut = new(StringComparer.Ordinal);
+
     /// <summary>Whether this run is holding shift.</summary>
     private static bool _shiftHeld;
 
@@ -282,6 +289,7 @@ internal static partial class Tablets
     {
         _craftPhase = CraftPhase.Supply;
         CraftSupplied.Clear();
+        CraftCurrenciesRunOut.Clear();
         _craftCurrency = 0;
         _craftSubTab = 0;
         _crafted = 0;
@@ -427,7 +435,8 @@ internal static partial class Tablets
                 return;
             }
 
-            _craftFinishSaid = $"done: nothing left to craft, {_crafted} currency used over {_craftPasses} pass(es)";
+            _craftFinishSaid = $"done: nothing left to craft, {_crafted} currency used over {_craftPasses} pass(es)" +
+                               (CraftCurrenciesRunOut.Count == 0 ? "" : $"; ran out of {string.Join(", ", CraftCurrenciesRunOut)}");
             _craftPhase = CraftPhase.ReturnSupply;
             _craftCurrency = CraftingCurrencies.Length;
             return;
@@ -436,6 +445,16 @@ internal static partial class Tablets
         var (line, baseName) = CraftingCurrencies[_craftCurrency];
         var action = CraftingActions[_craftCurrency];
         var holding = HeldOnCursor(gc) == action;
+
+        // A currency run out of is passed over for the rest of the run, as finishing it everywhere is. See CraftCurrenciesRunOut.
+        if (CraftCurrenciesRunOut.Contains(baseName) && !holding)
+        {
+            _craftCurrency++;
+            CraftSubTabsDone.Clear();
+            ReforgingSent.Clear();
+            _craftPhase = CraftPhase.Choose;
+            return;
+        }
 
         switch (_craftPhase)
         {
@@ -606,10 +625,15 @@ internal static partial class Tablets
                     return;
                 }
 
+                // **None left: the next currency, not the end of the run.** See CraftCurrenciesRunOut.
                 if (CurrencyTabStackOf(gc, baseName) is not { } kept)
                 {
-                    StopReforging($"no {baseName} in the inventory or the currency tab");
-                    CursorWarning.Show("Missing currency");
+                    LogReforging($"no {baseName} in the inventory or the currency tab: going on to the next currency");
+                    CraftCurrenciesRunOut.Add(baseName);
+                    _craftCurrency++;
+                    CraftSubTabsDone.Clear();
+                    ReforgingSent.Clear();
+                    _craftPhase = CraftPhase.Choose;
                     return;
                 }
 

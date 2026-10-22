@@ -111,7 +111,9 @@ internal static partial class Tablets
 
         if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } own && OwnPriceStands(search, own, settings, _valuation) &&
             PriceOfAnswer(own, settings, _valuation) is var price && !double.IsNaN(price))
-            return (price, "own search");
+            return PriceCappedByNewer(search.Key, own, price, settings, _valuation) is var capped && capped < price
+                ? (capped, "own search, capped by a newer search at higher rolls")
+                : (price, "own search");
 
         if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } unconverted && OwnPriceStands(search, unconverted, settings, _valuation) &&
             ListedOnlyUnconverted(unconverted, settings, _valuation))
@@ -119,13 +121,13 @@ internal static partial class Tablets
 
         double? floor = null, ceiling = null;
 
-        foreach (var (_, answer, tighter, looser) in TabletPricing.RelatedAnswers(search.Key))
+        foreach (var (relatedKey, answer, tighter, looser) in TabletPricing.RelatedAnswers(search.Key))
         {
             if (answer.Error.Length > 0 || PriceOfAnswer(answer, settings, _valuation) is var bound && double.IsNaN(bound))
                 continue;
 
-            if (looser && (floor == null || bound > floor))
-                floor = bound;
+            if (looser && PriceCappedByNewer(relatedKey, answer, bound, settings, _valuation) is var cappedBound && (floor == null || cappedBound > floor))
+                floor = cappedBound;
 
             if (tighter && answer.Listings.Count >= settings.ListingsWanted && (ceiling == null || bound < ceiling))
                 ceiling = bound;

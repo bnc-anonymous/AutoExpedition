@@ -320,22 +320,141 @@ internal static partial class Tablets
                 TabletWritten(before.Rarity, before.Modifiers), TabletWritten(after.Rarity, after.Modifiers)));
     }
 
+    /// <summary>
+    /// **Currency used by hand on a tablet**, written as the crafting run's crafts are: each tablet on screen is kept by
+    /// its cell with its modifiers as written, and a change to them while a currency is on the cursor, or was
+    /// at the last read, is a craft by that currency. Not while a tablet run holds the cursor, as the run writes its own;
+    /// both readings whole and identified, so a tablet half read or an identification is not taken for one. Chaos Orbs by
+    /// hand were not recorded, the run never using them, though they are what tests what a Chaos Orb does
+    /// (2026-10-20). A currency the plugin does not name is written as the game's cursor action, "by hand: " and its
+    /// string. See RollsCrafted and ChaosOrbPredictionRows.
+    /// </summary>
+    private static readonly Dictionary<string, (string Written, TabletOnScreen Tablet)> HandCraftWatch = new(StringComparer.Ordinal);
+
+    /// <summary>The game's cursor action at the last read. See HandCraftWatch.</summary>
+    private static string _cursorActionBefore = "";
+
+    /// <summary>
+    /// For each tablet crafted by hand that Chaos Orb odds can be worked out for, what they said before and what it came
+    /// to: its worth now and expected after in exalts, the chance it would come out ahead of the orb, and its worth after as
+    /// the same listings value it. Written to dumps/tablet_chaos_predictions.csv. See TabletChaosOrb.
+    /// </summary>
+    private static readonly List<string> ChaosOrbPredictionRows = [];
+
+    private const string ChaosOrbPredictionHeader = "when,currency,before,after,worthNowExalts,expectedAfterExalts,chanceAhead,worthAfterExalts";
+
+    /// <summary>
+    /// For each tablet on screen whose modifiers changed under a held currency: searches its own price (SearchAfterHandCraft)
+    /// and, with Collect tablet crafts on, writes the craft. While a currency is held, the hovered tablet's modifiers are read
+    /// fresh at every read, not from ModifierCache: whether a currency changes the Mods hash the cache watches is not known,
+    /// and a tablet showed the same price and Chaos Orb odds after an orb by hand as before it (the player, 2026-10-21).
+    /// See HandCraftWatch.
+    /// </summary>
+    private static void WatchHandCrafts(GameController gc, TabletRerollingSettings settings)
+    {
+        if (_reforgingHasCursor)
+        {
+            HandCraftWatch.Clear();
+            _cursorActionBefore = "";
+            return;
+        }
+
+        var action = CursorAction(gc);
+        var held = action.Length > 0 ? action : _cursorActionBefore;
+        var seenNow = new HashSet<string>(StringComparer.Ordinal);
+
+        if (action.Length > 0 && _hoveredAtDraw is { } hovered && AddressOf(hovered) is var hoveredAddress and not 0L)
+            MarkTabletChanging(hoveredAddress);
+
+        // **By the tablet's cell, not its item's address**: a Chaos Orb by hand was not recorded, the tablet read as
+        // another item after the use, as the crafting run finds it by cell too (CurrencyUsesPending; 2026-10-20). A stash
+        // cell with the tab and sub-tab showing, so a tab changed under a held currency is not taken for a craft.
+        var stashTab = Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement.IndexVisibleStash, -1);
+        var subTab = SelectedSubTab(gc);
+
+        foreach (var tablet in Seen)
+        {
+            var address = tablet.Where == "inventory"
+                ? $"inventory:{tablet.Rect.X:0},{tablet.Rect.Y:0}"
+                : $"{tablet.Where}:{stashTab}:{subTab}:{tablet.Rect.X:0},{tablet.Rect.Y:0}";
+
+            if (!tablet.Identified || !FullyRead(tablet))
+                continue;
+
+            seenNow.Add(address);
+
+            var written = TabletWritten(tablet.Rarity, tablet.Modifiers);
+
+            if (HandCraftWatch.TryGetValue(address, out var before) && before.Written != written && held.Length > 0)
+            {
+                SearchAfterHandCraft(gc, tablet, settings);
+
+                if (!_recordCrafts)
+                {
+                    HandCraftWatch[address] = (written, tablet);
+                    continue;
+                }
+
+                var currency = CurrencyOfCursorAction(held);
+
+                RollsCrafted(currency, before.Tablet, tablet);
+
+                if (ChaosOrbOddsOf(gc, before.Tablet, settings) is { } odds)
+                {
+                    // The outcome priced as ChaosOrbOddsUnkept prices each outcome: its set's price at any roll.
+                    var worthAfter = ChaosOrbWorthOfModifiers(gc, tablet.Modifiers, settings);
+
+                    lock (RollsLock)
+                        ChaosOrbPredictionRows.Add(string.Join(",",
+                            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture), currency,
+                            before.Written, written,
+                            odds.NowExalts.ToString("0.#", CultureInfo.InvariantCulture),
+                            odds.AfterExalts.ToString("0.#", CultureInfo.InvariantCulture),
+                            odds.ChanceAhead.ToString("0.###", CultureInfo.InvariantCulture),
+                            worthAfter?.ToString("0.#", CultureInfo.InvariantCulture) ?? ""));
+                }
+            }
+
+            HandCraftWatch[address] = (written, tablet);
+        }
+
+        foreach (var gone in HandCraftWatch.Keys.Where(k => !seenNow.Contains(k)).ToList())
+            HandCraftWatch.Remove(gone);
+
+        _cursorActionBefore = action;
+    }
+
+    /// <summary>A cursor action as the crafting run names its currency, or "by hand: " and the game's string for one it does not name.</summary>
+    private static string CurrencyOfCursorAction(string action) => action switch
+    {
+        "transmute_to_magic" => "Transmutation",
+        "add_mod_to_magic" => "Augmentation",
+        "transmute_to_rare" => "Alchemy",
+        "upgrade_magic_to_rare" => "Regal",
+        "add_mod_to_rare" => "Exalt",
+        // A Chaos Orb's, read on the player's first one by hand (2026-10-20 23:15:38).
+        "reroll" => "Chaos",
+        _ => "by hand: " + action,
+    };
+
     /// <summary>Appends the rows written since the last time to their files in the dumps folder.</summary>
     internal static void RollsFlush(BaseSettingsPlugin<AutoExpeditionSettings> plugin)
     {
-        List<string> reforges, crafts, identified;
+        List<string> reforges, crafts, identified, predictions;
 
         lock (RollsLock)
         {
-            if (ReforgeRows.Count == 0 && CraftRows.Count == 0 && IdentifyRows.Count == 0)
+            if (ReforgeRows.Count == 0 && CraftRows.Count == 0 && IdentifyRows.Count == 0 && ChaosOrbPredictionRows.Count == 0)
                 return;
 
             reforges = [.. ReforgeRows];
             crafts = [.. CraftRows];
             identified = [.. IdentifyRows];
+            predictions = [.. ChaosOrbPredictionRows];
             ReforgeRows.Clear();
             CraftRows.Clear();
             IdentifyRows.Clear();
+            ChaosOrbPredictionRows.Clear();
         }
 
         void Append(string file, string header, List<string> rows)
@@ -364,5 +483,6 @@ internal static partial class Tablets
         Append("tablet_reforges.csv", ReforgeHeader, reforges);
         Append("tablet_crafts.csv", CraftHeader, crafts);
         Append("tablet_identifications.csv", IdentifyHeader, identified);
+        Append("tablet_chaos_predictions.csv", ChaosOrbPredictionHeader, predictions);
     }
 }

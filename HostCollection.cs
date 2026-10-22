@@ -14,7 +14,7 @@ namespace AutoExpedition;
 ///
 /// **Why it is worth a button at all.** Workstation collection suspends every thread for a gen0 and
 /// the search allocates from several at once, so its garbage lands as frame spikes rather than as
-/// steady cost; server collection gives each core its own heap and a far larger budget before it
+/// steady cost; GC Server gives each core its own heap and a far larger budget before it
 /// stops anybody. Measured against the allocation work rather than instead of it - the two together
 /// are what moved the frame times, see NOTES.
 ///
@@ -26,7 +26,7 @@ internal static class HostCollection
     /// <summary>The variable the .NET runtime reads at startup to pick the collector.</summary>
     private const string Variable = "DOTNET_gcServer";
 
-    /// <summary>Asks for server collection from the next start onwards.</summary>
+    /// <summary>Asks for GC Server from the next start onwards.</summary>
     public static void UseServer() => Write("1");
 
     /// <summary>Takes the request back, leaving the runtime to choose as it did before.</summary>

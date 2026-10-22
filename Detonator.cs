@@ -498,11 +498,20 @@ internal static class Detonator
 
     /// <summary>
     /// Every explosive entity counted as standing, in id order: all with a position, less those not valid within
-    /// EntitiesLoadedWithin of the player, which are gone. See ExplosivesStandingInOrder.
+    /// EntitiesLoadedWithin of the player, which are gone, and those not valid anywhere once dropped as undone
+    /// (ExplosivesUndoneIds). See ExplosivesStandingInOrder.
     /// </summary>
     private static List<(uint Id, Vector2 At)> ExplosivesCountedInOrder(GameController gc)
     {
         var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var area = Safe.Read(gc, static g => g.Area.CurrentArea.Hash, 0u);
+
+        if (area != _explosivesUndoneArea)
+        {
+            ExplosivesUndoneIds.Clear();
+            _explosivesUndoneArea = area;
+        }
+
         var found = new List<(uint Id, Vector2 At)>();
 
         foreach (var entity in ExplosiveEntities(gc))
@@ -512,11 +521,20 @@ internal static class Detonator
             if (at == Vector2.Zero)
                 continue;
 
-            if (!Safe.Read(entity, static e => e.IsValid, false) && player != Vector2.Zero &&
-                Vector2.Distance(player, at) <= EntitiesLoadedWithin)
+            var id = Safe.Read(entity, static e => e.Id, 0u);
+            var valid = Safe.Read(entity, static e => e.IsValid, false);
+
+            if (!valid && player != Vector2.Zero && Vector2.Distance(player, at) <= EntitiesLoadedWithin)
                 continue;
 
-            found.Add((Safe.Read(entity, static e => e.Id, 0u), at));
+            // Once dropped as undone, a not-valid entity stays undone however far the player walks. See ExplosivesUndoneIds.
+            if (!valid && ExplosivesUndoneIds.Contains(id))
+                continue;
+
+            if (valid)
+                ExplosivesUndoneIds.Remove(id);
+
+            found.Add((id, at));
         }
 
         found.Sort((a, b) => a.Id.CompareTo(b.Id));
@@ -568,6 +586,7 @@ internal static class Detonator
         {
             _anotherPlayersChain = null;
             _anotherPlayersExplosives.Clear();
+            ExplosivesUndoneIds.Clear();
             _anotherPlayersChainSite = site;
             _anotherPlayersChainArea = area;
             AnotherPlayersChainSaid = "nothing read at this site";
@@ -594,6 +613,7 @@ internal static class Detonator
                 if (!present.Contains(id) && Vector2.Distance(player, at) <= EntitiesLoadedWithin)
                 {
                     _anotherPlayersExplosives.Remove(id);
+                    ExplosivesUndoneIds.Add(id);
                     dropped++;
                 }
             }
@@ -635,6 +655,20 @@ internal static class Detonator
 
     /// <summary>Every explosive kept at another player's site, by entity id. See AnotherPlayersChain.</summary>
     private static readonly Dictionary<uint, Vector2> _anotherPlayersExplosives = new();
+
+    /// <summary>
+    /// The entity ids dropped as undone at another player's site, cleared with the site. An undone explosive's entity can
+    /// stay in the list not valid, which ExplosivesCountedInOrder counts as standing once it is beyond EntitiesLoadedWithin
+    /// of the player, so walking away brought it back. A host with 15 read as 17 (dump 2026-10-22 02:01:07): 17 entities
+    /// counted, two pairs of them 4 and 21 grid apart where the host had undone and placed again, the 21-grid pair too far
+    /// apart for UndoneWithin. That the extra two were undone ones brought back is inferred from the pairs and the drop
+    /// log, not read. An id that reads valid again is taken off, so a drop on a frame where the entity was briefly missing
+    /// is not kept. Entity ids are reused in other areas, so the set is also cleared on an area change.
+    /// </summary>
+    private static readonly HashSet<uint> ExplosivesUndoneIds = new();
+
+    /// <summary>The area ExplosivesUndoneIds belongs to.</summary>
+    private static uint _explosivesUndoneArea;
 
     private static Vector2 _anotherPlayersChainSite;
     private static uint _anotherPlayersChainArea;
@@ -1378,7 +1412,7 @@ internal static class Detonator
             return ExplosivesAtAnotherPlayersSite(gc);
 
         if (_counted <= 0 && GrandAreaFlag(gc) == true)
-            return (int)MathF.Round(GrandExplosives * ExplosivesFactorOfMap(gc));
+            return ExplosivesOfSite(gc, true, false);
 
         return _counted > 0 ? _counted : Assumed;
     }
@@ -1460,14 +1494,12 @@ internal static class Detonator
 
 
     /// <summary>
-    /// The explosives another player's site is planned for: Explosives at another player's site where set; else Grand's
-    /// GrandExplosives or Assumed, or more where an owner was seen to place more this session (see
-    /// ExplosivesAtAnotherPlayersSiteNow), times the map's MapExpeditionExplosivesPct, and never fewer than its owner has
-    /// placed.
+    /// The explosives another player's site is planned for: Explosives at another player's site where set; else
+    /// ExplosivesOfSite without the atlas's extra explosive, or with it where OwnerHasAtlasExtraExplosive is set or once
+    /// the owner has placed more than that.
     /// Grand when GrandAreaFlag says so; where it cannot be read, when its owner has placed more than an ordinary site
     /// holds or the site has GrandRemnantsAtLeast remnants. The remnant count overcounts on a map with two sites, whose
     /// remnants are all filed under the one detonator seen (Bazaar, dump 2026-10-14 13:10:14: 16 remnants, two sites).
-    /// The rounding of the map's increase is not known; a run with +29% laid 20 links on 15 (spawns census).
     /// </summary>
     public static int ExplosivesAtAnotherPlayersSite(GameController gc)
     {
@@ -1483,15 +1515,22 @@ internal static class Detonator
     }
 
     /// <summary>
-    /// What the map's MapExpeditionExplosivesPct multiplies a site's explosives by: 1 plus the increase. The game's
-    /// rounding is not known; a run with +29% laid 20 links on 15 (spawns census).
+    /// The explosives a site holds: Assumed or GrandExplosives, plus one with the owner's atlas's extra explosive, times
+    /// 1 plus the map's MapExpeditionExplosivesPct, truncated. Nothing else changes the count.
+    ///
+    /// The truncation is measured: on the player's own Grand sites in the spawns census the chain's last link read 19 at
+    /// +27% to +31% and 22 at +47% and +49%, where rounding gives 20 at +30% and +31%; with no increase, 38 runs ended at
+    /// 15 and none past it. Whether the atlas's explosive is added before the increase or after is not known (the census
+    /// has no run with it); before is assumed, and the count with it is at least one more than without.
     /// </summary>
-    private static float ExplosivesFactorOfMap(GameController gc)
+    public static int ExplosivesOfSite(GameController gc, bool grand, bool atlasExplosive)
     {
         var increase = Safe.Read(() => gc.IngameState.Data.MapStatsVisible, null) is { } stats &&
                        stats.TryGetValue(GameStat.MapExpeditionExplosivesPct, out var pct) ? pct : 0;
+        var baseCount = grand ? GrandExplosives : Assumed;
+        var without = baseCount * Math.Max(0, 100 + increase) / 100;
 
-        return 1f + increase / 100f;
+        return atlasExplosive ? Math.Max(without + 1, (baseCount + 1) * Math.Max(0, 100 + increase) / 100) : without;
     }
 
     private static int _anotherPlayersCount;
@@ -1499,65 +1538,35 @@ internal static class Detonator
 
     private static int ExplosivesAtAnotherPlayersSiteNow(GameController gc)
     {
-        var factor = ExplosivesFactorOfMap(gc);
         var placed = ExplosivesStandingInOrder(gc).Length;
-        var ordinary = Math.Max(Assumed, _learnedOrdinaryAtAnotherPlayersSite);
-        var grandBase = Math.Max(GrandExplosives, _learnedGrandAtAnotherPlayersSite);
-        var grand = GrandAreaFlag(gc) ?? (placed > MathF.Round(ordinary * factor) || RemnantsAtSite >= GrandRemnantsAtLeast);
+        var grand = GrandAreaFlag(gc) ??
+                    (placed > ExplosivesOfSite(gc, false, true) || RemnantsAtSite >= GrandRemnantsAtLeast);
+        var without = ExplosivesOfSite(gc, grand, false);
+        var with = ExplosivesOfSite(gc, grand, true);
 
-        // **Learnt from what the owner places.** Their explosive count can carry their own atlas's bonus, which the map's
-        // stats do not show and the detonator does not state: a host with 6 was planned for the assumed 5 until the 6th
-        // went down (2026-10-18). The most seen down at another player's site of each kind, the map's increase taken off,
-        // is the least planned for at the next, for the session. One owner's atlas stands for all of them.
-        //
-        // Only from a count that has read the same for LearnAfterSteady, as what is learnt is never lowered: a count
-        // read once while the owner undid placements made them seem to have more for the rest of the session.
-        var now = DateTime.UtcNow;
+        // **The owner's atlas is read from what they place.** More down than the site holds without the atlas's explosive
+        // means they have it; more than it holds with it cannot be, and is a miscount (undone explosives counted, or
+        // another site's), so it is not believed. A host with 6 was planned for 5 until the 6th went down (2026-10-18). A
+        // host with 15 was planned for 17 when an earlier host's count, learnt for the session and never lowered, stood for
+        // every owner after it (dump 2026-10-22 02:01:07).
+        var planned = OwnerHasAtlasExtraExplosive || placed > without ? with : without;
 
-        if (placed != _placedLastRead)
-        {
-            _placedLastRead = placed;
-            _placedSteadySince = now;
-        }
+        AnotherPlayersSiteExplosivesSaid = placed > with
+            ? $"{planned}: {placed} counted down is more than the {with} the site can hold, so a miscount"
+            : $"{planned}: {without} without the atlas's extra explosive, {with} with it" +
+              $"{(OwnerHasAtlasExtraExplosive ? " (set to have it)" : "")}, {placed} down";
 
-        if (placed > 0 && now - _placedSteadySince >= LearnAfterSteady)
-        {
-            var learnt = (int)MathF.Ceiling(placed / factor - 0.01f);
-            var area = Safe.Read(gc, static g => g.Area.CurrentArea.Name, "") ?? "";
-
-            if (grand && learnt > _learnedGrandAtAnotherPlayersSite)
-            {
-                _learnedGrandAtAnotherPlayersSite = learnt;
-                LearnedAtAnotherPlayersSiteSaid = $"Grand {learnt}, from {placed} down at {area}";
-            }
-            else if (!grand && learnt > _learnedOrdinaryAtAnotherPlayersSite)
-            {
-                _learnedOrdinaryAtAnotherPlayersSite = learnt;
-                LearnedAtAnotherPlayersSiteSaid = $"ordinary {learnt}, from {placed} down at {area}";
-            }
-        }
-
-        return Math.Max(placed, (int)MathF.Round((grand ? grandBase : ordinary) * factor));
+        return planned;
     }
 
     /// <summary>
-    /// The most explosives seen down at another player's ordinary or Grand site this session, the map's increase taken
-    /// off; 0 before any. See ExplosivesAtAnotherPlayersSiteNow.
+    /// Whether another player's site is planned with the atlas's extra explosive before its owner places it. Set from
+    /// AdvancedSolverSettings.OwnerHasAtlasExtraExplosive each tick. See ExplosivesAtAnotherPlayersSiteNow.
     /// </summary>
-    private static int _learnedOrdinaryAtAnotherPlayersSite;
+    public static bool OwnerHasAtlasExtraExplosive { get; set; }
 
-    private static int _learnedGrandAtAnotherPlayersSite;
-
-    /// <summary>The explosives last read down at another player's site, and since when that count has held.</summary>
-    private static int _placedLastRead;
-
-    private static DateTime _placedSteadySince;
-
-    /// <summary>How long a count of explosives at another player's site must hold before it is learnt from. Chosen.</summary>
-    private static readonly TimeSpan LearnAfterSteady = TimeSpan.FromSeconds(2);
-
-    /// <summary>The last count learnt at another player's site, and where, for the dump.</summary>
-    public static string LearnedAtAnotherPlayersSiteSaid { get; private set; } = "nothing learnt this session";
+    /// <summary>How ExplosivesAtAnotherPlayersSite last came to its count, for the dump.</summary>
+    public static string AnotherPlayersSiteExplosivesSaid { get; private set; } = "not worked out this session";
 
     /// <summary>
     /// Whether the detonator's own panel can still tell us nothing about this site.
@@ -1635,7 +1644,7 @@ internal static class Detonator
     public static int ExplosivesInHand(GameController gc) =>
         PanelReady(gc) ? Safe.Read(Info(gc), static i => i.RemainingExplosiveCount, 0)
         : SiteIsAnotherPlayers(gc) ? ExplosivesAtAnotherPlayersSite(gc)
-        : GrandAreaFlag(gc) == true ? (int)MathF.Round(GrandExplosives * ExplosivesFactorOfMap(gc))
+        : GrandAreaFlag(gc) == true ? ExplosivesOfSite(gc, true, false)
         : Assumed;
 
     /// <summary>

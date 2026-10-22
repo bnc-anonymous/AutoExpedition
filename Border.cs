@@ -155,22 +155,11 @@ internal sealed class Border
             Ground(gc, grid + new Vector2(0f, Size)),
         };
 
-        var screen = new Vector2[corners.Length];
+        if (Array.IndexOf(corners, Vector3.Zero) >= 0)
+            return;
 
-        for (var i = 0; i < corners.Length; i++)
-        {
-            if (corners[i] == Vector3.Zero)
-                return;
-
-            screen[i] = Safe.Read((camera, corners[i]),
-                static x => x.camera.WorldToScreen(x.Item2), Vector2.Zero);
-
-            if (screen[i] == Vector2.Zero)
-                return;
-        }
-
-        graphics.DrawLine(screen[0], screen[1], 1f, colour);
-        graphics.DrawLine(screen[2], screen[3], 1f, colour);
+        WorldDrawing.Line(graphics, gc, camera, corners[0], corners[1], 1f, colour);
+        WorldDrawing.Line(graphics, gc, camera, corners[2], corners[3], 1f, colour);
     }
 
     private static Vector3 Ground(GameController gc, Vector2 grid) =>

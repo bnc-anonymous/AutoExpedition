@@ -653,7 +653,7 @@ internal static class Autoloot
     }
 
     /// <summary>The game's item class of an item on the ground, from its base type, or "" when it cannot be read.</summary>
-    private static string ItemClassOfItem(GameController gc, Entity onGround) => FactsOfItem(gc, onGround)?.ItemClass ?? "";
+    internal static string ItemClassOfItem(GameController gc, Entity onGround) => FactsOfItem(gc, onGround)?.ItemClass ?? "";
 
     /// <summary>The metadata path of an item on the ground - the item's, not the ground entity's - or "".</summary>
     private static string MetadataOfItem(Entity onGround) => FactsOfItem(null, onGround)?.Metadata ?? "";
@@ -3290,8 +3290,7 @@ internal static class Autoloot
         if (camera == null || player == Vector3.Zero)
             return;
 
-        var from = Safe.Read((camera, player), static x => x.camera.WorldToScreen(x.player), Vector2.Zero);
-        var to = Safe.Read((camera, nearest.World), static x => x.camera.WorldToScreen(x.World), Vector2.Zero);
+        var (from, to) = WorldDrawing.ScreenEnds(gc, camera, player, nearest.World) ?? (Vector2.Zero, Vector2.Zero);
 
         if (from == Vector2.Zero || to == Vector2.Zero || Panels.Covers(covered, from) || Panels.Covers(covered, to))
             return;

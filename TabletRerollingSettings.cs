@@ -114,12 +114,12 @@ public class TabletModifierRow
         new() { Id = "TowerPackSizeIncrease", Affix = "Prefix", Text = "#% increased Pack Size in Map", Weight = 4, Search = true, TradeStat = "explicit.stat_2017682521", ShortName = "pack size" },
         new() { Id = "TowerMonsterRarityIncrease", Affix = "Prefix", Text = "Map has #% increased Monster Rarity", Weight = 3, Search = true, TradeStat = "explicit.stat_4142653832", ShortName = "monster rarity" },
         new() { Id = "TowerExpeditionChanceForTwinnedElites", Affix = "Suffix", Text = "Expeditions have +#% Surpassing chance to Duplicate Runic Monsters in Map", Weight = 3, Search = true, TradeStat = "explicit.stat_779964546", ShortName = "duplicate runics" },
-        new() { Id = "TowerMagicPackIncrease", Affix = "Prefix", Text = "Map has #% increased Magic Monsters", Weight = 1, Search = true, TradeStat = "explicit.stat_3873704640", ShortName = "magic monsters" },
-        new() { Id = "TowerExpeditionRunicMonsters", Affix = "Suffix", Text = "Map contains #% increased number of Runic Monster Markers", Weight = 1, Search = true, TradeStat = "explicit.stat_1640965354", ShortName = "runic markers" },
+        new() { Id = "TowerMagicPackIncrease", Affix = "Prefix", Text = "Map has #% increased Magic Monsters", Weight = 1, TradeStat = "explicit.stat_3873704640", ShortName = "magic monsters" },
+        new() { Id = "TowerExpeditionRunicMonsters", Affix = "Suffix", Text = "Map contains #% increased number of Runic Monster Markers", Weight = 1, TradeStat = "explicit.stat_1640965354", ShortName = "runic markers" },
         new() { Id = "TowerExpeditionExplosionRadius", Affix = "Suffix", Text = "#% increased Expedition Explosive Area of Effect in Map", Search = true, TradeStat = "explicit.stat_3039133122", ShortName = "explosive area" },
         new() { Id = "TowerExpeditionVaalRemnants", Affix = "Suffix", Text = "Expeditions contain 1 Vaal Relic in Map", Search = true, TradeStat = "explicit.stat_2852112245", ValueSteps = "exact", ShortName = "vaal relic" },
-        new() { Id = "TowerExpeditionBuriedStrongboxes", Affix = "Suffix", Text = "Expeditions contain 1 buried Strongbox in Map", Search = true, TradeStat = "explicit.stat_181823691", ShortName = "buried strongbox" },
-        new() { Id = "TowerAdditionalAzmeriWisp", Affix = "Prefix", Text = "Map contains # additional Azmeri Spirit", Search = true, TradeStat = "explicit.stat_358129101", ShortName = "azmeri spirits" },
+        new() { Id = "TowerExpeditionBuriedStrongboxes", Affix = "Suffix", Text = "Expeditions contain 1 buried Strongbox in Map", TradeStat = "explicit.stat_181823691", ShortName = "buried strongbox" },
+        new() { Id = "TowerAdditionalAzmeriWisp", Affix = "Prefix", Text = "Map contains # additional Azmeri Spirit", TradeStat = "explicit.stat_358129101", ShortName = "azmeri spirits" },
         new() { Id = "TowerDroppedGoldIncrease", Affix = "Prefix", Text = "#% increased Gold found in Map (Gold Piles)", TradeStat = "explicit.stat_1276056105", ShortName = "gold" },
         new() { Id = "TowerStoneCircleChance", Affix = "Suffix", Text = "Map has #% increased chance to contain a Summoning Circle", TradeStat = "explicit.stat_267210597", ShortName = "summoning circle %" },
         new() { Id = "TowerExperienceGainIncrease", Affix = "Prefix", Text = "#% increased Experience gain in Map", TradeStat = "explicit.stat_57434274", ShortName = "experience" },
@@ -251,6 +251,15 @@ public class TabletPriceSettings
     public ToggleNode ShowMerchantPrices { get; set; } = new ToggleNode(true);
 
     /// <summary>
+    /// The hovered tablet's price table is drawn only while Alt is held, so it is out of the way while currency is used on
+    /// tablets one after another. The price labels are drawn either way. See Tablets.Draw.
+    /// </summary>
+    [Menu("Show price table only while holding Alt",
+        "The table of listings beside a hovered tablet appears only while Alt is\n" +
+        "held. Prices on the tablets are shown either way.")]
+    public ToggleNode ShowPriceTableOnlyWithAlt { get; set; } = new ToggleNode(true);
+
+    /// <summary>
     /// Whether a tablet already used - under Tablets.FullUses uses remaining - is left alone: no border, no price, no
     /// search. Its uses are read from its implicit. See Tablets.UsesOf.
     /// </summary>
@@ -263,6 +272,70 @@ public class TabletPriceSettings
     /// </summary>
     [Menu("Hide prices when currency held", "While a tablet currency is right-clicked for use, draw no prices.")]
     public ToggleNode HidePricesWhenCurrencyHeld { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether rare tablets one Chaos Orb is expected to raise in worth by at least ChaosOrbMinimumGainDivines, and worth
+    /// at most ChaosOrbMaximumValueDivines now, are marked and kept from reforging, for a Chaos Orb by hand. Experimental:
+    /// what the orb does is the game's description, not measured. See Tablets.IsChaosOrbCandidate.
+    /// </summary>
+    [Menu("Mark Chaos Orb candidates (experimental)",
+        "Marks rare tablets worth a Chaos Orb by hand, with the expected gain after\n" +
+        "the orb's price and the chance of coming out ahead after it, top left of\n" +
+        "its cell. Marked tablets are not reforged.\n\n" +
+        "Worth now is the tablet's own trade price. Each outcome is the price of\n" +
+        "tablets with exactly its searched modifiers, from tablet_outcome_survey.py;\n" +
+        "~ marks an estimate. What a Chaos Orb does is taken from the game's\n" +
+        "description: one modifier removed at random, one added by weight.")]
+    public ToggleNode MarkChaosOrbCandidates { get; set; } = new ToggleNode(false);
+
+    /// <summary>The least expected gain, in divines after the orb's price, that marks a tablet. See MarkChaosOrbCandidates.</summary>
+    [Menu("Chaos Orb minimum gain (divines)",
+        "A tablet is marked when one Chaos Orb is expected to raise its worth by at\n" +
+        "least this much, after the orb's price.")]
+    public RangeNode<float> ChaosOrbMinimumGainDivines { get; set; } = new RangeNode<float>(3f, 0f, 50f);
+
+    /// <summary>The most a tablet may be worth now, in divines, to be marked. See MarkChaosOrbCandidates.</summary>
+    [Menu("Chaos Orb maximum tablet value (divines)",
+        "Tablets worth more than this now are not marked: a Chaos Orb risks the\n" +
+        "modifier that makes a valuable tablet valuable.")]
+    public RangeNode<float> ChaosOrbMaximumValueDivines { get; set; } = new RangeNode<float>(5f, 0f, 100f);
+
+    /// <summary>
+    /// For checking the Chaos Orb odds: every tablet they can be worked out for shows them, in grey where it is not a
+    /// candidate - a loss as much as a gain, whatever the minimum gain, the maximum value or marking. Reforging is not
+    /// affected. See Tablets.DrawChaosOrbMark.
+    /// </summary>
+    [Menu("Show Chaos Orb odds on every tablet (debug)",
+        "Every tablet the Chaos Orb odds can be worked out for shows them, in grey\n" +
+        "where it is not a candidate: the expected gain or loss after the orb's price,\n" +
+        "and the chance of coming out ahead. Ignores the minimum gain and maximum\n" +
+        "value. Only what is drawn: what is reforged is unchanged.")]
+    public ToggleNode ShowChaosOrbOddsOnEveryTablet { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// While Alt is held, every tablet the Chaos Orb odds can be worked out for shows them, no hover needed, whatever the
+    /// minimum gain and the maximum value: orange for an expected gain, grey for a loss. Only what is drawn; what is
+    /// reforged is unchanged. See Tablets.DrawChaosOrbMark.
+    /// </summary>
+    [Menu("Show Chaos Orb odds on every tablet while holding Alt",
+        "While Alt is held, every tablet shows its Chaos Orb odds: orange for an\n" +
+        "expected gain, grey for a loss. Ignores the minimum gain and maximum value.")]
+    public ToggleNode ShowChaosOrbOddsWhileHoldingAlt { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Chaos Orb odds on the tablets in another player's merchant window (IngameUi.PurchaseWindowHideout), with worth now
+    /// its asking price. The price is read from a listing's tooltip, which the game fills only while it is shown (dumps
+    /// 2026-10-21 02:11:23 and 02:12:26), so a tablet is marked once hovered and stays marked while the window is open.
+    /// Orange where its gain is at least Chaos Orb minimum gain, grey otherwise; not marked at all when its asking price is
+    /// over Chaos Orb maximum tablet value. See Tablets.DrawOtherMerchantChaosOrbMarks.
+    /// </summary>
+    [Menu("Show Chaos Orb odds in other players' merchant windows",
+        "In another player's merchant window, each tablet hovered shows the expected\n" +
+        "gain from one Chaos Orb if bought at its asking price, and the chance of\n" +
+        "coming out ahead. The price is only readable from a tablet's tooltip, so\n" +
+        "each tablet is marked once hovered, and stays marked while the window is open.\n" +
+        "Tablets asking more than Chaos Orb maximum tablet value are not marked.")]
+    public ToggleNode ShowChaosOrbOddsInOtherMerchants { get; set; } = new ToggleNode(true);
 }
 
 /// <summary>
@@ -361,6 +434,22 @@ public class TabletTradeSiteSettings
         "Older prices stay shown, and are searched again\n" +
         "the next time you press the action key.")]
     public RangeNode<int> PriceFreshMinutes { get; set; } = new RangeNode<int>(180, 5, 1440);
+
+    /// <summary>
+    /// Cached search answers older than this many days are deleted, not kept as stale. The Chaos Orb odds are worked
+    /// out over every cached listing of the league, whatever its age, so a cache kept from weeks ago would set them by
+    /// that market. A tablet whose answer is deleted is unpriced until it is searched again. 14 by default, chosen: 7
+    /// deleted every listing of a tablet with no price movers, which only searches of cheap tablets find, and left 7 of
+    /// 68 stashed tablets with Chaos Orb odds (2026-10-20). See TabletPricing.DeleteAnswersOlderThan.
+    /// </summary>
+    [Menu("Delete prices older than (days)",
+        "Cached searches older than this are deleted.\n" +
+        "A tablet whose price is deleted shows no price\n" +
+        "until it is searched again. The Chaos Orb odds are\n" +
+        "worked out from every cached search, so old ones\n" +
+        "skew them; too short, and cheap tablets' searches\n" +
+        "go, leaving most tablets without odds.")]
+    public RangeNode<int> DeletePricesOlderThanDays { get; set; } = new RangeNode<int>(14, 1, 90);
 
     /// <summary>
     /// The highest price, in divines, that counts as cheap. A cheap price stays fresh for CheapPriceFreshHours, and a

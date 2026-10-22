@@ -1134,6 +1134,7 @@ internal static partial class Tablets
         _clickCell = null;
 
         PlannedAhead.Clear();
+        _movedAheadTo = null;
 
         if (WorldPointOf(gc, entity) is not { } point || !Input.MoveTo(point, ctrl: ctrl))
         {

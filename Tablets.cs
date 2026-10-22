@@ -91,6 +91,11 @@ internal static partial class Tablets
     /// <summary>The currency right-clicked for use at the last read, as the action it is; None for none. See HeldOnCursor.</summary>
     private static TabletAction _held;
 
+    /// <summary>Whether either Alt key is held. See TabletPriceSettings.ShowPriceTableOnlyWithAlt.</summary>
+    private static bool AltHeld() =>
+        ExileCore2.Input.IsKeyDown(System.Windows.Forms.Keys.Menu) || ExileCore2.Input.IsKeyDown(System.Windows.Forms.Keys.LMenu) ||
+        ExileCore2.Input.IsKeyDown(System.Windows.Forms.Keys.RMenu);
+
     /// <summary>The tablets found on the last read. For drawing and for the dump.</summary>
     internal static IReadOnlyList<TabletOnScreen> Seen { get; private set; } = [];
 
@@ -105,6 +110,7 @@ internal static partial class Tablets
             return;
 
         _valuation = valuation;
+        TabletPricing.DeleteAnswersOlderThan(TimeSpan.FromDays(tablets.TradeSite.DeletePricesOlderThanDays.Value));
         _automationOn = settings.Automation.Enable.Value;
         _tabletAutomation = tablets.TabletAutomation.EnableTabletAutomation.Value;
 
@@ -194,6 +200,7 @@ internal static partial class Tablets
 
                 RollsWatch(gc, () => carried.Value);
                 RollsWatchIdentified(gc, () => carried.Value);
+                WatchHandCrafts(gc, tablets);
             }
         }
 
@@ -251,6 +258,13 @@ internal static partial class Tablets
             DrawCraftingRequirements(graphics, gc, tablets);
         }
 
+        using (Spent.On("Tablets/OtherMerchant"))
+            DrawOtherMerchantChaosOrbMarks(graphics, gc, tablets);
+
+        // The set survey's answers kept read for the price labels' floor as well as the Chaos Orb odds, whether or not
+        // the odds are shown. Looked at every ten seconds at most. See SetSurveyPriceOf.
+        ChaosOrbSetAnswersOf(gc, tablets);
+
         if (Seen.Count == 0)
             return;
 
@@ -264,6 +278,7 @@ internal static partial class Tablets
         using (Spent.On("Tablets/Detail"))
             // Not while a run holds the cursor: it would open over every tablet the run passes. Prices are still drawn.
             detail = !_reforgingHasCursor && hovered != null && !(tablets.Prices.IgnoreUsedTablets && hovered.Uses < FullUses) &&
+                     (!tablets.Prices.ShowPriceTableOnlyWithAlt || AltHeld()) &&
                      IsPriced(hovered, ActionOf(hovered, tablets), tablets, valuation)
                 ? LayOutDetail(graphics, hovered.Rect, tooltip, Priced(gc, hovered, tablets, valuation))
                 : null;
@@ -294,6 +309,10 @@ internal static partial class Tablets
                 if (priced.Label.Length > 0)
                     DrawLabel(graphics, tablet.Rect, priced.Label, priced.Colour.A > 0 ? priced.Colour : Color.White);
             }
+
+            // A Chaos Orb candidate's gain and chance in the top left. See TabletPriceSettings.MarkChaosOrbCandidates.
+            if (!underDetail)
+                DrawChaosOrbMark(graphics, gc, tablet, tablets);
 
             // A finished tablet has no border: its price is all there is to say about it. None at all unless asked for.
             if (action == TabletAction.Finished || !tablets.CraftingByHand.DrawTabletBorders)
@@ -1459,6 +1478,7 @@ internal static partial class Tablets
         b.AppendLine($"  trade site: {TabletPricing.Status}, {TabletPricing.Pending} waiting; {TabletPricing.Limits}");
         b.AppendLine($"  {PricingRunSaid}");
         b.AppendLine($"  {MerchantSaid(gc)}");
+        b.Append(OtherMerchantSaid(gc, mouse));
         b.Append(ReforgingSaid(gc, settings));
         b.Append(StashElementsUnderCursorSaid(gc));
         b.Append(StashTabsSaid(gc));
@@ -1505,6 +1525,9 @@ internal static partial class Tablets
             foreach (var mod in Safe.Read(mods, static m => m.ImplicitMods, null) ?? [])
                 b.AppendLine($"    implicit {Safe.Read(mod, static m => m.RawName, "?")} values " +
                              $"[{string.Join(", ", Safe.Read(mod, static m => m.Values, null) ?? [])}]");
+
+            if (tablet.Rarity == ItemRarity.Rare)
+                b.AppendLine($"    {ChaosOrbOddsSaid(gc, tablet, settings)}");
         }
 
         return b.ToString().TrimEnd();
@@ -1534,11 +1557,24 @@ internal static partial class Tablets
             b.AppendLine($"    human stat \"{stat}\"");
 
         var tooltip = Safe.Read(hovered.Element, static e => e.Tooltip, null);
+        var texts = DumpTextsUnder(tooltip);
+
+        b.AppendLine(tooltip == null ? "    tooltip: none" : $"    tooltip text ({texts.Count} piece(s), depth-first):");
+
+        foreach (var text in texts)
+            b.AppendLine($"      {text}");
+
+        return b.ToString();
+    }
+
+    /// <summary>Every text under an element, depth-first, indented by depth: at most 80, twelve levels down. For the dump.</summary>
+    private static List<string> DumpTextsUnder(ExileCore2.PoEMemory.Element root)
+    {
         var texts = new List<string>();
         var stack = new Stack<(ExileCore2.PoEMemory.Element Element, int Depth)>();
 
-        if (tooltip != null)
-            stack.Push((tooltip, 0));
+        if (root != null)
+            stack.Push((root, 0));
 
         while (stack.Count > 0 && texts.Count < 80)
         {
@@ -1554,11 +1590,119 @@ internal static partial class Tablets
                 stack.Push((children[i], depth + 1));
         }
 
-        b.AppendLine(tooltip == null ? "    tooltip: none" : $"    tooltip text ({texts.Count} piece(s), depth-first):");
+        return texts;
+    }
 
-        foreach (var text in texts)
-            b.AppendLine($"      {text}");
+    /// <summary>
+    /// For reading another player's merchant window, which ExileCore2 names no property for (its OfflineMerchantPanel is
+    /// the player's own, and read not visible with another's open; dump 2026-10-21 02:05:52, where a window headed
+    /// "Merchant" was IngameUi child 80): each visible child of IngameUi but the stash, the inventory and the player's own
+    /// merchant window that holds Expedition Tablets among its elements - how many, the route to the first, its
+    /// components and the texts under it, and the tooltip of the one under the cursor, where the asking price is expected.
+    /// For the dump only; it reads, and moves nothing.
+    /// </summary>
+    private static string OtherMerchantSaid(GameController gc, System.Numerics.Vector2 mouse)
+    {
+        var b = new StringBuilder();
+        var ui = Safe.Read(gc, static g => g.IngameState.IngameUi, null);
+        var children = Safe.Read(ui, static u => u.Children, null) ?? [];
+        var known = new HashSet<long>
+        {
+            Safe.Read(ui, static u => u.StashElement?.Address ?? 0L, 0L),
+            Safe.Read(ui, static u => u.InventoryPanel?.Address ?? 0L, 0L),
+            Safe.Read(ui, static u => u.OfflineMerchantPanel?.Address ?? 0L, 0L),
+        };
+        var any = false;
+
+        // The window by its ExileCore2 name, as NinjaPricer reads it: IngameUi.PurchaseWindowHideout, its listed items in
+        // TabContainer.VisibleStash (the player named the dev tree's child 80 TradeWindow/PurchaseWindowHideout/HaggleWindow).
+        var purchase = Safe.Read(ui, static u => u.PurchaseWindowHideout, null);
+        var listed = Safe.Read(purchase, static p => p.TabContainer?.VisibleStash?.VisibleInventoryItems, null);
+
+        b.AppendLine($"  PurchaseWindowHideout: visible {Safe.Read(purchase, static p => p.IsVisible, false)}, " +
+                     (listed == null ? "no visible tab read" : $"{listed.Count} item(s) in its visible tab, " +
+                         $"{listed.Count(i => (Safe.Read(i, static x => x.Item?.Metadata, "") ?? "").StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase))} Expedition Tablet(s)"));
+
+        for (var index = 0; index < children.Count; index++)
+        {
+            var panel = children[index];
+
+            if (!Safe.Read(panel, static p => p.IsVisible, false) || known.Contains(Safe.Read(panel, static p => p.Address, 0L)))
+                continue;
+
+            var tablets = new List<(ExileCore2.PoEMemory.Element Element, List<int> Route)>();
+            var stack = new Stack<(ExileCore2.PoEMemory.Element Element, List<int> Route)>();
+            var visited = 0;
+
+            stack.Push((panel, [index]));
+
+            while (stack.Count > 0 && visited < 5000)
+            {
+                var (element, route) = stack.Pop();
+                visited++;
+
+                if (Safe.Read(element, static e => e.Entity?.Metadata, null) is { } path &&
+                    path.StartsWith(ExpeditionTabletPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    tablets.Add((element, route));
+                    continue;
+                }
+
+                var below = Safe.Read(element, static e => e.Children, null) ?? [];
+
+                for (var i = below.Count - 1; i >= 0 && route.Count < 16; i--)
+                    stack.Push((below[i], [.. route, i]));
+            }
+
+            if (tablets.Count == 0)
+                continue;
+
+            any = true;
+
+            var (first, firstRoute) = tablets[0];
+            var rect = Safe.Read(first, static e => e.GetClientRectCache, default);
+            var components = Safe.Read(() => first.Entity.CacheComp, null)?.Keys.OrderBy(k => k, StringComparer.Ordinal) ?? Enumerable.Empty<string>();
+
+            b.AppendLine($"  another window with tablets: IngameUi child {index}, {tablets.Count} tablet(s) among {visited} element(s); " +
+                         $"first at [{string.Join(",", firstRoute)}] ({rect.X:0},{rect.Y:0} {rect.Width:0}x{rect.Height:0}), " +
+                         $"components [{string.Join(", ", components)}]");
+
+            foreach (var text in DumpTextsUnder(first).Take(10))
+                b.AppendLine($"    under the first: {text}");
+
+            // Whether a listing's tooltip - where its asking price was, "18x" and "Chaos Orb" at its end (dump 2026-10-21
+            // 02:11:23) - can be read without hovering it: the last texts of two tablets' tooltips, hovered or not.
+            foreach (var (element, route) in tablets.Take(2))
+            {
+                var tip = Safe.Read(element, static e => e.Tooltip, null);
+                var tail = DumpTextsUnder(tip).TakeLast(3);
+
+                b.AppendLine($"    tooltip of [{string.Join(",", route)}] unhovered: " +
+                             (tip == null ? "none" : $"visible {Safe.Read(tip, static x => x.IsVisible, false)}, last texts {string.Join(" ", tail)}"));
+            }
+
+            var hovered = tablets.FirstOrDefault(x => Safe.Read(x.Element, static e => e.GetClientRectCache, default) is var r &&
+                                                      mouse.X >= r.Left && mouse.X <= r.Right && mouse.Y >= r.Top && mouse.Y <= r.Bottom);
+
+            if (hovered.Element == null)
+            {
+                b.AppendLine("    hovered there: none");
+                continue;
+            }
+
+            var tooltip = Safe.Read(hovered.Element, static e => e.Tooltip, null);
+
+            b.AppendLine($"    hovered there: [{string.Join(",", hovered.Route)}]; tooltip " +
+                         (tooltip == null ? "none" : $"visible {Safe.Read(tooltip, static x => x.IsVisible, false)}, its texts:"));
+
+            foreach (var text in DumpTextsUnder(tooltip))
+                b.AppendLine($"      {text}");
+        }
+
+        if (!any)
+            b.AppendLine("  another window with tablets: none");
 
         return b.ToString();
     }
+
 }

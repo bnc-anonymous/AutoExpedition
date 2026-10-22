@@ -186,7 +186,7 @@ internal static partial class Tablets
     /// <summary>IsJunk worked out, for the first ask of each read's record. See TabletJudgement.</summary>
     private static bool IsJunkUnjudged(GameController gc, TabletOnScreen tablet, TabletRerollingSettings settings) =>
         tablet.Rarity == ItemRarity.Rare && tablet.Identified && tablet.Uses == FullUses && FullyRead(tablet) &&
-        ActionOf(tablet, settings) != TabletAction.Exalt &&
+        ActionOf(tablet, settings) != TabletAction.Exalt && !IsChaosOrbCandidate(gc, tablet, settings) &&
         (settings.WeightOf(tablet.Modifiers) < settings.Prices.MinimumWeightToKeep.Value ||
          MostChaosOf(gc, tablet, settings) is { } most && most < settings.Prices.ReforgeUnderChaos.Value);
 
@@ -230,6 +230,9 @@ internal static partial class Tablets
         if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } own)
         {
             var price = ExaltsForReforging(own, settings);
+
+            if (!double.IsNaN(price))
+                price = PriceCappedByNewer(search.Key, own, price, settings, _valuation);
 
             return double.IsNaN(price) ? null : TabletChaosOf(price, _valuation);
         }
@@ -452,6 +455,7 @@ internal static partial class Tablets
         _reforgingDone = null;
         _worldTarget = null;
         _worldClick = false;
+        _movedAheadTo = null;
         _shiftHeld = false;
 
         if (_reforgingHasCursor)
@@ -852,7 +856,11 @@ internal static partial class Tablets
                 }
 
                 if (now <= _reforgingDeadline)
+                {
+                    // While the game catches up with the click, the cursor already on its way to the plan's next one.
+                    MoveAheadToPlanned();
                     return;
+                }
 
                 _reforgingStep = ReforgingStep.Idle;
                 _worldTarget = null;
@@ -1957,6 +1965,36 @@ internal static partial class Tablets
     /// <param name="timeout">How long after the click what must show may take; StepTimeout by default.</param>
     /// <param name="right">A right-click rather than a left one.</param>
     /// <param name="beforeClick">A reason not to click, asked on arrival, which stops the run; an empty one lets this click go instead. See _beforeClick.</param>
+    /// <summary>
+    /// **The next planned click moved to while the game catches up with the last**: after a click the run waits for the
+    /// game to show it - the reforged tablet gone from the bench, the three loads gone into the reforge, 85 to 167ms -
+    /// before choosing the next, and the cursor stood on the click meanwhile, a distinct pause on the reforged tablet and
+    /// on the reforge button where the loads flow on (the player, 2026-10-20; dump 22:42:33). The plan already says what
+    /// comes next, so its move is made at once; when the run sends that click, Send waits on this move rather than
+    /// making it again, which would start it afresh from wherever the cursor had got to. Once per wait. See Send.
+    /// </summary>
+    private static void MoveAheadToPlanned()
+    {
+        if (_movedAheadTo != null || PlannedAhead.Count == 0)
+            return;
+
+        var next = PlannedAhead[0];
+
+        if (next.Right || next.Rect.Width <= 0f)
+            return;
+
+        if (next.Point is { } at ? Input.MoveTo(at, ctrl: next.Ctrl) : Input.MoveTo(next.Rect, ctrl: next.Ctrl))
+        {
+            _movedAheadTo = next;
+            _movedAheadTimes = Input.LastMoveTimes();
+        }
+    }
+
+    /// <summary>The planned click MoveAheadToPlanned has sent the cursor to, and that move's times; null when none.</summary>
+    private static (RectangleF Rect, Vector2? Point, bool Right, bool Ctrl)? _movedAheadTo;
+
+    private static (float WaitMs, float TravelMs, bool Swooped, float OvershotPx)? _movedAheadTimes;
+
     private static void Send(RectangleF target, bool ctrl, string doing, Func<bool> done, Vector2? point = null,
         TimeSpan? timeout = null, bool right = false, Func<string> beforeClick = null)
     {
@@ -1981,10 +2019,17 @@ internal static partial class Tablets
         _clickCell = tabletClick ? target : null;
         _reaimed = false;
 
-        var aimed = target.Width > 0f && (point is { } at ? Input.MoveTo(at, ctrl: ctrl) : Input.MoveTo(target, ctrl: ctrl));
+        // Already on its way here, moved to ahead while the last click was shown: not moved again. See MoveAheadToPlanned.
+        var movedAhead = _movedAheadTo is { } ahead && ahead.Rect == target && ahead.Point == point && ahead.Ctrl == ctrl &&
+                         ahead.Right == right;
+
+        _movedAheadTo = null;
+
+        var aimed = movedAhead ||
+                    target.Width > 0f && (point is { } at ? Input.MoveTo(at, ctrl: ctrl) : Input.MoveTo(target, ctrl: ctrl));
 
         // The move's own times and flourishes, set as it was asked for, for the log. See ExileInput2's LastMoveTimes.
-        _sentMoveTimes = aimed ? Input.LastMoveTimes() : null;
+        _sentMoveTimes = movedAhead ? _movedAheadTimes : aimed ? Input.LastMoveTimes() : null;
 
         if (!aimed)
         {

@@ -2354,21 +2354,31 @@ public class AdvancedSolverSettings
     /// </summary>
     /// <summary>
     /// How many explosives a chain is planned for at another player's site, in a party, or 0 to work it out: 15 for a
-    /// Grand site and 5 otherwise, or the most an owner has been seen to place at one of each kind this session, times
-    /// the map's explosives increase, and never fewer than its owner has placed. Its
-    /// detonator panel gives no count. Planned only to compare with where its owner goes: the action key does not place
+    /// Grand site and 5 otherwise, plus one once its owner has placed more than that (the atlas's extra explosive), times
+    /// the map's explosives increase. Its detonator panel gives no count. Planned only to compare with where its owner goes: the action key does not place
     /// there. See Detonator.ExplosivesAtAnotherPlayersSite.
     /// </summary>
     [Menu("Explosives at another player's site (0 = work it out)",
         "In a party, at a site that is another player's, the game gives no explosive count.\n" +
         "The plan there - to compare with where they go - is made for this many explosives.\n" +
         "0 works it out: 15 on a Grand site, 5 otherwise, times the map's explosives increase,\n" +
-        "and never fewer than they have placed. Once an owner places more - an atlas bonus the\n" +
-        "game does not show you - their later sites are planned for that many, until you reload.\n" +
+        "and one more once the owner places more than that - the atlas's extra explosive,\n" +
+        "which the game does not show you. A count above that is taken as a miscount.\n" +
         "A site is taken as Grand once they place more\n" +
         "than an ordinary site allows, or when it holds 7 or more remnants.\n" +
         "Nothing is placed there by the action key; it only loots.")]
     public RangeNode<int> ExplosivesAtAnotherPlayersSite { get; set; } = new RangeNode<int>(0, 0, 40);
+
+    /// <summary>
+    /// Whether another player's site is planned with the atlas's extra explosive from the start, when Explosives at
+    /// another player's site is 0. The game does not show whether the owner has it; off, it is planned for once they
+    /// place more than the site holds without it. See Detonator.ExplosivesAtAnotherPlayersSite.
+    /// </summary>
+    [Menu("Owner has the atlas's extra explosive",
+        "In a party, at a site that is another player's, plans for one more explosive\n" +
+        "than the site gives - the atlas's extra explosive, which the game does not show.\n" +
+        "Off: planned for once they place more than the site holds without it.")]
+    public ToggleNode OwnerHasAtlasExtraExplosive { get; set; } = new ToggleNode(false);
 
     [Menu("Exhaustive search on simple sites",
         "On a site with only a few kinds of content, also tries each order of the kinds.\n\n" +
@@ -4103,6 +4113,31 @@ public class ScoreAreaSettings
     public ToggleNode DrawBombs { get; set; } = new ToggleNode(true);
 
     /// <summary>
+    /// The score area's last line, "Currency: 4.5d": the currency that has dropped in the map since entering it, in
+    /// divines. See MapCurrency.
+    /// </summary>
+    [Menu("Draw currency in score area",
+        "The currency that has dropped in this map since entering it, in divines,\n" +
+        "written last in the score area. Counts loot from before the expedition too,\n" +
+        "and both sites of an ordinary map. A trip to the hideout keeps it.")]
+    public ToggleNode DrawCurrency { get; set; } = new ToggleNode(true);
+
+    /// <summary>The least one item of a stack must be worth, in chaos, for the stack to count. See DrawCurrency.</summary>
+    [Menu("Currency worth at least (chaos)",
+        "A stack counts when one of it is worth at least this, by NinjaPricer.")]
+    public RangeNode<float> CurrencyAtLeastChaos { get; set; } = new RangeNode<float>(1f, 0f, 100f);
+
+    /// <summary>
+    /// Adds the currency the player did not pick up to the Currency line, "Currency: 4.5d (-1.2d)": what dropped, less
+    /// what the inventory gained. See MapCurrency.
+    /// </summary>
+    [Menu("Draw currency not picked up",
+        "Adds the currency you did not pick up to the Currency line - taken by others\n" +
+        "or left on the ground: what dropped, less what your inventory gained since\n" +
+        "entering the map. Currency spent from the inventory there counts as not picked up.")]
+    public ToggleNode DrawCurrencyNotPickedUp { get; set; } = new ToggleNode(true);
+
+    /// <summary>
     /// Placement warnings - Walk closer, Refused, Choose and the rest - written under the mouse cursor instead of on the
     /// score area's last line, where they went unnoticed. Off puts them back in the score area. See CursorWarning.
     /// </summary>
@@ -5489,11 +5524,11 @@ public class DebugSettings
     public CustomNode ResetEverythingUi { get; set; }
 
     /// <summary>
-    /// Turns on server garbage collection for the host, by setting DOTNET_gcServer for your account.
+    /// Turns GC Server (server garbage collection) on for the host, by setting DOTNET_gcServer for the account.
     ///
     /// **How the host collects is not this plugin's to set at runtime, and it decides what its
     /// allocation costs.** Workstation collection suspends every thread for a gen0 and the search
-    /// allocates from several at once, so its garbage arrives as frame spikes; server collection gives
+    /// allocates from several at once, so its garbage arrives as frame spikes; GC Server gives
     /// each core its own heap and a far larger budget before it stops anybody. Measured together with
     /// the allocation work - see NOTES - the two matter more in combination than either alone.
     ///
@@ -5507,14 +5542,14 @@ public class DebugSettings
     /// is why the tooltip says so and why there is a button to put it back.
     /// </summary>
     [JsonIgnore]
-    public CustomNode ServerCollectionUi { get; set; } = new CustomNode(() =>
+    public CustomNode GcServerUi { get; set; } = new CustomNode(() =>
     {
         var on = GCSettings.IsServerGC;
         var asked = HostCollection.Asked;
 
-        ImGui.TextUnformatted(on
-            ? "Server collection: ON for this process."
-            : "Server collection: OFF for this process - HIGHLY RECOMMENDED to turn on.");
+        // The mode this process runs in, which the button cannot change: it sets the account's variable, read at the
+        // next start. The two differ between a click and a restart, which the pending lines below say.
+        ImGui.TextUnformatted(on ? "GC Server: ON" : "GC Server: OFF (recommended: on)");
 
         ImGui.SameLine();
         ImGui.TextDisabled("(?)");
@@ -5522,25 +5557,30 @@ public class DebugSettings
         if (ImGui.IsItemHovered())
         {
             ImGui.SetTooltip(
-                "The .NET runtime collects garbage in one of two modes, and ExileCore2 picks\n" +
-                "one when it starts.\n\n" +
-                "Workstation mode stops EVERY thread to collect, and this plugin's search\n" +
-                "allocates from several at once - so its garbage arrives as frame stutters\n" +
-                "rather than as steady cost.\n\n" +
-                "Server mode gives each core its own heap and a far larger budget before it\n" +
-                "pauses anything. On a solve this is the difference between a smooth frame\n" +
-                "and a visible hitch.\n\n" +
-                "The button writes DOTNET_gcServer=1 to your Windows account, because the\n" +
-                "mode is read once at startup and cannot be changed in a running process.\n" +
-                "Restart ExileCore2 afterwards - not the game itself. It applies to\n" +
-                "every .NET program you start, not only this one, which is what\n" +
-                "Undo is for.");
+                "Trade-off: fewer and shorter frame stutters while the plugin searches,\n" +
+                "in exchange for more memory use.\n\n" +
+                "The .NET runtime collects garbage in one of two modes, and ExileCore2\n" +
+                "picks one when it starts.\n\n" +
+                "GC Workstation (the default) collects often, from one heap. Each\n" +
+                "collection pauses every thread, and this plugin's search allocates\n" +
+                "from several threads at once, so the pauses show as frame stutters.\n\n" +
+                "GC Server gives each core its own heap and lets far more build up\n" +
+                "before collecting, then collects on every core in parallel. Pauses\n" +
+                "come less often and end sooner; the larger heaps take more memory.\n\n" +
+                "The button sets DOTNET_gcServer=1 on your Windows account, because\n" +
+                "the mode is only read when a program starts. Restart ExileCore2\n" +
+                "afterwards; the game itself does not need restarting.\n\n" +
+                "The setting applies to every .NET program you start, not only\n" +
+                "ExileCore2. Ctrl-click the button again to remove it.\n\n" +
+                "What the button does, as the same call in PowerShell:\n" +
+                "  turn on:  [Environment]::SetEnvironmentVariable('DOTNET_gcServer', '1', 'User')\n" +
+                "  turn off: [Environment]::SetEnvironmentVariable('DOTNET_gcServer', $null, 'User')");
         }
 
         if (asked && !on)
-        {
-            ImGui.TextUnformatted("Set for your account - RESTART EXILECORE2 for it to take effect.");
-        }
+            ImGui.TextUnformatted("GC Server set - restart ExileCore2 to apply.");
+        else if (!asked && on)
+            ImGui.TextUnformatted("GC Server removed - restart ExileCore2 to apply.");
 
 
         // **One button carrying its own state, and inert unless ctrl is held.**
@@ -5554,7 +5594,7 @@ public class DebugSettings
 
         ImGui.BeginDisabled(!ctrl);
 
-        if (ImGui.Button($"Enable GC Server: {(asked ? "ON" : "OFF")}###gcServer"))
+        if (ImGui.Button($"{(asked ? "Turn GC Server off" : "Turn GC Server on")}###gcServer"))
         {
             if (asked)
                 HostCollection.Restore();
@@ -5571,12 +5611,11 @@ public class DebugSettings
             ImGui.SetTooltip(
                 (ctrl ? "" : "HOLD CTRL to use this." + "\n\n") +
                 (asked
-                    ? "Set for your account now. Pressing this removes DOTNET_gcServer, so the" + "\n" +
-                      "runtime chooses as it did before this was ever set." + "\n\n"
-                    : "Pressing this writes DOTNET_gcServer=1 to your account's environment" + "\n" +
-                      "variables." + "\n\n" +
-                      "Highly recommended: it is the single largest thing outside this plugin" + "\n" +
-                      "that decides what its allocation costs in frame time." + "\n\n") +
+                    ? "GC Server is set for your account. Pressing this removes DOTNET_gcServer," + "\n" +
+                      "so the runtime chooses as it did before it was ever set." + "\n\n"
+                    : "Pressing this sets DOTNET_gcServer=1 on your account, turning GC Server on." + "\n\n" +
+                      "Recommended: it is the single largest thing outside this plugin that" + "\n" +
+                      "decides what its allocation costs in frame time." + "\n\n") +
                 "Takes effect next time ExileCore2 starts, and applies to every .NET" + "\n" +
                 "program you start afterwards.");
         }

@@ -541,7 +541,7 @@ internal static class Overlay
                 if (where == Vector3.Zero || !OutlineProjectsSanely(gc, where, target.Sets * Detonator.GridToWorld, 32))
                     continue;
 
-                graphics.DrawCircleInWorld(where, target.Sets * Detonator.GridToWorld,
+                WorldDrawing.Circle(graphics, gc, where, target.Sets * Detonator.GridToWorld,
                     settings.Display.ThePlan.BarrelColour, 2f, 32, true);
             }
         }
@@ -1034,15 +1034,15 @@ internal static class Overlay
         if (lit)
         {
             if (FillsSafely(gc, world, radius, segments))
-                graphics.DrawFilledCircleInWorld(world, radius, colour, segments, false);
+                WorldDrawing.FilledCircle(graphics, gc, world, radius, colour, segments, false);
             else
-                graphics.DrawCircleInWorld(world, radius, colour, 2f, segments, false);
+                WorldDrawing.Circle(graphics, gc, world, radius, colour, 2f, segments, false);
 
-            graphics.DrawCircleInWorld(world, radius * 1.25f, covered, 2f, segments, false);
+            WorldDrawing.Circle(graphics, gc, world, radius * 1.25f, covered, 2f, segments, false);
         }
         else
         {
-            graphics.DrawCircleInWorld(world, radius, colour, 2f, segments, false);
+            WorldDrawing.Circle(graphics, gc, world, radius, colour, 2f, segments, false);
         }
     }
 
@@ -1168,7 +1168,7 @@ internal static class Overlay
         // dashes at the seam.
         var steps = Math.Max(4, segments % 2 == 0 ? segments : segments + 1);
 
-        var previous = Vector2.Zero;
+        var previous = world;
 
         for (var i = 0; i <= steps; i++)
         {
@@ -1179,12 +1179,10 @@ internal static class Overlay
                 Y = world.Y + MathF.Sin(angle) * radius,
             };
 
-            var screen = Safe.Read((camera, at), static x => x.camera.WorldToScreen(x.at), Vector2.Zero);
+            if (i > 0 && i % 2 == 1)
+                WorldDrawing.Line(graphics, gc, camera, previous, at, thickness, colour);
 
-            if (i > 0 && i % 2 == 1 && previous != Vector2.Zero && screen != Vector2.Zero)
-                graphics.DrawLine(previous, screen, thickness, colour);
-
-            previous = screen;
+            previous = at;
         }
     }
 
@@ -1200,7 +1198,7 @@ internal static class Overlay
         var centre = Safe.Read(() => gc.IngameState.Data.ToWorldWithTerrainHeight(at), Vector3.Zero);
 
         if (centre != Vector3.Zero && !Under(gc, covered, centre))
-            graphics.DrawCircleInWorld(centre, radius.Value * Detonator.GridToWorld,
+            WorldDrawing.Circle(graphics, gc, centre, radius.Value * Detonator.GridToWorld,
                 settings.Debug.BlastCircleColour, 2f, 48, !settings.Display.ThePlan.FlatCircles);
     }
 
@@ -1360,7 +1358,7 @@ internal static class Overlay
                 if (radius != null && !done &&
                     (ready || next || settings.Display.ThePlan.ShowLater))
                 {
-                    graphics.DrawCircleInWorld(world, radius.Value * Detonator.GridToWorld, colour,
+                    WorldDrawing.Circle(graphics, gc, world, radius.Value * Detonator.GridToWorld, colour,
                         thickness, 32, !settings.Display.ThePlan.FlatCircles);
                 }
 
@@ -1420,8 +1418,7 @@ internal static class Overlay
 
                 headStillToDraw = false;
 
-                var a =Safe.Read((camera, from), static x => x.camera.WorldToScreen(x.from), Vector2.Zero);
-                var b = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world), Vector2.Zero);
+                var (a, b) = WorldDrawing.ScreenEnds(gc, camera, from, world) ?? (Vector2.Zero, Vector2.Zero);
 
                 if (a != Vector2.Zero && b != Vector2.Zero && !Panels.Covers(covered, a) &&
                     !Panels.Covers(covered, b) &&
@@ -1682,7 +1679,7 @@ internal static class Overlay
             if (on == Vector2.Zero || Panels.Covers(covered, on))
                 continue;
 
-            Triangle(graphics, camera, world, TriangleSize(Astray.Nearest(targets, at)), Color.Red);
+            Triangle(graphics, gc, camera, world, TriangleSize(Astray.Nearest(targets, at)), Color.Red);
 
             var why = placement.Reason.Length > 0 ? placement.Reason : "Unlit";
             var size = graphics.MeasureText(why);
@@ -1748,24 +1745,11 @@ internal static class Overlay
                 Where(gc, at + new Vector2(0f, SpoiltSize)),
             };
 
-            var screen = new Vector2[corners.Length];
-            var readable = true;
-
-            for (var i = 0; i < corners.Length; i++)
-            {
-                screen[i] = corners[i] == Vector3.Zero
-                    ? Vector2.Zero
-                    : Safe.Read((camera, corners[i]),
-                        static x => x.camera.WorldToScreen(x.Item2), Vector2.Zero);
-
-                readable &= screen[i] != Vector2.Zero;
-            }
-
-            if (!readable)
+            if (Array.IndexOf(corners, Vector3.Zero) >= 0)
                 continue;
 
-            graphics.DrawLine(screen[0], screen[1], 1f, Color.Red);
-            graphics.DrawLine(screen[2], screen[3], 1f, Color.Red);
+            WorldDrawing.Line(graphics, gc, camera, corners[0], corners[1], 1f, Color.Red);
+            WorldDrawing.Line(graphics, gc, camera, corners[2], corners[3], 1f, Color.Red);
         }
     }
 
@@ -1831,10 +1815,10 @@ internal static class Overlay
     /// light for an automated run, and one a hand-placed explosive fell short of. Same shape,
     /// because from the player's side it is the same news.
     /// </summary>
-    private static void Triangle(Graphics graphics, Camera camera, Vector3 world, float radius,
+    private static void Triangle(Graphics graphics, GameController gc, Camera camera, Vector3 world, float radius,
         Color colour)
     {
-        if (camera == null || radius <= 0f)
+        if (camera == null || radius <= 0f || !WorldDrawing.RingInFront(gc, world, radius))
             return;
 
         // **Three points on the ground, projected - not three points on the screen.**
@@ -1933,7 +1917,7 @@ internal static class Overlay
                 if (mark == Vector2.Zero || Panels.Covers(covered, mark))
                     continue;
 
-                Triangle(graphics, camera, where, TriangleSize(marker), Color.Red);
+                Triangle(graphics, gc, camera, where, TriangleSize(marker), Color.Red);
 
                 // **The same two readouts the placement circle offers, on the markers that were
                 // given up.** Somebody who has those switched on has said they want to know what a
@@ -2060,7 +2044,7 @@ internal static class Overlay
                 // separate points and the band's shape is the shape of the dots rather than of one
                 // blob they have merged into - at 1.6 grid each dot was three across and every
                 // neighbour overlapped it.
-                graphics.DrawCircleInWorld(world, 0.4f * Detonator.GridToWorld, colour, 1f, 6, true);
+                WorldDrawing.Circle(graphics, gc, world, 0.4f * Detonator.GridToWorld, colour, 1f, 6, true);
             }
 
             foreach (var corner in corners)
@@ -2072,7 +2056,7 @@ internal static class Overlay
 
                 // Ringed rather than filled, and only a little larger than a cell: a band can be
                 // three grid across, and a corner marked at five would cover the whole of it.
-                graphics.DrawCircleInWorld(world, 1.3f * Detonator.GridToWorld, colour, 2f, 12, true);
+                WorldDrawing.Circle(graphics, gc, world, 1.3f * Detonator.GridToWorld, colour, 2f, 12, true);
             }
 
             if (corners.Count == 0)
@@ -2386,7 +2370,7 @@ internal static class Overlay
         if (at == Vector2.Zero || Panels.Covers(covered, at))
             return;
 
-        graphics.DrawCircleInWorld(world, 3f * Detonator.GridToWorld, Color.Magenta, 2f, 24, true);
+        WorldDrawing.Circle(graphics, gc, world, 3f * Detonator.GridToWorld, Color.Magenta, 2f, 24, true);
 
         var size = graphics.MeasureText(Curio.Says);
         var text = new Vector2(at.X - size.X / 2f, at.Y - size.Y - 10f);
@@ -3190,6 +3174,10 @@ internal static class Overlay
         // stops it drifting when a stage starts talking - moved it down into the count's old place.
         // The height of a row is the anchor's own height: every row here is one line of the same
         // text, so the score's height is the count's height, and the gap between them is Space.
+        // **Last**: the currency dropped in the map so far. See MapCurrency.
+        if (settings.Display.ScoreArea.DrawCurrency && MapCurrency.Line(settings.Display.ScoreArea.DrawCurrencyNotPickedUp) is { } currency)
+            readout.Line((currency, step));
+
         using (Spent.On("Status/Paint"))
         {
             readout.Draw(
@@ -3259,14 +3247,14 @@ internal static class Overlay
             // PlanDisplaySettings.FlatCircles.
             var followGround = !settings.Display.ThePlan.FlatCircles;
 
-            graphics.DrawCircleInWorld(world, 3.2f * Detonator.GridToWorld, colour, 2f, 24, followGround);
-            graphics.DrawCircleInWorld(world, 4.4f * Detonator.GridToWorld, colour, 2f, 24, followGround);
+            WorldDrawing.Circle(graphics, gc, world, 3.2f * Detonator.GridToWorld, colour, 2f, 24, followGround);
+            WorldDrawing.Circle(graphics, gc, world, 4.4f * Detonator.GridToWorld, colour, 2f, 24, followGround);
 
             // A third ring for the marker the chain takes last. See Insisted.IsTakenLast.
             var last = said == Insisted.Said.Take && Insisted.Here.IsTakenLast(target.Grid);
 
             if (last)
-                graphics.DrawCircleInWorld(world, 5.6f * Detonator.GridToWorld, colour, 2f, 24, followGround);
+                WorldDrawing.Circle(graphics, gc, world, 5.6f * Detonator.GridToWorld, colour, 2f, 24, followGround);
 
             var at = Safe.Read((camera, world), static x => x.camera.WorldToScreen(x.world),
                 Vector2.Zero);

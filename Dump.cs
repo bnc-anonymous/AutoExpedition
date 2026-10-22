@@ -800,6 +800,7 @@ internal static class Dump
         MonsterRarityStats(b, gc);
         RuneTable(b, gc);
         DropModifiers(b, gc);
+        TabletModifierRecords(b, gc);
         WeightTable(b);
         Guards(b);
         Relics(b);
@@ -2327,6 +2328,9 @@ internal static class Dump
         }
 
         GearFacts(b, gc);
+        b.AppendLine($"  currency dropped in this map (MapCurrency): {MapCurrency.Said}");
+        SectionHeader(b, "=== the camera's depth, which lines on the ground are cut at (WorldDrawing) ===");
+        b.AppendLine(WorldDrawing.ProjectionCheck(gc));
         SectionHeader(b, "=== how far the chain is believed to range ===");
         b.AppendLine($"  predicted {Detonator.PlacementRange(gc):0.#} grid " +
                      $"(base {Detonator.BaseReach(gc):0.#}, map {Detonator.PlacementRangePct(gc):+0;-0;+0}%)");
@@ -2335,8 +2339,8 @@ internal static class Dump
                      $"{Detonator.Counting}");
         b.AppendLine($"  at another player's site: {(Detonator.SiteIsAnotherPlayers(gc) ? "this is one" : "this is not one")}; " +
                      $"{Detonator.ExplosivesStandingInOrder(gc).Length} explosive(s) down on this site's chain; the chain its " +
-                     $"owner laid, as kept: {Detonator.AnotherPlayersChainSaid}; learnt from " +
-                     $"owners' placements: {Detonator.LearnedAtAnotherPlayersSiteSaid}");
+                     $"owner laid, as kept: {Detonator.AnotherPlayersChainSaid}; explosives planned for: " +
+                     $"{Detonator.AnotherPlayersSiteExplosivesSaid}");
         b.AppendLine($"  each change in the explosives kept for that chain ({Detonator.AnotherPlayersChainReads.Count}):");
 
         foreach (var line in Detonator.AnotherPlayersChainReads.ToList())
@@ -4150,7 +4154,7 @@ internal static class Dump
 
         // **How the host's runtime collects, which is not this plugin's to set and decides what its
         // allocation costs.** Workstation collection suspends every thread for a gen0, and the
-        // search allocates from several at once; server collection gives each core its own heap and
+        // search allocates from several at once; GC Server gives each core its own heap and
         // a far larger budget before it stops anybody. Read at runtime rather than off the host's
         // runtimeconfig, because what the file says and what the process does are two claims.
         b.AppendLine($"  the runtime collects in {(GCSettings.IsServerGC ? "SERVER" : "workstation")} " +
@@ -4749,6 +4753,65 @@ internal static class Dump
     /// gets checked at all, and the dump could previously say only that something was hovered - it
     /// caught the path and the rectangle and none of the words.
     /// </summary>
+    /// <summary>
+    /// Every modifier in the game's Mods file whose id starts with Tower - the tablets' - with its affix, group and
+    /// groups, level, tier, type and spawn weights by tag, and its stats with their ranges. Which modifiers block each
+    /// other is their shared group; Additional Shrine and Shrine chance were never seen together on 5,700 rare tablets
+    /// where about 11 were expected (2026-10-20), and a fit of the tablets' weights takes every modifier as its own
+    /// group. See tools/tablet_mod_weights.py.
+    /// </summary>
+    private static void TabletModifierRecords(StringBuilder b, GameController gc)
+    {
+        b.AppendLine();
+        SectionHeader(b, "=== tablet modifiers in the game's Mods file: affix, groups, level, tier, spawn weights by tag ===");
+
+        var records = Safe.Read(() => gc.Files.Mods.records, null);
+
+        if (records == null)
+        {
+            b.AppendLine("  the Mods file is unreadable");
+            return;
+        }
+
+        var lines = new List<string>();
+
+        foreach (var mod in records.Values)
+        {
+            var key = Safe.Read(() => mod.Key, "") ?? "";
+
+            if (!key.StartsWith("Tower", StringComparison.Ordinal))
+                continue;
+
+            var names = Safe.Read(() => mod.StatNames, null) ?? [];
+            var ranges = Safe.Read(() => mod.StatRange, null);
+            var stats = new List<string>();
+
+            for (var i = 0; i < names.Length; i++)
+            {
+                var stat = Safe.Read(() => names[i]?.MatchingStat, null);
+                var low = ranges != null && i < ranges.Length && ranges[i] != null ? ranges[i].Min : 0;
+                var high = ranges != null && i < ranges.Length && ranges[i] != null ? ranges[i].Max : 0;
+
+                stats.Add($"{stat?.ToString() ?? "?"}={(low == high ? $"{high}" : $"{low}..{high}")}");
+            }
+
+            var groups = Safe.Read(() => mod.Groups, null);
+            var chances = Safe.Read(() => mod.TagChances, null);
+
+            lines.Add($"  {key}  {Safe.Read(() => mod.AffixType.ToString(), "?")}  group={Safe.Read(() => mod.Group, "")}" +
+                      $"  groups=[{(groups == null ? "" : string.Join(",", groups))}]  level {Safe.Read(() => mod.MinLevel, -1)}" +
+                      $"  tier \"{Safe.Read(() => mod.Tier, "")}\"  type {Safe.Read(() => mod.TypeName, "")}" +
+                      $"  weights {(chances == null || chances.Count == 0 ? "none" : string.Join(",", chances.Select(c => $"{c.Key}:{c.Value}")))}" +
+                      $"  | {string.Join(", ", stats)}");
+        }
+
+        lines.Sort(StringComparer.Ordinal);
+        b.AppendLine($"  {lines.Count} modifier(s) whose id starts with Tower:");
+
+        foreach (var line in lines)
+            b.AppendLine(line);
+    }
+
     /// <summary>
     /// Every modifier in the game's Mods file with a stat that changes what a monster drops: its stat names with the
     /// rolled ranges, its group and the game's description. Read from the file rather than from monsters met, so it

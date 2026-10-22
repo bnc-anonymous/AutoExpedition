@@ -468,6 +468,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         // Kept beside the settings, not in dumps: it is a working cache, not evidence. See TabletPricing.
         TabletPricing.CacheFile = Path.Combine(ConfigDirectory, "tablet_prices.json");
+        Tablets.ChaosOrbSetPricesFile = Path.Combine(ConfigDirectory, "tablet_outcome_prices.json");
         Tablets.SubTabFile = Path.Combine(ConfigDirectory, "tablet_subtabs.json");
         Tablets.BenchResultFile = Path.Combine(ConfigDirectory, "tablet_bench_result.json");
         Detonator.SetOffFile = Path.Combine(ConfigDirectory, "sites_set_off.json");
@@ -795,6 +796,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         // What another player's site is planned for. See Detonator.AnotherPlayersSiteExplosives.
         Detonator.AnotherPlayersSiteExplosives = Settings.Solver.Advanced.ExplosivesAtAnotherPlayersSite.Value;
+        Detonator.OwnerHasAtlasExtraExplosive = Settings.Solver.Advanced.OwnerHasAtlasExtraExplosive.Value;
         Detonator.EntitiesLoadedWithin = Settings.Debug.ScoutReach.Value;
 
         // How often the ground labels are read. See Ground.RefreshEveryMs and Ground.FastRefreshForMs.
@@ -1179,6 +1181,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Tick/Placement.Tick"))
             _placement.Tick(GameController, Settings, _scan, _blast, _valuation);
+
+        using (Spent.On("Tick/MapCurrency"))
+            Safe.Do(() => MapCurrency.Tick(GameController, Settings));
 
         using (Spent.On("Tick/Autoloot"))
         {
@@ -2041,8 +2046,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
             Safe.Do(() => _scan.Arrived(entity));
 
             // An item dropped: the ground labels are read again on the next ask. See Ground.ItemArrived.
+            // And it is priced for the map's currency total. See MapCurrency.
             if (Safe.Read(entity, static e => e.Type, ExileCore2.Shared.Enums.EntityType.Error) == ExileCore2.Shared.Enums.EntityType.WorldItem)
+            {
                 Ground.ItemArrived(Safe.Read(entity, static e => e.Id, 0u));
+                MapCurrency.ItemArrived(entity);
+            }
         }
     }
 

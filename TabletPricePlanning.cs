@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -199,6 +199,22 @@ internal static partial class Tablets
     /// </summary>
     private static readonly HashSet<string> MerchantOnly = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Where each collected tablet has been seen, by fingerprint: "stash", "inventory" or "merchant". The inventory's are
+    /// read again whole whenever it is open, so a tablet taken out of it is no longer counted there; a stash tab shows
+    /// only some tablets at a time, so a stash sighting is kept. For the action key's pricing run, which prices the
+    /// windows open. See PlaceOfTablet and ActOnActionKey.
+    /// </summary>
+    private static readonly Dictionary<string, HashSet<string>> CollectedPlaces = new(StringComparer.Ordinal);
+
+    /// <summary>The window a tablet on screen is in, as CollectedPlaces names it.</summary>
+    private static string PlaceOfTablet(TabletOnScreen tablet) => tablet.Where switch
+    {
+        "stash" or "stash tab elements" => "stash",
+        "inventory" or "carried" => "inventory",
+        _ => tablet.Where,
+    };
+
     /// <summary>The collected tablets the running pricing run has still to settle, by fingerprint. Empty when none runs.</summary>
     private static readonly HashSet<string> PricingRun = new(StringComparer.Ordinal);
 
@@ -275,8 +291,7 @@ internal static partial class Tablets
         if (HoveredSearch(gc, settings) is not { } search)
             return false;
 
-        TabletPricing.OpenInBrowser(search.Key, search.League, search.BodyOf(search.Filters),
-            settings.TabletRerolling.TradeSite.HoveredSearchesPerFiveMinutes.Value, settings.TabletRerolling);
+        KeyNote(TabletPricing.OpenInBrowser(search.Key, search.League, search.BodyOf(search.Filters)));
 
         return true;
     }
@@ -367,6 +382,10 @@ internal static partial class Tablets
     /// <summary>Collects the priced tablets on screen. See Collected.</summary>
     private static void CollectTablets(GameController gc, TabletRerollingSettings settings, Valuation valuation)
     {
+        if (Safe.Read(gc, static g => g.IngameState.IngameUi.InventoryPanel.IsVisible, false))
+            foreach (var places in CollectedPlaces.Values)
+                places.Remove("inventory");
+
         foreach (var tablet in Seen)
         {
             if (settings.Prices.IgnoreUsedTablets && tablet.Uses < FullUses || !IsPriced(tablet, ActionOf(tablet, settings), settings, valuation))
@@ -386,17 +405,47 @@ internal static partial class Tablets
                 MerchantOnly.Remove(fingerprint);
 
             Collected[fingerprint] = search;
+
+            if (!CollectedPlaces.TryGetValue(fingerprint, out var seenIn))
+                CollectedPlaces[fingerprint] = seenIn = new HashSet<string>(StringComparer.Ordinal);
+
+            seenIn.Add(PlaceOfTablet(tablet));
         }
     }
 
     /// <summary>
+    /// After a currency used by hand changes a tablet, searches its own price at the action key's priority, as a press
+    /// over it would, unless it has a price younger than Hovered refresh minimum age. Without it the new modifiers had no
+    /// price of their own until the action key was pressed, and the label and the Chaos Orb odds stood on whatever else
+    /// was known (2026-10-21). See WatchHandCrafts.
+    /// </summary>
+    private static void SearchAfterHandCraft(GameController gc, TabletOnScreen tablet, TabletRerollingSettings settings)
+    {
+        if (_valuation == null || settings.Prices.IgnoreUsedTablets && tablet.Uses < FullUses ||
+            !IsPriced(tablet, ActionOf(tablet, settings), settings, _valuation) ||
+            SearchOfTablet(gc, tablet, settings, out _) is not { } search)
+            return;
+
+        if (TabletPricing.Cached(search.Key) is { Error.Length: 0 } own &&
+            DateTime.UtcNow - own.When <= TimeSpan.FromMinutes(settings.TradeSite.HoveredRefreshMinimumMinutes.Value))
+            return;
+
+        TabletPricing.Enqueue(search.Key, search.League, search.BodyOf(search.Filters),
+            static _ => false, long.MaxValue - 1, settings.TradeSite.HoveredSearchesPerFiveMinutes.Value, settings);
+    }
+
+    /// <summary>
     /// The action key: over a priced tablet, searches it at its own rolls, first of all, unless its own price is younger
-    /// than HoveredRefreshMinimumMinutes; over anything else, starts a pricing run over every collected tablet, which
-    /// does not search again a price still fresh.
+    /// than HoveredRefreshMinimumMinutes; over anything else, starts a pricing run over the collected tablets of the
+    /// windows open - the stash, the inventory or both - and nothing with neither open; a run does not search again a
+    /// price still fresh.
     /// </summary>
     private static void ActOnActionKey(GameController gc, TabletOnScreen hovered, TabletRerollingSettings settings,
         Valuation valuation)
     {
+        // A press is the player asking again after the trade site was down. See TabletPricing.SiteDown.
+        TabletPricing.ResumeAfterSiteDown();
+
         if (hovered != null && !(settings.Prices.IgnoreUsedTablets && hovered.Uses < FullUses) &&
             IsPriced(hovered, ActionOf(hovered, settings), settings, valuation) &&
             SearchOfTablet(gc, hovered, settings, out _) is { } search)
@@ -431,8 +480,23 @@ internal static partial class Tablets
             return;
         }
 
+        // **The windows open**: the stash's tablets with the stash open, the inventory's with the inventory open, both with
+        // both, and nothing with neither. A merchant-only tablet still only with Include merchant tablets in pricing runs.
+        var open = new HashSet<string>(StringComparer.Ordinal);
+
+        if (Safe.Read(gc, static g => g.IngameState.IngameUi.StashElement.IsVisible, false))
+            open.Add("stash");
+
+        if (Safe.Read(gc, static g => g.IngameState.IngameUi.InventoryPanel.IsVisible, false))
+            open.Add("inventory");
+
+        if (open.Count == 0)
+            return;
+
         PricingRun.Clear();
-        PricingRun.UnionWith(Collected.Keys.Where(x => settings.TradeSite.IncludeMerchantTabletsInPricingRuns || !MerchantOnly.Contains(x)));
+        PricingRun.UnionWith(Collected.Keys.Where(x =>
+            (settings.TradeSite.IncludeMerchantTabletsInPricingRuns || !MerchantOnly.Contains(x)) &&
+            CollectedPlaces.TryGetValue(x, out var places) && places.Overlaps(open)));
         _pricingRunTotal = PricingRun.Count;
         _planned = DateTime.MinValue;
     }
@@ -722,9 +786,14 @@ internal static partial class Tablets
     /// <summary>How long an estimate stands while no answer changes.</summary>
     private static readonly TimeSpan EstimateKeptFor = TimeSpan.FromSeconds(10);
 
+    /// <summary>How long a hold by the rate limits must be to be named in the progress line. Chosen: shorter holds are the
+    /// pacing the minutes estimate already counts.</summary>
+    private static readonly TimeSpan RateLimitShownOver = TimeSpan.FromSeconds(15);
+
     /// <summary>
     /// "Pricing 14/37 tablets, about 9 minutes" under the inventory's gold while a run is going, "Priced 37 tablets" for a
-    /// moment after, whenever the inventory is open.
+    /// moment after, whenever the inventory is open; "Pricing 0/1 tablets: rate limited, next search in 5h 9m" while the
+    /// trade site's limits hold the next search longer than RateLimitShownOver.
     /// The minutes are the searches the run may still send at the searches-per-five-minutes cap, which is stricter than
     /// the site's own.
     /// </summary>
@@ -739,6 +808,15 @@ internal static partial class Tablets
             var minutes = Math.Max(1, (int)Math.Ceiling(_searchesLeft * secondsPerSearch / 60d));
 
             line = $"Pricing {_pricingRunTotal - PricingRun.Count}/{_pricingRunTotal} tablets, about {minutes} minute{(minutes == 1 ? "" : "s")}";
+
+            // **Held by the trade site's rate limits**, said, with when the next search may go; the estimate above counts
+            // only the searches-per-five-minutes cap. **Down**, said, and what resumes it.
+            if (TabletPricing.SiteDown.Length > 0)
+                line = $"Pricing {_pricingRunTotal - PricingRun.Count}/{_pricingRunTotal} tablets: trade site down " +
+                       $"({TabletPricing.SiteDown}), {_actionKeyName} to try again";
+            else if (TabletPricing.SearchesHeldUntil - DateTime.UtcNow is var held && held > RateLimitShownOver)
+                line = $"Pricing {_pricingRunTotal - PricingRun.Count}/{_pricingRunTotal} tablets: rate limited, next search in " +
+                       (held.TotalHours >= 1 ? $"{(int)held.TotalHours}h {held.Minutes}m" : $"{Math.Ceiling(held.TotalMinutes):0}m");
         }
         else if (_pricingRunTotal > 0 && DateTime.UtcNow - _pricingRunEnded < RunEndedShownFor)
             line = $"Priced {_pricingRunTotal} tablets";
@@ -776,6 +854,28 @@ internal static partial class Tablets
         $"{Collected.Count} tablet(s) collected; pricing run {(PricingRun.Count > 0 ? $"{_pricingRunTotal - PricingRun.Count}/{_pricingRunTotal}, " + $"at most {_searchesLeft} search(es) left" : "not running")}";
 
     /// <summary>
+    /// An answer's price capped at the cheapest price of a newer answer for the same modifiers at higher rolls with as
+    /// many listings as Price from takes. A search at higher rolls finds a subset of one at lower, so its cheapest cannot
+    /// truly be cheaper: where a newer one is, the market moved after the older search and the newer stands. Old answers
+    /// are kept as fetched; only the price read from them is capped. A minimum-roll price had stood against a newer, cheaper
+    /// higher-roll one unless the newer was under Cheap price up to and the older past its freshness (2026-10-21).
+    /// </summary>
+    private static double PriceCappedByNewer(string key, TabletPricing.Answer answer, double price, TabletRerollingSettings settings,
+        Valuation valuation)
+    {
+        foreach (var (_, newer, tighter, _) in TabletPricing.RelatedAnswers(key))
+        {
+            if (!tighter || newer.When <= answer.When || newer.Error.Length > 0 || newer.Listings.Count < settings.ListingsWanted)
+                continue;
+
+            if (PriceOfAnswer(newer, settings, valuation) is var capped && !double.IsNaN(capped) && capped < price)
+                price = capped;
+        }
+
+        return price;
+    }
+
+    /// <summary>
     /// What a tablet's price reads as now, from the answers so far, without queuing anything: its own search's price;
     /// else a ceiling from a tighter search, shown first when it is a low value; else a floor from a looser one; else
     /// whether a search for it is coming.
@@ -809,7 +909,11 @@ internal static partial class Tablets
 
         if (exact is { Error.Length: 0 } && OwnPriceStands(search, exact, settings, valuation))
         {
-            var price = PriceOfAnswer(exact, settings, valuation);
+            var uncapped = PriceOfAnswer(exact, settings, valuation);
+            var price = double.IsNaN(uncapped) ? uncapped : PriceCappedByNewer(search.Key, exact, uncapped, settings, valuation);
+            var cappedSaid = price < uncapped
+                ? $"Its own search said {Shown(uncapped, valuation)}; a newer search at higher rolls found it at {Shown(price, valuation)}"
+                : "";
 
             // With no listing to price from at its own rolls, the bounds below say what is known.
             if (!double.IsNaN(price))
@@ -819,7 +923,7 @@ internal static partial class Tablets
 
                 return chaos < settings.Prices.ReforgeUnderChaos.Value
                     ? Make(Color.Transparent, "", $"{Shown(price, valuation)}, under Reforge under", exact.Listings)
-                    : Make(BandColour(chaos, settings), Shown(price, valuation), "", exact.Listings);
+                    : Make(BandColour(chaos, settings), Shown(price, valuation), cappedSaid, exact.Listings);
             }
 
             // **Listed only in currencies the valuation does not convert** - alchemy, regal - which tablets are listed in
@@ -840,7 +944,7 @@ internal static partial class Tablets
 
         (double Price, TabletPricing.Answer Answer)? ceiling = null, floor = null;
 
-        foreach (var (_, answer, tighter, looser) in TabletPricing.RelatedAnswers(search.Key))
+        foreach (var (relatedKey, answer, tighter, looser) in TabletPricing.RelatedAnswers(search.Key))
         {
             if (answer.Error.Length > 0 || PriceOfAnswer(answer, settings, valuation) is var price && double.IsNaN(price))
                 continue;
@@ -848,23 +952,46 @@ internal static partial class Tablets
             if (tighter && answer.Listings.Count >= settings.ListingsWanted && (ceiling == null || price < ceiling.Value.Price))
                 ceiling = (price, answer);
 
-            if (looser && (floor == null || price > floor.Value.Price))
-                floor = (price, answer);
+            // A floor no higher than any newer search at higher rolls. See PriceCappedByNewer.
+            if (looser && PriceCappedByNewer(relatedKey, answer, price, settings, valuation) is var low &&
+                (floor == null || low > floor.Value.Price))
+                floor = (low, answer);
         }
+
+        // **The set survey as a floor too** (tools/tablet_outcome_survey.py): every set of searched modifiers priced at any
+        // roll, so a tablet whose own rolls and lower rolls were never searched still has a least price. A tablet with
+        // Additional Modifier, Passover and Rare Monsters showed nothing, the survey pricing its set at 88 divines
+        // (Empyrean Challenge, dump 2026-10-21 03:01:21). Taken where it is higher than the floor from lower rolls.
+        var floorFromSurvey = false;
+
+        if (SetSurveyPriceOf(search, settings, valuation) is { } surveyed && (floor == null || surveyed.Price > floor.Value.Price))
+            (floor, floorFromSurvey) = (surveyed, true);
 
         // Its own rolls not searched: the key prices them. Searched, the first line already says what they found.
         var priceExactly = exact is { Error.Length: 0 } ? "" : $", {_actionKeyName} to price exactly";
+        var floorSaid = floorFromSurvey ? "at any roll, from the set survey" : "against lower rolls";
 
         var boundDetail = (ceiling, floor) switch
         {
-            ({ } c, { } f) => $"Checked against other rolls: between {Shown(f.Price, valuation)} and {Shown(c.Price, valuation)}, priced " +
+            ({ } c, { } f) => $"Checked against higher rolls and {floorSaid}: between {Shown(f.Price, valuation)} and {Shown(c.Price, valuation)}, priced " +
                               $"{AgeInWords(DateTime.UtcNow - (c.Answer.When > f.Answer.When ? c.Answer.When : f.Answer.When))}{priceExactly}",
             ({ } c, null) => $"Checked against higher rolls: at most {Shown(c.Price, valuation)}, priced " +
                               $"{AgeInWords(DateTime.UtcNow - c.Answer.When)}{priceExactly}",
-            (null, { } f) => $"Checked against lower rolls: at least {Shown(f.Price, valuation)}, priced " +
+            (null, { } f) => $"Checked {floorSaid}: at least {Shown(f.Price, valuation)}, priced " +
                               $"{AgeInWords(DateTime.UtcNow - f.Answer.When)}{priceExactly}",
             _ => "",
         };
+
+        // **Both bounds as a range**, "3d-35d": one alone hid the other, a tablet reading "<35d" whose set sold from 3d.
+        if (ceiling is { } upper && floor is { } lower && lower.Price < upper.Price)
+        {
+            var chaos = TabletChaosOf(upper.Price, valuation);
+
+            return chaos < settings.Prices.ReforgeUnderChaos.Value
+                ? Make(Color.Transparent, "", boundDetail + ", under Reforge under", upper.Answer.Listings)
+                : Make(BandColour(TabletChaosOf(lower.Price, valuation), settings),
+                    $"{Shown(lower.Price, valuation)}-{Shown(upper.Price, valuation)}", boundDetail, upper.Answer.Listings);
+        }
 
         if (ceiling is { } top && (floor == null || top.Price / valuation.PerExalt("Divine") <= settings.TradeSite.CheapPriceUpToDivine.Value))
         {

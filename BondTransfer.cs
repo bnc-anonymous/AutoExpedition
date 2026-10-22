@@ -123,7 +123,7 @@ internal static class BondTransfer
                     new Vector2(rares[j].At.X, rares[j].At.Y)) <= TransferRangeWorld;
             }
 
-            graphics.DrawCircleInWorld(rares[i].At, TransferRangeWorld, shared ? InRange : alone, 2f, 32, true);
+            WorldDrawing.Circle(graphics, gc, rares[i].At, TransferRangeWorld, shared ? InRange : alone, 2f, 32, true);
         }
     }
 }

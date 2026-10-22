@@ -130,7 +130,7 @@ internal static class TabletPricing
     {
         Load();
 
-        if (Failures.TryGetValue(key, out var failed) && DateTime.UtcNow - failed < FailureRetry)
+        if (SiteDown.Length > 0 || Failures.TryGetValue(key, out var failed) && DateTime.UtcNow - failed < FailureRetry)
             return;
 
         lock (WaitingLock)
@@ -164,6 +164,9 @@ internal static class TabletPricing
     {
         while (true)
         {
+            if (SiteDown.Length > 0)
+                return null;
+
             Query top;
 
             lock (WaitingLock)
@@ -186,6 +189,7 @@ internal static class TabletPricing
                     Waiting.Remove(next.Key);
                     _sending = next.Key;
                     Searches.Record();
+                    SearchesHeldUntil = DateTime.MinValue;
 
                     return top;
                 }
@@ -194,9 +198,16 @@ internal static class TabletPricing
             var wait = Searches.WaitFor(spacing, (top.SearchCap, 300));
 
             Status = $"waiting {wait.TotalSeconds:0}s for the search limit";
+            SearchesHeldUntil = DateTime.UtcNow + wait;
             await Task.Delay(wait < QueuePoll ? wait + TimeSpan.FromMilliseconds(50) : QueuePoll);
         }
     }
+
+    /// <summary>
+    /// When the rate limits next let a waiting search go, while one waits on them; MinValue otherwise. For the pricing
+    /// progress line, which said "Pricing 0/1 tablets, about 1 minute" through a five-hour hold (2026-10-21).
+    /// </summary>
+    internal static DateTime SearchesHeldUntil { get; private set; } = DateTime.MinValue;
 
     /// <summary>How often a query waiting on the search limits looks at the queue again. See Next.</summary>
     private static readonly TimeSpan QueuePoll = TimeSpan.FromMilliseconds(250);
@@ -271,6 +282,24 @@ internal static class TabletPricing
         }
     }
 
+    /// <summary>
+    /// The cached answers of one modifier set - "league|rarity[|mods&lt;=N]|uses=U|stat;stat;..." with the stats sorted - at
+    /// any minimums. See KeyParts.ModifierSet.
+    /// </summary>
+    internal static IEnumerable<Answer> AnswersOfModifierSet(string modifierSet)
+    {
+        Load();
+
+        if (!KeysByModifierSet.TryGetValue(modifierSet, out var keys))
+            yield break;
+
+        foreach (var key in keys.Keys)
+        {
+            if (Answers.TryGetValue(key, out var answer))
+                yield return answer;
+        }
+    }
+
     /// <summary>Counts every change to the answers, so a figure worked out from many of them knows when to work it out again.</summary>
     internal static int AnswersVersion => Volatile.Read(ref _answersVersion);
 
@@ -312,6 +341,45 @@ internal static class TabletPricing
         Save(force: true);
     }
 
+    /// <summary>
+    /// Forgets every answer fetched longer ago than age, in memory at once and in CacheFile at the next save (after the
+    /// next answer, or as the plugin unloads). Looked at once a minute at most. Deleted rather than kept as stale because
+    /// the figures worked out over every answer - the Chaos Orb odds' medians - count all cached listings whatever their
+    /// age or league. See TabletTradeSiteSettings.DeletePricesOlderThanDays.
+    /// </summary>
+    internal static void DeleteAnswersOlderThan(TimeSpan age)
+    {
+        Load();
+
+        var now = DateTime.UtcNow;
+
+        if (now - _answerAgesCheckedAt < TimeSpan.FromMinutes(1))
+            return;
+
+        _answerAgesCheckedAt = now;
+
+        var deleted = false;
+
+        foreach (var (key, answer) in Answers)
+        {
+            if (now - answer.When.ToUniversalTime() <= age || !Answers.TryRemove(key, out _))
+                continue;
+
+            if (KeysByModifierSet.TryGetValue(PartsOf(key).ModifierSet, out var keys))
+                keys.TryRemove(key, out _);
+
+            deleted = true;
+        }
+
+        if (!deleted)
+            return;
+
+        Interlocked.Increment(ref _answersVersion);
+        _dirty = true;
+    }
+
+    private static DateTime _answerAgesCheckedAt = DateTime.MinValue;
+
     /// <summary>Starts the background task if there is work and it is not already running.</summary>
     private static void Pump(TabletRerollingSettings settings)
     {
@@ -331,6 +399,11 @@ internal static class TabletPricing
                     try
                     {
                         answer = await Run(query, spacing);
+                    }
+                    catch (Exception e) when (e is HttpRequestException or TaskCanceledException)
+                    {
+                        SiteDown = "unreachable";
+                        answer = new Answer([], 0, DateTime.UtcNow, $"trade site unreachable: {e.Message}");
                     }
                     catch (Exception e)
                     {
@@ -355,10 +428,22 @@ internal static class TabletPricing
                     }
 
                     // Cleared only once the answer or the failure is recorded, so the query is not queued again meanwhile.
+                    // **Down, everything waiting is dropped**: nothing more is sent until the player asks. See SiteDown.
                     lock (WaitingLock)
+                    {
                         _sending = "";
 
+                        if (SiteDown.Length > 0)
+                            Waiting.Clear();
+                    }
+
                     Save(force: false);
+
+                    if (SiteDown.Length > 0)
+                    {
+                        Status = $"trade site down ({SiteDown}); stopped until the action key is pressed";
+                        break;
+                    }
                 }
             }
             finally
@@ -369,17 +454,45 @@ internal static class TabletPricing
         });
     }
 
-    /// <summary>One query's search and fetch. Its search turn is already taken and recorded by Next.</summary>
+    /// <summary>
+    /// Why the trade site was taken as down - "HTTP 405" and the page's title, or "unreachable" - or empty while it is not.
+    /// While set, nothing is queued or sent; only the action key clears it (ResumeAfterSiteDown). During maintenance a
+    /// search answered 405 with a web page, and each tablet of a pricing run was tried and failed in turn, every try a
+    /// request against the limits (dump 2026-10-21 15:06:06).
+    /// </summary>
+    internal static string SiteDown { get; private set; } = "";
+
+    /// <summary>Lets searches be queued and sent again after SiteDown. Called by the action key.</summary>
+    internal static void ResumeAfterSiteDown() => SiteDown = "";
+
+    /// <summary>
+    /// "HTTP 405" and the page's title where a refused request reads as the site being down - 405, 502, 503 or 504, or any
+    /// refusal but the rate limit's 429 answered with a web page rather than the API's JSON - else empty.
+    /// </summary>
+    private static string DownSaid(int status, string body)
+    {
+        var page = body.TrimStart().StartsWith('<');
+
+        if (status is not (405 or 502 or 503 or 504) && !(status >= 400 && status != 429 && page))
+            return "";
+
+        var title = page ? Regex.Match(body, @"<title[^>]*>\s*([^<]*?)\s*</title>", RegexOptions.IgnoreCase).Groups[1].Value : "";
+
+        return $"HTTP {status}" + (title.Length > 0 ? $": {Shorten(title)}" : "");
+    }
+
     /// <summary>How long a search's id is used again to open it, rather than a new search. How long the site keeps
     /// one is not known; a search this young is taken to be there still.</summary>
     private static readonly TimeSpan SearchIdReusedFor = TimeSpan.FromMinutes(10);
 
     /// <summary>
-    /// Opens a search on the trade site in the default browser: the cached answer's search when its id is young enough,
-    /// else a new search, made within the given cap like any other and then opened. Not cached: the answer it gives is
-    /// only the id.
+    /// Opens a search on the trade site in the default browser, whatever the rate limits: the cached answer's search when
+    /// its id is young enough, else the search itself in the page's address ("?q=" and the body), which the browser
+    /// runs on opening, so no request of this plugin's is made or waited for. A new search made here first, to get an
+    /// id, waited its turn under the limits, and with the searches per six hours used up a hold of the action key did
+    /// nothing for five hours (2026-10-21). Returns the note to show under the cursor.
     /// </summary>
-    internal static void OpenInBrowser(string key, string league, string body, int searchCap, TabletRerollingSettings settings)
+    internal static string OpenInBrowser(string key, string league, string body)
     {
         Load();
 
@@ -387,39 +500,23 @@ internal static class TabletPricing
             DateTime.UtcNow - held.When < SearchIdReusedFor)
         {
             Open(league, held.SearchId);
-            return;
+            return "Opened on the trade site";
         }
 
-        var spacing = TimeSpan.FromSeconds(Math.Max(0.5, settings.TradeSite.SecondsBetweenRequests.Value));
-
-        Task.Run(async () =>
+        try
         {
-            try
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                $"https://www.pathofexile.com/trade2/search/poe2/{Uri.EscapeDataString(league)}?q={Uri.EscapeDataString(body)}")
             {
-                await Searches.WaitTurn(spacing, (searchCap, 300));
-
-                using var search = new HttpRequestMessage(HttpMethod.Post, $"{Site}/search/poe2/{Uri.EscapeDataString(league)}")
-                {
-                    Content = new StringContent(body, Encoding.UTF8, "application/json"),
-                };
-
-                search.Headers.UserAgent.ParseAdd(Agent);
-
-                using var searched = await Client.SendAsync(search);
-                var text = await searched.Content.ReadAsStringAsync();
-
-                Searches.Read(searched, text);
-
-                if (searched.IsSuccessStatusCode && JObject.Parse(text).Value<string>("id") is { Length: > 0 } id)
-                    Open(league, id);
-                else
-                    Status = $"opening on the trade site failed: search {(int)searched.StatusCode}";
-            }
-            catch (Exception e)
-            {
-                Status = $"opening on the trade site failed: {e.Message}";
-            }
-        });
+                UseShellExecute = true,
+            });
+            OpenedAt = DateTime.UtcNow;
+            return "Opened on the trade site";
+        }
+        catch (Exception e)
+        {
+            return $"Opening on the trade site failed: {e.Message}";
+        }
     }
 
     /// <summary>When a search was last opened in the browser, for the "Opened in browser" note. MinValue before any.</summary>
@@ -432,6 +529,7 @@ internal static class TabletPricing
         OpenedAt = DateTime.UtcNow;
     }
 
+    /// <summary>One query's search and fetch. Its search turn is already taken and recorded by Next.</summary>
     private static async Task<Answer> Run(Query query, TimeSpan spacing)
     {
         Status = "searching";
@@ -451,7 +549,9 @@ internal static class TabletPricing
         Searches.Read(searched, searchText);
 
         if (!searched.IsSuccessStatusCode)
-            return new Answer([], 0, DateTime.UtcNow, $"search {(int)searched.StatusCode}: {Shorten(searchText)}");
+            return new Answer([], 0, DateTime.UtcNow, DownSaid((int)searched.StatusCode, searchText) is { Length: > 0 } down
+                ? $"trade site down ({SiteDown = down})"
+                : $"search {(int)searched.StatusCode}: {Shorten(searchText)}");
 
         var found = JObject.Parse(searchText);
         var id = found.Value<string>("id") ?? "";
@@ -479,7 +579,9 @@ internal static class TabletPricing
         Fetches.Read(fetched, fetchText);
 
         if (!fetched.IsSuccessStatusCode)
-            return new Answer([], total, DateTime.UtcNow, $"fetch {(int)fetched.StatusCode}: {Shorten(fetchText)}", id);
+            return new Answer([], total, DateTime.UtcNow, DownSaid((int)fetched.StatusCode, fetchText) is { Length: > 0 } down
+                ? $"trade site down ({SiteDown = down})"
+                : $"fetch {(int)fetched.StatusCode}: {Shorten(fetchText)}", id);
 
         var listings = new List<Listing>();
 
