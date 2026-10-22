@@ -4128,13 +4128,14 @@ public class ScoreAreaSettings
     public RangeNode<float> CurrencyAtLeastChaos { get; set; } = new RangeNode<float>(1f, 0f, 100f);
 
     /// <summary>
-    /// Adds the currency the player did not pick up to the Currency line, "Currency: 4.5d (-1.2d)": what dropped, less
-    /// what the inventory gained. See MapCurrency.
+    /// Adds what the player picked up and did not to the Currency line, "Currency: 3.3d/4.5d (-1.2d)": picked up is what
+    /// the inventory gained, not picked up what dropped less that. See MapCurrency.
     /// </summary>
     [Menu("Draw currency not picked up",
-        "Adds the currency you did not pick up to the Currency line - taken by others\n" +
-        "or left on the ground: what dropped, less what your inventory gained since\n" +
-        "entering the map. Currency spent from the inventory there counts as not picked up.")]
+        "Adds what you picked up and did not to the Currency line - 3.3d/4.5d (-1.2d) is\n" +
+        "3.3d picked up of 4.5d dropped, 1.2d taken by others or left on the ground.\n" +
+        "Picked up is what your inventory gained since entering the map, so currency\n" +
+        "spent from the inventory there counts as not picked up.")]
     public ToggleNode DrawCurrencyNotPickedUp { get; set; } = new ToggleNode(true);
 
     /// <summary>

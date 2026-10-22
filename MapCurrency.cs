@@ -21,8 +21,9 @@ namespace AutoExpedition;
 /// it. Currency the player drops from their own inventory is counted too, as the game does not say who dropped an
 /// item. An item NinjaPricer has no price for within PricedWithin is left out.
 ///
-/// **What the player did not pick up** - taken by other players in a party, or left on the ground - is the total less
-/// what the player's inventory gained in currency by the same rule. The inventory is valued on entering the map, once
+/// **What the player picked up** is what the inventory gained in currency by the same rule, and **what the player did
+/// not pick up** - taken by other players in a party, or left on the ground - is the total less that, both shown as
+/// "Currency: 3.3d/4.5d (-1.2d)". The inventory is valued on entering the map, once
 /// NinjaPricer has its prices, and every InventoryReadEvery after; a trip to the hideout banks what was gained so far
 /// and values it again on coming back, so a deposit there is not a loss. Currency spent from the inventory in the map
 /// reads as not picked up.
@@ -204,10 +205,10 @@ internal static class MapCurrency
     }
 
     /// <summary>
-    /// The score area's line, "Currency: 4.5d", with what the player did not pick up where notPickedUp asks -
-    /// "Currency: 4.5d (-1.2d)" - once the inventory has been valued; null without a divine rate. Not picked up is never
-    /// shown below 0, which the inventory gaining more than was counted dropping would give, and not shown at all while it
-    /// rounds to 0.
+    /// The score area's line, "Currency: 4.5d", with what the player picked up and did not where notPickedUp asks -
+    /// "Currency: 3.3d/4.5d (-1.2d)", picked up over dropped - once the inventory has been valued; null without a divine
+    /// rate. Neither is shown below 0, which currency spent, or the inventory gaining more than was counted dropping,
+    /// would give, and not picked up is not shown at all while it rounds to 0.
     /// </summary>
     internal static string Line(bool notPickedUp)
     {
@@ -216,13 +217,18 @@ internal static class MapCurrency
         if (divine <= 0d)
             return null;
 
-        var line = string.Create(System.Globalization.CultureInfo.InvariantCulture, $"Currency: {Exalts / divine:0.#}d");
+        var invariant = System.Globalization.CultureInfo.InvariantCulture;
+
+        if (!notPickedUp || PickedUpExalts is not { } picked)
+            return string.Create(invariant, $"Currency: {Exalts / divine:0.#}d");
+
+        var line = string.Create(invariant, $"Currency: {Math.Max(0d, picked) / divine:0.#}d/{Exalts / divine:0.#}d");
 
         // Left off while it would read "(-0d)": nothing missed yet, or less than shows at one decimal place.
-        var missed = notPickedUp && PickedUpExalts is { } picked ? Math.Round(Math.Max(0d, Exalts - picked) / divine, 1) : 0d;
+        var missed = Math.Round(Math.Max(0d, Exalts - picked) / divine, 1);
 
         return missed > 0d
-            ? line + string.Create(System.Globalization.CultureInfo.InvariantCulture, $" (-{missed:0.#}d)")
+            ? line + string.Create(invariant, $" (-{missed:0.#}d)")
             : line;
     }
 
