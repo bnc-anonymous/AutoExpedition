@@ -36,6 +36,12 @@ internal static class MapCurrency
     /// <summary>The total so far, in exalts.</summary>
     internal static double Exalts { get; private set; }
 
+    /// <summary>The total so far, in divines; 0 without a divine rate.</summary>
+    internal static double DroppedDivines => Valuation.DivineInExalts > 0d ? Exalts / Valuation.DivineInExalts : 0d;
+
+    /// <summary>The dropped total, in divines, above which the score area writes the Currency line in purple. Chosen.</summary>
+    internal const double RichDivines = 100d;
+
     /// <summary>The stacks counted in the total.</summary>
     internal static int Stacks { get; private set; }
 

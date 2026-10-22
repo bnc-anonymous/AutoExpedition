@@ -3174,9 +3174,10 @@ internal static class Overlay
         // stops it drifting when a stage starts talking - moved it down into the count's old place.
         // The height of a row is the anchor's own height: every row here is one line of the same
         // text, so the score's height is the count's height, and the gap between them is Space.
-        // **Last**: the currency dropped in the map so far. See MapCurrency.
+        // **Last**: the currency dropped in the map so far, purple, the colour value is written in, once the dropped
+        // total passes MapCurrency.RichDivines. See MapCurrency.
         if (settings.Display.ScoreArea.DrawCurrency && MapCurrency.Line(settings.Display.ScoreArea.DrawCurrencyNotPickedUp) is { } currency)
-            readout.Line((currency, step));
+            readout.Line((currency, MapCurrency.DroppedDivines > MapCurrency.RichDivines ? Color.FromArgb(255, 190, 120, 255) : step));
 
         using (Spent.On("Status/Paint"))
         {
