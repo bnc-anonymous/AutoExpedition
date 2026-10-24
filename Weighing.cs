@@ -180,6 +180,39 @@ internal static class Weighing
     }
 
     /// <summary>
+    /// Each combination's waves as parts, for the runes its recipe uses, walked exactly as Choices is; null at an entry
+    /// whose recipe uses as many runes as the remnant's Parts are built for, or whose count is unknown, which then
+    /// stands. The payout pays the waves of the combination taken, not the remnant's Parts. See WavesOfRemnant and
+    /// PlanTarget.PartsOfChoice.
+    /// </summary>
+    public static (long Mask, float Worth, float Many)[][] PartsOfChoices(Target target, string locked = null)
+    {
+        if (target.Kind != TargetKind.Remnant || target.Rewards.Count == 0)
+            return null;
+
+        var waves = WavesOfRemnant(target);
+
+        (long Mask, float Worth, float Many)[] Own(Reward reward) =>
+            reward.RuneCount > 0 && reward.RuneCount != waves ? PartsOfWaves(reward.RuneCount) : null;
+
+        if (!string.IsNullOrWhiteSpace(locked))
+        {
+            foreach (var reward in target.Rewards)
+            {
+                if (Locked(reward, locked))
+                    return new[] { Own(reward) };
+            }
+        }
+
+        var found = new (long Mask, float Worth, float Many)[target.Rewards.Count][];
+
+        for (var i = 0; i < target.Rewards.Count; i++)
+            found[i] = Own(target.Rewards[i]);
+
+        return found;
+    }
+
+    /// <summary>
     /// The Gaining Traction row's rates, magic and rare, as fractions per remnant completed before: its effects on
     /// magic_monster and rare_monster. Nought for a rarity the row does not name. Fitted to recorded waves, not the
     /// node's text: rares grow about 25% per remnant, magic about 5%. Read only while DebugSettings.GainingTraction
@@ -1174,27 +1207,30 @@ internal static class Weighing
     }
 
     /// <summary>
-    /// How many waves a remnant sends up: the number of runes in the recipe it takes, taken as the best priced
-    /// recipe it offers, or its socket count where it offers none that could be read.
+    /// How many waves a remnant's Parts are built for: the most runes any recipe it offers uses, or its socket count
+    /// where it offers none that could be read.
     ///
     /// **Runes used, not sockets.** A remnant sends up one wave per rune, the rune in slot k joining from wave k
     /// (slots one and two both from the first). Measured on 39 completed remnants over five sites (2026-09-30):
-    /// about 14 monsters a wave, where the table carried a fixed three waves for every remnant.
-    /// Whether a recipe using fewer runes than the remnant has sockets sends fewer waves is not yet settled - two
-    /// of three such remnants were not watched to the end - and runes used is the choice made until it is.
+    /// about 14 monsters a wave, where the table carried a fixed three waves for every remnant. That a recipe using
+    /// fewer runes than the remnant has sockets sends fewer waves is confirmed by the user from play (2026-10-15).
     ///
-    /// The best priced recipe because that is what Rewards holds first; a combination using a different number
-    /// of runes is corrected to its own in Choices, so the planner still sees what each recipe sends up.
+    /// **The longest recipe, so every combination's waves are at most these.** Each combination is scored on its own
+    /// waves (PartsOfChoices), and the ceilings bound a remnant by its Parts; with Parts built for the longest recipe,
+    /// no combination can pay on more than the ceilings counted. A combination using fewer runes is corrected to its
+    /// own count in Choices, MagicAndRareWavesOfChoices and PartsOfChoices.
     /// </summary>
     public static int WavesOfRemnant(Target target)
     {
         if (target == null || target.Kind != TargetKind.Remnant)
             return 0;
 
-        if (target.Rewards is { Count: > 0 } rewards && rewards[0].RuneCount > 0)
-            return rewards[0].RuneCount;
+        var most = 0;
 
-        return Math.Max(0, target.Sockets);
+        foreach (var reward in target.Rewards ?? [])
+            most = Math.Max(most, reward.RuneCount);
+
+        return most > 0 ? most : Math.Max(0, target.Sockets);
     }
 
     // ---------------------------------------------------------------- remnant waves as packs

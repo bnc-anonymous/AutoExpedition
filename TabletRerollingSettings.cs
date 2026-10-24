@@ -182,10 +182,15 @@ public class TabletPriceSettings
     [Menu("Low tier colour")]
     public ColorNode LowTierColour { get; set; } = new ColorNode(Color.FromArgb(255, 235, 90, 90));
 
-    /// <summary>The top of the mid tier: prices from Low tier under up to this are drawn in the mid tier colour, higher ones in the high tier colour.</summary>
+    /// <summary>
+    /// The top of the mid tier: prices from Low tier under up to this are drawn in the mid tier colour, higher ones in the
+    /// high tier colour. A pricing run also searches first the tablets an earlier search priced above it. See
+    /// Tablets.PriorityOfPricingRun.
+    /// </summary>
     [Menu("Mid tier under (chaos)",
         "Prices from Low tier under up to this use Mid tier colour.\n" +
-        "Higher prices use High tier colour.")]
+        "Higher prices use High tier colour.\n" +
+        "A pricing run searches first the tablets an earlier search priced above this, dearest first.")]
     public RangeNode<float> MidTierUnderChaos { get; set; } = new RangeNode<float>(100f, 0f, 500f);
 
     /// <summary>Prices in the mid tier. The plugin's green, as the pick colour.</summary>

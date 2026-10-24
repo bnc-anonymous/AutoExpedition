@@ -2037,7 +2037,9 @@ internal sealed class Planning
                 TractionByBefore: Weighing.TractionByBeforeOfTarget(t,
                     Safe.Read(() => settings.Debug.GainingTraction.Value, true)),
                 // And how many waves it brings, for what a lift passed in reaches. See PlanTarget.ShareOfWavesPassedLift.
-                WaveCount: Weighing.WavesOfRemnant(t));
+                WaveCount: Weighing.WavesOfRemnant(t),
+                // And each combination's own waves, which the payout pays for the one taken. See PlanTarget.PartsOfChoice.
+                PartsOfChoices: Weighing.PartsOfChoices(t, pinned));
 
     /// <summary>
     /// Each group's starting increase as a fraction: the map's increased number of rare monsters for the group whose

@@ -27,6 +27,10 @@ namespace AutoExpedition;
 ///
 /// A tablet then shows "5d" for a price from its own search, "&lt;5d" at most, "&gt;5d" at least, "..." while its run is
 /// still searching and "?" when it has not been asked for. See TabletPricing.RelatedAnswers for why the bounds hold.
+///
+/// **The order a run searches in.** High tier tablets first - those an earlier search, of any age, priced above Mid
+/// tier under - the dearest first; then the rest by weight, heaviest first. Within either, a modifier set's higher
+/// rolls go before its lower, so a ceiling lands before what it can settle. See PriorityOfPricingRun.
 /// </summary>
 internal static partial class Tablets
 {
@@ -617,6 +621,77 @@ internal static partial class Tablets
     }
 
     /// <summary>
+    /// What an earlier search says a tablet is worth, in chaos, at any age: its own answer, or the dearest answer at
+    /// lower rolls of its modifier set, which is a floor for it. Answers at higher rolls are left out, being only a
+    /// ceiling. Null when there is none, or no chaos rate. See PriorityOfPricingRun.
+    /// </summary>
+    private static double? PriorChaosOfTablet(TabletSearch search, TabletRerollingSettings settings, Valuation valuation)
+    {
+        double? most = null;
+
+        void Take(TabletPricing.Answer answer)
+        {
+            if (answer is not { Error.Length: 0 })
+                return;
+
+            var exalts = PriceOfAnswer(answer, settings, valuation);
+
+            if (double.IsNaN(exalts) || TabletChaosOf(exalts, valuation) is not { } chaos)
+                return;
+
+            most = most is { } so ? Math.Max(so, chaos) : chaos;
+        }
+
+        Take(TabletPricing.Cached(search.Key));
+
+        foreach (var related in TabletPricing.RelatedAnswers(search.Key))
+        {
+            if (related.Looser && !related.Tighter)
+                Take(related.Answer);
+        }
+
+        return most;
+    }
+
+    /// <summary>
+    /// Where a pricing run's search goes in the queue, for the tablets it prices and the sum of its searched minimums.
+    ///
+    /// **High tier first.** Where an earlier search, of any age, priced one of the tablets above Mid tier under, the
+    /// search goes before every tablet priced at or below it and every tablet never priced, the dearest first: a stale
+    /// price is a measurement of the market where weight is a model of it, and the dear tablets are the ones whose
+    /// price is acted on. A run held for hours by the search limits (2026-10-21) gets to these first. Otherwise by the
+    /// heaviest tablet's weight, as before. Either way the rolls break ties, higher first, so a ceiling lands before
+    /// what it can settle. Below the hovered tablet and a hand craft, which queue at long.MaxValue and one less.
+    /// </summary>
+    private static long PriorityOfPricingRun(IEnumerable<TabletSearch> tablets, long rolls, TabletRerollingSettings settings,
+        Valuation valuation)
+    {
+        var mid = settings.Prices.MidTierUnderChaos.Value;
+        var heaviest = 0;
+        double? dearest = null;
+
+        foreach (var tablet in tablets)
+        {
+            heaviest = Math.Max(heaviest, tablet.Weight);
+
+            if (PriorChaosOfTablet(tablet, settings, valuation) is { } chaos && chaos > mid)
+                dearest = dearest is { } so ? Math.Max(so, chaos) : chaos;
+        }
+
+        var tiebreak = Math.Clamp(rolls, 0L, 999_999L);
+
+        return dearest is { } high
+            ? HighTierPriority + (long)Math.Clamp(Math.Round(high * 100d), 0d, 1e9) * 1_000_000L + tiebreak
+            : heaviest * 1_000_000L + tiebreak;
+    }
+
+    /// <summary>
+    /// Where the high tier starts in the queue: above any weight times a million, below the hovered tablet's
+    /// long.MaxValue. See PriorityOfPricingRun.
+    /// </summary>
+    private const long HighTierPriority = 1L << 56;
+
+    /// <summary>
     /// Plans the running pricing run: settles what the answers so far settle, and queues the next search of each
     /// modifier set that still needs one. See the class summary for the order.
     /// </summary>
@@ -645,8 +720,9 @@ internal static partial class Tablets
             // A capped tablet's own price past Capped price fresh for: its own rolls, which the cap must not settle.
             foreach (var due in needing.Where(x => CappedSearchDue(x, settings, valuation)).ToList())
             {
-                TabletPricing.Enqueue(due.Key, due.League, due.BodyOf(due.Filters), static _ => false, due.Weight * 1_000_000L,
-                    settings.TradeSite.SweepSearchesPerFiveMinutes.Value, settings);
+                TabletPricing.Enqueue(due.Key, due.League, due.BodyOf(due.Filters), static _ => false,
+                    PriorityOfPricingRun([due], 0L, settings, valuation), settings.TradeSite.SweepSearchesPerFiveMinutes.Value,
+                    settings);
                 needing.Remove(due);
                 _searchesLeft++;
             }
@@ -659,7 +735,8 @@ internal static partial class Tablets
                 var lower = NextLowerFilters(lowering, settings, valuation);
 
                 TabletPricing.Enqueue(lowering.KeyOf(lower), lowering.League, lowering.BodyOf(lower),
-                    Settles, lowering.Weight * 1_000_000L, settings.TradeSite.SweepSearchesPerFiveMinutes.Value, settings);
+                    Settles, PriorityOfPricingRun([lowering], 0L, settings, valuation),
+                    settings.TradeSite.SweepSearchesPerFiveMinutes.Value, settings);
                 needing.Remove(lowering);
                 _searchesLeft++;
             }
@@ -671,9 +748,10 @@ internal static partial class Tablets
             var ceiling = CombinedFilters(needing, highest: true);
             var floor = CombinedFilters(needing, highest: false);
 
-            // Highest weight first, then higher rolls first, so a ceiling lands before what it can settle.
+            // High tier, then weight, then higher rolls first, so a ceiling lands before what it can settle. See
+            // PriorityOfPricingRun.
             long PriorityOf(IEnumerable<SearchFilter> filters) =>
-                needing.Max(x => x.Weight) * 1_000_000L + Math.Clamp(filters.Sum(f => f.Min ?? 0), 0, 999_999);
+                PriorityOfPricingRun(needing, filters.Sum(f => (long)(f.Min ?? 0)), settings, valuation);
 
             void Want(IReadOnlyList<SearchFilter> filters) =>
                 TabletPricing.Enqueue(first.KeyOf(filters), first.League, first.BodyOf(filters), Settles,

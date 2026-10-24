@@ -93,8 +93,10 @@ internal static class ThreadRoles
 
         /// <summary>
         /// Which remnants this worker searches as though they were must take: none (remnants=free), every one
-        /// (remnants=all), or every one and then fewer in turn (remnants=descending). The chains it finds are judged
-        /// by the pool on what they really score. See Repair.WithMustTake and Repair.SearchDescendingRemnants.
+        /// (remnants=all), every one and then fewer in turn (remnants=descending), or each strong propagator the
+        /// best chain misses, one at a time (remnants=propagators). The chains it finds are judged by the pool on what
+        /// they really score. See Repair.WithMustTake, Repair.SearchDescendingRemnants and
+        /// Repair.SearchHoldingStrongPropagators.
         /// </summary>
         RemnantsHeld HoldsRemnants = RemnantsHeld.Free);
 
@@ -109,6 +111,12 @@ internal static class ThreadRoles
 
         /// <summary>Every remnant, then every one but one, then but two, a slice of the window each. See Repair.SearchDescendingRemnants.</summary>
         Descending,
+
+        /// <summary>
+        /// Each strong propagator the best chain so far misses, on its own, a slice of the window each. See
+        /// Repair.SearchHoldingStrongPropagators.
+        /// </summary>
+        Propagators,
     }
 
     /// <summary>
@@ -282,10 +290,12 @@ internal static class ThreadRoles
                         role = role with { HoldsRemnants = RemnantsHeld.All };
                     else if (string.Equals(value, "descending", StringComparison.OrdinalIgnoreCase))
                         role = role with { HoldsRemnants = RemnantsHeld.Descending };
+                    else if (string.Equals(value, "propagators", StringComparison.OrdinalIgnoreCase))
+                        role = role with { HoldsRemnants = RemnantsHeld.Propagators };
                     else if (string.Equals(value, "free", StringComparison.OrdinalIgnoreCase))
                         role = role with { HoldsRemnants = RemnantsHeld.Free };
                     else
-                        complaints.Add($"worker {worker}: remnants=\"{value}\" is not free, all or descending");
+                        complaints.Add($"worker {worker}: remnants=\"{value}\" is not free, all, descending or propagators");
 
                     break;
 

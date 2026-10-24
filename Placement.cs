@@ -493,6 +493,14 @@ internal sealed class Placement
             return Status;
         }
 
+        // **A solve still running is stopped first, so the run places the chain on screen.** While a search runs the
+        // overlay draws its best chain so far (Planning.Live), and Plan holds the chain from before the search until the
+        // search is collected or stopped. With explosives down the action key places rather than stops, so a run
+        // started mid-solve placed the earlier chain while the new one was drawn (dump 2026-10-24 04:02:02, 3
+        // explosives left after a re-solve). Stopping keeps the best chain reached as the plan. See Planning.Stop.
+        if (planning.Searching)
+            planning.Stop("a placement run starting, which places the chain on screen");
+
         _plan = planning.Plan;
         _reach = planning.Reach;
         _landed = 0;

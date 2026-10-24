@@ -152,7 +152,10 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     (int Source, float Rate, float WaveShare, long Mask, float WorthEach, bool UnaffectedByRunes, int Empowerment)[][] CreatedOfChoices = null,
     // What Gaining Traction multiplies this remnant's normal, magic and rare waves by, by remnants completed before it,
     // or null for the environment's own rule. See Weighing.TractionByBeforeOfTarget and Planner.TractionScalesOfTarget.
-    (float Normal, float Magic, float Rare)[] TractionByBefore = null)
+    (float Normal, float Magic, float Rare)[] TractionByBefore = null,
+    // Each entry's waves as parts, same order as Choices, null at an entry whose waves are Parts. Anything replacing
+    // Choices replaces this with it. See Weighing.PartsOfChoices and PartsOfChoice.
+    (long Mask, float Worth, float Many)[][] PartsOfChoices = null)
 {
     /// <summary>
     /// This target with combination c its only one: Choices and every list kept in the same order as it narrowed to that
@@ -176,7 +179,97 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             CarriedWaveSharesOfChoices = One(CarriedWaveSharesOfChoices, c),
             SlotRunesOfChoices = One(SlotRunesOfChoices, c),
             CreatedOfChoices = One(CreatedOfChoices, c),
+            PartsOfChoices = One(PartsOfChoices, c),
         };
+    }
+
+    /// <summary>
+    /// Combination c's waves as parts: its own entry of PartsOfChoices, or Parts where it has none - a recipe using as
+    /// many runes as Parts are built for, an unknown count, or a target read from a file that carries no such list. The
+    /// payout pays these for the combination taken. See Weighing.PartsOfChoices.
+    /// </summary>
+    public (long Mask, float Worth, float Many)[] PartsOfChoice(int c) =>
+        PartsOfChoices is { } all && c >= 0 && c < all.Length && all[c] is { } own ? own : Parts;
+
+    /// <summary>
+    /// Whether combination c's waves are its own entry of PartsOfChoices rather than Parts, in which case its waves
+    /// over Parts are in the parts themselves and MagicAndRareWavesOfChoices must not add them again.
+    /// </summary>
+    internal bool HasOwnPartsOfChoice(int c) =>
+        PartsOfChoices is { } all && c >= 0 && c < all.Length && all[c] != null;
+
+    /// <summary>
+    /// The monsters combination c's waves have over Parts, at the given Gaining Traction scales, as OwnWavesOfTag counts
+    /// them - normal monsters unscaled unless normalScale says otherwise; negative for a combination using fewer runes.
+    /// What its ordinary runes reach is OwnWavesOfTag plus this, and what the chain unearths from its link on is the
+    /// downstream pool plus this at all three scales.
+    /// </summary>
+    public float MonstersOverRecipeOfChoice(int c, float magicScale, float rareScale, float normalScale = 1f)
+    {
+        if (!HasOwnPartsOfChoice(c))
+            return 0f;
+
+        float Monsters((long Mask, float Worth, float Many)[] parts)
+        {
+            var sum = 0f;
+
+            foreach (var (mask, part, _) in parts ?? [])
+            {
+                if (part <= 0f || (mask & (1L << Tags.Monsters)) == 0L)
+                    continue;
+
+                sum += part * ((mask & (1L << Tags.Rares)) != 0L ? rareScale
+                    : (mask & (1L << Tags.Magics)) != 0L ? magicScale
+                    : normalScale);
+            }
+
+            return sum;
+        }
+
+        return Monsters(PartsOfChoice(c)) - Monsters(Parts);
+    }
+
+    /// <summary>
+    /// What combination c's waves over Parts are worth beyond face value, as the payout pays them: each part's change,
+    /// at its Gaining Traction scale, times what the shares in force on these waves multiply its class by, less one.
+    /// Negative for a combination using fewer runes. Its reward counts the change at face value (Weighing.WavesOfRecipe)
+    /// and TractionOfChoice the Gaining Traction on it; this is the rest, which the payout's per-marker product pays on
+    /// the waves the combination brings. Nought without its own parts. For Best.
+    ///
+    /// **Ranked without it, a short recipe kept the multiplied worth of waves it does not bring.** On a Lush Isle site
+    /// (2026-10-23) a 9-socket remnant whose blast multiplied monsters by 2.4 and rares by 7 was planned on a 5-rune
+    /// Orb of Chance over 3x Orb of Chance: the 4 waves it gives up were charged at face value, 1,025 and 705 of Gaining
+    /// Traction, while the payout went on paying all 9 waves at the multiplied rate.
+    /// </summary>
+    public float WavesPaidOverRecipeOfChoice(int c, float magicScale, float rareScale, PlanEnvironment env, float[] shares,
+        int groups, int width)
+    {
+        if (!HasOwnPartsOfChoice(c))
+            return 0f;
+
+        var change = new Dictionary<long, float>();
+
+        foreach (var (mask, part, _) in PartsOfChoice(c))
+            change[mask] = change.GetValueOrDefault(mask) + part;
+
+        foreach (var (mask, part, _) in Parts ?? [])
+            change[mask] = change.GetValueOrDefault(mask) - part;
+
+        var worth = 0d;
+
+        foreach (var (mask, part) in change)
+        {
+            if (part == 0f)
+                continue;
+
+            var scale = (mask & (1L << Tags.Rares)) != 0L ? rareScale
+                : (mask & (1L << Tags.Magics)) != 0L ? magicScale
+                : 1f;
+
+            worth += part * scale * (Planner.PaidProductOfMask(env, shares, groups, width, mask) - 1d);
+        }
+
+        return (float)worth;
     }
 
     /// <summary>The rune in each slot of combination c's recipe, or null when not known. See Propagation.RunesPerWave.</summary>
@@ -457,7 +550,7 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
         var change = 0f;
         var (rareMask, magicMask) = (0L, 0L);
 
-        foreach (var (mask, part, _) in Parts ?? [])
+        foreach (var (mask, part, _) in PartsOfChoice(c) ?? [])
         {
             var rare = (mask & (1L << Tags.Rares)) != 0L;
             var magic = !rare && (mask & (1L << Tags.Magics)) != 0L;
@@ -474,7 +567,8 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
                 change += part * (rare ? rareScale : magic ? magicScale : 1f) * (worth - 1f);
         }
 
-        if (MagicAndRareWavesOfChoices is { } waves && c < waves.Length)
+        // The waves over Parts at face value, where the combination's own parts do not already hold them.
+        if (!HasOwnPartsOfChoice(c) && MagicAndRareWavesOfChoices is { } waves && c < waves.Length)
         {
             if (rareMask != 0L)
                 change += waves[c].Rare * rareScale * (OwnFactorsOfPart(c, rareMask, lift).Worth - 1f);
@@ -508,7 +602,7 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
         {
             var (rareMask, magicMask) = (0L, 0L);
 
-            foreach (var (mask, part, _) in Parts ?? [])
+            foreach (var (mask, part, _) in PartsOfChoice(c) ?? [])
             {
                 var rare = (mask & (1L << Tags.Rares)) != 0L;
                 var magic = !rare && (mask & (1L << Tags.Magics)) != 0L;
@@ -526,7 +620,8 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
                               (float)Planner.PaidProductOfMask(env, shares, groups, width, mask);
             }
 
-            if (MagicAndRareWavesOfChoices is { } waves && c < waves.Length)
+            // The waves over Parts at face value, where the combination's own parts do not already hold them.
+            if (!HasOwnPartsOfChoice(c) && MagicAndRareWavesOfChoices is { } waves && c < waves.Length)
             {
                 if (rareMask != 0L)
                     change += waves[c].Rare * rareScale * (OwnFactorsOfPart(c, rareMask, lift).Worth - 1f);
@@ -586,7 +681,7 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     {
         var (source, rate, waveShare, _, _, _, empowerment) = entry;
 
-        if (source < 0 || rate <= 0f || Parts is not { Length: > 0 } parts)
+        if (source < 0 || rate <= 0f || PartsOfChoice(c) is not { Length: > 0 } parts)
             return 0f;
 
         var counted = 0f;
@@ -609,7 +704,7 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
 
         // The magic waves this combination has over the remnant's own recipe, as monsters. See
         // MagicAndRareWavesOfChoices, which keeps their worth.
-        if (source == Tags.Magics && MagicAndRareWavesOfChoices is { } waves && c < waves.Length &&
+        if (source == Tags.Magics && !HasOwnPartsOfChoice(c) && MagicAndRareWavesOfChoices is { } waves && c < waves.Length &&
             magicWorth > 0f && magicMany > 0f)
             counted += waves[c].Magic * magicScale / (magicWorth / magicMany);
 
@@ -826,10 +921,16 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
     /// Which entry of Choices was taken, so a detailed pass can publish the decision rather than
     /// leaving it to be inferred from the rune counts afterwards. See Planner.Picked.
     /// </param>
+    /// <param name="ownWavesInDownstream">
+    /// What downstream already holds of this remnant's own waves over Parts - its provisional pick's, from Settle's
+    /// provisional pass - in MonstersOverRecipeOfChoice's units at normalScale. Taken out and each combination's own
+    /// put back, so a carried rune is ranked on the waves its own combination brings.
+    /// </param>
     public (float Reward, float Carries, float Local, (string Id, float Worth)[] Locals, string[] Runes, (string Id, int Tag, float Percent, bool Flat)[] Spread) Best(float downstream, float local,
         PlanEnvironment env, float[][] sums, int at, int distinct, out int chose, float magicScale = 1f,
         float rareScale = 1f, double passedLift = 0d, float[] sharesInForce = null, int groups = 0, int width = 0,
-        (int Key, int Link)[] laterSends = null, int laterCount = 0, float[] after = null)
+        (int Key, int Link)[] laterSends = null, int laterCount = 0, float[] after = null, float ownWavesInDownstream = 0f,
+        float normalScale = 1f)
     {
         chose = -1;
 
@@ -845,9 +946,17 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
 
         chose = 0;
 
+        // The downstream pool with this remnant's own waves at Parts, so each combination can put back its own. See
+        // ownWavesInDownstream.
+        var downstreamAtParts = downstream - ownWavesInDownstream;
+
         for (var c = 0; c < Choices.Length; c++)
         {
             var choice = Choices[c];
+
+            // **What the chain unearths from this link on, with this combination's own waves**, which are in the pool:
+            // a carried rune reaches the remnant carrying it. A shorter recipe brings fewer of them.
+            downstream = MathF.Max(0f, downstreamAtParts + MonstersOverRecipeOfChoice(c, magicScale, rareScale, normalScale));
 
             // **Ranked against what this chain actually unearths per tag**, not against a single
             // downstream figure standing in for all of them. The per-tag sums are built before the
@@ -916,6 +1025,15 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
 
             var held = Planner.DiscountedForDuplicates(env, this, choice.Locals, choice.Local, at, distinct);
 
+            // Its ordinary runes reach the waves it brings, which for a shorter recipe are fewer than local counts.
+            var localOfChoice = MathF.Max(0f, local + MonstersOverRecipeOfChoice(c, magicScale, rareScale));
+
+            // And its waves over the remnant's Parts beyond face value, as the payout pays them. See
+            // WavesPaidOverRecipeOfChoice.
+            var wavesPaid = sharesInForce != null
+                ? WavesPaidOverRecipeOfChoice(c, magicScale, rareScale, env, sharesInForce, groups, width)
+                : 0f;
+
             // **And what the lifts it holds add to what it propagates.** A held Power sends the beneficial runes it
             // carries down the chain empowered, so they count again by the lift; any class's held lift the same. See
             // HeldLiftsOfChoice.
@@ -968,8 +1086,8 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             var own = sharesInForce != null
                 ? OwnPaidOfChoice(c, magicScale, rareScale, passed, env, sharesInForce, groups, width)
                 : OwnOfChoice(c, magicScale, rareScale, passed);
-            var worth = choice.Reward + traction + own +
-                        (float)(((carried * downstream - laterSent) * carriedFactor * (1d + passed) + held * local * (1d + onOwnWaves) +
+            var worth = choice.Reward + traction + own + wavesPaid +
+                        (float)(((carried * downstream - laterSent) * carriedFactor * (1d + passed) + held * localOfChoice * (1d + onOwnWaves) +
                                  reach + spreadReach * passed) / 100d);
 
             // **What each option was ranked at, kept only when somebody is reading.** The winner
@@ -980,10 +1098,11 @@ internal sealed record PlanTarget(Vector2 Grid, float Radius, float Weight, Targ
             Planner.ChoiceRankingTrail?.Add(
                 $"{(Named != null && c < Named.Length ? Named[c] : "?")}: reward {choice.Reward:N1}" +
                 $" + carried {carried:N2}% x {downstream:N0}{(laterSent > 0d ? $" less {laterSent / 100d:N1} sent later anyway" : "")}" +
-                $"{(carriedFactor != 1d ? $" x {carriedFactor:N2} as paid" : "")} + local {held:N2}% x {local:N0}" +
-                $" + scoped {reach:N1} (spread {spreadReach:N1}, held lifts {heldLiftReach:N1}, amplifiers " +
-                $"{reach - spreadReach - heldLiftReach:N1}, passed lift {passed:0.##}) + traction {traction:N1} + own {own:N1}" +
+                $"{(carriedFactor != 1d ? $" x {carriedFactor:N2} as paid" : "")} + local {held:N2}% x {localOfChoice:N0}" +
+                $" + scoped {reach / 100d:N1} (spread {spreadReach / 100d:N1}, held lifts {heldLiftReach / 100d:N1}, amplifiers " +
+                $"{(reach - spreadReach - heldLiftReach) / 100d:N1}, passed lift {passed:0.##}) + traction {traction:N1} + own {own:N1}" +
                 (sharesInForce != null ? " (as paid)" : "") +
+                (wavesPaid != 0f ? $" + waves over the recipe as paid {wavesPaid:N1}" : "") +
                 $" = {worth:N1}");
 
             if (worth > most)
@@ -5280,6 +5399,128 @@ internal static class Planner
         int[] touched, int found,
         double content, int covered, int musts, double travel, bool detail)
     {
+        Verdict Round(int[] forecast, bool readout) =>
+            SettleWithForecast(env, chain, step, seen, visit, monsters, tagged, classed, counted, touched, found,
+                content, covered, musts, travel, readout, forecast);
+
+        // **Settled again while a real pick missed its forecast.** Picks are made in link order, so each sees what the
+        // remnants before it chose and only a forecast of the ones after - which runes they send and the waves they
+        // bring. Where a later remnant's real pick differs from its forecast, every remnant before it chose on the wrong
+        // figure, so the chain is settled again with the real picks as the forecast, until the picks repeat or
+        // MostSettleRounds is reached. Each round's score is exact for its own picks, so the best round is kept, and
+        // a detailed pass repeats that round last so the readouts describe it.
+        var verdict = Round(null, false);
+        var best = verdict;
+        int[] bestForecast = null;
+        var rounds = 1;
+
+        while (rounds < MostSettleRounds && ForecastMissed(env, step, touched, found, out var forecast))
+        {
+            rounds++;
+            verdict = Round(forecast, false);
+
+            if (verdict.Total > best.Total)
+            {
+                best = verdict;
+                bestForecast = (int[])forecast.Clone();
+            }
+        }
+
+        SettleRoundsTaken = rounds;
+
+        if (CountSettles)
+        {
+            Interlocked.Increment(ref SettlesDone);
+            Interlocked.Add(ref SettleRoundsAfterFirst, rounds - 1);
+        }
+
+        return detail ? Round(bestForecast, true) : best;
+    }
+
+    /// <summary>
+    /// The most times Settle settles one chain: the first round and up to two more on its real picks. Chosen: each
+    /// round costs a whole settle, and only chains whose picks missed their forecast take a second. Settable for the
+    /// offline tool's --settle-rounds, where 1 settles once as before the rounds.
+    /// </summary>
+    internal static int MostSettleRounds = 3;
+
+    /// <summary>Settles, and the rounds after the first they took, since the process started. For the offline tool.</summary>
+    internal static long SettlesDone, SettleRoundsAfterFirst;
+
+    /// <summary>
+    /// Whether a forecast missing only in the runes a remnant sends settles the chain again too. Off: measured offline
+    /// (2026-10-24, the shipped thread roles, 3 layouts, one run of 2 presses of 4 s each way) such misses came on most
+    /// chains - 130,014 to 1,173,952 extra rounds - the search scored 7-38% fewer chains, and the best plan was equal or
+    /// lower (65,940 against 66,843 on one Frigid Bluffs layout, 43,165 against 43,227 on another). For the offline tool's
+    /// --resettle-on-runes.
+    /// </summary>
+    internal static bool ResettleOnRunesSent;
+
+    /// <summary>Whether Settle counts into SettlesDone and SettleRoundsAfterFirst. Off in the game. For the offline tool.</summary>
+    internal static bool CountSettles;
+
+    /// <summary>How many rounds the last Settle on this thread took. For the dump. See Settle.</summary>
+    [ThreadStatic] internal static int SettleRoundsTaken;
+
+    /// <summary>
+    /// Whether a remnant's real pick in the last round differs from its forecast in what the remnants before it ranked
+    /// on - the waves it brings or the runes it sends - with a remnant that has a choice to make at its link or an earlier
+    /// one; if so the real picks by target index, minus one where none was made, as the next round's forecast. A miss
+    /// nobody ranked on, at the earliest remnant or in a rune that stays put, settles nothing again. See Settle.
+    /// </summary>
+    private static bool ForecastMissed(PlanEnvironment env, int[] step, int[] touched, int found, out int[] forecast)
+    {
+        forecast = null;
+
+        var missed = false;
+
+        for (var t = 0; t < found && !missed; t++)
+        {
+            var target = env.Targets[touched[t]];
+
+            if (target.Choices is not { Length: > 1 } offered || _chosenOf[t] == _forecastOf[t] ||
+                _chosenOf[t] < 0 || _forecastOf[t] < 0)
+                continue;
+
+            // A remnant choosing at its own link or before it: another than itself, since its own ranking does not
+            // read its forecast's waves (see Best's ownWavesInDownstream) and its runes are booked as sent, not forecast.
+            var misled = false;
+
+            for (var u = 0; u < found && !misled; u++)
+            {
+                misled = u != t && env.Targets[touched[u]].Choices is { Length: > 1 } &&
+                         step[touched[u]] <= step[touched[t]];
+            }
+
+            if (!misled)
+                continue;
+
+            missed = !ReferenceEquals(target.PartsOfChoice(_chosenOf[t]), target.PartsOfChoice(_forecastOf[t])) ||
+                     ResettleOnRunesSent &&
+                     !(offered[_chosenOf[t]].Runes ?? []).SequenceEqual(offered[_forecastOf[t]].Runes ?? []);
+        }
+
+        if (!missed)
+            return false;
+
+        forecast = new int[env.Targets.Count];
+        Array.Fill(forecast, -1);
+
+        for (var t = 0; t < found; t++)
+            forecast[touched[t]] = _chosenOf[t];
+
+        return true;
+    }
+
+    /// <summary>
+    /// Settle's one round: the forecast, by target index, is the pick each remnant's provisional pass takes instead of
+    /// ranking one, or null to rank. See Settle.
+    /// </summary>
+    private static Verdict SettleWithForecast(PlanEnvironment env, List<Vector2> chain, int[] step, int[] seen,
+        int visit, float[] monsters, float[][] tagged, float[][] classed, float[][] counted,
+        int[] touched, int found,
+        double content, int covered, int musts, double travel, bool detail, int[] forecast)
+    {
 // Monster weight unearthed from each link ONWARDS, including that link's own.
         //
         // Inclusive because the game is: a remnant's modifiers reach "monsters unearthed by the
@@ -6086,23 +6327,52 @@ internal static class Planner
         // the same rune. Choices are made in link order, so a later remnant's real pick is not known when an earlier one
         // ranks; this ranks every remnant once with nothing booked, as one would choose with nothing arriving. One
         // provisional pick each, not iterated. See Planner.LaterSentReach.
+        //
+        // Last link first, so each provisional pick ranks on pools that already hold the waves the remnants after it
+        // bring. See OverRecipeInPools.
         var laterCount = 0;
         var trailKept = ChoiceRankingTrail;
 
+        _ownWavesInDownstream = Grow(_ownWavesInDownstream, Math.Max(found, 1));
+        _forecastOf = Grow(_forecastOf, Math.Max(found, 1));
+
+        for (var t = 0; t < found; t++)
+        {
+            _ownWavesInDownstream[t] = 0f;
+            _forecastOf[t] = -1;
+        }
+
         ChoiceRankingTrail = null;
 
-        for (var k = 0; k < found; k++)
+        for (var k = found - 1; k >= 0; k--)
         {
             var i = touched[order[k]];
 
             if (env.Targets[i].Choices is not { Length: > 0 } offered)
                 continue;
 
+            // The forecast where there is one - the last round's real pick, or the pinned one - otherwise ranked here.
+            var known = forecast != null && i < forecast.Length && forecast[i] >= 0 && forecast[i] < offered.Length
+                ? forecast[i]
+                : _pinnedChoices != null && i < _pinnedChoices.Length && _pinnedChoices[i] >= 0 &&
+                  _pinnedChoices[i] < offered.Length
+                    ? _pinnedChoices[i]
+                    : -1;
+            var provisionalChoice = 0;
             var provisional = offered.Length == 1
                 ? offered[0]
-                : env.Targets[i].Best(after[step[i]],
-                    env.Targets[i].OwnWavesOfTag(-1, tractionOf[order[k]], rareTractionOf[order[k]]), env, taggedAfter,
-                    step[i], 0, out _, tractionOf[order[k]], rareTractionOf[order[k]]);
+                : known >= 0
+                    ? offered[provisionalChoice = known]
+                    : env.Targets[i].Best(after[step[i]],
+                        env.Targets[i].OwnWavesOfTag(-1, tractionOf[order[k]], rareTractionOf[order[k]]), env, taggedAfter,
+                        step[i], 0, out provisionalChoice, tractionOf[order[k]], rareTractionOf[order[k]]);
+
+            _forecastOf[order[k]] = provisionalChoice;
+
+            // **And the waves it brings, in the pools of every link up to its own**, so the remnants that choose before
+            // it in link order rank on what it sends up rather than on its longest recipe. Its own ranking below takes
+            // this back out and puts each combination's own in. See PlanTarget.PartsOfChoice.
+            OverRecipeInPools(order[k], i, provisionalChoice);
 
             foreach (var id in provisional.Runes ?? [])
             {
@@ -6115,6 +6385,53 @@ internal static class Planner
         }
 
         ChoiceRankingTrail = trailKept;
+
+        // Folds combination c's waves over Parts into the downstream pools from link 0 to the remnant's own, at its Gaining
+        // Traction scales, and keeps the monster figure for its own ranking. Per tag where the tag is scoped.
+        void OverRecipeInPools(int t, int i, int c)
+        {
+            var target = env.Targets[i];
+
+            _ownWavesInDownstream[t] = 0f;
+
+            if (c < 0 || !target.HasOwnPartsOfChoice(c))
+                return;
+
+            var monstersOver = target.MonstersOverRecipeOfChoice(c, tractionOf[t], rareTractionOf[t], normalTractionOf[t]);
+
+            _ownWavesInDownstream[t] = monstersOver;
+
+            for (var s = 0; s <= step[i]; s++)
+                after[s] += monstersOver;
+
+            if (taggedAfter == null || env.Scoped is not { Length: > 0 } scoped)
+                return;
+
+            void Fold((long Mask, float Worth, float Many)[] parts, float sign)
+            {
+                foreach (var (mask, part, _) in parts ?? [])
+                {
+                    if (part <= 0f)
+                        continue;
+
+                    var tierScale = (mask & (1L << Tags.Rares)) != 0L ? rareTractionOf[t]
+                        : (mask & (1L << Tags.Magics)) != 0L ? tractionOf[t]
+                        : normalTractionOf[t];
+
+                    for (var k = 0; k < scoped.Length; k++)
+                    {
+                        if ((mask & (1L << scoped[k])) == 0L || taggedAfter[k] == null)
+                            continue;
+
+                        for (var s = 0; s <= step[i]; s++)
+                            taggedAfter[k][s] += sign * part * tierScale;
+                    }
+                }
+            }
+
+            Fold(target.PartsOfChoice(c), 1f);
+            Fold(target.Parts, -1f);
+        }
 
         for (var k = 0; k < found; k++)
         {
@@ -6134,7 +6451,7 @@ internal static class Planner
                 env, taggedAfter, step[i], distinct, out var chose, tractionOf[t], rareTractionOf[t],
                 PowerPassedTo(step[i]),
                 env.Targets[i].Choices is { Length: > 1 } ? SharesInForceAt(step[i]) : null, groups, width,
-                _laterSends, laterCount, after);
+                _laterSends, laterCount, after, _ownWavesInDownstream[t], normalTractionOf[t]);
 
             // The combination the full chain took, when ScoreOfEachBlast has pinned it, so that passes with fewer
             // sources differ in the sources alone.
@@ -6605,8 +6922,10 @@ internal static class Planner
             {
                 var i = touched[t];
 
+                // The waves of the combination taken, not the remnant's Parts: a recipe using fewer runes brings fewer
+                // waves, and paying Parts paid the waves it gives up at the full product. See PlanTarget.PartsOfChoice.
                 if (step[i] != s || !env.Targets[i].PartsSettledPerMarker ||
-                    env.Targets[i].Parts is not { Length: > 0 } waving)
+                    env.Targets[i].PartsOfChoice(_chosenOf[t]) is not { Length: > 0 } waving)
                     continue;
 
                 var own = LocalSharesOfMarker(env, _localsOf, t, groups, s, distinct, mineLifts);
@@ -8321,7 +8640,7 @@ internal static class Planner
         float rareWorth = 0f, rareMany = 0f, magicWorth = 0f, magicMany = 0f;
         long rareMask = 0L, magicMask = 0L;
 
-        foreach (var (mask, worth, many) in target.Parts ?? [])
+        foreach (var (mask, worth, many) in target.PartsOfChoice(c) ?? [])
         {
             var isRare = (mask & (1L << Tags.Rares)) != 0L;
             var isMagic = !isRare && (mask & (1L << Tags.Magics)) != 0L;
@@ -8365,7 +8684,9 @@ internal static class Planner
             }
         }
 
-        if (target.MagicAndRareWavesOfChoices is { } changes && c >= 0 && c < changes.Length)
+        // The waves over Parts, where the combination's own parts do not already hold them.
+        if (target.PartsOfChoices?.ElementAtOrDefault(c) == null &&
+            target.MagicAndRareWavesOfChoices is { } changes && c >= 0 && c < changes.Length)
         {
             if (rareMask != 0L && rareWorth > 0f && rareMany > 0f)
             {
@@ -8385,7 +8706,8 @@ internal static class Planner
         }
 
         // The wave model's share of each tier, wave by wave, for the split below.
-        var waves = Weighing.PartsOfEachWave(target.WaveCount);
+        // Over the waves the combination brings, one per rune its recipe uses. See Weighing.WavesOfRemnant.
+        var waves = Weighing.PartsOfEachWave(target.SlotRunesOfChoice(c)?.Count(rune => !string.IsNullOrEmpty(rune)) is int runes and > 0 ? runes : target.WaveCount);
         var shape = new (float Normal, float Magic, float Rare)[waves.Length];
         var (allNormal, allMagic, allRare) = (0f, 0f, 0f);
 
@@ -11211,6 +11533,18 @@ internal static class Planner
 
     /// <summary>Scratch for Settle's SharesInForceAt.</summary>
     [ThreadStatic] private static float[] _sharesInForce;
+
+    /// <summary>
+    /// Scratch for Settle's provisional pass: per touched target, what its provisional pick's waves over Parts added to
+    /// the downstream pools, for its own ranking to take back out. See Settle's OverRecipeInPools.
+    /// </summary>
+    [ThreadStatic] private static float[] _ownWavesInDownstream;
+
+    /// <summary>
+    /// Scratch for Settle's provisional pass: per touched target, the pick it was forecast to take, against which the
+    /// remnants before it ranked. See Settle and ForecastMissed.
+    /// </summary>
+    [ThreadStatic] private static int[] _forecastOf;
 
     /// <summary>Scratch for Settle's provisional pass: each provisional pick's propagated runes and its link.</summary>
     [ThreadStatic] private static (int Key, int Link)[] _laterSends;

@@ -2927,6 +2927,7 @@ internal static class Repair
         {
             ThreadRoles.RemnantsHeld.All => Search(WithEveryRemnantMustTake(env), budget, settle, token, found, stream, seed, own),
             ThreadRoles.RemnantsHeld.Descending => SearchDescendingRemnants(env, budget, settle, token, found, stream, seed, own),
+            ThreadRoles.RemnantsHeld.Propagators => SearchHoldingStrongPropagators(env, budget, settle, token, found, stream, seed, own),
             _ => Search(env, budget, settle, token, found, stream, seed, own),
         };
 
@@ -3022,6 +3023,131 @@ internal static class Repair
             variants.Add(remnants.Where(i => i != few[a] && i != few[b]).ToList());
 
         return variants;
+    }
+
+    /// <summary>
+    /// Searches with each strong propagator the best chain so far misses held must take on its own, a slice each,
+    /// strongest first, then as itself for the rest of the window, each search seeded with the best chain so far, and
+    /// answers the best by env's own score. What it finds goes to the pool as it is found, judged there on env.
+    ///
+    /// **Why.** A remnant whose runes multiply everything after it can sit off the route the search settles on, where
+    /// no move of one or two links reaches it within the reach and every partial detour scores worse. Held must take,
+    /// the search builds a route through it and then optimises around it. One remnant at a time, because holding
+    /// several makes a chain pay for all of them where one may be enough.
+    ///
+    /// **Not in the shipped line, because it measured no gain.** On a Frigid Bluffs layout (2026-10-17 22:16) a pool
+    /// with no roles stalled at about 32,000 without an Opulent remnant the game's chain took; the shipped line does not
+    /// stall there. Offline (2026-10-24, 6 layouts, 3 cold presses of 4 s each) the shipped line against the same line
+    /// with one reach remnant-order worker on remnants=propagators: equal on 4 layouts, 32,023 against 31,718 in one of
+    /// three runs on Craggy Peninsula, and 43,165-43,174 against 43,218-43,227 on a Frigid Bluffs layout.
+    /// </summary>
+    internal static Plan SearchHoldingStrongPropagators(PlanEnvironment env, TimeSpan budget, TimeSpan settle,
+        CancellationToken token, Action<List<Vector2>> found, int stream, List<Vector2> seed, List<Vector2> own)
+    {
+        var began = DateTime.UtcNow;
+        var strong = StrongPropagatorRemnants(env);
+        List<Vector2> best = null;
+        var bestScore = double.NegativeInfinity;
+        Plan bestPlan = null;
+
+        void Keep(Plan plan)
+        {
+            if (plan?.Points is not { Count: > 0 } points)
+                return;
+
+            var score = Planner.Score(env, points);
+
+            if (score <= bestScore)
+                return;
+
+            bestScore = score;
+            best = new List<Vector2>(points);
+            bestPlan = plan;
+        }
+
+        var slice = TimeSpan.FromMilliseconds(PropagatorSliceMs);
+        var first = true;
+
+        foreach (var held in strong)
+        {
+            if (token.IsCancellationRequested || DateTime.UtcNow - began + slice >= budget)
+                break;
+
+            // Only while the best chain so far misses it: one that already takes it needs no help to.
+            if ((best ?? seed) is { Count: > 0 } sofar && ChainCatches(env, sofar, held))
+                continue;
+
+            Solving.Happened(stream, $"holding strong propagator ({env.Targets[held].Grid.X:0},{env.Targets[held].Grid.Y:0}) " +
+                                     $"as must take for {PropagatorSliceMs} ms");
+            Keep(Search(WithMustTake(env, [held]), slice, slice, token, found, stream, best ?? seed, first ? own : null));
+            first = false;
+        }
+
+        var left = budget - (DateTime.UtcNow - began);
+
+        if (!token.IsCancellationRequested && left > TimeSpan.Zero)
+            Keep(Search(env, left, settle, token, found, stream, best ?? seed, best == null ? own : null));
+
+        return bestPlan == null || best == null ? bestPlan : Planner.Describe(env, best);
+    }
+
+    /// <summary>How long each strong propagator is held in SearchHoldingStrongPropagators. Chosen, as DescendingSliceMs.</summary>
+    private const int PropagatorSliceMs = 1500;
+
+    /// <summary>
+    /// The carried weight, in percent, at or above which a remnant is a strong propagator: its best combination's
+    /// carried runes' weights plus its scoped effects' percents. Chosen: Opulent (75), Power (100) and Bond (15
+    /// scoped) clear it on their own, while a combination of two ordinary runes carries about 4 to 7.
+    /// </summary>
+    private const float StrongPropagatorPercent = 10f;
+
+    /// <summary>
+    /// The remnants a strong propagator could come from, strongest first: each remnant not shunned and not already must
+    /// take, by the most any of its combinations carries (see StrongPropagatorPercent). Indices into env.Targets.
+    /// </summary>
+    internal static List<int> StrongPropagatorRemnants(PlanEnvironment env)
+    {
+        var found = new List<(int Index, float Carried)>();
+
+        for (var i = 0; i < env.Targets.Count; i++)
+        {
+            var target = env.Targets[i];
+
+            if (target.Kind != TargetKind.Remnant || target.Shunned || target.Must || target.Choices is not { Length: > 0 } offered)
+                continue;
+
+            var most = 0f;
+
+            foreach (var choice in offered)
+            {
+                var carried = 0f;
+
+                foreach (var (_, weight) in Planner.WeightsOfChosenRunes(target, choice.Runes) ?? [])
+                    carried += MathF.Max(0f, weight);
+
+                foreach (var (_, _, percent, _) in choice.Spread ?? [])
+                    carried += MathF.Max(0f, percent);
+
+                most = MathF.Max(most, carried);
+            }
+
+            if (most >= StrongPropagatorPercent)
+                found.Add((i, most));
+        }
+
+        return found.OrderByDescending(x => x.Carried).Select(x => x.Index).ToList();
+    }
+
+    /// <summary>Whether any link of the chain catches the target. See Planner.CaughtIndicesAt.</summary>
+    private static bool ChainCatches(PlanEnvironment env, List<Vector2> chain, int target)
+    {
+        foreach (var link in chain)
+        {
+            if (Array.IndexOf(Planner.CaughtIndicesAt(env, link), target) >= 0)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>This worker's place among the workers descending, from nought, for where it starts in the variants.</summary>
