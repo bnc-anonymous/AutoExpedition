@@ -32,6 +32,7 @@ internal static class CursorWarning
         "Failed to click", "ExileInput2 input refused", "ExileInput2 not installed", "ExileInput2 busy",
         "Missing currency", "AutoExpedition: Automation is enabled\nbut ExileInput2 was not found.", "Inventory full",
         "AutoExpedition: ExileInput2 is out of date.\nUpdate it - automation will not work fully.", "Item held",
+        "AutoExpedition: NinjaPricer has no prices.\nLoot lists with MIN match nothing.",
     };
 
     /// <summary>
@@ -85,6 +86,13 @@ internal static class CursorWarning
 
     /// <summary>Takes the warning down. Called when a placement run begins.</summary>
     public static void Clear() => _shown = ("", DateTime.MinValue);
+
+    /// <summary>Takes the warning down if it is this word, leaving any other warning showing.</summary>
+    public static void Clear(string word)
+    {
+        if (string.Equals(_shown.Word, word, StringComparison.Ordinal))
+            Clear();
+    }
 
     public static void Draw(Graphics graphics, GameController gc, AutoExpeditionSettings settings)
     {

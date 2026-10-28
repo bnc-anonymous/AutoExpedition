@@ -55,6 +55,54 @@ internal static class Rolls
     public static (int Sockets, float Share)[] SocketsFor(bool grand) => grand ? SocketsOnGrandSites : SocketsOnRegularSites;
 
     /// <summary>
+    /// SocketsFor on a map whose remnants are rolled more than once, keeping the roll with the most sockets: the shares
+    /// of the most sockets over 1 + extraRolls draws, or 2 + extraRolls with extraRollChancePct percent chance. The
+    /// unchanged shares with no extra rolls and no chance. See LuckyRollsOfMap.
+    ///
+    /// **Assumed, not measured: the roll kept is the one with the most sockets, and the fixed rune is drawn as on any
+    /// other map**, so only the socket count changes. Census rows from four Grand maps reading
+    /// MapExpedition2RemnantGenerationHasXLuckyRolls 1 (2026-10-10 to 10-14, 38 fresh remnants) averaged 5.32 sockets,
+    /// against 4.50 over 1,261 fresh remnants on other Grand maps and 5.18 for the most of two draws from those; no set
+    /// of four other Grand maps drawn at random out of 20,000 reached 5.32. Four maps is too few to settle it, and what
+    /// the chance stat does is not known: it is read as the chance of one more roll.
+    /// </summary>
+    public static (int Sockets, float Share)[] SocketsFor(bool grand, int extraRolls, int extraRollChancePct)
+    {
+        var shares = SocketsFor(grand);
+        var chance = Math.Clamp(extraRollChancePct, 0, 100) / 100d;
+        var draws = 1 + Math.Max(0, extraRolls);
+
+        if (draws == 1 && chance <= 0d)
+            return shares;
+
+        var kept = new (int Sockets, float Share)[shares.Length];
+        var below = 0d;
+        var keptBelow = 0d;
+
+        // Shares are ordered by socket count, so the running sum is the chance one draw comes up at most this many.
+        for (var i = 0; i < shares.Length; i++)
+        {
+            below += shares[i].Share;
+
+            var keptAtMost = (1d - chance) * Math.Pow(below, draws) + chance * Math.Pow(below, draws + 1);
+
+            kept[i] = (shares[i].Sockets, (float)(keptAtMost - keptBelow));
+            keptBelow = keptAtMost;
+        }
+
+        return kept;
+    }
+
+    /// <summary>
+    /// How many extra times this map rolls each remnant, and the percent chance of one more, from its
+    /// MapExpedition2RemnantGenerationHasXLuckyRolls and MapExpedition2RemnantGenerationHasAdditionalLuckyRollChancePct;
+    /// nought for either the map does not have or that cannot be read. See SocketsFor.
+    /// </summary>
+    public static (int ExtraRolls, int ExtraRollChancePct) LuckyRollsOfMap(ExileCore2.GameController gc) =>
+        (MapStat(gc, ExileCore2.Shared.Enums.GameStat.MapExpedition2RemnantGenerationHasXLuckyRolls),
+            MapStat(gc, ExileCore2.Shared.Enums.GameStat.MapExpedition2RemnantGenerationHasAdditionalLuckyRollChancePct));
+
+    /// <summary>
     /// How many sockets a roll comes up with on a Grand Expedition site. Shares, summing to one.
     ///
     /// **Counted from rolled remnants on Grand sites, 901 of them**, recorded by Census up to 2026-10-06 at area levels

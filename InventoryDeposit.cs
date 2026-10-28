@@ -65,6 +65,12 @@ internal static class InventoryDeposit
     private static readonly HashSet<long> Retried = new();
 
     /// <summary>
+    /// When each item put back for a second click had its first, by entity address: for the log line saying how long it
+    /// took to go when it goes before its second. See Choose.
+    /// </summary>
+    private static readonly Dictionary<long, DateTime> FirstClickOfRetried = new();
+
+    /// <summary>
     /// The clicks still to make, in order, each with the point it lands on: planned from the run's start, or from where
     /// the run is when something unexpected sends it back - an item clicked again, the inventory changed under it. Given
     /// to ExileInput2 to draw and to make as drawn. See PlanQueue.
@@ -226,6 +232,7 @@ internal static class InventoryDeposit
         Sent.Clear();
         Pending.Clear();
         Retried.Clear();
+        FirstClickOfRetried.Clear();
         Log.Clear();
         _clicks = 0;
         _moves = 0;
@@ -318,8 +325,31 @@ internal static class InventoryDeposit
             }
 
             LogLine($"an item was still there {MoveSettle.TotalMilliseconds:0}ms after its click: clicking it again");
+            FirstClickOfRetried[key] = clicked;
             Pending.Remove(key);
             Sent.Remove(key);
+        }
+
+        // **A planned click whose items have all gone is taken out of the queue**, and the queue given again so the drawn
+        // way does not end on empty cells. An item put back for still being there MoveSettle after its click often goes
+        // later on that first click: two tablets put on the end of the queue left before their second click, and the
+        // queue still held and drew them (dump 2026-10-25 18:52:57).
+        var queueShortened = false;
+
+        for (var q = Queue.Count - 1; q >= 0; q--)
+        {
+            if (Queue[q].Click.Takes.Any(shown.Contains))
+                continue;
+
+            foreach (var key in Queue[q].Click.Takes)
+            {
+                if (FirstClickOfRetried.TryGetValue(key, out var first))
+                    LogLine($"{Queue[q].Click.Name} went {(now - first).TotalMilliseconds:0}ms after its first click, before its second: " +
+                            "taken out of the queue");
+            }
+
+            Queue.RemoveAt(q);
+            queueShortened = true;
         }
 
         var left = items.Where(i => !i.Kept && !Sent.Contains(i.Key)).ToList();
@@ -334,15 +364,15 @@ internal static class InventoryDeposit
         }
 
         // The queue, planned again when it is empty or no longer fits what the inventory shows. An item to click that it
-        // does not hold - one clicked again for still being there - is fitted into it where it adds least to the way,
-        // rather than the whole being planned again from the cursor, which left it last and far off. See FitIntoQueue.
+        // does not hold - one clicked again for still being there - goes on the end of it, after everything still
+        // planned. Fitted in where it added least to the way, the first clicks of a run missed together went back in at
+        // the head of the queue one after another, and the cursor went back over the same few cells before moving on
+        // (dump 2026-10-25 18:39:36). See AppendToQueue.
         var leftKeys = left.Select(i => i.Key).ToHashSet();
 
         if (Queue.Count == 0 || !Queue[0].Click.Takes.All(leftKeys.Contains))
             PlanQueue(gc, settings, items, left);
-        else if (FitIntoQueue(gc, items, left))
-            GiveQueue(settings);
-        else if (_queueDropped)
+        else if (AppendToQueue(gc, items, left) || queueShortened || _queueDropped)
             GiveQueue(settings);
 
         var (next, point, _) = Queue[0];
@@ -396,11 +426,11 @@ internal static class InventoryDeposit
     }
 
     /// <summary>
-    /// Fits each item to click that the queue does not hold into the queue where it adds least to the way: between the two
-    /// clicks it detours least from, or at the end. Its point is just inside its edge facing the click before it. True
-    /// when anything was fitted, for the queue to be given to ExileInput2 again.
+    /// Puts each item to click that the queue does not hold on the end of the queue, in the order ItemClicks.NextItemOf
+    /// takes them from the last click planned. Its point is just inside its edge facing the click before it. True when
+    /// anything was added, for the queue to be given to ExileInput2 again.
     /// </summary>
-    private static bool FitIntoQueue(GameController gc,
+    private static bool AppendToQueue(GameController gc,
         List<(Entity Item, long Key, RectangleF Rect, string Metadata, bool Stackable, bool Kept)> items,
         List<(Entity Item, long Key, RectangleF Rect, string Metadata, bool Stackable, bool Kept)> left)
     {
@@ -411,45 +441,33 @@ internal static class InventoryDeposit
             return false;
 
         var keptKinds = items.Where(i => i.Kept && i.Stackable).Select(i => i.Metadata).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var cursor = Cursor(gc);
+        var from = Queue.Count > 0 ? Queue[^1].Point : Cursor(gc);
+        var remaining = missing.ToList();
 
-        foreach (var item in missing)
+        while (remaining.Count > 0)
         {
+            var item = ItemClicks.NextItemOf(remaining, i => i.Rect, from, false);
+
+            remaining.Remove(item);
+
             if (held.Contains(item.Key))
                 continue;
-
-            var centre = new Vector2(item.Rect.Center.X, item.Rect.Center.Y);
-            var at = Queue.Count;
-            var least = float.MaxValue;
-
-            for (var k = 0; k <= Queue.Count; k++)
-            {
-                var before = k == 0 ? cursor : Queue[k - 1].Point;
-                var cost = k == Queue.Count
-                    ? Vector2.Distance(before, centre)
-                    : Vector2.Distance(before, centre) + Vector2.Distance(centre, Queue[k].Point) - Vector2.Distance(before, Queue[k].Point);
-
-                if (cost < least)
-                {
-                    least = cost;
-                    at = k;
-                }
-            }
 
             var right = item.Stackable && item.Metadata.Length > 0 && !keptKinds.Contains(item.Metadata);
             var takes = right
                 ? missing.Where(i => string.Equals(i.Metadata, item.Metadata, StringComparison.OrdinalIgnoreCase) && !held.Contains(i.Key))
                     .Select(i => i.Key).ToArray()
                 : [item.Key];
-            var from = at == 0 ? cursor : Queue[at - 1].Point;
             var name = Safe.Read(item.Item, static e => e.GetComponent<Base>()?.Name, "") ?? "an item";
+            var point = ItemClicks.NearEdgeOf(item.Rect, from);
 
-            Queue.Insert(at, (new PlannedClick(item.Rect, right, name, takes), ItemClicks.NearEdgeOf(item.Rect, from), false));
+            Queue.Add((new PlannedClick(item.Rect, right, name, takes), point, false));
 
             foreach (var key in takes)
                 held.Add(key);
 
-            LogLine($"fitted {name} into the queue at {at + 1} of {Queue.Count}");
+            from = point;
+            LogLine($"put {name} on the end of the queue, now {Queue.Count} long");
         }
 
         return true;

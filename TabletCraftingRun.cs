@@ -469,6 +469,18 @@ internal static partial class Tablets
                     .Where(c => need.GetValueOrDefault(c.Line) > 0 && held.GetValueOrDefault(c.BaseName) == 0 && !CraftSupplied.Contains(c.BaseName))
                     .ToList();
 
+                // **Only as many stacks as the inventory has free cells for**: the rest are picked up in the currency tab,
+                // as a single currency is. A ctrl+click with no free cell moves nothing, and a full inventory of tablets
+                // stopped the run on "nothing came of a stack of Alchemy" (dump 2026-10-25 17:09:25). Unreadable, -1,
+                // limits nothing.
+                if (InventoryFreeCells(gc) is >= 0 and var free && free < lacking.Count)
+                {
+                    foreach (var (_, name) in lacking.Skip(free))
+                        CraftSupplied.Add(name);
+
+                    lacking = lacking.Take(free).ToList();
+                }
+
                 if (CraftingCurrencies.Count(c => need.GetValueOrDefault(c.Line) > 0) < 2 || lacking.Count == 0)
                 {
                     _navigateStep = 0;

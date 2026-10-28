@@ -4562,6 +4562,11 @@ internal static class Repair
 
     internal static bool Sound(PlanEnvironment env, List<Vector2> chain)
     {
+        // No more links than explosives in hand: a chain kept from a solve under a larger count keeps its length, and the
+        // search never shortens one. See Planning.Placeable.
+        if (chain.Count > env.Explosives)
+            return false;
+
         for (var i = 0; i < chain.Count; i++)
         {
             var before = i == 0 ? env.Origin : chain[i - 1];

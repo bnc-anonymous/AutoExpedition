@@ -66,8 +66,13 @@ internal sealed class Rolling
     /// still, and it is advised once no roll on the chain clears MinimumAdvisedGain. See OffChainRollsAreAdvised.
     /// </param>
     /// <param name="AwayFromChain">For an off-chain remnant, its distance in grid from the nearest planned link.</param>
+    /// <param name="RefusalLabel">
+    /// For a refused remnant, the few words printed beside it in place of a figure, such as "chain too far". Why holds
+    /// the full reason. See RefusalReason.
+    /// </param>
     internal sealed record RollAdvice(Vector2 Grid, double Gain, string Why, bool Refused = false,
-        string TakenWhenWeighed = null, double ChanceAbove = 0d, bool OffChain = false, float AwayFromChain = 0f);
+        string TakenWhenWeighed = null, double ChanceAbove = 0d, bool OffChain = false, float AwayFromChain = 0f,
+        string RefusalLabel = null);
 
     /// <summary>
     /// **A remnant within reach that the chain does not take is always rolled.** Its roll is scored against the chain
@@ -493,25 +498,25 @@ internal sealed class Rolling
     /// <summary>The Gathering key of the chain and contents the last pass was dispatched for. See Consider.</summary>
     private string _dispatchedFor = "";
 
-    /// <summary>The last OnScreenKey worked out, and the plan and environment it was worked out from.</summary>
-    private (Plan Plan, PlanEnvironment Env, string Key) _onScreen;
+    /// <summary>The last OnScreenKey worked out, and the chain and environment it was worked out from.</summary>
+    private (List<Vector2> Chain, PlanEnvironment Env, string Key) _onScreen;
 
     /// <summary>
-    /// The Gathering key of the chain and contents on screen, worked out again only when the plan or the environment is a
+    /// The Gathering key of the chain and contents on screen, worked out again only when the chain or the environment is a
     /// different object - every frame asks, and a solve hands over a new one of either only when something changed.
-    /// Empty without both.
+    /// Empty without both. The chain is Planning.BestChain: during a solve the screen draws the search's best so far.
     /// </summary>
-    private string OnScreenKey(PlanEnvironment env, Plan plan)
+    private string OnScreenKey(PlanEnvironment env, List<Vector2> chain)
     {
-        if (env == null || plan?.Points is not { Count: > 0 } points)
+        if (env == null || chain is not { Count: > 0 } points)
             return "";
 
-        if (ReferenceEquals(_onScreen.Plan, plan) && ReferenceEquals(_onScreen.Env, env))
+        if (ReferenceEquals(_onScreen.Chain, chain) && ReferenceEquals(_onScreen.Env, env))
             return _onScreen.Key;
 
         var key = Safe.Read(() => Gathering(env, points), "");
 
-        _onScreen = (plan, env, key);
+        _onScreen = (chain, env, key);
 
         return key;
     }
@@ -536,7 +541,13 @@ internal sealed class Rolling
         Planning planning, Valuation valuation, bool settling, int down)
     {
         var env = planning?.Env;
-        var chain = planning?.Plan?.Points;
+
+        // **The chain on screen, which during a solve is the search's best so far and not the plan.** Plan keeps the
+        // chain from before the search until the search is collected, and a continuous solve ran 20 s past publishing a
+        // better one: the advice stayed fresh against the plan and said to roll (764,1207), +412 on the plan's chain,
+        // where on the chain drawn that remnant was the Opulent source and the roll measured -3,388 offline (Bleached
+        // Shoals, dump 2026-10-24 23:19:23). See Planning.BestChain.
+        var chain = planning?.BestChain;
 
         // Whether anything may be drawn from this, worked out before the early returns so it is
         // answered on every frame rather than only on the frames that dispatch a pass. See Fresh.
@@ -598,7 +609,7 @@ internal sealed class Rolling
         // at -3,312 on that chain (2026-10-14). So a verdict is drawn only while the Gathering key it was weighed under
         // matches the one on screen; when they differ the next pass is dispatched at once - see the gate below.
         Fresh = mode == RerollSettings.Continuous
-            ? _adviceByCell.Count > 0 && _publishedFor.Length > 0 && _publishedFor == OnScreenKey(env, planning?.Plan)
+            ? _adviceByCell.Count > 0 && _publishedFor.Length > 0 && _publishedFor == OnScreenKey(env, chain)
             : planning is { Searching: false } && !Working && _plan != null &&
               ReferenceEquals(_plan, planning.Plan);
 
@@ -783,7 +794,7 @@ internal sealed class Rolling
 
         // And whenever the chain or contents on screen are not what the last dispatched pass weighed, which is what
         // keeps Fresh from staying false. Continuous only, like the deepening: the other modes ask once per solve.
-        var onScreen = mode == RerollSettings.Continuous ? OnScreenKey(env, planning.Plan) : _dispatchedFor;
+        var onScreen = mode == RerollSettings.Continuous ? OnScreenKey(env, chain) : _dispatchedFor;
 
         if (!deepening && rolled == _rolledWhen && Vector2.Distance(_for, site) < 1f &&
             _after == Planning.Solves && taken == _takenWhen && onScreen == _dispatchedFor)
@@ -876,7 +887,7 @@ internal sealed class Rolling
         var tables = RollRecipeTables.FromValuation(valuation,
             Safe.Read(() => gc.IngameState.Data.CurrentAreaLevel, 0),
             Safe.Read(() => gc.IngameState.ServerData.League, "") ?? "");
-        var shapes = ShapesARollCouldProduce(tables, Rolls.MapSlotFloor(gc), Detonator.Grand(gc));
+        var shapes = ShapesARollCouldProduce(tables, Rolls.MapSlotFloor(gc), Detonator.Grand(gc), Rolls.LuckyRollsOfMap(gc));
 
         // **Its own thread, at normal priority - ahead of the solver's workers.** A pass is usually asked for when the
         // chain has reached a strong point and the player is deciding what to roll, so it is what they are waiting on.
@@ -1102,14 +1113,19 @@ internal sealed class Rolling
     /// Whether the site is a Grand Expedition, whose rolls come up seven sockets far more often than any other site's.
     /// See Rolls.SocketsFor.
     /// </param>
-    private static List<RolledShape> ShapesARollCouldProduce(RollRecipeTables tables, int floor = 0, bool grand = true)
+    /// <param name="lucky">
+    /// How many extra times the map rolls each remnant, and the percent chance of one more: a roll then keeps the most
+    /// sockets of its draws, and its fixed rune is drawn as on any other map. See Rolls.LuckyRollsOfMap.
+    /// </param>
+    private static List<RolledShape> ShapesARollCouldProduce(RollRecipeTables tables, int floor = 0, bool grand = true,
+        (int ExtraRolls, int ExtraRollChancePct) lucky = default)
     {
         var shapes = new List<RolledShape>();
 
         if (tables == null)
             return shapes;
 
-        var socketShares = Rolls.SocketsFor(grand);
+        var socketShares = Rolls.SocketsFor(grand, lucky.ExtraRolls, lucky.ExtraRollChancePct);
 
         foreach (var (sockets, socketShare) in socketShares)
         {
@@ -1189,7 +1205,12 @@ internal sealed class Rolling
             }
         }
 
-        ShapeSharesSaid = said.Length == 0 ? "no shapes" : said.ToString().Trim();
+        ShapeSharesSaid = (said.Length == 0 ? "no shapes" : said.ToString().Trim()) +
+                          (lucky.ExtraRolls > 0 || lucky.ExtraRollChancePct > 0
+                              ? string.Create(CultureInfo.InvariantCulture,
+                                  $"; lucky map, {lucky.ExtraRolls} extra roll(s) and {lucky.ExtraRollChancePct}% chance of one more, " +
+                                  $"so the most sockets of the draws: {string.Join(", ", socketShares.Select(x => $"{x.Sockets} {x.Share:P1}"))}")
+                              : "");
 
         return shapes;
     }
@@ -1471,7 +1492,7 @@ internal sealed class Rolling
     /// <summary>
     /// The exact expected gain of rolling each remnant on this chain, every round walked: what a full advice pass would
     /// settle on, with no game. For the offline tool, which scores a saved layout's rolls from RollRecipeTables. The
-    /// same ScoreRollOutcomes the pass runs, summed the same way; refusals (rolled, must take, out of reach) are left to
+    /// same ScoreRollOutcomes the pass runs, summed the same way; refusals (rolled, must take, chain too far) are left to
     /// the caller, and an unreached remnant is floored at nought as the pass floors it.
     /// </summary>
     internal static List<(int Index, double Gain, double ShareAbove, bool Reached)> ExactRollGains(PlanEnvironment env,
@@ -1662,11 +1683,11 @@ internal sealed class Rolling
             // See Progress.
             RoundProgress = remnantsToScreen > 0 ? (float)remnantsScreened++ / remnantsToScreen : 0f;
 
-            var why = RefusalReason(scan, env, chain, target, i, marked[i], markedForReward[i], settings);
+            var (why, refusalLabel) = RefusalReason(scan, env, chain, target, i, marked[i], markedForReward[i], settings);
 
             if (why != null)
             {
-                RecordAdvice(said, target.Grid, 0d, why, taken, refused: true);
+                RecordAdvice(said, target.Grid, 0d, why, taken, refused: true, refusalLabel: refusalLabel);
 
                 continue;
             }
@@ -2370,12 +2391,12 @@ internal sealed class Rolling
 
     private static void RecordAdvice(Dictionary<(int X, int Y), RollAdvice> said, Vector2 grid, double gain,
         string why, Dictionary<(int X, int Y), string> taken, bool refused = false, double chanceAbove = 0d,
-        bool offChain = false, float awayFromChain = 0f)
+        bool offChain = false, float awayFromChain = 0f, string refusalLabel = null)
     {
         var cell = ((int)MathF.Round(grid.X), (int)MathF.Round(grid.Y));
 
         said[cell] = new RollAdvice(grid, gain, why, refused, taken?.GetValueOrDefault(cell), chanceAbove, offChain,
-            awayFromChain);
+            awayFromChain, refusalLabel);
     }
 
     /// <summary>
@@ -2444,34 +2465,35 @@ internal sealed class Rolling
     }
 
     /// <summary>
-    /// Why this remnant is not a candidate, or null when it is one.
+    /// Why this remnant is not a candidate, in full for the dump and as a short label for the overlay, or nulls when it
+    /// is one.
     ///
     /// Read in the order a person would: the things that make rolling impossible first, then the
     /// one that makes it wrong.
     /// </summary>
-    private static string RefusalReason(List<Target> scan, PlanEnvironment env,
+    private static (string Why, string Label) RefusalReason(List<Target> scan, PlanEnvironment env,
         List<Vector2> chain, PlanTarget target, int index, Insisted.Said marked, bool markedForReward,
         AutoExpeditionSettings settings)
     {
         var live = Nearest(scan, target.Grid);
 
         if (live != null && live.Rerolled)
-            return "already rolled - a remnant takes one Liquid Verisium and no more";
+            return ("already rolled - a remnant takes one Liquid Verisium and no more", "rolled");
 
         if (Reroll.HoldsPlayerChosenCombination(live, settings))
-            return "its combination is chosen and Overrule already chosen rewards is off";
+            return ("its combination is chosen and Overrule already chosen rewards is off", "chosen");
 
         // **Must take vetoes the roll, and it is a veto rather than a term.** Marked for its reward's value, the
         // threshold has already said this reward is worth building the whole chain around, and replacing it with an
         // average one cannot be an improvement whatever the runes do. See Insisted.Automatic. Marked by hand, the
         // remnant is kept as it was marked, whatever a roll might be worth.
         if (target.Must || marked == Insisted.Said.Take)
-            return markedForReward
+            return (markedForReward
                 ? "must take - the reward is worth more than any roll could return"
-                : "marked must take by hand - not rolled";
+                : "marked must take by hand - not rolled", "must take");
 
         if (marked == Insisted.Said.Avoid)
-            return "marked must avoid";
+            return ("marked must avoid", "must avoid");
 
         // **The environment's word for it, which can disagree with the mark.** A solve begun while the remnant was marked
         // avoid weighs it at its weight less a ceiling above every weight on the site - below nought, since a remnant's
@@ -2479,16 +2501,15 @@ internal sealed class Rolling
         // meanwhile. A rolled outcome is weighed afresh without that, so the penalty read as the roll's gain: 20,000 and
         // more on a 7 socket remnant whose mark had been cycled past avoid, on a Grazed Prairie site (2026-10-06).
         if (target.Weight < 0f)
-            return "avoided when the solve began";
+            return ("avoided when the solve began", "must avoid");
 
         // **Being unreached is not a refusal.** The remnant is still weighed and listed; with the chain
-        // held still a roll there is worth nought, so it is never advised.
+        // held still a roll there is worth nought, and it is advised as off chain. See OffChainRollsAreAdvised.
 
-        // **Being out of every link's range is a different question, and is a refusal.** The gate
-        // asks whether ONE more explosive could catch this remnant - placed from a bomb already
-        // down, near enough for its blast to cover it - not whether the chain catches it now. So a
-        // remnant the route misses by a link stays in, and one several reaches away goes, because
-        // advising a walk there is advising a walk on the chance of a good draw.
+        // **Being far from every link is a refusal.** The gate is a distance from the chain as planned,
+        // RollWithinReach reaches plus the blast radius, not whether an explosive is spare or another chain
+        // would take the remnant. Beyond it, rolling means a walk away from the route on the chance of a
+        // good draw.
         //
         // Re-evaluated every pass, so exclusion is never permanent: the moment the route moves
         // near a remnant it becomes a candidate again. See RewardSettings.RollWithinReach.
@@ -2499,16 +2520,16 @@ internal sealed class Rolling
             ? DistanceToChain(env, chain, index)
             : Vector2.Distance(env.Origin, target.Grid);
 
-        var reaches = MathF.Max(0f, Safe.Read(() => settings.Rewards.RollWithinReach.Value, 1f));
+        var reaches = MathF.Max(0f, Safe.Read(() => settings.Rewards.RollWithinReach.Value, 3f));
         var within = env.Reach * reaches + env.Blast;
 
         if (away > within)
         {
-            return $"{away:0} grid from the chain, past the {within:0} that one more explosive " +
-                   "could cover";
+            return ($"{away:0} grid from the chain, past the {within:0} that Only advise rolling within (reach) " +
+                    "allows", "chain too far");
         }
 
-        return null;
+        return (null, null);
     }
 
     /// <summary>

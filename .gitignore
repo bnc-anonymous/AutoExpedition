@@ -11,3 +11,4 @@ STATE.md
 __pycache__/
 composition_plan.md
 *.before-*
+TABLET_WEIGHTS.md

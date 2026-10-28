@@ -3687,12 +3687,75 @@ internal sealed class Placement
     /// do not pay the lag. See HoldPress.
     /// </summary>
     internal static bool MovingForPress(GameController gc) =>
-        DateTime.UtcNow - _characterMovedAt < CharacterMovedWithin || Walking(gc) || DodgeRolling(gc);
+        PositionChangedRecently() || Walking(gc) || DodgeRolling(gc) || Sprinting(gc);
 
-    /// <summary>Whether the character's current action is a dodge roll, by its action type's id. See MovingForPress.</summary>
-    private static bool DodgeRolling(GameController gc) =>
-        string.Equals(Safe.Read(gc, static g => g.Player?.GetComponent<Actor>()?.CurrentAction?.ActionType?.Id, "") ?? "",
-            "DodgeRoll", StringComparison.Ordinal);
+    /// <summary>Whether the character's grid position changed within CharacterMovedWithin. See NoteCharacterPosition.</summary>
+    internal static bool PositionChangedRecently() => DateTime.UtcNow - _characterMovedAt < CharacterMovedWithin;
+
+    /// <summary>When the character's grid position last changed. See NoteCharacterPosition.</summary>
+    internal static DateTime PositionLastChangedAt => _characterMovedAt;
+
+    /// <summary>How long without a change of position counts as standing, for PositionChangedRecently.</summary>
+    internal static TimeSpan StandingAfter => CharacterMovedWithin;
+
+    /// <summary>
+    /// The animation, the current action and which of MovingForPress's signs hold now - position, walking, roll,
+    /// sprint - for instant loot's timeline of a click held for the character to stop. See Autoloot.HeldForMovement.
+    /// </summary>
+    internal static string MovementSignsSaid(GameController gc)
+    {
+        var actor = Safe.Read(gc, static g => g.Player?.GetComponent<Actor>(), null);
+        var signs = new List<string>();
+
+        if (PositionChangedRecently())
+            signs.Add("position");
+
+        if (Walking(gc))
+            signs.Add("walking");
+
+        if (DodgeRolling(gc))
+            signs.Add("roll");
+
+        if (Sprinting(gc))
+            signs.Add("sprint");
+
+        return $"{Safe.Read(actor, static a => a.Animation.ToString(), "?")}, action " +
+               $"\"{Safe.Read(actor, static a => a.CurrentAction?.ActionType?.Id, "") ?? ""}\", " +
+               $"moving by {(signs.Count == 0 ? "nothing" : string.Join(" + ", signs))}";
+    }
+
+    /// <summary>
+    /// Whether the character's animation is one of the game's sprint animations (AnimationE names containing Sprint:
+    /// Sprint, SprintEnd and the sprinting rolls). Its own check because the slowing at a sprint's end barely moves the
+    /// character: an instant loot click sent during SprintEnd started no walk for 1191ms, and the run gave up before
+    /// it did (dump 2026-10-25 01:10:43). See MovingForPress, and SprintEnding for that glide.
+    /// </summary>
+    internal static bool Sprinting(GameController gc) =>
+        Safe.Read(gc, static g => g.Player?.GetComponent<Actor>()?.Animation.ToString(), "")?.Contains("Sprint", StringComparison.Ordinal) ?? false;
+
+    /// <summary>
+    /// Whether the character is in the glide a sprint ends in once its key is let go: the animation SprintEnd. A pickup's
+    /// click does not wait it out - a pickup goes through as soon as the sprint is let go (the player's account,
+    /// 2026-10-25), and a click held through it waited 741ms of SprintEnd after a chase let its sprint go (dump 02:36:35).
+    /// One click sent during SprintEnd started its walk only 1191ms later (dump 01:10:43), with the player's keys being
+    /// pressed again at the time. See Autoloot.HeldForMovement.
+    /// </summary>
+    internal static bool SprintEnding(GameController gc) =>
+        Safe.Read(gc, static g => g.Player?.GetComponent<Actor>()?.Animation.ToString(), "")?.Contains("SprintEnd", StringComparison.Ordinal) ?? false;
+
+    /// <summary>
+    /// Whether the character is in a dodge roll: its current action's type id is DodgeRoll, or its animation is one of the
+    /// game's dodge animations (AnimationE names containing Dodge: DodgeRoll, DodgeRollBack, the sprint, float and cannon
+    /// rolls). The animation as well, because an instant loot click went out with the animation DodgeRoll while the action
+    /// id check alone let it through (dump 2026-10-25 01:39:25). See MovingForPress, and Autoloot.HeldForMovement.
+    /// </summary>
+    internal static bool DodgeRolling(GameController gc)
+    {
+        var actor = Safe.Read(gc, static g => g.Player?.GetComponent<Actor>(), null);
+
+        return string.Equals(Safe.Read(actor, static a => a.CurrentAction?.ActionType?.Id, "") ?? "", "DodgeRoll", StringComparison.Ordinal) ||
+               Safe.Read(actor, static a => a.Animation.ToString(), "").Contains("Dodge", StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// How recently the character's grid position must have changed to count as moving, for MovingForPress. 50ms is a

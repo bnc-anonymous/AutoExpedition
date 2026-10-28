@@ -817,6 +817,15 @@ internal sealed class Planning
     /// </summary>
     public List<Vector2> Live => _live;
 
+    /// <summary>
+    /// The best chain known now: the search's best so far while one is running and has published, else the plan's.
+    ///
+    /// Plan holds the chain from before a search until the search is collected or stopped, and a continuous solve can
+    /// run for tens of seconds after publishing a better chain, which the overlay draws (Overlay, from Live). Anything
+    /// advising on the chain on screen reads this rather than Plan. See Rolling.Consider.
+    /// </summary>
+    public List<Vector2> BestChain => Searching && _live is { Count: > 0 } live ? live : Plan.Points;
+
     /// <summary>Bumped whenever a better chain is published, so a reader knows to recompute.</summary>
     public int Found => _found;
 
@@ -3004,6 +3013,13 @@ internal sealed class Planning
             : keeps
                 ? $"carried the previous {seed.Count} spots over as a floor worth {_floor:N0}"
                 : $"DROPPED the previous chain, so there is no floor: {dropped}";
+
+        // **A dropped chain is no worker's seed either.** It was dropped as the floor and still handed to every worker,
+        // which checks reach and spacing and not length: at another player's site planned for 16 while miscounted
+        // explosives stood and then for 15, each solve said it had dropped the 16 link chain and worker nought published
+        // it again within 150ms, at the same score (dump 2026-10-26 17:51:07, runs 28 to 33).
+        if (!keeps)
+            seed = null;
 
         // Before Site is moved on, because the loop window turns on whether THIS site already had
         // an answer. See looping.

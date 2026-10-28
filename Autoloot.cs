@@ -36,7 +36,7 @@ namespace AutoExpedition;
 /// checked in the background (InReachPickups); after one that needs a walk, from under other labels, or with the
 /// inventory open, the next waits until its label has gone.
 /// </summary>
-internal static class Autoloot
+internal static partial class Autoloot
 {
     /// <summary>The ExileInput2 caller name for the instant loot run. Its own, so it never shares a pointer with placement.</summary>
     private const string Caller = "AutoExpedition.Autoloot";
@@ -73,6 +73,9 @@ internal static class Autoloot
         /// StepUnderLabels.
         /// </summary>
         UnderLabels,
+
+        /// <summary>Heading toward a listed item off screen until its label is on screen. See StepOffScreenChase.</summary>
+        Chasing,
     }
 
     private static Phase _phase = Phase.Idle;
@@ -300,6 +303,8 @@ internal static class Autoloot
         SoundedItemIds.Clear();
         PendingConfirmations.Clear();
         InReachPickups.Clear();
+        ChasedItemIds.Clear();
+        ClosestApproachOfItems.Clear();
         ClickTargets.Clear();
         PricesOfItems.Clear();
         UnpricedUntil.Clear();
@@ -1572,6 +1577,9 @@ internal static class Autoloot
         ObserveClickResponse(gc);
         ObserveClickTargets(gc);
 
+        // Every Tick, whatever the phase: how near the player has come to each clicked item. See ClosestApproachOfItems.
+        TrackClosestApproaches(gc);
+
         // Every Tick, whatever the phase: the pickups in reach the run did not wait for. See InReachPickups.
         StepInReachPickups(gc, settings);
 
@@ -1624,6 +1632,11 @@ internal static class Autoloot
 
                 return;
 
+            case Phase.Chasing:
+                StepOffScreenChase(gc);
+
+                return;
+
             case Phase.WaitingForLabel:
                 // Labels just put back read as gone until the key lands, which would take the pickup as done before a
                 // walk to it: until one of the labels that were over it reads shown again. See LabelsBack.
@@ -1650,7 +1663,7 @@ internal static class Autoloot
                     // **Confirmed in the background, not waited on.** Waiting held the run for InventoryShowsWithin
                     // whenever the item went to somebody else, since the count then never rises, and every other listed
                     // item in view waited out the second. See ConfirmInBackground.
-                    PendingConfirmations.Add((_itemName, _targetMetadata, _carriedAtClick, _deadline));
+                    PendingConfirmations.Add((_itemId, _itemName, _targetMetadata, _carriedAtClick, _deadline));
                     _phase = Phase.Idle;
                     _scannedAt = DateTime.MinValue;
                     ConfirmInBackground(gc, settings);
@@ -1883,6 +1896,11 @@ internal static class Autoloot
                                      $"room, {notClickable} off screen, behind a panel or under other labels" +
                                      (underLabelsAllowed ? "" : " (\"Use the Toggle Highlighting key when buttons are obscured\" is off, so none is taken from under labels)"));
 
+            // Nothing on screen to pick up: a listed item off screen headed toward, where the setting allows. See
+            // StartOffScreenChase.
+            if (StartOffScreenChase(gc, settings))
+                return;
+
             LetGoWhenNoPickupStarts();
             return;
         }
@@ -1932,6 +1950,12 @@ internal static class Autoloot
         _target = chosen.Of;
         _targetPath = chosen.Path;
         TriedItemIds.Add(chosen.Id);
+        _pickupStartedAt = DateTime.UtcNow;
+        _rollSeenFrom = null;
+        _rollSeenWhileHeld = false;
+        _rollOverAt = null;
+        HeldTimeline.Clear();
+        _heldLastSaid = "";
 
         var ms = Math.Clamp(autoloot.MouseBlockMs.Value, 125, 1000);
 
@@ -1940,9 +1964,48 @@ internal static class Autoloot
         var blockInput = autoloot.BlockInputForInstantLoot.Value && (!autoloot.BlockInputOnlyWithParty.Value || PartyInArea(gc));
 
         _input.IgnorePlayerMouse(ms, blockInput);
+        _mouseBlockMs = ms;
+        _inputBlocked = blockInput;
 
         // The keyboard too, from the pickup on, so a walk on WASD stops before the click. See BlockInputForInstantLoot.
         _restoreHeldKeys = autoloot.RestoreHeldKeysAfterInstantLoot.Value;
+        _divertDodgeRolls = autoloot.DivertDodgeRollsTowardLoot.Value;
+        _movementKeys = (Safe.Read(() => autoloot.MoveUpKey.Value.Key, Keys.W), Safe.Read(() => autoloot.MoveLeftKey.Value.Key, Keys.A),
+            Safe.Read(() => autoloot.MoveDownKey.Value.Key, Keys.S), Safe.Read(() => autoloot.MoveRightKey.Value.Key, Keys.D));
+        _dodgeRollKey = Safe.Read(() => autoloot.DodgeRollKey.Value.Key, Keys.None);
+        _sprintAfterRoll = autoloot.SprintAfterInstantLootDodgeRoll.Value;
+        NoteSteeringMoveTimes(autoloot);
+
+        // A roll toward the item, where that is quicker than the walk. Only with the player's keys blocked, so the roll
+        // goes where it is aimed, and not from under other labels. From a run too: a pickup starting with the character
+        // running was never weighed, and walked to Divine Orbs 76.5 and 132.2 grid away that a roll reached 163 and
+        // 516ms sooner (dump 2026-10-25 02:06:36). Not during a roll, which cannot cancel itself. See RollIsFaster.
+        _rollPlanned = false;
+        _rollPressedAt = null;
+        _rollAimSentAt = null;
+        _rollSeenAfterPress = false;
+        _sprintKeyHeld = false;
+        _sprintKeyLetGo = false;
+
+        if (autoloot.DodgeRollToOutOfRangeLootWhenFaster.Value && chosen.Path.Length == 0)
+        {
+            var notWeighed = !blockInput ? "input not blocked for this pickup"
+                : _dodgeRollKey == Keys.None ? "no dodge roll key set"
+                : fromUnderLabels ? "taken from under other labels"
+                : Placement.DodgeRolling(gc) ? "already dodge rolling"
+                : null;
+            string weighed;
+
+            if (notWeighed != null)
+                weighed = $"walked - {notWeighed}";
+            else
+                _rollPlanned = RollIsFaster(gc, chosen.Of, out weighed);
+
+            RollDecisions.Add($"{DateTime.Now:HH:mm:ss.fff} {chosen.Name}: {weighed}");
+
+            if (RollDecisions.Count > RollDecisionsKept)
+                RollDecisions.RemoveAt(0);
+        }
         _cancelKey = autoloot.ActionKeyEndsInputBlock.Value ? Safe.Read(() => settings.ActionHotkey.Value.Key, Keys.None) : Keys.None;
 
         if (blockInput)
@@ -2119,7 +2182,9 @@ internal static class Autoloot
         // The click armed to go out on arrival from ExileInput2's input thread. See StepMoving and
         // AutolootSettings.ClickInstantLootWithoutWaiting.
         _armedAt = aim;
-        _clickArmed = autoloot.ClickInstantLootWithoutWaiting.Value && _input.ClickOnArrival();
+        // Not armed with the character moving: the click waits for it to stop. See HeldForMovement.
+        _clickArmed = autoloot.ClickInstantLootWithoutWaiting.Value && !_rollPlanned && !Placement.MovingForPress(gc) &&
+                      _input.ClickOnArrival();
     }
 
     /// <summary>Whether this pickup's click is armed in ExileInput2 to go out on arrival, and where it aims. See StepMoving.</summary>
@@ -2143,6 +2208,10 @@ internal static class Autoloot
             AfterClick(gc, true);
             return true;
         }
+
+        // Taken back with the character moving, for the arrival to wait for it to stop. See HeldForMovement.
+        if (Placement.MovingForPress(gc))
+            return Disarm(gc);
 
         var rect = Placement.Button(gc, _target, _targetPath).Rect;
 
@@ -2326,6 +2395,9 @@ internal static class Autoloot
             return;
         }
 
+        if (HeldForMovement(gc))
+            return;
+
         var clicked = _input.Click();
 
         UnderLabelsSaid += clicked ? "; the cursor on it showed its label, clicked it" : "; the click was refused";
@@ -2345,11 +2417,25 @@ internal static class Autoloot
         if (_clickArmed && StepArmed(gc))
             return;
 
+        // A steering glide in flight: the wait goes on, its sprint let go in reach, while the cursor travels. See
+        // SteerCursorToward.
+        if (_steeringGlide && !_input.Arrived())
+        {
+            HeldForMovement(gc);
+            return;
+        }
+
         if (_input.Arrived())
         {
             // Arrived with the click still armed - its last click's button not yet up, say - it is taken back and made
             // here, after the checks. See StepArmed.
             if (_clickArmed && Disarm(gc))
+                return;
+
+            if (StepPlannedRoll(gc))
+                return;
+
+            if (HeldForMovement(gc))
                 return;
 
             // **Where the label is now, not where it was.** With the character moving, the camera follows and the label
@@ -2407,6 +2493,554 @@ internal static class Autoloot
         }
     }
 
+    /// <summary>
+    /// Whether the click in hand waits, the cursor already on the item, for the character to stop: a dodge roll, a run
+    /// or a sprint, as Placement.MovingForPress reads it for the action key. The pickup starts at once - the key block
+    /// lets go of the player's movement keys from then - and only the click waits. The cursor going to the item mid-roll
+    /// helps too: a roll steers toward the cursor (the player's account, 2026-10-25), so it ends nearer the item. The
+    /// game does not take a click on an item during a roll (the player's account, 2026-10-25), and a click sent with the character still sprinting from
+    /// keys let go 13ms before started no walk (dump 2026-10-25 01:57:54; key_blocks.log). Held up to KeyBlockMs from
+    /// the pickup's start, the key block's own length, with the mouse block renewed meanwhile; past it still moving,
+    /// nothing is clicked, the input is let go and the item is left untried for the next look. True when the caller is
+    /// to return.
+    /// </summary>
+    private static bool HeldForMovement(GameController gc)
+    {
+        NoteHeldForMovement(gc);
+
+        // **After a roll, its own end.** A roll seen while the click waits ends the wait with it, and a sprint's if one
+        // follows: not the walking flags or the position's 50ms, which after the roll read the run it ends in - FixedRun
+        // on action Move, 35 to 50ms long, then the position's window, about 140ms in all after each of three rolls (dumps
+        // 2026-10-25 01:18:59, 01:22:05). The click on the item is meant to take over from that run.
+        if (Placement.DodgeRolling(gc))
+            _rollSeenWhileHeld = true;
+
+        // **The planned roll's key, held to sprint the rest of the way**, let go once the item is in reach - the roll's
+        // end and the sprint after it then are not waited out: a pickup goes through as soon as the sprint is let go
+        // (the player's account, 2026-10-25). Sprinting is no slower than walking, so this is never worse than the walk
+        // RollIsFaster weighed.
+        if (_sprintKeyHeld && ItemInReachOrGone(gc))
+            LetGoOfSprintKey();
+
+        // **Stalled against something**: past the roll, no change of position since it ended, for as long as counts as
+        // standing. The key let go and the click sent, whose walk the game routes round it - a wall the straight line
+        // check missed, or a monster in the way. Timed from the roll's end, since its still tail moves nothing.
+        if (_rollSeenWhileHeld && !Placement.DodgeRolling(gc))
+            _rollOverAt ??= DateTime.UtcNow;
+
+        if (_sprintKeyHeld && _rollOverAt is { } over && DateTime.UtcNow - over > Placement.StandingAfter &&
+            Placement.PositionLastChangedAt < over)
+        {
+            LetGoOfSprintKey();
+            HeldTimeline.Add($"{(DateTime.UtcNow - _pickupStartedAt).TotalMilliseconds:0}ms the sprint stalled, its key let go");
+        }
+
+        // **Not a sprint's end glide**, SprintEnd: once a sprint is let go a click goes through. See
+        // Placement.SprintEnding.
+        var moving = _sprintKeyHeld ||
+                     (!Placement.SprintEnding(gc) &&
+                      (_rollSeenWhileHeld
+                          ? Placement.DodgeRolling(gc) || (!_sprintKeyLetGo && Placement.Sprinting(gc))
+                          : Placement.MovingForPress(gc)));
+
+        if (!moving)
+        {
+            ReleaseDivertingKeys();
+            EndSteeringGlide();
+            CloseHeldForMovement();
+            return false;
+        }
+
+        if ((DateTime.UtcNow - _pickupStartedAt).TotalMilliseconds < KeyBlockMs)
+        {
+            DivertDodgeRollTowardItem(gc);
+            _input.IgnorePlayerMouse(_mouseBlockMs, _inputBlocked);
+            _deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(_mouseBlockMs);
+            return true;
+        }
+
+        TriedItemIds.Remove(_itemId);
+        _lastOutcome = $"{_itemName}: the character still moving {KeyBlockMs}ms after the pickup started - not clicked, input let go, looked at again";
+        HeldTimeline.Add($"{(DateTime.UtcNow - _pickupStartedAt).TotalMilliseconds:0}ms still moving - not clicked, given up");
+        CloseHeldForMovement();
+        Finish();
+        return true;
+    }
+
+    /// <summary>AutolootSettings.SprintAfterInstantLootDodgeRoll, read when the pickup or chase in hand began.</summary>
+    private static bool _sprintAfterRoll;
+
+    /// <summary>AutolootSettings.DodgeRollKey, read when the pickup in hand began.</summary>
+    private static Keys _dodgeRollKey = Keys.Space;
+
+    /// <summary>Whether the pickup in hand rolls toward its item before the click. See RollIsFaster.</summary>
+    private static bool _rollPlanned;
+
+    /// <summary>When the planned roll's key went out, and whether a roll has been seen since. See StepPlannedRoll.</summary>
+    private static DateTime? _rollPressedAt;
+
+    /// <summary>
+    /// When the planned roll's aim was sent again for the game's cursor pointing off the item's way; null until then. See
+    /// StepPlannedRoll.
+    /// </summary>
+    private static DateTime? _rollAimSentAt;
+
+    private static bool _rollSeenAfterPress;
+
+    /// <summary>Each choice between rolling and walking, with the times weighed, newest last, for the dump.</summary>
+    private static readonly List<string> RollDecisions = new();
+
+    /// <summary>How many RollDecisions are kept. Chosen.</summary>
+    private const int RollDecisionsKept = 10;
+
+    /// <summary>
+    /// Whether rolling toward an item out of pickup reach, then walking what is left, reaches it sooner than walking:
+    /// walking takes the distance past PickupReachGrid at the measured walking speed; rolling takes the measured roll's
+    /// time, still tail included, then the walk from where a straight roll toward the item ends, |distance - roll|, less
+    /// the reach. The start of a walk after a click and of a roll after its key are taken as equal and left out, and so is
+    /// the click after the roll. False when the item is in reach. See CharacterMovementFromStats.
+    /// </summary>
+    private static bool RollIsFaster(GameController gc, Entity item, out string weighed)
+    {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var at = Safe.Read(item, static e => e.GridPos, Vector2.Zero);
+        var away = player == Vector2.Zero || at == Vector2.Zero ? 0f : Vector2.Distance(player, at);
+
+        if (away <= PickupReachGrid)
+        {
+            weighed = $"walked - in reach, {away:0.0} grid";
+            return false;
+        }
+
+        // **A wall between, walked**: the roll and the sprint after it go straight and stop at a wall, where a click's
+        // walk is routed round it. A roll at a Divine Orb 118.4 grid away sprinted into one until the pickup gave up
+        // 2s later (dump 2026-10-25 02:22:27). See GroundRoutes.
+        var grid = Safe.Read(gc, static g => g.IngameState.Data.RawPathfindingData, null);
+
+        if (!GroundRoutes.LineWalkable(grid, player, at))
+        {
+            weighed = $"walked - {away:0.0} grid away, a wall between in a straight line";
+            return false;
+        }
+
+        var roll = CharacterMovementFromStats.Roll(gc);
+        var speed = CharacterMovementFromStats.WalkGridPerSecond(gc);
+
+        var walkMs = (away - PickupReachGrid) / speed * 1000d;
+        var rollMs = roll.Ms + Math.Max(0f, Math.Abs(away - roll.Grid) - PickupReachGrid) / speed * 1000d;
+        var faster = rollMs < walkMs;
+
+        weighed = $"{(faster ? "rolled" : "walked")} - {away:0.0} grid away: walking {walkMs:0}ms at {speed:0.0} grid/s, rolling " +
+                  $"{rollMs:0}ms ({roll.Grid:0.0} grid in {roll.Ms:0}ms, then the rest walked)";
+
+        return faster;
+    }
+
+    /// <summary>
+    /// The planned roll, once the cursor is on the item: its key tapped, then held until the roll is seen, which
+    /// HeldForMovement then waits out, diverting it toward the item, before the click. A roll not seen within the time a
+    /// walk has to begin after a click (ClickFailsAfterMs) is given up, and the click goes out as it would have. True
+    /// when the caller is to return.
+    /// </summary>
+    private static bool StepPlannedRoll(GameController gc)
+    {
+        if (!_rollPlanned)
+            return false;
+
+        // Held, not tapped: past the roll it sprints the rest of the way, let go in reach. See HeldForMovement. The
+        // cursor on the item's ground position first, not its label above it: with no movement key held, the roll goes
+        // toward the cursor. See AimCursorAtItem.
+        if (_rollPressedAt == null)
+        {
+            if (AimCursorAtItem(gc))
+                return true;
+
+            // **The roll only once the game's own cursor points the item's way**, as an off-screen chase's: a chase's
+            // first roll went the wrong way, most likely toward where the cursor was before it was aimed (dump 2026-10-25
+            // 18:24:06). Off by more than SteeringTurnDegrees: aimed again, waited for as long as a click has to show a
+            // walk, then clicked instead of rolled.
+            var itemAt = Safe.Read(_target, static e => e.GridPos, Vector2.Zero);
+            var off = CursorOffWayDegrees(gc, itemAt, Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero));
+
+            if (off > SteeringTurnDegrees)
+            {
+                if (_rollAimSentAt == null)
+                {
+                    _steeringSentWay = Vector2.Zero;
+                    _rollAimSentAt = DateTime.UtcNow;
+                    return true;
+                }
+
+                if ((DateTime.UtcNow - _rollAimSentAt.Value).TotalMilliseconds < ClickFailsAfterMs(gc, true))
+                    return true;
+
+                _rollPlanned = false;
+                _lastOutcome = $"{_itemName}: the cursor still {off:0} degrees off the item's way " +
+                               $"{(DateTime.UtcNow - _rollAimSentAt.Value).TotalMilliseconds:0}ms after it was aimed again - clicked instead";
+                return false;
+            }
+
+            // The cursor on the item is the way sent, so steering moves it only on a turn. See SteerCursorToward.
+            NoteSteeringWayTo(gc, itemAt);
+
+            if (WalkingOnLetGoKeys(gc, _pickupStartedAt))
+                return true;
+
+            // Held into a sprint, or tapped. See AutolootSettings.SprintAfterInstantLootDodgeRoll.
+            if (!(_sprintAfterRoll ? _input.Hold(_dodgeRollKey) : _input.Tap(_dodgeRollKey)))
+            {
+                _rollPlanned = false;
+                _lastOutcome = $"{_itemName}: the dodge roll key was refused - clicked instead";
+                return false;
+            }
+
+            _sprintKeyHeld = _sprintAfterRoll;
+            _rollPressedAt = DateTime.UtcNow;
+            _input.IgnorePlayerMouse(_mouseBlockMs, _inputBlocked);
+            _deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(_mouseBlockMs);
+            return true;
+        }
+
+        if (Placement.DodgeRolling(gc))
+        {
+            _rollSeenAfterPress = true;
+            _rollPlanned = false;
+            return false;
+        }
+
+        if ((DateTime.UtcNow - _rollPressedAt.Value).TotalMilliseconds < ClickFailsAfterMs(gc, true))
+            return true;
+
+        _rollPlanned = false;
+        LetGoOfSprintKey();
+        _lastOutcome = $"{_itemName}: no dodge roll seen after its key - clicked instead";
+        return false;
+    }
+
+    /// <summary>
+    /// Sends the cursor the item's way before the plugin's own roll, a pickup reach out from the character
+    /// (AimCursorAtGround): with no movement key held the roll goes toward the cursor, which points anywhere where the
+    /// four movement keys point in eight directions (the player's account, 2026-10-25). True when a move was sent. See
+    /// SteerCursorToward for the roll and sprint after.
+    /// </summary>
+    private static bool AimCursorAtItem(GameController gc) =>
+        AimCursorAtGround(gc, Safe.Read(_target, static e => e.GridPos, Vector2.Zero), Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero));
+
+    /// <summary>
+    /// How far the way to steer may turn, on the ground, before the cursor is moved after it, in degrees. Chosen, so a
+    /// straight run holds the cursor still.
+    /// </summary>
+    private const float SteeringTurnDegrees = 5f;
+
+    /// <summary>Whether the cursor's moves are set to the steering glide. See SteerCursorToward.</summary>
+    private static bool _steeringGlide;
+
+    /// <summary>The way on the ground the cursor was last sent to steer, unit length; zero before the first. See SteerCursorToward.</summary>
+    private static Vector2 _steeringSentWay;
+
+    /// <summary>The steering glide's move times and the instant ones put back after it, read when a pickup or chase began.</summary>
+    private static (int Shortest, int PerRootPixel) _steeringMoveTimes = (66, 3), _instantMoveTimes = (0, 0);
+
+    /// <summary>Reads the move times SteerCursorToward glides with and hands back. See AutolootSettings.AutolootShortestMoveMs.</summary>
+    private static void NoteSteeringMoveTimes(AutolootSettings autoloot)
+    {
+        _steeringMoveTimes = (autoloot.AutolootShortestMoveMs.Value, autoloot.AutolootMoveTimePerRootPixelMs.Value);
+        _instantMoveTimes = (autoloot.InstantLootShortestMoveMs.Value, autoloot.InstantLootMoveTimePerRootPixelMs.Value);
+        _steeringSentWay = Vector2.Zero;
+    }
+
+    /// <summary>
+    /// Points the cursor the way a roll or sprint is to go, toward a ground point: on the ground PickupReachGrid from the
+    /// character that way, or at the point when nearer, as it shows on screen (brought onto the screen along the line
+    /// when it falls off). A roll or sprint goes the cursor's way from the character whatever its distance.
+    ///
+    /// **Moved only when the way on the ground turns more than SteeringTurnDegrees from the way last sent** - not from
+    /// where the cursor is, which mid-glide is part of the way there and read as off course every Tick, so each Tick began
+    /// a new glide and the cursor shook (the player's account, 2026-10-25). On a straight run the way does not turn and
+    /// the cursor is put once. With the action key's move times rather than instant loot's 0ms, so a turn glides. True
+    /// when a move was sent.
+    /// </summary>
+    private static bool SteerCursorToward(GameController gc, Vector2 groundAt)
+    {
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var way = groundAt - player;
+
+        if (player == Vector2.Zero || groundAt == Vector2.Zero || way.Length() < 1f)
+            return false;
+
+        var unit = Vector2.Normalize(way);
+
+        if (_steeringSentWay != Vector2.Zero &&
+            Vector2.Dot(unit, _steeringSentWay) >= MathF.Cos(SteeringTurnDegrees * MathF.PI / 180f))
+            return false;
+
+        var point = ScreenTowardGround(gc, player + unit * Math.Min(PickupReachGrid, way.Length()), player);
+
+        if (point == Vector2.Zero)
+            return false;
+
+        if (!_steeringGlide)
+        {
+            _input.SetShortestMove(_steeringMoveTimes.Shortest);
+            _input.SetMoveTimePerRootPixel(_steeringMoveTimes.PerRootPixel);
+            _steeringGlide = true;
+        }
+
+        if (!_input.MoveTo(new RectangleF(point.X - 3f, point.Y - 3f, 6f, 6f)))
+            return false;
+
+        _steeringSentWay = unit;
+        return true;
+    }
+
+    /// <summary>
+    /// Whether the character still walks on the movement keys the key block let go of at since, within the time a walk
+    /// has to begin after a click (ClickFailsAfterMs): the plugin's roll waits it out, or the roll sets off partly the
+    /// old key's way - a chase begun with W held, its roll pressed a Tick after W was let go, started off aim (the
+    /// player's account, 2026-10-25; key_blocks.log 02:50:03.573). By Placement.Walking, the actor's own state.
+    /// </summary>
+    private static bool WalkingOnLetGoKeys(GameController gc, DateTime since) =>
+        Placement.Walking(gc) && (DateTime.UtcNow - since).TotalMilliseconds < ClickFailsAfterMs(gc, true);
+
+    /// <summary>Takes the way from the character to a ground point as the way last sent. See SteerCursorToward.</summary>
+    private static void NoteSteeringWayTo(GameController gc, Vector2 groundAt)
+    {
+        var way = groundAt - Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (groundAt != Vector2.Zero && way.Length() >= 1f)
+            _steeringSentWay = Vector2.Normalize(way);
+    }
+
+    /// <summary>Puts instant loot's move times back after steering, for the click's own move. See SteerCursorToward.</summary>
+    private static void EndSteeringGlide()
+    {
+        if (!_steeringGlide)
+            return;
+
+        _input?.SetShortestMove(_instantMoveTimes.Shortest);
+        _input?.SetMoveTimePerRootPixel(_instantMoveTimes.PerRootPixel);
+        _steeringGlide = false;
+        _steeringSentWay = Vector2.Zero;
+    }
+
+    /// <summary>
+    /// Whether the planned roll's key is held, sprinting the character on toward the item after the roll. See
+    /// HeldForMovement.
+    /// </summary>
+    private static bool _sprintKeyHeld;
+
+    /// <summary>Whether the planned roll's key was let go this pickup: the sprint it ended is not waited out.</summary>
+    private static bool _sprintKeyLetGo;
+
+    /// <summary>Lets go of the planned roll's key, if held. On every way the pickup ends, and once the item is in reach.</summary>
+    private static void LetGoOfSprintKey()
+    {
+        if (!_sprintKeyHeld)
+            return;
+
+        _input?.Let(_dodgeRollKey);
+        _sprintKeyHeld = false;
+        _sprintKeyLetGo = true;
+    }
+
+    /// <summary>Whether the player stands within PickupReachGrid of the item in hand, or the item's label is gone.</summary>
+    private static bool ItemInReachOrGone(GameController gc)
+    {
+        if (Placement.Button(gc, _target, _targetPath).Rect.Width <= 0f)
+            return true;
+
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+        var item = Safe.Read(_target, static e => e.GridPos, Vector2.Zero);
+
+        return player != Vector2.Zero && item != Vector2.Zero && Vector2.Distance(player, item) <= PickupReachGrid;
+    }
+
+    /// <summary>When the pickup in hand started, for HeldForMovement.</summary>
+    private static DateTime _pickupStartedAt;
+
+    /// <summary>Whether a dodge roll has been seen while the click in hand waits. See HeldForMovement.</summary>
+    private static bool _rollSeenWhileHeld;
+
+    /// <summary>When the roll seen while the click waits was first read over, for the sprint's stall. See HeldForMovement.</summary>
+    private static DateTime? _rollOverAt;
+
+    /// <summary>
+    /// The click in hand's wait for the character to stop, as it went: each change of Placement.MovementSignsSaid, timed
+    /// from the pickup's start. Kept to find what holds the click once a dodge roll is over - the player's account is of a
+    /// pause between the roll's end and the click (2026-10-25). See HeldTimelinesSaid.
+    /// </summary>
+    private static readonly List<string> HeldTimeline = new();
+
+    private static string _heldLastSaid = "";
+
+    /// <summary>The finished HeldTimelines, newest last, for the dump.</summary>
+    private static readonly List<string> HeldTimelinesSaid = new();
+
+    /// <summary>How many HeldTimelinesSaid are kept. Chosen.</summary>
+    private const int HeldTimelinesKept = 10;
+
+    private static void NoteHeldForMovement(GameController gc)
+    {
+        var said = Placement.MovementSignsSaid(gc) +
+                   (DivertingKeysHeld.Count == 0 ? "" : $", diverting with {string.Join("+", DivertingKeysHeld.Order())}") +
+                   (_sprintKeyHeld ? ", roll key held to sprint" : "");
+
+        var rolling = Placement.DodgeRolling(gc);
+        var at = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (rolling && _rollSeenFrom == null && at != Vector2.Zero)
+            _rollSeenFrom = (at, DateTime.UtcNow);
+        else if (!rolling && _rollSeenFrom is { } from && at != Vector2.Zero)
+        {
+            var moved = Vector2.Distance(at, from.At);
+            var ms = (DateTime.UtcNow - from.When).TotalMilliseconds;
+
+            HeldTimeline.Add($"{(DateTime.UtcNow - _pickupStartedAt).TotalMilliseconds:0}ms the roll, from when the wait first saw it, " +
+                             $"moved {moved:0.0} grid in {ms:0}ms{(ms > 0 ? $", {moved / ms * 1000d:0} grid/s" : "")}");
+            _rollSeenFrom = null;
+        }
+
+        if (said == _heldLastSaid)
+            return;
+
+        _heldLastSaid = said;
+        HeldTimeline.Add($"{(DateTime.UtcNow - _pickupStartedAt).TotalMilliseconds:0}ms {said}");
+    }
+
+    /// <summary>
+    /// Where and when the click's wait first read a dodge roll, for the roll's distance and time in the timeline; null
+    /// with none under way. The pickup can start mid-roll, so it measures the roll from then, not from its start.
+    /// </summary>
+    private static (Vector2 At, DateTime When)? _rollSeenFrom;
+
+    /// <summary>
+    /// Words a stat's name holds for MovementStatsSaid to print it: the character's dodge roll and movement stats, and
+    /// slows such as chilled ground. Chosen by name rather than listed, because nine stats named by guess missed the
+    /// player's own roll distance modifiers and did not move with chilled ground: MovementVelocityPermyriad read 4800
+    /// with the chilled buff on and off (dumps 2026-10-25 01:41:28 and 01:43:01).
+    /// </summary>
+    private static readonly string[] MovementStatWords = ["Dodge", "Movement", "Velocity", "Speed", "Chill", "Travel", "Sprint"];
+
+    /// <summary>
+    /// Every stat the player carries whose name holds one of MovementStatWords, with its value, for the dump beside the
+    /// rolls and walks measured. Reads only.
+    /// </summary>
+    private static string MovementStatsSaid(GameController gc)
+    {
+        var stats = Safe.Read(gc, static g => g.Player?.GetComponent<Stats>()?.StatDictionary, null);
+
+        if (stats == null)
+            return "unreadable";
+
+        var carried = Safe.Read(stats, static s => s.ToList(), null) ?? [];
+
+        var shown = carried
+            .Where(p => MovementStatWords.Any(w => p.Key.ToString().Contains(w, StringComparison.Ordinal)))
+            .OrderBy(p => p.Key.ToString(), StringComparer.Ordinal)
+            .Select(p => $"{p.Key} {p.Value}")
+            .ToList();
+
+        return $"{shown.Count} of {carried.Count} carried: {(shown.Count == 0 ? "none" : string.Join(", ", shown))}";
+    }
+
+    /// <summary>Closes the timeline at the click, kept only where the click was held at all.</summary>
+    private static void CloseHeldForMovement()
+    {
+        if (HeldTimeline.Count > 1)
+        {
+            HeldTimelinesSaid.Add($"{DateTime.Now:HH:mm:ss.fff} {_itemName}: {string.Join("; ", HeldTimeline)}; clicked at " +
+                                  $"{(DateTime.UtcNow - _pickupStartedAt).TotalMilliseconds:0}ms");
+
+            if (HeldTimelinesSaid.Count > HeldTimelinesKept)
+                HeldTimelinesSaid.RemoveAt(0);
+        }
+
+        HeldTimeline.Clear();
+        _heldLastSaid = "";
+    }
+
+    /// <summary>
+    /// tan 22.5 degrees: a direction this close to an axis takes that axis's key alone, so the eight directions the
+    /// four keys make each cover an eighth of the turn.
+    /// </summary>
+    private const float EighthTurnSlope = 0.41421356f;
+
+    /// <summary>AutolootSettings.DivertDodgeRollsTowardLoot, read when the pickup in hand began.</summary>
+    private static bool _divertDodgeRolls = true;
+
+    /// <summary>AutolootSettings.MoveUpKey and the three after it, read when the pickup in hand began.</summary>
+    private static (Keys Up, Keys Left, Keys Down, Keys Right) _movementKeys = (Keys.W, Keys.A, Keys.S, Keys.D);
+
+    /// <summary>The movement keys DivertDodgeRollTowardItem holds now.</summary>
+    private static readonly HashSet<Keys> DivertingKeysHeld = new();
+
+    /// <summary>
+    /// During a dodge roll with the click held for it, holds the movement keys toward the item - W and D for an item up
+    /// and to the right on screen - and lets go of the rest; once the roll is over, none. A roll goes the way the
+    /// movement keys point, ahead of the cursor, and keeps turning to them mid-roll; with none held it goes toward the
+    /// cursor (the player's account, 2026-10-25). The key block has let go of the player's own movement keys, so a roll
+    /// begun on a held A would otherwise run on away from the item. Every Tick the click is held. See HeldForMovement.
+    /// </summary>
+    private static void DivertDodgeRollTowardItem(GameController gc)
+    {
+        var wanted = new HashSet<Keys>();
+
+        // **The plugin's own roll is steered by the cursor**, kept on the item, and no movement key is held: those point
+        // in eight directions, the cursor in any. Only a roll the player made is diverted with the keys, since one begun
+        // with a movement key held follows the keys rather than the cursor. See AimCursorAtItem.
+        if (_rollPressedAt != null)
+        {
+            if ((Placement.DodgeRolling(gc) || _sprintKeyHeld) && !ItemInReachOrGone(gc))
+                SteerCursorToward(gc, Safe.Read(_target, static e => e.GridPos, Vector2.Zero));
+        }
+        // During a roll, and the sprint the planned roll's key holds after it; none once the item is in reach, where a
+        // roll beside the item swung the keys around it - D, A+S, W, D+S within 400ms (dump 2026-10-25 02:12:20).
+        else if (_divertDodgeRolls && (Placement.DodgeRolling(gc) || _sprintKeyHeld) && !ItemInReachOrGone(gc))
+        {
+            var player = Placement.ScreenOfItem(gc, Safe.Read(gc, static g => g.Player, null));
+            var item = Placement.ScreenOfItem(gc, _target);
+            var way = item - player;
+
+            // The movement keys by screen direction, as set in AutolootSettings.MoveUpKey and the three after it.
+            if (player != Vector2.Zero && item != Vector2.Zero && way != Vector2.Zero)
+            {
+                if (Math.Abs(way.X) > EighthTurnSlope * Math.Abs(way.Y))
+                    wanted.Add(way.X < 0f ? _movementKeys.Left : _movementKeys.Right);
+
+                if (Math.Abs(way.Y) > EighthTurnSlope * Math.Abs(way.X))
+                    wanted.Add(way.Y < 0f ? _movementKeys.Up : _movementKeys.Down);
+
+                wanted.Remove(Keys.None);
+            }
+        }
+
+        foreach (var key in DivertingKeysHeld.Except(wanted).ToList())
+        {
+            _input.Let(key);
+            DivertingKeysHeld.Remove(key);
+        }
+
+        foreach (var key in wanted.Except(DivertingKeysHeld).ToList())
+        {
+            if (_input.Hold(key))
+                DivertingKeysHeld.Add(key);
+        }
+    }
+
+    /// <summary>Lets go of every key DivertDodgeRollTowardItem holds. On every way the pickup ends, and when the roll is over.</summary>
+    private static void ReleaseDivertingKeys()
+    {
+        foreach (var key in DivertingKeysHeld)
+            _input?.Let(key);
+
+        DivertingKeysHeld.Clear();
+    }
+
+    /// <summary>The pickup's mouse block, its length and whether the player's mouse is dropped, renewed by HeldForMovement.</summary>
+    private static int _mouseBlockMs;
+
+    private static bool _inputBlocked;
+
     /// <summary>What follows the click, made here or armed and made on arrival: the note, the pickup to confirm, the walk.</summary>
     private static void AfterClick(GameController gc, bool clicked)
     {
@@ -2427,14 +3061,25 @@ internal static class Autoloot
             _clickPressedFromExileInput2 = since is >= 0d and < 1000d;
             _clickPressedAt = _clickPressedFromExileInput2 ? down : System.Diagnostics.Stopwatch.GetTimestamp();
             StartClickResponse(gc);
-            NoteClickTarget(gc);
 
             if (_targetPath.Length == 0)
                 NoteClicked(gc, _target);
 
-            // What is carried of it now, for ConfirmPickup to compare against.
-            _targetMetadata = Safe.Read(_target, static e => e.GetComponent<WorldItem>()?.ItemEntity?.Metadata, "") ?? "";
+            // What is carried of it now, for ConfirmPickup to compare against. The metadata kept from the item's first
+            // look before a fresh read: read again at the click, a Perfect Chaos Orb's came back unreadable, and its
+            // missed click went unsounded and unretried (dump 2026-10-25 06:45:14).
+            _targetMetadata = MetadataOfItem(_target);
+
+            if (_targetMetadata.Length == 0)
+                _targetMetadata = Safe.Read(_target, static e => e.GetComponent<WorldItem>()?.ItemEntity?.Metadata, "") ?? "";
+
             _carriedAtClick = CarriedOfMetadata(gc, _targetMetadata);
+
+            if (_carriedAtClick < 0 && Safe.Read(_target, static e => e.HasComponent<WorldItem>(), false))
+                _lastOutcome += _targetMetadata.Length == 0
+                    ? "; what is carried of it unread at the click: its metadata unreadable"
+                    : "; what is carried of it unread at the click: the inventory unreadable";
+            NoteClickTarget(gc);
 
             // Out of reach, the character walks to it. See ClickFailed.
             var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
@@ -2445,6 +3090,14 @@ internal static class Autoloot
             _lastPosition = player;
             _walkExpected = player != Vector2.Zero && item != Vector2.Zero &&
                             Vector2.Distance(player, item) > PickupReachGrid;
+
+            if (player != Vector2.Zero && item != Vector2.Zero)
+            {
+                if (ClosestApproachOfItems.Count > ClosestApproachesKept)
+                    ClosestApproachOfItems.Clear();
+
+                ClosestApproachOfItems[_itemId] = (item, Vector2.Distance(player, item));
+            }
 
             // The key block runs on from the click, for the walk to the item; it ends when the label goes. See
             // KeyBlockMs.
@@ -2467,8 +3120,10 @@ internal static class Autoloot
         if (!_walkExpected && !_pickupFromUnderLabels && _targetPath.Length == 0 && !InventoryPanelOpen(gc) &&
             Safe.Read(_target, static e => e.HasComponent<WorldItem>(), false))
         {
+            // **The key block kept until the pickup lands**, though the run goes on: let go at the click, a held A and
+            // Space pressed again at once carried the character off and the pickup never landed (dump 2026-10-25
+            // 01:10:43; key_blocks.log). Let go by StepInReachPickups once none is in flight. See LetGoWhenNoPickupStarts.
             InReachPickups.Add((_itemId, _target, _itemName, _clickPressedAt, _targetMetadata, _carriedAtClick));
-            EndKeyBlock();
             _scannedAt = DateTime.MinValue;
 
             return;
@@ -2556,7 +3211,11 @@ internal static class Autoloot
                     InReachPickupTimes.RemoveAt(0);
 
                 InReachPickups.RemoveAt(i);
-                PendingConfirmations.Add((pickup.Name, pickup.Metadata, pickup.CarriedAtClick, DateTime.UtcNow + InventoryShowsWithin));
+
+                // A look at once, which lets the key block go with none left in flight. See LetGoWhenNoPickupStarts.
+                _scannedAt = DateTime.MinValue;
+                PendingConfirmations.Add((pickup.Id, pickup.Name, pickup.Metadata, pickup.CarriedAtClick,
+                    DateTime.UtcNow + InventoryShowsWithin));
                 continue;
             }
 
@@ -2594,7 +3253,8 @@ internal static class Autoloot
     /// <summary>
     /// Why the click being waited on has failed, or "" while it has not: the character is standing, and ClickFailsAfterMs
     /// has passed since the button went down with no walk begun (an item out of reach) or no pickup (an item in reach),
-    /// or since the character stopped after a walk with no pickup. The caller has already found the label there.
+    /// or since the character stopped after a walk with no pickup; at once when the character stopped without having
+    /// come within PickupReachGrid of the item since the click. The caller has already found the label there.
     /// </summary>
     private static string ClickFailed(GameController gc)
     {
@@ -2607,6 +3267,12 @@ internal static class Autoloot
             return sincePress >= ClickFailsAfterMs(gc, false) ? $"not picked up {sincePress:0}ms after the click" : "";
 
         var sinceStopped = (DateTime.UtcNow - _movedAt).TotalMilliseconds;
+
+        // Stopped without having come within reach of the item since the click: no pickup is coming, so no margin is
+        // waited out. A dodge roll at the click read as the walk beginning, and the retry then waited the ping and
+        // ClickPickupMarginMs after the roll ended, 1166ms from the click in all (dump 2026-10-25 01:34:38).
+        if (NeverInReachSinceClick(_itemId))
+            return $"the movement after the click ended {sinceStopped:0}ms ago without coming within pickup reach of the item";
 
         return sinceStopped >= ClickFailsAfterMs(gc, false) ? $"not picked up {sinceStopped:0}ms after the walk ended" : "";
     }
@@ -2756,10 +3422,23 @@ internal static class Autoloot
     /// ClickResponses closes a click's row at the next click, so a label going after it was not seen. Kept for a stack of
     /// ten dropped one every half second, eight taken and two left after their retries, which the rows could not explain:
     /// a click cancelling the pickup before it, or landing on a newer stack's label, were both suspected (dump 2026-10-20
-    /// 18:21:50). Reads only.
+    /// 18:21:50).
+    ///
+    /// For the item aimed at, also when its label came back after going, when its entity left the entity list (see
+    /// Ground.ItemDeparted) and when more of it was carried, each timed from the button going down. Kept to find out
+    /// whether the entity leaving the list follows a pickup as soon as the label going does, which would let a pickup be
+    /// judged without the label: Sirenscale Gloves' label read gone 52ms after their click and was back, the item
+    /// clickable, 2s later (dump 2026-10-25 00:56:01). Reads only.
     /// </summary>
     private static readonly List<(DateTime At, long PressedAt, uint TargetId, string Name, uint HoveredId,
-        Dictionary<uint, string> Visible, List<string> Gone)> ClickTargets = new();
+        Dictionary<uint, string> Visible, List<string> Gone, string Metadata, int CarriedAtClick, DateTime PressedUtc,
+        int[] TargetTimes)> ClickTargets = new();
+
+    /// <summary>
+    /// The slots of a ClickTargets row's TargetTimes, in ms from the button going down, -1 until seen: the label back
+    /// after going, the entity leaving the list, more carried.
+    /// </summary>
+    private const int LabelBackSlot = 0, LeftEntityListSlot = 1, CarriedSlot = 2;
 
     /// <summary>Whether the click in hand went where the cursor already was, the game naming the item under it. See Tick.</summary>
     private static bool _aimedWhereCursorWas;
@@ -2780,7 +3459,8 @@ internal static class Autoloot
         }
 
         ClickTargets.Add((DateTime.Now, _clickPressedAt, _itemId, _itemName + (_aimedWhereCursorWas ? " (clicked where the cursor was)" : ""),
-            Placement.ItemOnHoverId(gc), visible, new List<string>()));
+            Placement.ItemOnHoverId(gc), visible, new List<string>(), _targetMetadata, _carriedAtClick,
+            DateTime.UtcNow - System.Diagnostics.Stopwatch.GetElapsedTime(_clickPressedAt), [-1, -1, -1]));
     }
 
     private static void ObserveClickTargets(GameController gc)
@@ -2798,6 +3478,9 @@ internal static class Autoloot
             var click = ClickTargets[i];
             var ms = (int)System.Diagnostics.Stopwatch.GetElapsedTime(click.PressedAt).TotalMilliseconds;
 
+            var targetLabelGone = !click.Visible.ContainsKey(click.TargetId) &&
+                                  click.Gone.Any(g => g.StartsWith("the one aimed at", StringComparison.Ordinal));
+
             foreach (var (id, name) in click.Visible.ToList())
             {
                 if (now.Contains(id))
@@ -2807,12 +3490,27 @@ internal static class Autoloot
                 click.Visible.Remove(id);
             }
 
+            var times = click.TargetTimes;
+
+            if (targetLabelGone && times[LabelBackSlot] < 0 && now.Contains(click.TargetId))
+                times[LabelBackSlot] = ms;
+
+            if (times[LeftEntityListSlot] < 0 && Ground.DepartureOfItem(click.TargetId) is { } departed && departed >= click.PressedUtc)
+                times[LeftEntityListSlot] = (int)(departed - click.PressedUtc).TotalMilliseconds;
+
+            if (times[CarriedSlot] < 0 && click.CarriedAtClick >= 0 && CarriedOfMetadata(gc, click.Metadata) > click.CarriedAtClick)
+                times[CarriedSlot] = ms;
+
             if (ms < ClickResponseFor)
                 continue;
 
+            string Said(int slot) => times[slot] < 0 ? "-" : $"{times[slot]}ms";
+
             ClickTargets.RemoveAt(i);
             ClickTargetsSaid.Add($"{click.At:HH:mm:ss.fff} {click.Name} {click.TargetId}, the game's hovered item {click.HoveredId}; " +
-                                 $"gone within {ClickResponseFor}ms: {(click.Gone.Count == 0 ? "nothing" : string.Join(", ", click.Gone))}");
+                                 $"gone within {ClickResponseFor}ms: {(click.Gone.Count == 0 ? "nothing" : string.Join(", ", click.Gone))}; " +
+                                 $"the one aimed at: label back {Said(LabelBackSlot)}, left the entity list {Said(LeftEntityListSlot)}, " +
+                                 $"more carried {(click.CarriedAtClick < 0 ? "unreadable" : Said(CarriedSlot))}");
 
             if (ClickTargetsSaid.Count > ClickResponsesKept)
                 ClickTargetsSaid.RemoveAt(0);
@@ -2908,13 +3606,25 @@ internal static class Autoloot
     /// Pickups whose label has gone, still to be confirmed against the inventory while the run looks at other items,
     /// oldest first. See ConfirmInBackground.
     /// </summary>
-    private static readonly List<(string Name, string Metadata, int CarriedAtClick, DateTime Until)> PendingConfirmations = new();
+    private static readonly List<(uint Id, string Name, string Metadata, int CarriedAtClick, DateTime Until)>
+        PendingConfirmations = new();
 
     /// <summary>
     /// ConfirmPickup for each pickup whose label has gone, run on every Tick whatever the run is doing: success once more
-    /// of the item is carried than at its click, failure when Until passes without it. Two of the same metadata in flight
+    /// of the item is carried than at its click, failure when Until passes without it; with what is carried unread, the
+    /// entity list decides, as in ConfirmPickup. Two of the same metadata in flight
     /// compare against their own counts at their clicks, so one arriving can read as both: a failure beside a success of
     /// the same item can be sounded as a success. See AfterClick.
+    ///
+    /// **A failure is a failed click, not a lost item**, and gets the retry Instant loot retries allows, by putting it
+    /// back among the untried; an item truly gone shows no label and is never clicked. A label, and the entity, can go
+    /// for a moment and come back: Sirenscale Gloves read gone 52ms after their click, nothing was carried, and 2s later the same item was
+    /// listed in view, clickable and passed over only as already tried (dump 2026-10-25 00:56:01).
+    ///
+    /// **Never in reach since the click, decided at once.** A pickup that was the player's own needs the player to have
+    /// come within PickupReachGrid of the item at some point after the click, so a label going without that - a dodge
+    /// roll taking the item off screen, a label hiding for a moment - is not one, and waiting out Until for the inventory
+    /// would only hold the retry back while the item comes back into view. See ClosestApproachOfItems.
     /// </summary>
     private static void ConfirmInBackground(GameController gc, AutoExpeditionSettings settings)
     {
@@ -2922,14 +3632,9 @@ internal static class Autoloot
         {
             var pending = PendingConfirmations[i];
             var carried = CarriedOfMetadata(gc, pending.Metadata);
+            var countable = pending.CarriedAtClick >= 0 && carried >= 0;
 
-            if (pending.CarriedAtClick < 0 || carried < 0)
-            {
-                PendingConfirmations.RemoveAt(i--);
-                continue;
-            }
-
-            if (carried > pending.CarriedAtClick)
+            if (countable && carried > pending.CarriedAtClick)
             {
                 PendingConfirmations.RemoveAt(i--);
                 _lastOutcome += $"; {pending.Name} picked up";
@@ -2937,15 +3642,103 @@ internal static class Autoloot
                 continue;
             }
 
-            if (DateTime.UtcNow < pending.Until)
+            // **With no count to compare, the entity list decides**: an item picked up leaves it, one left on the ground
+            // stays. Whose pickup it was is not known this way.
+            if (!countable && Ground.DepartureOfItem(pending.Id) != null && !ItemInEntityList(gc, pending.Id))
+            {
+                PendingConfirmations.RemoveAt(i--);
+                _lastOutcome += $"; {pending.Name} picked up, by its leaving the entity list (what is carried unread)";
+                SoundForResult(settings, true);
+                continue;
+            }
+
+            var neverInReach = NeverInReachSinceClick(pending.Id);
+
+            if (DateTime.UtcNow < pending.Until && !neverInReach)
                 continue;
 
             PendingConfirmations.RemoveAt(i--);
-            _lastOutcome += $"; {pending.Name}: the label went but no more was carried after " +
-                            $"{InventoryShowsWithin.TotalMilliseconds:0}ms - taken by someone else, or no room";
+            _lastOutcome += neverInReach
+                ? $"; {pending.Name}: the label went with the player never within pickup reach of it since the click"
+                : countable
+                    ? $"; {pending.Name}: the label went but no more was carried after {InventoryShowsWithin.TotalMilliseconds:0}ms"
+                    : $"; {pending.Name}: the label went but the item was still on the ground after {InventoryShowsWithin.TotalMilliseconds:0}ms";
+            var inEntityList = ItemInEntityList(gc, pending.Id);
+
+            _lastOutcome += inEntityList ? ", the item in the entity list now" : ", the item not in the entity list now";
+
+            // **Gone while the player was never in reach: someone else took it**, and sounded now. Put back for a retry
+            // below, that retry never comes - a gone item has no label - and nothing was sounded: a Perfect Chaos Orb
+            // clicked 47 grid away left the entity list 89ms after the click, taken by another player (dump 2026-10-25
+            // 15:56:34). Should it come back, its retry sounds again on its own result.
+            if (neverInReach && !inEntityList)
+            {
+                _lastOutcome += ", taken by someone else";
+                SoundForResult(settings, false);
+            }
+
+            // **Put back among the untried whether or not it is in the entity list now.** An item that is gone has no
+            // label and is never clicked, so this costs nothing; absence is not proof it is gone: a Divine Orb left the
+            // entity list 133ms after its click and its label was back at 151ms (dump 2026-10-25 01:39:25).
+            if (RetriesOfItems.GetValueOrDefault(pending.Id) < settings.Automation.Autoloot.InstantLootRetries)
+            {
+                RetriesOfItems[pending.Id] = RetriesOfItems.GetValueOrDefault(pending.Id) + 1;
+                TriedItemIds.Remove(pending.Id);
+                _scannedAt = DateTime.MinValue;
+                _lastOutcome += " - to be clicked again if it shows";
+                continue;
+            }
+
+            _lastOutcome += ", with no retry left - given up";
             SoundForResult(settings, false);
         }
     }
+
+    /// <summary>
+    /// Each clicked item's position and the nearest the player has stood to it since its last click, by entity id: set
+    /// at the click, lowered every Tick by TrackClosestApproaches. An item on the ground does not move, so its position
+    /// at the click serves throughout. See ConfirmInBackground.
+    /// </summary>
+    private static readonly Dictionary<uint, (Vector2 At, float Closest)> ClosestApproachOfItems = new();
+
+    /// <summary>How many items ClosestApproachOfItems holds before it is emptied. Chosen, well above the clicks in flight.</summary>
+    private const int ClosestApproachesKept = 200;
+
+    /// <summary>Lowers each entry of ClosestApproachOfItems to the player's distance now, every Tick.</summary>
+    private static void TrackClosestApproaches(GameController gc)
+    {
+        if (ClosestApproachOfItems.Count == 0)
+            return;
+
+        var player = Safe.Read(gc, static g => g.Player.GridPos, Vector2.Zero);
+
+        if (player == Vector2.Zero)
+            return;
+
+        foreach (var (id, (at, closest)) in ClosestApproachOfItems.ToList())
+        {
+            var away = Vector2.Distance(player, at);
+
+            if (away < closest)
+                ClosestApproachOfItems[id] = (at, away);
+        }
+    }
+
+    /// <summary>
+    /// Whether the player has stayed further than PickupReachGrid from the item since its last click, so it cannot have
+    /// been the player's pickup. False when the item's click was not tracked. See ClosestApproachOfItems.
+    /// </summary>
+    private static bool NeverInReachSinceClick(uint id) =>
+        ClosestApproachOfItems.TryGetValue(id, out var approach) && approach.Closest > PickupReachGrid;
+
+    /// <summary>
+    /// Whether an entity of this id is among ExileCore2's valid entities: a ground item picked up, by anyone, leaves the
+    /// list. Walks the whole list, so asked only when a pickup has failed. See ConfirmInBackground.
+    /// </summary>
+    private static bool ItemInEntityList(GameController gc, uint id) =>
+        id != 0u &&
+        (Safe.Read(gc, static g => g.EntityListWrapper.OnlyValidEntities, null) ?? [])
+        .Any(e => Safe.Read(e, static x => x.Id, 0u) == id);
 
     /// <summary>
     /// How many of this base the player carries in the main inventory, stacks summed, from the game's own record of it
@@ -2971,7 +3764,8 @@ internal static class Autoloot
 
     /// <summary>
     /// After the clicked label went: success once more of the item is carried than at the click, failure when
-    /// InventoryShowsWithin passes without it. A chest, a remnant or an unreadable inventory has nothing to compare and
+    /// InventoryShowsWithin passes without it. With what is carried unread, an item is judged by the entity list instead:
+    /// picked up once it has left, failed if still there at the deadline. A chest or a remnant has nothing to compare and
     /// plays nothing. See AutolootSettings.PlayInstantLootResultSound.
     /// </summary>
     private static void ConfirmPickup(GameController gc, AutoExpeditionSettings settings)
@@ -2984,18 +3778,31 @@ internal static class Autoloot
         }
 
         var carried = CarriedOfMetadata(gc, _targetMetadata);
+        var countable = _carriedAtClick >= 0 && carried >= 0;
+        var isItem = _itemId != 0u && Safe.Read(_target, static e => e.HasComponent<WorldItem>(), false);
 
-        if (_carriedAtClick < 0 || carried < 0)
+        // A chest or a remnant has nothing carried to compare and plays nothing.
+        if (!countable && !isItem)
         {
             _phase = Phase.Idle;
 
             return;
         }
 
-        if (carried > _carriedAtClick)
+        if (countable && carried > _carriedAtClick)
         {
             _phase = Phase.Idle;
             _lastOutcome += "; picked up";
+            SoundForResult(settings, true);
+
+            return;
+        }
+
+        // With no count to compare, the entity list decides. See ConfirmInBackground.
+        if (!countable && Ground.DepartureOfItem(_itemId) != null && !ItemInEntityList(gc, _itemId))
+        {
+            _phase = Phase.Idle;
+            _lastOutcome += "; picked up, by its leaving the entity list (what is carried unread)";
             SoundForResult(settings, true);
 
             return;
@@ -3005,7 +3812,9 @@ internal static class Autoloot
             return;
 
         _phase = Phase.Idle;
-        _lastOutcome += $"; the label went but no more was carried after {InventoryShowsWithin.TotalMilliseconds:0}ms - taken by someone else, or no room";
+        _lastOutcome += countable
+            ? $"; the label went but no more was carried after {InventoryShowsWithin.TotalMilliseconds:0}ms - taken by someone else, or no room"
+            : $"; the label went but the item was still on the ground after {InventoryShowsWithin.TotalMilliseconds:0}ms";
         SoundForResult(settings, false);
     }
 
@@ -3119,7 +3928,8 @@ internal static class Autoloot
     /// </summary>
     private static void LetGoWhenNoPickupStarts()
     {
-        if (_keysBlocked)
+        // Kept while a pickup in reach is in flight, for StepInReachPickups to let go. See AfterClick.
+        if (_keysBlocked && InReachPickups.Count == 0)
         {
             EndKeyBlock();
             _lastOutcome += "; nothing more to click, so the keyboard was let go";
@@ -3210,6 +4020,12 @@ internal static class Autoloot
     private static void Finish(bool keepKeysBlocked = false, bool keepCursor = false)
     {
         _phase = Phase.Idle;
+
+        // Before the cursor is given up, which ExileInput2 needs held to let go of a key. See DivertDodgeRollTowardItem.
+        ReleaseDivertingKeys();
+        EndSteeringGlide();
+        LetGoOfSprintKey();
+        LetGoOfChaseKeys();
 
         if (keepCursor && _input != null)
         {
@@ -3310,7 +4126,8 @@ internal static class Autoloot
                      $"{settings.Automation.Autoloot.MouseBlockMs.Value}ms, instant move {settings.Automation.Autoloot.InstantLootShortestMoveMs.Value}ms + " +
                      $"{settings.Automation.Autoloot.InstantLootMoveTimePerRootPixelMs.Value}ms per root pixel; action key move " +
                      $"{settings.Automation.Autoloot.AutolootShortestMoveMs.Value}ms + " +
-                     $"{settings.Automation.Autoloot.AutolootMoveTimePerRootPixelMs.Value}ms per root pixel");
+                     $"{settings.Automation.Autoloot.AutolootMoveTimePerRootPixelMs.Value}ms per root pixel" +
+                     (Valuation.LivePricesMissing ? "; NINJAPRICER HAS NO PRICES - every item reads 0, no MIN line matches" : ""));
         b.AppendLine($"  instant loot run: {_phase}, {TriedItemIds.Count} item(s) tried this area, " +
                      $"{RetriesOfItems.Values.Sum()} retry click(s), keys blocked {_keysBlocked}, last: {_lastOutcome}");
         b.AppendLine($"  instant loot from under other labels, last: {UnderLabelsSaid}");
@@ -3371,6 +4188,24 @@ internal static class Autoloot
                      "path nodes | actor moving | animation):");
 
         foreach (var said in ClickResponses)
+            b.AppendLine($"    {said}");
+
+        b.AppendLine($"  each click held for the character to stop, what held it as it went, timed from the pickup's start - " +
+                     $"the animation, the action, and which signs read moving - newest last ({HeldTimelinesSaid.Count}):");
+
+        foreach (var said in HeldTimelinesSaid)
+            b.AppendLine($"    {said}");
+
+        b.AppendLine($"  the player's movement and dodge roll stats, as the character carries them: {MovementStatsSaid(gc)}");
+        b.AppendLine($"  the character's roll and walking, from its stats: {CharacterMovementFromStats.Said(gc)}");
+        b.AppendLine($"  heading toward listed items off screen, the last look: {ChaseLookSaid}; newest last ({ChasesSaid.Count}):");
+
+        foreach (var said in ChasesSaid)
+            b.AppendLine($"    {said}");
+
+        b.AppendLine($"  rolling or walking to an item out of reach, newest last ({RollDecisions.Count}):");
+
+        foreach (var said in RollDecisions)
             b.AppendLine($"    {said}");
 
         b.AppendLine($"  each instant click followed for {ClickResponseFor}ms whatever came after it - the item aimed at, the item " +

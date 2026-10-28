@@ -406,8 +406,8 @@ internal static class Minimap
     }
 
     /// <summary>
-    /// Each remnant's reroll verdict, "+200 (30%)", written under it on whichever map is up, in the same colour and on
-    /// the same background as the socket count: on the line below the count where one is drawn, in its place where not. The remnants Overlay.ShowsRollFigures picks for the
+    /// Each remnant's reroll verdict, "+200 (30%)", written under it on whichever map is up, in the colour
+    /// Overlay.RollFigureColour gives and on the same background as the socket count: on the line below the count where one is drawn, in its place where not. The remnants Overlay.ShowsRollFigures picks for the
     /// figure beside the button, so the map and the world never disagree about which remnants have one. See
     /// Overlay.RollFigureText and RerollDisplaySettings.RollFiguresOnMinimap.
     ///
@@ -422,7 +422,6 @@ internal static class Minimap
 
         using var clip = graphics.MapSurfaceClip();
 
-        var colour = Overlay.RollFigureColour(settings);
         var back = Color.FromArgb(170, 0, 0, 0);
         var counting = settings.Display.Remnants.Rerolls.DrawSocketCountOnMinimap;
 
@@ -443,6 +442,7 @@ internal static class Minimap
                 continue;
 
             var text = Overlay.RollFigureText(said);
+            var colour = Overlay.RollFigureColour(settings, target.Grid);
             var size = graphics.MeasureText(text);
 
             // Under the remnant's map icon, a line lower when its socket count is drawn there - SocketCounts skips the

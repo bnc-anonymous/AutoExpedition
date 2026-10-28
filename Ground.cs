@@ -65,6 +65,33 @@ internal static class Ground
     private static readonly Dictionary<uint, DateTime> ArrivalsOfItems = new();
 
     /// <summary>
+    /// An item entity left ExileCore2's entity list - picked up by anyone, or streamed out: noted with the time, for the
+    /// dump to set against the label going and the inventory filling (see Autoloot.ObserveClickTargets), and the list
+    /// read again as Changed does.
+    /// </summary>
+    public static void ItemDeparted(uint id)
+    {
+        lock (DeparturesOfItems)
+        {
+            if (DeparturesOfItems.Count > 2000)
+                DeparturesOfItems.Clear();
+
+            DeparturesOfItems[id] = DateTime.UtcNow;
+        }
+
+        Changed();
+    }
+
+    /// <summary>When each item entity left the entity list this area, by id, or null. See ItemDeparted.</summary>
+    public static DateTime? DepartureOfItem(uint id)
+    {
+        lock (DeparturesOfItems)
+            return DeparturesOfItems.TryGetValue(id, out var at) ? at : null;
+    }
+
+    private static readonly Dictionary<uint, DateTime> DeparturesOfItems = new();
+
+    /// <summary>
     /// **Read every FastRefreshEveryMs for this long after an item arrives or goes, or an instant loot click, not only
     /// once.** An item's entity can arrive before its label is in the list, so the one read the arrival asks for can miss
     /// it, and it was then seen only at the next RefreshEveryMs: of two stacks dropped together, one was clicked at once

@@ -324,11 +324,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     }
 
     /// <summary>
-    /// The ExileInput2 bridge version this plugin needs (ExileInput2.BridgeVersion): 1 is the first with a version,
-    /// and has every method the client uses - instant loot's click on arrival, the planned clicks, the input blocks and
-    /// the reforging loiter among them. Raised with the client whenever it starts using a newer method.
+    /// The ExileInput2 bridge version this plugin needs (ExileInput2.BridgeVersion). 2 adds LastPressDownAt, which instant
+    /// loot times its pickups by, and sends held and restored keys with their own scan codes: under 1 the movement keys
+    /// held to steer a dodge roll did not walk, and keys pressed again after instant loot's key block stayed held in the
+    /// game. Raised with the client whenever it starts using a newer method or behaviour.
     /// </summary>
-    private const int ExileInput2VersionNeeded = 1;
+    private const int ExileInput2VersionNeeded = 2;
 
     private const string InputOutdatedWord = "AutoExpedition: ExileInput2 is out of date.\nUpdate it - automation will not work fully.";
 
@@ -347,6 +348,54 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         return _input?.Available == true && (listed == null || Safe.Read(() => listed.IsEnable, true));
     }
+
+    /// <summary>
+    /// Says so at the cursor, for PricesMissingWarningSeconds, and in the log when NinjaPricer has no live prices
+    /// (Valuation.LivePricesMissing) in a map, and in the log when they return, taking the cursor warning down. Once until they return, and only once
+    /// prices have been built PriceWarningAfter from loading, as Told waits: NinjaPricer starts with none and may load
+    /// its saved copy at once.
+    ///
+    /// Not in a hideout or town, or with no area read, where nothing drops for a loot list to miss. NinjaPricer downloads
+    /// every category before it answers any price, which after a restart took 8 minutes (see Valuation.LivePricesMissing),
+    /// so a warning in the hideout mostly reported that download.
+    /// </summary>
+    private void WarnWhenPricesMissing()
+    {
+        if (Safe.Read(() => _valuation.PricesBuiltAt, DateTime.MinValue) < _loadedAt + PriceWarningAfter)
+            return;
+
+        var missing = Valuation.LivePricesMissing;
+
+        if (missing == _pricesMissingSaid)
+            return;
+
+        if (missing && IsOutsideMaps())
+            return;
+
+        _pricesMissingSaid = missing;
+
+        if (missing)
+        {
+            CursorWarning.Show(PricesMissingWord, PricesMissingWarningSeconds);
+            DebugWindow.LogError("[AutoExpedition] NinjaPricer has no prices: every item reads 0, so no MIN line in either " +
+                                 "loot list matches. It may still be downloading - forcing a fetch in its settings has fixed it.", 30f);
+        }
+        else
+        {
+            CursorWarning.Clear(PricesMissingWord);
+            DebugWindow.LogMsg("[AutoExpedition] NinjaPricer's prices have arrived", 5f);
+        }
+    }
+
+    private bool _pricesMissingSaid;
+
+    private const int PricesMissingWarningSeconds = 10;
+
+    /// <summary>Whether the player is in a hideout or town, or no area is read.</summary>
+    private bool IsOutsideMaps() =>
+        Safe.Read(() => GameController.Area.CurrentArea is not { } area || area.IsHideout || area.IsTown, true);
+
+    private const string PricesMissingWord = "AutoExpedition: NinjaPricer has no prices.\nLoot lists with MIN match nothing.";
 
     private const string InputMissingWord = "AutoExpedition: Automation is enabled\nbut ExileInput2 was not found.";
 
@@ -403,6 +452,12 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // DataDownloader.StartDataReload, read 2026-10-11). The prices are built every 5s, so it is the first build after
         // the wait that counts, not the wait alone.
         if (doubt is { Length: > 0 } && Safe.Read(() => _valuation.PricesBuiltAt, DateTime.MinValue) < _loadedAt + PriceWarningAfter)
+            return;
+
+        // Rewards are only priced at a site, in a map. Before entering one after loading, this said "0 of 1 recipes carry
+        // a price" while NinjaPricer had had its prices for 23s, and "reward prices have arrived" at the next area change
+        // (log 2026-10-27 22:44:24 and 22:44:36), so the recipe table read there was the incomplete part.
+        if (doubt is { Length: > 0 } && IsOutsideMaps())
             return;
 
         if (doubt is { Length: > 0 })
@@ -1043,6 +1098,9 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         using (Spent.On("Tick/InputMissing"))
             WarnWhenInputMissing();
+
+        using (Spent.On("Tick/PricesMissing"))
+            WarnWhenPricesMissing();
 
         using (Spent.On("Tick/ReleaseRouting"))
             ReleaseRoutingWhenDone();
@@ -2064,7 +2122,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
             // An item went - picked up, or out of range: its label is not to be read from a stale list. See Ground.Changed.
             if (Safe.Read(entity, static e => e.Type, ExileCore2.Shared.Enums.EntityType.Error) == ExileCore2.Shared.Enums.EntityType.WorldItem)
-                Ground.Changed();
+                Ground.ItemDeparted(Safe.Read(entity, static e => e.Id, 0u));
         }
     }
 

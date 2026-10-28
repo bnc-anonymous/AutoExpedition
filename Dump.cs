@@ -809,6 +809,7 @@ internal static class Dump
         AtlasPassives(b, gc);
         RemnantSlotsFromTheClient(b, gc);
         RemnantOwnerSearch(b, gc);
+        IgniteSources(b, gc);
 
         b.AppendLine();
         SectionHeader(b, "=== reward and reroll lines, as last drawn ===");
@@ -4646,6 +4647,164 @@ internal static class Dump
                          $"{blocks.Count} blocks searched: " +
                          (found.Count == 0 ? "no player's id found" : string.Join("; ", found.Distinct().Take(20))));
         }
+    }
+
+    /// <summary>
+    /// The player behind each entity id: each player's own, and each of its deployed objects (Actor.DeployedObjects -
+    /// minions, totems), with the player's entity id and name.
+    /// </summary>
+    internal static Dictionary<uint, (uint Id, string Name, bool Deployed)> OwnersOfEntities(IEnumerable<Entity> players)
+    {
+        var owners = new Dictionary<uint, (uint Id, string Name, bool Deployed)>();
+
+        foreach (var player in players ?? [])
+        {
+            var id = Safe.Read(player, static e => e.Id, 0u);
+
+            if (id == 0u)
+                continue;
+
+            var name = Safe.Read(player, static e => e.GetComponent<Player>()?.PlayerName, null);
+
+            name = string.IsNullOrEmpty(name) ? $"player {id}" : name;
+            owners[id] = (id, name, false);
+
+            foreach (var deployed in Safe.Read(player, static e => e.GetComponent<Actor>()?.DeployedObjects, null) ?? [])
+            {
+                var objectId = Safe.Read(deployed, static d => d.ObjectId, 0u);
+
+                if (objectId != 0u)
+                    owners.TryAdd(objectId, (id, name, true));
+            }
+        }
+
+        return owners;
+    }
+
+    /// <summary>How far from the local player, in grid units, IgniteSources looks at monsters.</summary>
+    private const float IgniteSourceRange = 200f;
+
+    /// <summary>How many fire-marked monsters IgniteSources prints, nearest first.</summary>
+    private const int IgniteSourceMonstersShown = 40;
+
+    /// <summary>
+    /// Who applied each buff on the monsters near the local player, living and dead: for every monster carrying a buff
+    /// named for ignite, burn, fire or flammability, all its buffs, with the Buff's SourceEntityId resolved against the
+    /// players in the entity list, its source skill and its time left, the fire ones marked. Monsters without such a buff
+    /// are only counted, so the radius can cover a fight without the section growing with every monster in it. Corpses too, because a monster an ignite kills keeps visual_burnt_death and the
+    /// ignite build-up (flammability_ignite_chance_buildup) after the ignite itself is gone (dump 2026-10-24 23:57:32).
+    /// Written to find out whether the client fills the source for an ignite at all, whether ground fire names a player,
+    /// and whether several players' ignites sit on one monster as separate buffs. Unchecked as of 2026-10-24. Reads only.
+    /// </summary>
+    private static void IgniteSources(StringBuilder b, GameController gc)
+    {
+        b.AppendLine();
+        SectionHeader(b, $"=== who applied the buffs on the monsters within {IgniteSourceRange:0} grid of the player, fire marked ===");
+
+        var entities = Safe.Read(gc, static g => g.EntityListWrapper.Entities, null) ?? [];
+        var players = new Dictionary<uint, string>();
+        var localAddress = Safe.Read(gc, static g => g.Player.Address, -1L);
+
+        foreach (var entity in entities)
+        {
+            var player = Safe.Read(entity, static e => e.GetComponent<Player>(), null);
+
+            if (player == null)
+                continue;
+
+            var name = Safe.Read(player, static p => p.PlayerName, "") ?? "";
+            var local = Safe.Read(entity, static e => e.Address, 0L) == localAddress;
+
+            players.TryAdd(Safe.Read(entity, static e => e.Id, 0u), $"{(name.Length > 0 ? name : "?")}{(local ? " (you)" : "")}");
+        }
+
+        b.AppendLine("  players: " + (players.Count == 0
+            ? "none read"
+            : string.Join(", ", players.Select(p => $"{p.Value} entity {p.Key}"))));
+
+        // Each player's deployed objects, by Actor.DeployedObjects: whether the client fills the list for other players
+        // decides whether a minion's ignite can be put to its owner. See OwnersOfEntities.
+        var owners = OwnersOfEntities(entities.Where(e => Safe.Read(e, static x => x.GetComponent<Player>(), null) != null));
+
+        b.AppendLine("  deployed objects (minions, totems) per player: " + string.Join(", ",
+            owners.Values.Where(o => !o.Deployed).Select(o => $"{o.Name} {owners.Values.Count(d => d.Deployed && d.Id == o.Id)}")));
+
+        var centre = Safe.Read(gc, static g => g.Player.GridPos, System.Numerics.Vector2.Zero);
+        var inRange = 0;
+        var burningBuffs = 0;
+        var burningMonsters = new List<(float Distance, string Heading, List<string> Lines)>();
+
+        foreach (var entity in entities)
+        {
+            if (Safe.Read(entity, static e => e.Type, EntityType.Error) != EntityType.Monster)
+                continue;
+
+            var at = Safe.Read(entity, static e => e.GridPos, System.Numerics.Vector2.Zero);
+
+            if (at == System.Numerics.Vector2.Zero || System.Numerics.Vector2.Distance(at, centre) > IgniteSourceRange)
+                continue;
+
+            inRange++;
+
+            var buffs = Safe.Read(entity, static e => e.GetComponent<Buffs>()?.BuffsList, null);
+            var fires = new List<string>();
+            var anyFire = false;
+
+            foreach (var buff in buffs ?? [])
+            {
+                var name = Safe.Read(buff, static x => x.Name, "") ?? "";
+
+                // hidden_monster is on every monster still underground, and says nothing about who did what.
+                if (name.Length == 0 || name == "hidden_monster")
+                    continue;
+
+                var fire = new[] { "ignit", "burn", "fire", "flammab" }.Any(w => name.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+                if (fire)
+                {
+                    burningBuffs++;
+                    anyFire = true;
+                }
+
+                var source = Safe.Read(buff, static x => x.SourceEntityId, 0u);
+                var sourceSaid = source == 0u ? "none (0)"
+                    : players.TryGetValue(source, out var who) ? $"{who} ({source})"
+                    : $"entity {source}, not a player: " +
+                      (entities.FirstOrDefault(e => Safe.Read(e, static x => x.Id, 0u) == source) is { } other
+                          ? Safe.Read(other, static x => x.Metadata, "?")
+                          : "not in the entity list") +
+                      (owners.TryGetValue(source, out var owner) ? $", deployed by {owner.Name}" : "");
+                var skill = Safe.Read(buff, static x => x.SourceSkill?.Name, null);
+
+                fires.Add($"{(fire ? "FIRE " : "")}{name}: from {sourceSaid}, skill {(string.IsNullOrEmpty(skill) ? "?" : skill)} " +
+                          $"(ids {Safe.Read(buff, static x => x.SourceSkillId, 0)}/{Safe.Read(buff, static x => x.SourceSkillId2, 0)}), " +
+                          $"time {Safe.Read(buff, static x => x.Timer, 0f):0.##} of {Safe.Read(buff, static x => x.MaxTime, 0f):0.##}s, " +
+                          $"stacks {Safe.Read(buff, static x => x.BuffStacks, (ushort)0)}");
+            }
+
+            if (!anyFire)
+                continue;
+
+            var distance = System.Numerics.Vector2.Distance(at, centre);
+
+            burningMonsters.Add((distance,
+                $"  {Safe.Read(entity, static e => e.Metadata, "?")} id {Safe.Read(entity, static e => e.Id, 0u)}" +
+                $"{(Safe.Read(entity, static e => e.IsHostile, false) ? "" : " (not hostile)")}" +
+                $"{(Safe.Read(entity, static e => e.IsAlive, false) ? "" : " (dead)")} at ({at.X:0},{at.Y:0}), {distance:0} from the player:",
+                fires));
+        }
+
+        foreach (var (_, heading, lines) in burningMonsters.OrderBy(m => m.Distance).Take(IgniteSourceMonstersShown))
+        {
+            b.AppendLine(heading);
+
+            foreach (var line in lines)
+                b.AppendLine("    " + line);
+        }
+
+        b.AppendLine($"  {inRange} monster(s) within range, living and dead; {burningMonsters.Count} with a buff named for ignite, " +
+                     $"burn, fire or flammability ({burningBuffs} such buff(s)), the nearest " +
+                     $"{Math.Min(burningMonsters.Count, IgniteSourceMonstersShown)} printed with all their buffs");
     }
 
     private static void RemnantSlotsFromTheClient(StringBuilder b, GameController gc)

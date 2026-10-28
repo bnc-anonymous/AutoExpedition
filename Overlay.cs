@@ -4586,16 +4586,21 @@ internal static class Overlay
         var height = graphics.MeasureText("+0").Y;
         var at = new Vector2(button.Right + 4f, button.Center.Y - height / 2f);
 
-        Figure(graphics, ref at, RollFigureText(said), RollFigureColour(settings));
+        Figure(graphics, ref at, RollFigureText(said), RollFigureColour(settings, target.Grid));
     }
 
     /// <summary>
-    /// The colour a reroll figure is written in: the propagating rune colour, at half strength while the figures are a
-    /// step behind the chain and contents on screen. See Rolling.FiguresShowable.
+    /// The colour a reroll figure is written in: the reroll highlight colour on the remnant the advice says to roll
+    /// next, the one the border rings, and the propagating rune colour on every other; at half strength while the
+    /// figures are a step behind the chain and contents on screen. See Rolling.FiguresShowable and
+    /// RerollDisplaySettings.RollColour.
     /// </summary>
-    internal static Color RollFigureColour(AutoExpeditionSettings settings)
+    internal static Color RollFigureColour(AutoExpeditionSettings settings, Vector2 grid)
     {
-        var colour = (Color)settings.Display.Remnants.Propagation.PassColour;
+        var advised = Rolling.Here.Advised is { } best && Vector2.Distance(best.Grid, grid) < 1f;
+        var colour = advised
+            ? (Color)settings.Display.Remnants.Rerolls.RollColour
+            : (Color)settings.Display.Remnants.Propagation.PassColour;
 
         return Rolling.Here.Fresh ? colour : Color.FromArgb(colour.A / 2, colour);
     }
@@ -4607,10 +4612,14 @@ internal static class Overlay
     /// can rest on a few large outcomes. Thousands separated, because the gain runs to five digits on a big chain.
     /// Led by "~" while the figures are a step behind the screen, being worked out again. "off chain" for a remnant
     /// within reach that the chain does not take, whose gain is nought by construction and which is rolled anyway -
-    /// see Rolling.OffChainRollsAreAdvised. See Rolling.RollAdvice and Rolling.FiguresShowable.
+    /// see Rolling.OffChainRollsAreAdvised. A refused remnant has no figure, its gain being a placeholder nought, so it
+    /// shows the refusal's label instead, such as "chain too far" for one beyond the reach gate. See Rolling.RollAdvice
+    /// and Rolling.FiguresShowable.
     /// </summary>
     internal static string RollFigureText(Rolling.RollAdvice said) =>
-        said.OffChain && said.Gain < 1d
+        said.Refused && !string.IsNullOrEmpty(said.RefusalLabel)
+            ? $"{(Rolling.Here.Fresh ? "" : "~")}{said.RefusalLabel}"
+            : said.OffChain && said.Gain < 1d
             ? $"{(Rolling.Here.Fresh ? "" : "~")}off chain"
             : string.Create(System.Globalization.CultureInfo.InvariantCulture,
                 $"{(Rolling.Here.Fresh ? "" : "~")}{said.Gain.ToString("+#,##0;-#,##0;0", System.Globalization.CultureInfo.InvariantCulture)} ({said.ChanceAbove * 100d:0}%)");

@@ -326,6 +326,7 @@ internal sealed class Valuation
             // last stored: the freeze returned before any was read, and no tablet could be priced in chaos under it.
             Priced = true;
             UseRates(0d, 0d, 0d);
+            LivePricesMissing = false;
 
             return _held = _stored;
         }
@@ -338,7 +339,10 @@ internal sealed class Valuation
 
         Priced = value != null;
 
-        UseRates(Rate(value, "Divine Orb"), Rate(value, "Chaos Orb"), Rate(value, "Vaal Orb"));
+        var liveDivine = Rate(value, "Divine Orb");
+
+        UseRates(liveDivine, Rate(value, "Chaos Orb"), Rate(value, "Vaal Orb"));
+        LivePricesMissing = liveDivine <= 0d;
 
         var recipes = Safe.Read(() => _gc.Files.Expedition2Recipes.EntriesList, null);
 
@@ -447,6 +451,16 @@ internal sealed class Valuation
 
     /// <summary>Which rates are in use, for the dump. See UseRates.</summary>
     public static string RatesSaid { get; private set; } = "not read yet";
+
+    /// <summary>
+    /// Whether NinjaPricer answered no price for a Divine Orb at the last build of the prices: it has no prices at all,
+    /// absent or still loading, so every item it is asked about reads 0. The stored rates and recipe prices stand in for
+    /// the rewards, which keeps Unpriced quiet, but nothing stands in for an item on the ground: a MIN line matches
+    /// nothing. NinjaPricer replaces its prices only once every category has downloaded, and after a restart with its
+    /// saved copy older than its reload period it had none for 8 minutes, one category every 21 seconds (log and cache
+    /// files 2026-10-25 19:25:06 to 19:33:13). False while prices are frozen. See AutoExpedition.WarnWhenPricesMissing.
+    /// </summary>
+    public static bool LivePricesMissing { get; private set; }
 
     /// <summary>The rates as stored, read once and kept; noughts when there are none.</summary>
     private (double Divine, double Chaos, double Vaal)? _ratesStored;

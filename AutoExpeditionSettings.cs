@@ -3339,7 +3339,7 @@ public class AutolootSettings
         "# 1d+ exceptional socket bases\n" +
         "CLASS:Helmet,Boots,Gloves,Focus ILVL:82 LEVEL:75 SOCKETS:2 DEFENCE:ES\n" +
         "CLASS:Boots ILVL:82 LEVEL:80 SOCKETS:2\n" +
-        "Warmonger Bow ILVL:82 SOCKETS:2\n" +
+        "Warmonger Bow ILVL:82 SOCKETS:3\n" +
         "CLASS:Helmet,Gloves,Focus LEVEL:80 SOCKETS:2 DEFENCE:ES\n" +
         "Flying Spear ILVL:82 SOCKETS:2\n" +
         "Dueling Wand SOCKETS:2\n" +
@@ -3448,7 +3448,7 @@ public class AutolootSettings
         "# 5d+ exceptional socket bases\n" +
         "CLASS:Helmet,Boots,Focus ILVL:82 LEVEL:75 SOCKETS:2 DEFENCE:ES\n" +
         "CLASS:Boots ILVL:82 LEVEL:80 SOCKETS:2 DEFENCE:AR,EV,AR+EV,EV+ES\n" +
-        "Warmonger Bow ILVL:82 SOCKETS:2\n" +
+        "Warmonger Bow ILVL:82 SOCKETS:3\n" +
         "CLASS:Helmet,Gloves,Focus LEVEL:80 SOCKETS:2 DEFENCE:ES\n" +
         "Flying Spear ILVL:82 SOCKETS:2\n" +
         "Dueling Wand ILVL:82 SOCKETS:2\n" +
@@ -3514,6 +3514,89 @@ public class AutolootSettings
         "- that item is not tried again, but the next listed item is\n" +
         "- the press does nothing else")]
     public ToggleNode ActionKeyEndsInputBlock { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// Diverts a dodge roll the player made toward the item instant loot is picking up: while the click waits for the
+    /// roll to end, holds the movement keys that point at the item - Move up key and Move right key for an item up and
+    /// to the right on screen - and lets go when the roll ends. Never starts a roll. A roll goes the way the movement
+    /// keys point, ahead of the cursor, and turns to them mid-roll; with none held it goes toward the cursor (the
+    /// player's account, 2026-10-25). Off, the roll goes where the player sent it. See Autoloot.DivertDodgeRollTowardItem.
+    /// </summary>
+    [Menu("Divert dodge rolls toward loot", "When you dodge roll as instant loot picks up an item, your roll is\n" +
+                                            "turned toward the item by holding the movement keys toward it\n" +
+                                            "until the roll ends. It never starts a roll itself.\n" +
+                                            "Uses the four movement keys below.")]
+    public ToggleNode DivertDodgeRollsTowardLoot { get; set; } = new ToggleNode(true);
+
+    /// <summary>
+    /// The game's movement keys, held by Divert dodge rolls toward loot. Set here rather than read from the game: its
+    /// settings file on the machine this was written on had not been written since 2024-12-25, its bindings stale, and
+    /// ExileCore2 does not read them.
+    /// </summary>
+    [Menu("Move up key", "Your movement key for up the screen.")]
+    public HotkeyNodeV2 MoveUpKey { get; set; } = new HotkeyNodeV2(Keys.W);
+
+    /// <summary>See MoveUpKey.</summary>
+    [Menu("Move left key", "Your movement key for left.")]
+    public HotkeyNodeV2 MoveLeftKey { get; set; } = new HotkeyNodeV2(Keys.A);
+
+    /// <summary>See MoveUpKey.</summary>
+    [Menu("Move down key", "Your movement key for down the screen.")]
+    public HotkeyNodeV2 MoveDownKey { get; set; } = new HotkeyNodeV2(Keys.S);
+
+    /// <summary>See MoveUpKey.</summary>
+    [Menu("Move right key", "Your movement key for right.")]
+    public HotkeyNodeV2 MoveRightKey { get; set; } = new HotkeyNodeV2(Keys.D);
+
+    /// <summary>
+    /// Lets instant loot press Dodge roll key itself, toward an item out of pickup reach, when the roll and the walk
+    /// after it reach the item sooner than walking there - judged from the character's roll distance, movement speed and
+    /// slows, read from its stats (CharacterMovementFromStats). The key is held past the roll, sprinting the rest of the
+    /// way, and let go once the item is in reach; the walk weighed is no faster than that sprint. The roll is aimed by
+    /// the cursor on the item and by Divert dodge rolls toward loot's movement keys, and the click goes out as it ends.
+    /// Only with the player's input blocked for the pickup. See Autoloot.RollIsFaster.
+    /// </summary>
+    [Menu("Dodge roll to out of range loot when faster",
+        "Instant loot presses your dodge roll key itself, toward an item\n" +
+        "out of reach, when rolling there and walking the rest is quicker\n" +
+        "than walking. Decided from your dodge roll distance, movement\n" +
+        "speed and slows such as chill, read from your character's stats.\n" +
+        "The key is held after the roll to sprint the rest of the way,\n" +
+        "and let go once the item is in reach.")]
+    public ToggleNode DodgeRollToOutOfRangeLootWhenFaster { get; set; } = new ToggleNode(true);
+
+    /// <summary>The game's dodge roll key, pressed by Dodge roll to out of range loot when faster. See MoveUpKey.</summary>
+    [Menu("Dodge roll key", "Your dodge roll key, as bound in the game.")]
+    public HotkeyNodeV2 DodgeRollKey { get; set; } = new HotkeyNodeV2(Keys.Space);
+
+    /// <summary>
+    /// After a dodge roll instant loot makes, toward an item or heading toward one off screen, keeps Dodge roll key
+    /// held so the roll runs on into a sprint, let go once the item is in reach. Quicker over a long way, but a
+    /// sprinting character can be knocked down when hit. Off by default: the key is tapped, and after the roll the
+    /// character walks, or a chase rolls again where a straight stretch is a roll long. See Autoloot.StepPlannedRoll.
+    /// </summary>
+    [Menu("Sprint after instant loot's dodge roll",
+        "After a dodge roll instant loot makes, keeps the key held so you\n" +
+        "sprint the rest of the way, let go once the item is in reach.\n" +
+        "Quicker over a long way, but you can be knocked down if hit\n" +
+        "while sprinting. Off, the roll is a tap and you walk the rest.")]
+    public ToggleNode SprintAfterInstantLootDodgeRoll { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// With nothing on screen to pick up, instant loot heads toward the nearest listed item lying off screen: along a
+    /// route round walls over the pathfinding grid, rolling and sprinting down a straight stretch at least a roll long
+    /// (when Dodge roll to out of range loot when faster is on) and walking with the movement keys otherwise, until the
+    /// item's label is on screen, when the ordinary pickup takes it. For at most 3 seconds, not again for an item that
+    /// ran out of time, and only with the player's input blocked for instant loot. Off by default: it moves the
+    /// character on its own. See Autoloot.StartOffScreenChase.
+    /// </summary>
+    [Menu("Head toward listed loot off screen",
+        "With nothing on screen to pick up, instant loot moves you toward\n" +
+        "the nearest item on the instant list lying off screen, along a\n" +
+        "route round walls - rolling and sprinting down straight stretches,\n" +
+        "walking with your movement keys otherwise - until it is on screen,\n" +
+        "then picks it up as usual. For up to 3 seconds.")]
+    public ToggleNode HeadTowardListedLootOffScreen { get; set; } = new ToggleNode(false);
 
     /// <summary>
     /// How long an instant loot pickup has, and how long the player's mouse is ignored or blocked for, in milliseconds.
@@ -4524,8 +4607,8 @@ public class RerollDisplaySettings
     /// about where the chain goes - and sharing a colour with the chain, the covered markers and
     /// the chosen reward meant reading position to tell them apart.
     ///
-    /// One setting drives the border, the line that leads to it, and the two score-card lines that
-    /// say a roll is outstanding, so they are one mark in four places rather than four marks.
+    /// One setting drives the border, the line that leads to it, the advised remnant's roll figure in
+    /// the world and on the map, and the two score-card lines that say a roll is outstanding.
     /// </summary>
     [Menu("Highlight colour")]
     public ColorNode RollColour { get; set; } = new ColorNode(Color.FromArgb(255, 90, 160, 255));
@@ -5056,27 +5139,24 @@ public class RewardSettings
     /// <summary>
     /// How far from the chain a remnant may sit and still be advised on, in reaches.
     ///
-    /// **A candidate is a remnant one new link could catch.** The test is whether any planned
-    /// explosive is within `reach * this + blast` of it, because a new link does not have to land
-    /// on the remnant, only close enough for its blast to cover it. At 1.0 that reads as "one more
-    /// explosive, placed from one already down, near enough to catch this" - a statement about the
-    /// chain rather than a tuning figure. Higher is a dial on optimism.
+    /// The test is whether any planned explosive is within `reach * this + blast` of the remnant, where a reach is how
+    /// far one explosive may be placed from the last. It is a distance from the chain as planned, not a statement
+    /// about explosives in hand or about whether another chain would take the remnant.
     ///
-    /// **Not the same as refusing a remnant the chain misses, which was a real hole once.** That
-    /// refusal threw away exactly the remnants a roll exists to rescue - currently worth nothing,
-    /// worth re-routing for after a good draw. This keeps those and refuses only the ones no single
-    /// link could reach, which is a walk of several reaches on the chance of a good draw.
+    /// A remnant within it that the chain does not take is "off chain": its roll scores nought against the chain held
+    /// still, and it is advised after every roll on the chain, nearest first (Rolling.OffChainRollsAreAdvised). One
+    /// beyond it is "chain too far" and is never advised, since rolling it means a walk away from the route on the
+    /// chance of a good draw that the re-solve then takes. Re-evaluated every pass, so a remnant becomes a candidate
+    /// once the route moves near it.
     ///
-    /// **Safe because it is not permanent.** A remnant excluded at three reaches becomes a
-    /// candidate the moment the route moves near it, since the gate is re-evaluated whenever the
-    /// chain changes. Being excluded from one pass costs nothing; walking three reaches to a
-    /// remnant the chain will never pass costs the site.
+    /// 3 by default. At 1, on a Grand Frigid Bluffs site with 15 explosives (2026-10-28), remnants 174 and 210 grid from
+    /// the chain against a limit of 143 were never advised, though a chain could plainly have reached them.
     /// </summary>
     [Menu("Only advise rolling within (reach)",
         "A remnant is only considered for rolling when a planned explosive\n" +
         "is within this many reaches of it, plus the blast radius.\n" +
-        "1.0 means one more explosive could catch it.")]
-    public RangeNode<float> RollWithinReach { get; set; } = new RangeNode<float>(1f, 0.5f, 4f);
+        "Remnants beyond it show \"chain too far\" and are never advised.")]
+    public RangeNode<float> RollWithinReach { get; set; } = new RangeNode<float>(3f, 0.5f, 4f);
 
     /// <summary>
     /// **Four thresholds used to live here and the calculation replaced all of them.**
