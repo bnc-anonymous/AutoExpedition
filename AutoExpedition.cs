@@ -325,9 +325,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
     /// <summary>
     /// The ExileInput2 bridge version this plugin needs (ExileInput2.BridgeVersion). 2 adds LastPressDownAt, which instant
-    /// loot times its pickups by, and sends held and restored keys with their own scan codes: under 1 the movement keys
-    /// held to steer a dodge roll did not walk, and keys pressed again after instant loot's key block stayed held in the
-    /// game. Raised with the client whenever it starts using a newer method or behaviour.
+    /// loot times its pickups by, and every install at 2 has the key-up check that stops keys staying held in the game
+    /// after instant loot's key block (ExileInput2 db33f43). 2 also sends held and restored keys with their own scan
+    /// codes, which the game turned out not to need (see ExileInput2's PhysicalKeys). Raised with the client whenever it
+    /// starts using a newer method or behaviour.
     /// </summary>
     private const int ExileInput2VersionNeeded = 2;
 
