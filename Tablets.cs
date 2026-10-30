@@ -111,7 +111,7 @@ internal static partial class Tablets
 
         _valuation = valuation;
         TabletPricing.DeleteAnswersOlderThan(TimeSpan.FromDays(tablets.TradeSite.DeletePricesOlderThanDays.Value));
-        _automationOn = settings.Automation.Enable.Value;
+        _automationOn = settings.Automation.Active;
         _tabletAutomation = tablets.TabletAutomation.EnableTabletAutomation.Value;
 
         if (!tablets.TabletAutomation.HideIndividualCraftReforgeZonesSetForScreen &&

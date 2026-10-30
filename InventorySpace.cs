@@ -200,7 +200,7 @@ internal static class InventorySpace
     /// AutolootSettings.InventorySlotsKeptForInstantLoot.
     /// </summary>
     public static int KeptForInstantLoot(GameController gc, AutoExpeditionSettings settings) =>
-        settings.Automation.Enable.Value && settings.Automation.Autoloot.EnableInstantAutoloot && Autoloot.PartyInArea(gc)
+        settings.Automation.Active && settings.Automation.Autoloot.EnableInstantAutoloot && Autoloot.PartyInArea(gc)
             ? settings.Automation.Autoloot.InventorySlotsKeptForInstantLoot.Value
             : 0;
 

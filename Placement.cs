@@ -565,7 +565,7 @@ internal sealed class Placement
     /// </summary>
     public bool ListedItemReady(GameController gc, AutoExpeditionSettings settings)
     {
-        if (!settings.Automation.Enable.Value || !settings.Automation.Autoloot.EnableAutoloot)
+        if (!settings.Automation.Active || !settings.Automation.Autoloot.EnableAutoloot)
             return false;
 
         if (!Busy)
@@ -3273,7 +3273,7 @@ internal sealed class Placement
 
         // Shattering and chests only where the action key list has their ENTITY line: the list is their only switch.
         // See Autoloot.RemnantsLine.
-        var listing = settings.Automation.Enable.Value && autoloot.EnableAutoloot;
+        var listing = settings.Automation.Active && autoloot.EnableAutoloot;
         var remnantsRank = Autoloot.RankOfLine(autoloot.ItemsOnActionKey, Autoloot.RemnantsLine);
         var chestsRank = Autoloot.RankOfLine(autoloot.ItemsOnActionKey, Autoloot.ExcavatedChestsLine);
 

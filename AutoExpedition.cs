@@ -294,7 +294,15 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
 
         _inputCheckedAt = DateTime.UtcNow;
 
-        var missing = Settings.Automation.Enable.Value && !ExileInput2Running();
+        // **Automation held off until the player accepts the automation warning**, for a file saved with it on from
+        // before the warning: said once, as a missing ExileInput2 is, and again on each action key press. See
+        // AutomationSettings.RisksAccepted.
+        if (Settings.Automation.AwaitingAnswer && !_automationDisabledSaid)
+            CursorWarning.Show(AutomationDisabledWord, AutomationDisabledWarningSeconds);
+
+        _automationDisabledSaid = Settings.Automation.AwaitingAnswer;
+
+        var missing = Settings.Automation.Active && !ExileInput2Running();
 
         if (missing && !_inputMissingSaid)
             CursorWarning.Show(InputMissingWord, InputMissingWarningSeconds);
@@ -304,7 +312,7 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         // **Running but older than this plugin needs**: the methods it lacks degrade to doing nothing, so instant loot,
         // loot plans and the tablet runs fail without a word. Asked once each time it is found running, so a reinstall
         // is checked again. See ExileInput2VersionNeeded.
-        if (missing || !Settings.Automation.Enable.Value)
+        if (missing || !Settings.Automation.Active)
         {
             _inputVersionChecked = false;
             return;
@@ -401,6 +409,14 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
     private const string InputMissingWord = "AutoExpedition: Automation is enabled\nbut ExileInput2 was not found.";
 
     private const int InputMissingWarningSeconds = 30;
+
+    /// <summary>Said at the cursor while automation is held off for the automation warning. See WarnWhenInputMissing.</summary>
+    private const string AutomationDisabledWord = "AutoExpedition: Automation has been disabled.\nEnable it in Settings > Automation and accept the risks.";
+
+    /// <summary>How long AutomationDisabledWord stays at the cursor, in seconds.</summary>
+    private const int AutomationDisabledWarningSeconds = 10;
+
+    private bool _automationDisabledSaid;
 
     private static readonly TimeSpan InputMissingGrace = TimeSpan.FromSeconds(10);
 
@@ -1817,6 +1833,10 @@ public partial class AutoExpedition : BaseSettingsPlugin<AutoExpeditionSettings>
         var hotkeyPressed = Settings.ActionHotkey.PressedOnce();
         var keyWentDown = ActionKeyWentDown();
         var actionPressed = InventoryDeposit.Running || Tablets.RunHoldsCursor ? keyWentDown : hotkeyPressed;
+
+        // A press while automation is held off for the automation warning says why again: it would only plan.
+        if (actionPressed && Settings.Automation.AwaitingAnswer)
+            CursorWarning.Show(AutomationDisabledWord, AutomationDisabledWarningSeconds);
 
         // On the Deposit zone, or during a deposit run, the key is Autodeposit's, ahead of the tablets'. See InventoryDeposit.
         if (actionPressed && InventoryDeposit.TakesActionKey(GameController, Settings))

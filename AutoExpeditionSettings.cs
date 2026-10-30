@@ -3005,21 +3005,114 @@ public class AutomationSettings
     /// no way to say "plan and draw, but keep your hands off my mouse" in one move, which is the
     /// first thing anybody trying the plugin wants to be able to say.
     ///
-    /// On, because placing the chain is what the plugin is for and a tester who has to find two
-    /// switches before anything happens reports that it does not work. Off, every key still plans,
-    /// draws and prices; nothing moves the cursor.
+    /// **Off until the player turns it on and accepts the risk** (2026-10-30). The clicks and keys ExileInput2 sends
+    /// are marked by Windows as sent rather than coming from a device, and the game reads its input through raw input,
+    /// which carries that mark - so automation is visible to the game, and the player decides whether to take that on.
+    /// Turning it on goes through the warning in DrawEnable; turning it off does not ask. A file saved with it on from
+    /// before the warning keeps it on, held off until the player accepts the warning, with a warning at the cursor
+    /// saying so. See RisksAccepted.
+    /// Off, every key still plans, draws and prices; nothing moves the cursor.
     ///
     /// Drawing is not automation and is not gated by this - the line to loot still points the way.
     /// </summary>
-    [Menu("Enable automation",
+    [IgnoreMenu]
+    public ToggleNode Enable { get; set; } = new ToggleNode(false);
+
+    /// <summary>
+    /// Whether the player has accepted the automation warning, from the checkbox's popup. A file saved with Enable on
+    /// from before the warning has this off: automation is held off without the saved Enable being changed, and a
+    /// warning at the cursor says so and where to accept (AutoExpedition.AutomationDisabledWord), so nobody takes it
+    /// for the plugin having broken.
+    /// </summary>
+    [IgnoreMenu]
+    public ToggleNode RisksAccepted { get; set; } = new ToggleNode(false);
+
+    /// <summary>Whether automation may act: Enable on and the warning accepted. Every gate on automation reads this.</summary>
+    [JsonIgnore]
+    public bool Active => Enable.Value && RisksAccepted.Value;
+
+    /// <summary>Enable on with the warning not yet accepted: automation held off until the player accepts it.</summary>
+    [JsonIgnore]
+    public bool AwaitingAnswer => Enable.Value && !RisksAccepted.Value;
+
+    /// <summary>Enable's checkbox, drawn here rather than by the menu so that turning it on asks first. See DrawEnable.</summary>
+    [JsonIgnore]
+    public CustomNode EnableUi { get; set; }
+
+    public AutomationSettings()
+    {
+        EnableUi = new CustomNode(DrawEnable);
+    }
+
+    private const string EnableHelp =
         "Lets the plugin move the mouse, click and press keys for you:\n" +
         "- placing explosives and choosing rewards\n" +
         "- autoloot and instant loot\n" +
         "- autodeposit and the tablet runs\n\n" +
         "Requires the ExileInput2 plugin, installed and enabled: it is what moves the mouse\n" +
         "and presses the keys. Without it, nothing here does anything.\n\n" +
-        "Off, the plugin still plans, draws and prices; it never touches the mouse or keyboard.")]
-    public ToggleNode Enable { get; set; } = new ToggleNode(true);
+        "Off, the plugin still plans, draws and prices; it never touches the mouse or keyboard.";
+
+    internal const string RisksText =
+        "With automation on, AutoExpedition controls the mouse and keyboard through ExileInput2.\n" +
+        "Keys and clicks are sent with keybd_event and mouse_event; the cursor is moved with\n" +
+        "SetCursorPos.\n\n" +
+        "This input is distinguishable from your own:\n" +
+        "- Raw input, which Path of Exile 2 uses, reports injected keys and clicks with a null\n" +
+        "  device handle, where input from your mouse and keyboard carries the device's handle.\n" +
+        "- Cursor moves made with SetCursorPos produce no raw mouse movement at all.\n" +
+        "- Keyboard and mouse hooks see the injected flag on every sent event.\n\n" +
+        "It would be trivial for GGG to detect this if they chose to: Windows includes it with\n" +
+        "every input the game receives.\n\n" +
+        "Automating gameplay is against Path of Exile 2's terms of use and can get your account banned.";
+
+    /// <summary>
+    /// The Enable automation checkbox. Ticking it opens the warning, and automation goes on only from its button;
+    /// unticking it turns automation off at once.
+    /// </summary>
+    private void DrawEnable()
+    {
+        var on = Active;
+
+        if (ImGui.Checkbox("Enable automation###aeEnableAutomation", ref on))
+        {
+            if (on)
+                ImGui.OpenPopup("###aeAutomationRisks");
+            else
+                Enable.Value = false;
+        }
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(EnableHelp);
+
+        if (AwaitingAnswer)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled("(disabled until you accept the risks: tick to read them)");
+        }
+
+        var open = true;
+
+        if (ImGui.BeginPopupModal("Before you turn on automation###aeAutomationRisks", ref open, ImGuiWindowFlags.AlwaysAutoResize))
+        {
+            ImGui.TextUnformatted(RisksText);
+            ImGui.Spacing();
+
+            if (ImGui.Button("Turn on automation"))
+            {
+                Enable.Value = true;
+                RisksAccepted.Value = true;
+                ImGui.CloseCurrentPopup();
+            }
+
+            ImGui.SameLine();
+
+            if (ImGui.Button("Cancel"))
+                ImGui.CloseCurrentPopup();
+
+            ImGui.EndPopup();
+        }
+    }
 
     /// <summary>
     /// Whether to hide ground labels when one is sitting over a button that needs clicking, or over every part of a
@@ -3086,7 +3179,7 @@ public class AutomationSettings
     public ToggleNode ShowPlannedAutomationAutoloot { get; set; } = new ToggleNode(true);
 
     /// <summary>Whether a switch below is on AND automation is on at all.</summary>
-    public bool On(ToggleNode switched) => Enable.Value && switched.Value;
+    public bool On(ToggleNode switched) => Active && switched.Value;
 
     /// <summary>
     /// The Expedition Tablet Rerolling section's Enable tablet automation, drawn here as well, so it can be changed from

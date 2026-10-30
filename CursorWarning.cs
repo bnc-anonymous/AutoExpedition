@@ -31,6 +31,7 @@ internal static class CursorWarning
         "Placement lands wrong", "Marker not lit", "Placement key not working", "Timeout", "Window did not open",
         "Failed to click", "ExileInput2 input refused", "ExileInput2 not installed", "ExileInput2 busy",
         "Missing currency", "AutoExpedition: Automation is enabled\nbut ExileInput2 was not found.", "Inventory full",
+        "AutoExpedition: Automation has been disabled.\nEnable it in Settings > Automation and accept the risks.",
         "AutoExpedition: ExileInput2 is out of date.\nUpdate it - automation will not work fully.", "Item held",
         "AutoExpedition: NinjaPricer has no prices.\nLoot lists with MIN match nothing.",
     };

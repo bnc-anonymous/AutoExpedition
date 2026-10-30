@@ -276,7 +276,7 @@ internal static partial class Autoloot
     private static void SoundForNewItems(GameController gc, AutoExpeditionSettings settings,
         List<(Entity Item, LabelOnGround Label, int Rank, string Name)> listed)
     {
-        if (!settings.Automation.Enable.Value || !settings.Automation.Autoloot.EnableInstantAutoloot ||
+        if (!settings.Automation.Active || !settings.Automation.Autoloot.EnableInstantAutoloot ||
             !settings.Automation.Autoloot.PlayInstantLootSound)
             return;
 
@@ -1721,7 +1721,7 @@ internal static partial class Autoloot
                 return;
         }
 
-        if (!settings.Automation.Enable.Value || !autoloot.EnableInstantAutoloot)
+        if (!settings.Automation.Active || !autoloot.EnableInstantAutoloot)
         {
             LetGoWhenNoPickupStarts();
             return;

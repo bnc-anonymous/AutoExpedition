@@ -184,7 +184,7 @@ internal static class InventoryDeposit
     /// </summary>
     public static bool TakesActionKey(GameController gc, AutoExpeditionSettings settings) =>
         Running ||
-        settings.Automation.Enable.Value && settings.Automation.Autodeposit.EnableAutodeposit.Value &&
+        settings.Automation.Active && settings.Automation.Autodeposit.EnableAutodeposit.Value &&
         Contains(ZoneRect(gc), Cursor(gc));
 
     /// <summary>The action key on the zone starts a run; during one, anywhere, it stops it.</summary>
@@ -747,7 +747,7 @@ internal static class InventoryDeposit
     /// </summary>
     public static void Draw(Graphics graphics, GameController gc, AutoExpeditionSettings settings)
     {
-        if (!settings.Automation.Enable.Value || !settings.Automation.Autodeposit.EnableAutodeposit.Value ||
+        if (!settings.Automation.Active || !settings.Automation.Autodeposit.EnableAutodeposit.Value ||
             ZoneRect(gc) is not { Width: > 0f } zone)
             return;
 

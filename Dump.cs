@@ -1689,7 +1689,7 @@ internal static class Dump
 
         var after = Settings.Automation.PostExpedition;
 
-        b.AppendLine($"  automate {Settings.Automation.Enable.Value}, " +
+        b.AppendLine($"  automate {Settings.Automation.Enable.Value} (warning accepted {Settings.Automation.RisksAccepted.Value}), " +
                      $"action key list: shatter {Autoloot.RankOfLine(Settings.Automation.Autoloot.ItemsOnActionKey, Autoloot.RemnantsLine) != int.MaxValue}, " +
                      $"chests {Autoloot.RankOfLine(Settings.Automation.Autoloot.ItemsOnActionKey, Autoloot.ExcavatedChestsLine) != int.MaxValue}, " +
                      $"placement enabled {Settings.Automation.PreExpedition.Enable.Value}, " +
