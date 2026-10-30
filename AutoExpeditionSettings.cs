@@ -3572,7 +3572,7 @@ public class AutolootSettings
     /// <summary>
     /// After a dodge roll instant loot makes, toward an item or heading toward one off screen, keeps Dodge roll key
     /// held so the roll runs on into a sprint, let go once the item is in reach. Quicker over a long way, but a
-    /// sprinting character can be knocked down when hit. Off by default: the key is tapped, and after the roll the
+    /// sprinting character can be knocked down when hit. On by default. Off, the key is tapped, and after the roll the
     /// character walks, or a chase rolls again where a straight stretch is a roll long. See Autoloot.StepPlannedRoll.
     /// </summary>
     [Menu("Sprint after instant loot's dodge roll",
@@ -3580,14 +3580,14 @@ public class AutolootSettings
         "sprint the rest of the way, let go once the item is in reach.\n" +
         "Quicker over a long way, but you can be knocked down if hit\n" +
         "while sprinting. Off, the roll is a tap and you walk the rest.")]
-    public ToggleNode SprintAfterInstantLootDodgeRoll { get; set; } = new ToggleNode(false);
+    public ToggleNode SprintAfterInstantLootDodgeRoll { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// With nothing on screen to pick up, instant loot heads toward the nearest listed item lying off screen: along a
     /// route round walls over the pathfinding grid, rolling and sprinting down a straight stretch at least a roll long
     /// (when Dodge roll to out of range loot when faster is on) and walking with the movement keys otherwise, until the
     /// item's label is on screen, when the ordinary pickup takes it. For at most 3 seconds, not again for an item that
-    /// ran out of time, and only with the player's input blocked for instant loot. Off by default: it moves the
+    /// ran out of time, and only with the player's input blocked for instant loot. On by default; it moves the
     /// character on its own. See Autoloot.StartOffScreenChase.
     /// </summary>
     [Menu("Head toward listed loot off screen",
@@ -3596,7 +3596,7 @@ public class AutolootSettings
         "route round walls - rolling and sprinting down straight stretches,\n" +
         "walking with your movement keys otherwise - until it is on screen,\n" +
         "then picks it up as usual. For up to 3 seconds.")]
-    public ToggleNode HeadTowardListedLootOffScreen { get; set; } = new ToggleNode(false);
+    public ToggleNode HeadTowardListedLootOffScreen { get; set; } = new ToggleNode(true);
 
     /// <summary>
     /// How long an instant loot pickup has, and how long the player's mouse is ignored or blocked for, in milliseconds.
